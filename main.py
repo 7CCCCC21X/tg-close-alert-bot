@@ -31,7 +31,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -64,8 +64,13 @@ def beijing_day(now: float | None = None) -> str:
     return dt.datetime.fromtimestamp(time.time() if now is None else now, BEIJING).date().isoformat()
 
 
-def stamp(ms: int | float) -> str:
-    return dt.datetime.fromtimestamp(float(ms) / 1000, BEIJING).strftime("%m-%d %H:%M:%S")
+def stamp(ms: int | float, seconds: bool = True) -> str:
+    """Beijing-time stamp such as 09-17 16:00:00, or 09-17 16:00 without seconds."""
+    return dt.datetime.fromtimestamp(float(ms) / 1000, BEIJING).strftime("%m-%d %H:%M:%S" if seconds else "%m-%d %H:%M")
+
+
+def close_label(close_ms: int) -> str:
+    return f"｜收盘 {stamp(close_ms, seconds=False)}（北京时间）" if close_ms else ""
 
 
 def clean_error(error: BaseException | str) -> str:
@@ -239,6 +244,7 @@ class Baseline:
     key: str
     label: str
     valid_until_ms: int
+    close_ms: int = 0  # When the close behind this baseline happened; 0 = unknown.
 
 
 def daily_baseline(rows: Any, now_ms: int) -> Baseline:
@@ -258,7 +264,7 @@ def daily_baseline(rows: Any, now_ms: int) -> Baseline:
             value = number(row[4], "上一日收盘价")
             day = dt.datetime.fromtimestamp(opening / 1000, UTC).date().isoformat()
             return Baseline(value, f"daily:{day}:{value}",
-                            f"币安日 K 昨收｜{day}（UTC）", boundary + DAY_MS)
+                            f"币安日 K 昨收｜{day}（UTC）" + close_label(boundary), boundary + DAY_MS, boundary)
     raise ValueError("没有完整的上一 UTC 日日 K（可能新上市或接口数据未就绪）；不使用旧基准")
 
 
@@ -269,8 +275,12 @@ def manual_baseline(record: dict | None, now_ms: int) -> Baseline:
     value = number(record.get("value"), "手动基准")
     until = dt.datetime.combine(dt.date.fromisoformat(today) + dt.timedelta(days=1),
                                 dt.time(), BEIJING)
+    close_ms = 0
+    with contextlib.suppress(ValueError, TypeError):  # Older records have no close time.
+        close_ms = int(dt.datetime.fromisoformat(str(record.get("close_at"))).replace(tzinfo=BEIJING).timestamp() * 1000)
     return Baseline(value, f"manual:{today}:{value}",
-                    f"手动参考价｜适用日 {today}（北京时间）", int(until.timestamp() * 1000))
+                    f"手动参考价｜适用日 {today}（北京时间）" + close_label(close_ms),
+                    int(until.timestamp() * 1000), close_ms)
 
 
 class Binance:
@@ -367,6 +377,15 @@ def alert_plan(state: dict | None, baseline_key: str, change: D, now: float,
     return s, Plan(reason, next_state)
 
 
+def alert_text(symbol: str, quote: Quote, base: Baseline, change: D, threshold: D, reason: str) -> str:
+    side = "📈 上涨" if change > 0 else "📉 下跌"
+    return (f"{side}超过 {fmt(threshold)}%｜{NAMES.get(symbol, symbol)}\n{symbol}\n\n"
+            f"当前成交价：{fmt(quote.price)}\n参考收盘价：{fmt(base.value)}\n"
+            f"相对基准：{change:+.3f}%\n\n{base.label}\n原因：{reason}\n"
+            f"行情时间：{stamp(quote.timestamp_ms)}（北京时间）\n"
+            "⚠️ 合约行情提示，不代表股票官方收盘结算结果。")
+
+
 class Telegram:
     def __init__(self, token: str):
         self.root = f"https://api.telegram.org/bot{token}/"
@@ -381,21 +400,37 @@ class Telegram:
             raise RemoteError(f"Telegram: {clean_error(msg)}", int(retry))
         return data.get("result")
 
-    async def send(self, chat: int, thread: int, text: str) -> None:
+    async def paced(self, method: str, payload: dict) -> Any:
+        """Serialize outgoing messages and respect Telegram's per-chat send rate."""
+        async with self.lock:
+            await asyncio.sleep(max(0, self.next_send - time.monotonic()))
+            try:
+                return await self.call(method, payload)
+            except RemoteError as error:
+                self.next_send = time.monotonic() + max(1.1, error.retry_after)
+                raise
+            finally:
+                self.next_send = max(self.next_send, time.monotonic() + 1.1)
+
+    async def send(self, chat: int, thread: int, text: str, reply_markup: dict | None = None) -> None:
         # Plain text avoids HTML/Markdown escaping problems in symbols/errors.
-        for chunk in split_text(text):
-            async with self.lock:
-                await asyncio.sleep(max(0, self.next_send - time.monotonic()))
-                payload: dict[str, Any] = {"chat_id": chat, "text": chunk,
-                                          "link_preview_options": {"is_disabled": True}}
-                if thread:
-                    payload["message_thread_id"] = thread
-                try:
-                    await self.call("sendMessage", payload)
-                except RemoteError as error:
-                    self.next_send = time.monotonic() + max(1.1, error.retry_after)
-                    raise
-                self.next_send = time.monotonic() + 1.1
+        chunks = split_text(text)
+        for index, chunk in enumerate(chunks):
+            payload: dict[str, Any] = {"chat_id": chat, "text": chunk,
+                                      "link_preview_options": {"is_disabled": True}}
+            if thread:
+                payload["message_thread_id"] = thread
+            if reply_markup and index == len(chunks) - 1:
+                payload["reply_markup"] = reply_markup  # Buttons belong under the final chunk.
+            await self.paced("sendMessage", payload)
+
+    async def edit(self, chat: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
+        """Rewrite a card in place after a button press so it reflects the new selection."""
+        payload: dict[str, Any] = {"chat_id": chat, "message_id": message_id, "text": split_text(text)[0],
+                                   "link_preview_options": {"is_disabled": True}}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        await self.paced("editMessageText", payload)
 
 
 def split_text(text: str, limit: int = 3400) -> list[str]:
@@ -425,26 +460,180 @@ def is_admin(message: dict, config: Config) -> bool:
     return bool(config.admin_id and not sender.get("is_bot") and sender.get("id") == config.admin_id)
 
 
-HELP = """📡 合约昨收偏离提醒
+@dataclass(frozen=True)
+class Command:
+    """One bot command: drives /help text, the Telegram "菜单" button and dispatch."""
+    name: str
+    description: str
+    example: str = ""  # Arguments shown in /help and the menu hint, e.g. "1" for /threshold 1.
+    note: str = ""     # Extra /help line under the command.
 
-/subscribe  在当前私聊/群组话题订阅
-/unsubscribe  取消当前订阅
-/status  查看四个合约、基准与数据状态
-/threshold 1  改为严格超过 ±1% 提醒
-/cooldown 300  持续超标每 300 秒提醒（0=关闭周期提醒）
-/mode daily  自动使用币安上一 UTC 日日 K 收盘
-/mode manual  使用手动同口径参考价
-/setclose UNITREE 75 2026-09-18
-  示例：75 是基准；日期是适用日，不是收盘发生日
-/pause  暂停当前订阅
-/resume  恢复当前订阅
-/test  发送测试消息，不代表行情正常
-/id  查看你的用户 ID、聊天 ID、话题 ID
-/help  显示说明
+    @property
+    def usage(self) -> str:
+        return f"/{self.name} {self.example}".rstrip()
+
+    def help_line(self) -> str:
+        line = f"{self.usage}  {self.description}"
+        return f"{line}\n  {self.note}" if self.note else line
+
+    def menu_entry(self) -> dict[str, str]:
+        # Telegram shows only name + description in the menu; append a usage hint when arguments exist.
+        text = f"{self.description}｜用法 {self.usage}" if self.example else self.description
+        return {"command": self.name, "description": text[:256]}
+
+
+COMMANDS: tuple[Command, ...] = (
+    Command("subscribe", "在当前私聊/群组话题订阅"),
+    Command("unsubscribe", "取消当前订阅"),
+    Command("status", "查看合约、基准与数据状态"),
+    Command("threshold", "改为严格超过 ±1% 提醒", "1", "不带数字则弹出档位按钮卡片，点选即可"),
+    Command("cooldown", "持续超标每 300 秒提醒（0=关闭周期提醒）", "300"),
+    Command("mode", "daily=币安上一 UTC 日日 K 收盘；manual=手动同口径参考价", "daily|manual"),
+    Command("setclose", "设置手动参考价，可一次发多条", "UNITREE 75 09-17 16:00",
+            "示例：75 是基准，09-17 16:00 是它的收盘时间（北京，可省略）\n"
+            "  末尾再写 YYYY-MM-DD 可指定适用日（默认今天）；批量：每行一组，首行可写统一适用日"),
+    Command("pause", "暂停当前订阅"),
+    Command("resume", "恢复当前订阅"),
+    Command("test", "发送测试消息，不代表行情正常"),
+    Command("id", "查看你的用户 ID、聊天 ID、话题 ID"),
+    Command("help", "显示说明"),
+)
+# Accepted spellings that are not listed in the menu.
+COMMAND_ALIASES = {"/start": "/help", "/price": "/status"}
+# Threshold choices offered as buttons on the /threshold card (percent deviation from the baseline).
+THRESHOLD_PRESETS = ("0.3", "0.5", "1", "1.5", "2", "3", "5", "10")
+
+
+def threshold_card(current: D) -> tuple[str, dict]:
+    """Card text + inline keyboard; the active preset is ticked."""
+    buttons = [{"text": ("✅ " if D(p) == current else "") + f"±{p}%", "callback_data": f"threshold:{p}"}
+               for p in THRESHOLD_PRESETS]
+    text = (f"📏 提醒阈值：跟上一日收盘价（基准）偏离多少才提醒\n当前：严格超过 ±{fmt(current)}%\n\n"
+            "点选下方档位即时生效；其他数值请发送 /threshold 0.8。")
+    return text, {"inline_keyboard": [buttons[i:i + 4] for i in range(0, len(buttons), 4)]}
+
+HELP = "📡 合约昨收偏离提醒\n\n" + "\n".join(c.help_line() for c in COMMANDS) + """
 
 ⚠️ 默认并非股票交易所正式昨收，也不是滚动 24h 涨跌幅。
 手动价必须与币安合约显示数值采用同一计价口径；不自动换汇。
 只有管理员能订阅或修改设置；不会自动下单、撤单。"""
+
+
+def id_text(user_id: int, chat: int, thread: int) -> str:
+    return f"你的用户 ID：{user_id}\n聊天 ID：{chat}\n话题 ID：{thread}"
+
+
+@dataclass(frozen=True)
+class Request:
+    """A parsed admin command with the chat it came from."""
+    command: str
+    args: list[str]
+    chat: int
+    thread: int
+    user_id: int
+    raw: str = ""  # Argument text with line breaks kept, for multi-line commands such as /setclose.
+
+    @property
+    def sub_id(self) -> str:
+        return subscription_key(self.chat, self.thread)
+
+
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def parse_day(value: str) -> str:
+    try:
+        return dt.date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise ValueError(f"日期格式应为 YYYY-MM-DD：{value}") from None
+
+
+def short_name(symbol: str) -> str:
+    """Shortest ASCII alias for a symbol, used in examples (UNITREEUSDT -> UNITREE)."""
+    aliases = [a for a, s in ALIASES.items() if s == symbol and a.isascii()]
+    return min(aliases, key=len) if aliases else symbol
+
+
+SHORT_DATE_RE = re.compile(r"\d{1,2}-\d{1,2}")
+TIME_RE = re.compile(r"\d{1,2}:\d{2}")
+
+
+@dataclass(frozen=True)
+class CloseEntry:
+    alias: str
+    value: D
+    day: str        # Applicable Beijing calendar day (YYYY-MM-DD).
+    close_at: str   # Beijing close datetime "YYYY-MM-DDTHH:MM", or "" when not given.
+
+
+def parse_close_time(date_token: str, time_token: str, now_ms: int) -> str:
+    """'2026-09-17 16:00' or '09-17 16:00' (Beijing) -> 'YYYY-MM-DDTHH:MM'; must not be in the future."""
+    now = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+    try:
+        if DATE_RE.fullmatch(date_token):
+            day = dt.date.fromisoformat(date_token)
+        else:
+            month, dom = (int(p) for p in date_token.split("-"))
+            day = dt.date(now.year, month, dom)
+            if day > now.date():  # e.g. "12-31" typed in early January
+                day = dt.date(now.year - 1, month, dom)
+        hour, minute = (int(p) for p in time_token.split(":"))
+        moment = dt.datetime.combine(day, dt.time(hour, minute), BEIJING)
+    except ValueError:
+        raise ValueError(f"收盘时间格式应为 MM-DD HH:MM 或 YYYY-MM-DD HH:MM：{date_token} {time_token}") from None
+    if moment > now + dt.timedelta(minutes=5):
+        raise ValueError(f"收盘时间不能晚于当前时间：{date_token} {time_token}")
+    return moment.strftime("%Y-%m-%dT%H:%M")
+
+
+def parse_close_tail(tokens: list[str], day: str, close_at: str, now_ms: int) -> tuple[str, str, list[str]]:
+    """Consume leading date/time tokens: a date followed by HH:MM is the close time, a lone date the day.
+
+    Returns (day, close_at, remaining tokens).
+    """
+    i = 0
+    while i < len(tokens):
+        token, following = tokens[i], tokens[i + 1] if i + 1 < len(tokens) else ""
+        if (DATE_RE.fullmatch(token) or SHORT_DATE_RE.fullmatch(token)) and TIME_RE.fullmatch(following):
+            close_at = parse_close_time(token, following, now_ms)
+            i += 2
+        elif DATE_RE.fullmatch(token):
+            day = parse_day(token)
+            i += 1
+        else:
+            break
+    return day, close_at, tokens[i:]
+
+
+def parse_close_entries(raw: str, now_ms: int) -> list[CloseEntry]:
+    """Parse "SYMBOL PRICE [收盘日期 HH:MM] [适用日]" entries separated by newlines/commas.
+
+    Leading date/time tokens before the first symbol apply to every entry that has none of its own.
+    Nothing is stored here, so a bad line rejects the whole batch.
+    """
+    today = beijing_day(now_ms / 1000)
+    usage = ("用法：/setclose UNITREE 75 [收盘时间 MM-DD HH:MM] [适用日期 YYYY-MM-DD]\n"
+             "批量：每行（或用逗号分隔）一组「合约 价格 [收盘时间]」，最前面可写统一适用日/收盘时间，例如\n"
+             f"/setclose {today}\nUNITREE 75 09-17 16:00\nSHEIN 40 09-17 16:00\n"
+             "价格须与币安显示值同口径；不自动换汇")
+    entries = [e.split() for e in re.split(r"[\n\r,，;；]+", raw) if e.strip()]
+    default_day, default_close = today, ""
+    if entries:
+        default_day, default_close, entries[0] = parse_close_tail(entries[0], today, "", now_ms)
+        if not entries[0]:
+            entries.pop(0)
+    if not entries:
+        raise ValueError(usage)
+    result = []
+    for tokens in entries:
+        if len(tokens) < 2:
+            raise ValueError(usage)
+        alias, value = tokens[0], number(tokens[1], f"{tokens[0]} 手动参考价")
+        day, close_at, rest = parse_close_tail(tokens[2:], default_day, default_close, now_ms)
+        if rest:
+            raise ValueError(f"无法识别「{' '.join(rest)}」\n{usage}")
+        result.append(CloseEntry(alias, value, day, close_at))
+    return result
 
 
 class Bot:
@@ -457,14 +646,39 @@ class Bot:
         self.last_log: dict[str, float] = {}
         self.command_notice: dict[int, float] = {}
         self.username = ""
+        self.handlers = {
+            "/help": self.cmd_help, "/id": self.cmd_id, "/status": self.cmd_status, "/test": self.cmd_test,
+            "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
+            "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
+            "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
+        }
 
     def settings(self) -> dict:
         saved = self.store.get("settings", {})
         return {"threshold": str(self.config.threshold), "cooldown": self.config.cooldown,
                 "mode": self.config.baseline_mode, **saved}
 
+    def update_settings(self, **changes: Any) -> dict:
+        settings = {**self.settings(), **changes}
+        self.store.put("settings", settings)
+        return settings
+
     def subscriptions(self) -> dict:
         return self.store.get("subscriptions", {})
+
+    def set_subscription(self, req: Request, active: bool) -> None:
+        subs = self.subscriptions()
+        subs[req.sub_id] = {"chat": req.chat, "thread": req.thread, "active": active}
+        self.store.put("subscriptions", subs)
+
+    def manual_baseline_for(self, symbol: str, now_ms: int) -> Baseline:
+        day = beijing_day(now_ms / 1000)
+        return manual_baseline(self.store.get(f"manual:{symbol}:{day}"), now_ms)
+
+    async def wait(self, seconds: float) -> None:
+        """Sleep, but wake immediately when a stop is requested."""
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self.stopping.wait(), timeout=seconds)
 
     def resolve_symbol(self, value: str) -> str:
         symbol = ALIASES.get(value.upper(), value.upper())
@@ -478,9 +692,9 @@ class Bot:
             LOG.warning("%s", clean_error(text))
             self.last_log[key] = now
 
-    async def tell(self, chat: int, thread: int, text: str) -> bool:
+    async def tell(self, chat: int, thread: int, text: str, reply_markup: dict | None = None) -> bool:
         try:
-            await self.telegram.send(chat, thread, text)
+            await self.telegram.send(chat, thread, text, reply_markup)
             return True
         except Exception as error:
             self.log_limited("telegram_send", f"Telegram 发送失败：{clean_error(error)}")
@@ -500,101 +714,185 @@ class Bot:
             if await self.tell(sub["chat"], sub["thread"], f"✅ 数据恢复｜{key}\n后续按当前基准继续监控。"):
                 self.store.put(record_key, {"active": False, "sent": now})
 
-    async def process_message(self, message: dict) -> None:
+    def parse_request(self, message: dict) -> Request | None:
+        """Return the command in ``message`` when it is addressed to this bot, else None."""
         text = message.get("text", "").strip()
         if not text.startswith("/"):
-            return
+            return None
         parts = text.split()
-        raw_command = parts[0].lower()
-        if "@" in raw_command and self.username and raw_command.split("@", 1)[1] != self.username.lower():
-            return
-        command = raw_command.split("@", 1)[0]
+        raw_command, _, mention = parts[0].lower().partition("@")
+        if mention and self.username and mention != self.username.lower():
+            return None
         chat, thread = target_from_message(message)
-        sender = message.get("from") or {}
-        # Only /id and public help work before administrator configuration.
-        if command in {"/id", "/start", "/help"} and not is_admin(message, self.config):
-            uid = int(sender.get("id") or 0)
-            now = time.monotonic()
-            if now - self.command_notice.get(uid, -1e9) < 10:
-                return
-            if len(self.command_notice) > 2000:
-                self.command_notice.clear()
-            self.command_notice[uid] = now
-            await self.tell(chat, thread, f"你的用户 ID：{uid}\n聊天 ID：{chat}\n话题 ID：{thread}\n"
-                            "把你的用户 ID 填入 Railway 的 ADMIN_USER_ID 后重新部署，再发 /subscribe。")
+        user_id = int((message.get("from") or {}).get("id") or 0)
+        return Request(COMMAND_ALIASES.get(raw_command, raw_command), parts[1:], chat, thread, user_id,
+                       raw=text[len(parts[0]):].strip())
+
+    async def process_message(self, message: dict) -> None:
+        req = self.parse_request(message)
+        if req is None:
             return
         if not is_admin(message, self.config):
-            return  # Do not expose settings or allow arbitrary group members to alter them.
-        sub_id = subscription_key(chat, thread)
+            # Only /id and public help work before administrator configuration. Everything else
+            # is ignored so settings are never exposed to, or altered by, arbitrary group members.
+            if req.command in {"/id", "/help"}:
+                await self.public_id_notice(req)
+            return
+        markup = None
         try:
-            if command in {"/start", "/help"}:
-                reply = HELP
-            elif command == "/id":
-                reply = f"你的用户 ID：{sender['id']}\n聊天 ID：{chat}\n话题 ID：{thread}"
-            elif command in {"/subscribe", "/resume", "/pause", "/unsubscribe"}:
-                subs = self.subscriptions()
-                if command == "/unsubscribe":
-                    subs.pop(sub_id, None)
-                    self.store.delete_prefix(f"alert:{sub_id}:")
-                    self.store.delete_prefix(f"notice:{sub_id}:")
-                    reply = "✅ 已取消当前私聊/话题的订阅。"
-                else:
-                    subs[sub_id] = {"chat": chat, "thread": thread, "active": command != "/pause"}
-                    reply = "⏸ 当前订阅已暂停。" if command == "/pause" else (
-                        "✅ 当前私聊/话题已订阅。\n" + self.config_summary() +
-                        "\n首次观察就超过阈值，也会提醒；请用 /status 核对基准和行情。")
-                self.store.put("subscriptions", subs)
-            elif command == "/threshold":
-                if len(parts) != 2:
-                    raise ValueError("用法：/threshold 1（1 表示 1%）")
-                value = number(parts[1].rstrip("%"), "阈值")
-                if not D("0.01") <= value <= D(100):
-                    raise ValueError("阈值必须在 0.01～100 之间")
-                settings = self.settings()
-                settings["threshold"] = str(value)
-                self.store.put("settings", settings)
-                self.store.delete_prefix("alert:")
-                reply = f"✅ 全局阈值已改为严格超过 ±{fmt(value)}%。下一轮按新阈值判断。"
-            elif command == "/cooldown":
-                if len(parts) != 2 or not parts[1].isdigit() or not 0 <= int(parts[1]) <= 86400:
-                    raise ValueError("用法：/cooldown 300，范围 0～86400 秒；0 关闭周期重复提醒")
-                settings = self.settings()
-                settings["cooldown"] = int(parts[1])
-                self.store.put("settings", settings)
-                reply = f"✅ 周期重复提醒间隔：{parts[1]} 秒（0 表示关闭）。"
-            elif command == "/mode":
-                if len(parts) != 2 or parts[1].lower() not in {"daily", "binance_daily", "manual"}:
-                    raise ValueError("用法：/mode daily 或 /mode manual")
-                settings = self.settings()
-                settings["mode"] = "manual" if parts[1].lower() == "manual" else "binance_daily"
-                self.store.put("settings", settings)
-                self.snapshots.clear()
-                self.store.delete_prefix("alert:")
-                reply = "✅ " + self.config_summary()
-                if settings["mode"] == "manual":
-                    reply += "\n请逐个设置参考价。缺失/过期的合约不发涨跌提醒。\n/setclose UNITREE 75 " + beijing_day(self.market.now_ms() / 1000)
-            elif command == "/setclose":
-                if len(parts) not in {3, 4}:
-                    raise ValueError("用法：/setclose UNITREE 75 [适用日期 YYYY-MM-DD]\n价格须与币安显示值同口径；不自动换汇")
-                symbol = self.resolve_symbol(parts[1])
-                value = number(parts[2], "手动参考价")
-                day = parts[3] if len(parts) == 4 else beijing_day(self.market.now_ms() / 1000)
-                day = dt.date.fromisoformat(day).isoformat()
-                self.store.put(f"manual:{symbol}:{day}", {"value": str(value), "valid_date": day})
-                self.snapshots.pop(symbol, None)
-                reply = (f"✅ {symbol} 参考价：{fmt(value)}\n适用日：{day}（北京时间）"
-                         "\n这是你输入的参考价，未独立核验，不自动换汇。")
-                if self.settings()["mode"] != "manual":
-                    reply += "\n当前仍为日 K 模式；发 /mode manual 后才会使用此价格。"
-            elif command in {"/status", "/price"}:
-                reply = self.status(sub_id)
-            elif command == "/test":
-                reply = "✅ TG 测试消息发送成功。\n此测试仅验证推送，行情是否正常请看 /status。"
-            else:
-                reply = "未知命令。发送 /help 查看用法。"
+            handler = self.handlers.get(req.command)
+            reply = handler(req) if handler else "未知命令。发送 /help 查看用法。"
+            if isinstance(reply, tuple):  # (text, inline keyboard) card
+                reply, markup = reply
         except (ValueError, decimal.InvalidOperation) as error:
             reply = "❌ " + clean_error(error)
-        await self.tell(chat, thread, reply)
+        await self.tell(req.chat, req.thread, reply, markup)
+
+    async def process_callback(self, query: dict) -> None:
+        """Handle a tap on a card button (callback_query)."""
+        query_id = str(query.get("id", ""))
+        message = query.get("message") or {}
+
+        async def answer(text: str, alert: bool = False) -> None:
+            with contextlib.suppress(Exception):  # A missed toast must not abort the update.
+                await self.telegram.call("answerCallbackQuery",
+                                         {"callback_query_id": query_id, "text": text[:200], "show_alert": alert})
+
+        if not is_admin(query, self.config):
+            await answer("仅管理员可以修改设置")
+            return
+        kind, _, value = str(query.get("data", "")).partition(":")
+        try:
+            if kind != "threshold":
+                raise ValueError("未知操作，请重新发送命令")
+            toast = self.apply_threshold(value)
+            text, markup = threshold_card(D(self.settings()["threshold"]))
+        except (ValueError, decimal.InvalidOperation) as error:
+            await answer("❌ " + clean_error(error), alert=True)
+            return
+        await answer(toast)
+        if message.get("message_id") and message.get("chat"):
+            try:
+                await self.telegram.edit(int(message["chat"]["id"]), int(message["message_id"]), text, markup)
+            except RemoteError as error:
+                # "message is not modified" when re-selecting the current preset is harmless.
+                if "not modified" not in str(error):
+                    self.log_limited("telegram_edit", f"卡片更新失败：{clean_error(error)}")
+
+    async def public_id_notice(self, req: Request) -> None:
+        now = time.monotonic()
+        if now - self.command_notice.get(req.user_id, -1e9) < 10:
+            return
+        if len(self.command_notice) > 2000:
+            self.command_notice.clear()
+        self.command_notice[req.user_id] = now
+        await self.tell(req.chat, req.thread, id_text(req.user_id, req.chat, req.thread) +
+                        "\n把你的用户 ID 填入 Railway 的 ADMIN_USER_ID 后重新部署，再发 /subscribe。")
+
+    # --- command handlers: each returns the reply text or raises ValueError with the usage hint ---
+
+    def cmd_help(self, req: Request) -> str:
+        return HELP
+
+    def cmd_id(self, req: Request) -> str:
+        return id_text(req.user_id, req.chat, req.thread)
+
+    def cmd_status(self, req: Request) -> str:
+        return self.status(req.sub_id)
+
+    def cmd_test(self, req: Request) -> str:
+        return "✅ TG 测试消息发送成功。\n此测试仅验证推送，行情是否正常请看 /status。"
+
+    def cmd_subscribe(self, req: Request) -> str:
+        self.set_subscription(req, active=True)
+        return ("✅ 当前私聊/话题已订阅。\n" + self.config_summary() +
+                "\n首次观察就超过阈值，也会提醒；请用 /status 核对基准和行情。")
+
+    def cmd_resume(self, req: Request) -> str:
+        self.set_subscription(req, active=True)
+        return "✅ 当前订阅已恢复。\n" + self.config_summary()
+
+    def cmd_pause(self, req: Request) -> str:
+        self.set_subscription(req, active=False)
+        return "⏸ 当前订阅已暂停。"
+
+    def cmd_unsubscribe(self, req: Request) -> str:
+        subs = self.subscriptions()
+        subs.pop(req.sub_id, None)
+        self.store.put("subscriptions", subs)
+        self.store.delete_prefix(f"alert:{req.sub_id}:")
+        self.store.delete_prefix(f"notice:{req.sub_id}:")
+        return "✅ 已取消当前私聊/话题的订阅。"
+
+    def cmd_threshold(self, req: Request) -> str | tuple[str, dict]:
+        if not req.args:
+            return threshold_card(D(self.settings()["threshold"]))
+        if len(req.args) != 1:
+            raise ValueError("用法：/threshold 1（1 表示 1%），或直接发 /threshold 选择档位")
+        return self.apply_threshold(req.args[0])
+
+    def apply_threshold(self, raw: str) -> str:
+        """Validate and persist a new global threshold; shared by the command and the card buttons."""
+        value = number(raw.rstrip("%"), "阈值")
+        if not D("0.01") <= value <= D(100):
+            raise ValueError("阈值必须在 0.01～100 之间")
+        self.update_settings(threshold=str(value))
+        self.store.delete_prefix("alert:")
+        return f"✅ 全局阈值已改为严格超过 ±{fmt(value)}%。下一轮按新阈值判断。"
+
+    def cmd_cooldown(self, req: Request) -> str:
+        if len(req.args) != 1 or not req.args[0].isdigit() or not 0 <= int(req.args[0]) <= 86400:
+            raise ValueError("用法：/cooldown 300，范围 0～86400 秒；0 关闭周期重复提醒")
+        seconds = int(req.args[0])
+        self.update_settings(cooldown=seconds)
+        return f"✅ 周期重复提醒间隔：{seconds} 秒（0 表示关闭）。"
+
+    def cmd_mode(self, req: Request) -> str:
+        choice = req.args[0].lower() if len(req.args) == 1 else ""
+        if choice not in {"daily", "binance_daily", "manual"}:
+            raise ValueError("用法：/mode daily 或 /mode manual")
+        settings = self.update_settings(mode="manual" if choice == "manual" else "binance_daily")
+        self.snapshots.clear()
+        self.store.delete_prefix("alert:")
+        reply = "✅ " + self.config_summary()
+        if settings["mode"] == "manual":
+            reply += ("\n请设置参考价：复制下面模板，把“价格”换成数值，“MM-DD HH:MM”换成该价格的收盘时间"
+                      "（北京时间，可删掉不填）。缺失/过期的合约不发涨跌提醒。\n"
+                      + self.setclose_template(beijing_day(self.market.now_ms() / 1000)))
+        return reply
+
+    def cmd_setclose(self, req: Request) -> str:
+        now_ms = self.market.now_ms()
+        today = beijing_day(now_ms / 1000)
+        # Resolve and validate every line first so a typo in one line does not half-apply the batch.
+        seen: dict[tuple[str, str], CloseEntry] = {}
+        for entry in parse_close_entries(req.raw, now_ms):
+            symbol = self.resolve_symbol(entry.alias)
+            previous = seen.get((symbol, entry.day))
+            if previous and (previous.value, previous.close_at) != (entry.value, entry.close_at):
+                raise ValueError(f"{symbol} 在 {entry.day} 出现了两条不同的记录，请只保留一条")
+            seen[(symbol, entry.day)] = entry
+        lines = []
+        for (symbol, day), entry in seen.items():
+            record = {"value": str(entry.value), "valid_date": day}
+            if entry.close_at:
+                record["close_at"] = entry.close_at
+            self.store.put(f"manual:{symbol}:{day}", record)
+            self.snapshots.pop(symbol, None)
+            close = f"｜收盘 {entry.close_at[5:].replace('T', ' ')}（北京时间）" if entry.close_at else "｜未填收盘时间"
+            lines.append(f"✅ {symbol} 参考价：{fmt(entry.value)}｜适用日 {day}（北京时间）{close}")
+        lines.append("这是你输入的参考价，未独立核验，不自动换汇。")
+        if self.settings()["mode"] != "manual":
+            lines.append("当前仍为日 K 模式；发 /mode manual 后才会使用这些价格。")
+        else:
+            missing = [s for s in self.config.symbols if not self.store.get(f"manual:{s}:{today}")]
+            if missing:
+                lines.append(f"今日（{today}）尚未设置：" + "、".join(missing))
+        return "\n".join(lines)
+
+    def setclose_template(self, day: str) -> str:
+        """A ready-to-edit batch /setclose covering every monitored symbol."""
+        return f"/setclose {day}\n" + "\n".join(f"{short_name(s)} 价格 MM-DD HH:MM" for s in self.config.symbols)
 
     def config_summary(self) -> str:
         settings = self.settings()
@@ -654,8 +952,7 @@ class Bot:
                 if settings["mode"] == "binance_daily":
                     base = await self.market.baseline(symbol, now_ms)
                 else:
-                    day = beijing_day(now_ms / 1000)
-                    base = manual_baseline(self.store.get(f"manual:{symbol}:{day}"), now_ms)
+                    base = self.manual_baseline_for(symbol, now_ms)
                 return symbol, {"quote": quote, "baseline": base}
             except Exception as error:
                 return symbol, {"error": clean_error(error)}
@@ -688,11 +985,8 @@ class Bot:
                 current_ms = self.market.now_ms()
                 if current_ms >= base.valid_until_ms or current_ms - quote.timestamp_ms > self.config.max_age * 1000:
                     continue  # Slow Telegram/API calls must not produce stale price alerts.
-                if settings["mode"] == "manual":
-                    day = beijing_day(current_ms / 1000)
-                    fresh_base = manual_baseline(self.store.get(f"manual:{symbol}:{day}"), current_ms)
-                    if fresh_base.key != base.key:
-                        continue
+                if settings["mode"] == "manual" and self.manual_baseline_for(symbol, current_ms).key != base.key:
+                    continue
                 change = percent(quote.price, base.value)
                 state_key = f"alert:{sub_id}:{symbol}"
                 old = self.store.get(state_key, {})
@@ -702,12 +996,7 @@ class Bot:
                     self.store.put(state_key, passive)
                 if not plan:
                     continue
-                side = "📈 上涨" if change > 0 else "📉 下跌"
-                text = (f"{side}超过 {fmt(threshold)}%｜{NAMES.get(symbol, symbol)}\n{symbol}\n\n"
-                        f"当前成交价：{fmt(quote.price)}\n参考收盘价：{fmt(base.value)}\n"
-                        f"相对基准：{change:+.3f}%\n\n{base.label}\n原因：{plan.reason}\n"
-                        f"行情时间：{stamp(quote.timestamp_ms)}（北京时间）\n"
-                        "⚠️ 合约行情提示，不代表股票官方收盘结算结果。")
+                text = alert_text(symbol, quote, base, change, threshold, plan.reason)
                 if await self.tell(sub["chat"], sub["thread"], text):
                     # Only mark a price alert as delivered AFTER Telegram accepts it.
                     # Avoid resurrecting state deleted by a command during delivery.
@@ -727,11 +1016,19 @@ class Bot:
                          len(self.config.symbols), sum(bool(s.get("active")) for s in self.subscriptions().values()),
                          self.settings()["mode"])
                 self.last_log["heartbeat"] = time.monotonic()
-            delay = max(0.1, self.config.poll - (time.monotonic() - started))
-            try:
-                await asyncio.wait_for(self.stopping.wait(), timeout=delay)
-            except asyncio.TimeoutError:
-                pass
+            await self.wait(max(0.1, self.config.poll - (time.monotonic() - started)))
+
+    async def process_update(self, update: dict) -> None:
+        message = update.get("message")
+        if isinstance(message, dict):
+            # Do not execute old configuration commands left over from long downtime.
+            age = time.time() - float(message.get("date", time.time()))
+            if -60 <= age <= 900:
+                await self.process_message(message)
+            return
+        query = update.get("callback_query")
+        if isinstance(query, dict):  # A button tap is a live intent, so it is not age-filtered.
+            await self.process_callback(query)
 
     async def commands_loop(self) -> None:
         offset = int(self.store.get("telegram_offset", 0))
@@ -739,33 +1036,36 @@ class Bot:
         while not self.stopping.is_set():
             try:
                 updates = await self.telegram.call("getUpdates", {"offset": offset, "timeout": 25,
-                                                   "allowed_updates": ["message"]}, timeout=40)
+                                                   "allowed_updates": ["message", "callback_query"]}, timeout=40)
                 if not isinstance(updates, list):
                     raise ValueError("Telegram 更新格式异常")
                 failures = 0
                 for update in updates:
                     if self.stopping.is_set():
                         break
-                    message = update.get("message")
-                    if isinstance(message, dict):
-                        # Do not execute old configuration commands left over from long downtime.
-                        age = time.time() - float(message.get("date", time.time()))
-                        if -60 <= age <= 900:
-                            try:
-                                await self.process_message(message)
-                            except Exception as error:
-                                self.log_limited("command", "命令处理异常：" + clean_error(error))
+                    try:
+                        await self.process_update(update)
+                    except Exception as error:
+                        self.log_limited("command", "命令处理异常：" + clean_error(error))
                     offset = int(update["update_id"]) + 1
                     self.store.put("telegram_offset", offset)
             except Exception as error:
                 failures += 1
                 self.log_limited("poll", "TG 轮询异常：" + clean_error(error))
                 retry_after = getattr(error, "retry_after", 0)
-                delay = max(retry_after, min(60, 2 ** min(failures, 6)))
-                try:
-                    await asyncio.wait_for(self.stopping.wait(), timeout=delay)
-                except asyncio.TimeoutError:
-                    pass
+                await self.wait(max(retry_after, min(60, 2 ** min(failures, 6))))
+
+    async def register_menu(self) -> None:
+        """Publish the command list so Telegram shows the "菜单" button next to the input box.
+
+        Failure here is not fatal: commands still work when typed by hand.
+        """
+        try:
+            await self.telegram.call("setMyCommands", {"commands": [c.menu_entry() for c in COMMANDS]})
+            await self.telegram.call("setChatMenuButton", {"menu_button": {"type": "commands"}})
+            LOG.info("Registered %s menu commands", len(COMMANDS))
+        except Exception as error:
+            LOG.warning("注册命令菜单失败（不影响手动输入命令）：%s", clean_error(error))
 
     async def run(self) -> None:
         # Refuse to silently remove a webhook that may belong to another service.
@@ -776,6 +1076,7 @@ class Bot:
         self.username = me.get("username", "")
         LOG.info("Starting @%s; symbols=%s; administrator_configured=%s", self.username,
                  ",".join(self.config.symbols), bool(self.config.admin_id))
+        await self.register_menu()
         if not self.config.admin_id:
             LOG.warning("ADMIN_USER_ID 尚未配置：只能使用 /id；没有任何自动订阅")
         loop = asyncio.get_running_loop()
