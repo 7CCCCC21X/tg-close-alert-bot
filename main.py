@@ -245,6 +245,7 @@ class Baseline:
     label: str
     valid_until_ms: int
     close_ms: int = 0  # When the close behind this baseline happened; 0 = unknown.
+    currency: str = ""  # Price unit when it differs from the contract's quote unit (reference prices only).
 
 
 def daily_baseline(rows: Any, now_ms: int) -> Baseline:
@@ -271,11 +272,15 @@ def daily_baseline(rows: Any, now_ms: int) -> Baseline:
 # Two kinds of user-entered daily prices share one record format and one command grammar:
 #   manual   -> the alert baseline in manual mode (same quote unit as the Binance contract)
 #   official -> the exchange's official close, shown for reference next to the baseline
-PRICE_KINDS = {"manual": ("手动参考价", "/setclose"), "official": ("官方收盘价", "/setofficial")}
+#   exchange -> the securities exchange's close in its own currency (HKD, KRW, ...), for reference
+PRICE_KINDS = {"manual": ("手动参考价", "/setclose", ""),
+               "official": ("官方收盘价", "/setofficial", "相对官方"),
+               "exchange": ("证券交易所收盘价", "/setexchange", "相对交易所")}
+REFERENCE_KINDS = ("official", "exchange")  # Shown next to the baseline, never used for triggering.
 
 
 def manual_baseline(record: dict | None, now_ms: int, kind: str = "manual") -> Baseline:
-    label, command = PRICE_KINDS[kind]
+    label, command, _ = PRICE_KINDS[kind]
     today = beijing_day(now_ms / 1000)
     if not record or record.get("valid_date") != today:
         raise ValueError(f"缺少 {today} 的{label}；请用 {command} 设置，不能沿用过期价格")
@@ -285,17 +290,22 @@ def manual_baseline(record: dict | None, now_ms: int, kind: str = "manual") -> B
     close_ms = 0
     with contextlib.suppress(ValueError, TypeError):  # Older records have no close time.
         close_ms = int(dt.datetime.fromisoformat(str(record.get("close_at"))).replace(tzinfo=BEIJING).timestamp() * 1000)
+    currency = str(record.get("currency") or "").upper()
     return Baseline(value, f"{kind}:{today}:{value}",
                     f"{label}｜适用日 {today}（北京时间）" + close_label(close_ms),
-                    int(until.timestamp() * 1000), close_ms)
+                    int(until.timestamp() * 1000), close_ms, currency)
 
 
-def official_line(price: D, official: Baseline | None) -> str:
-    """One line comparing the live price with the exchange's official close, if one is recorded."""
-    if official is None:
-        return "官方收盘价：未设置（/setofficial）"
-    return (f"官方收盘价：{fmt(official.value)}｜相对官方：{percent(price, official.value):+.3f}%"
-            + close_label(official.close_ms))
+def reference_line(kind: str, price: D, ref: Baseline | None) -> str:
+    """One line showing a recorded reference close; the deviation only when units are comparable."""
+    label, command, relative = PRICE_KINDS[kind]
+    if ref is None:
+        return f"{label}：未设置（{command}）"
+    if ref.currency in SAME_UNIT:
+        body = f"{fmt(ref.value)}{' ' + ref.currency if ref.currency else ''}｜{relative}：{percent(price, ref.value):+.3f}%"
+    else:
+        body = f"{fmt(ref.value)} {ref.currency}｜币种不同，不计算涨跌"
+    return f"{label}：{body}" + close_label(ref.close_ms)
 
 
 class Binance:
@@ -393,9 +403,9 @@ def alert_plan(state: dict | None, baseline_key: str, change: D, now: float,
 
 
 def alert_text(symbol: str, quote: Quote, base: Baseline, change: D, threshold: D, reason: str,
-               official: Baseline | None = None) -> str:
+               references: dict[str, Baseline] | None = None) -> str:
     side = "📈 上涨" if change > 0 else "📉 下跌"
-    extra = official_line(quote.price, official) + "\n" if official else ""
+    extra = "".join(reference_line(kind, quote.price, ref) + "\n" for kind, ref in (references or {}).items())
     return (f"{side}超过 {fmt(threshold)}%｜{NAMES.get(symbol, symbol)}\n{symbol}\n\n"
             f"当前成交价：{fmt(quote.price)}\n参考收盘价：{fmt(base.value)}\n"
             f"相对基准：{change:+.3f}%\n{extra}\n{base.label}\n原因：{reason}\n"
@@ -509,8 +519,10 @@ COMMANDS: tuple[Command, ...] = (
     Command("setclose", "设置手动参考价，可一次发多条", "UNITREE 75 09-17 16:00",
             "示例：75 是基准，09-17 16:00 是它的收盘时间（北京，可省略）\n"
             "  末尾再写 YYYY-MM-DD 可指定适用日（默认今天）；批量：每行一组，首行可写统一适用日"),
-    Command("setofficial", "记录交易所官方收盘价（对照显示）", "SHEIN 40 09-17 16:00",
+    Command("setofficial", "记录官方收盘价（对照显示）", "SHEIN 40 09-17 16:00",
             "语法同 /setclose；显示在状态和提醒里，不参与触发判断"),
+    Command("setexchange", "记录证券交易所收盘价，可带货币（对照显示）", "SKHYNIX 258000 KRW 09-17 14:30",
+            "带 HKD/CNY/KRW 等非美元货币时只展示不算涨跌；不带货币按同口径算相对涨跌"),
     Command("pause", "暂停当前订阅"),
     Command("resume", "恢复当前订阅"),
     Command("test", "发送测试消息，不代表行情正常"),
@@ -583,6 +595,11 @@ class CloseEntry:
     value: D
     day: str        # Applicable Beijing calendar day (YYYY-MM-DD).
     close_at: str   # Beijing close datetime "YYYY-MM-DDTHH:MM", or "" when not given.
+    currency: str = ""  # ISO-style code such as HKD/KRW when the price is not in the contract's quote unit.
+
+
+CURRENCIES = {"USD", "USDT", "USDC", "HKD", "CNY", "CNH", "KRW", "JPY", "TWD", "EUR", "GBP", "SGD", "INR"}
+SAME_UNIT = {"", "USD", "USDT", "USDC"}  # Currencies comparable with the USDT-quoted contract price.
 
 
 def parse_close_time(date_token: str, time_token: str, now_ms: int) -> str:
@@ -605,11 +622,18 @@ def parse_close_time(date_token: str, time_token: str, now_ms: int) -> str:
     return moment.strftime("%Y-%m-%dT%H:%M")
 
 
-def parse_close_tail(tokens: list[str], day: str, close_at: str, now_ms: int) -> tuple[str, str, list[str]]:
-    """Consume leading date/time tokens: a date followed by HH:MM is the close time, a lone date the day.
+@dataclass(frozen=True)
+class Tail:
+    """Optional qualifiers after a price (or before the first symbol, as batch-wide defaults)."""
+    day: str
+    close_at: str = ""
+    currency: str = ""
 
-    Returns (day, close_at, remaining tokens).
-    """
+
+def parse_close_tail(tokens: list[str], default: Tail, now_ms: int) -> tuple[Tail, list[str]]:
+    """Consume leading qualifiers: a date followed by HH:MM is the close time, a lone date the
+    applicable day, a currency code (HKD, KRW, ...) the price unit. Returns (tail, remaining tokens)."""
+    day, close_at, currency = default.day, default.close_at, default.currency
     i = 0
     while i < len(tokens):
         token, following = tokens[i], tokens[i + 1] if i + 1 < len(tokens) else ""
@@ -619,26 +643,29 @@ def parse_close_tail(tokens: list[str], day: str, close_at: str, now_ms: int) ->
         elif DATE_RE.fullmatch(token):
             day = parse_day(token)
             i += 1
+        elif token.upper() in CURRENCIES:
+            currency = token.upper()
+            i += 1
         else:
             break
-    return day, close_at, tokens[i:]
+    return Tail(day, close_at, currency), tokens[i:]
 
 
-def parse_close_entries(raw: str, now_ms: int) -> list[CloseEntry]:
-    """Parse "SYMBOL PRICE [收盘日期 HH:MM] [适用日]" entries separated by newlines/commas.
+def parse_close_entries(raw: str, now_ms: int, command: str = "/setclose") -> list[CloseEntry]:
+    """Parse "SYMBOL PRICE [货币] [收盘日期 HH:MM] [适用日]" entries separated by newlines/commas.
 
-    Leading date/time tokens before the first symbol apply to every entry that has none of its own.
+    Qualifiers before the first symbol apply to every entry that has none of its own.
     Nothing is stored here, so a bad line rejects the whole batch.
     """
     today = beijing_day(now_ms / 1000)
-    usage = ("用法：/setclose UNITREE 75 [收盘时间 MM-DD HH:MM] [适用日期 YYYY-MM-DD]\n"
-             "批量：每行（或用逗号分隔）一组「合约 价格 [收盘时间]」，最前面可写统一适用日/收盘时间，例如\n"
-             f"/setclose {today}\nUNITREE 75 09-17 16:00\nSHEIN 40 09-17 16:00\n"
-             "价格须与币安显示值同口径；不自动换汇")
+    usage = (f"用法：{command} UNITREE 75 [货币 如 HKD] [收盘时间 MM-DD HH:MM] [适用日期 YYYY-MM-DD]\n"
+             "批量：每行（或用逗号分隔）一组「合约 价格 [货币] [收盘时间]」，最前面可写统一适用日/收盘时间/货币，例如\n"
+             f"{command} {today}\nUNITREE 75 09-17 16:00\nSHEIN 40 09-17 16:00\n"
+             "不带货币时价格须与币安显示值同口径；不自动换汇")
     entries = [e.split() for e in re.split(r"[\n\r,，;；]+", raw) if e.strip()]
-    default_day, default_close = today, ""
+    default = Tail(today)
     if entries:
-        default_day, default_close, entries[0] = parse_close_tail(entries[0], today, "", now_ms)
+        default, entries[0] = parse_close_tail(entries[0], default, now_ms)
         if not entries[0]:
             entries.pop(0)
     if not entries:
@@ -647,11 +674,11 @@ def parse_close_entries(raw: str, now_ms: int) -> list[CloseEntry]:
     for tokens in entries:
         if len(tokens) < 2:
             raise ValueError(usage)
-        alias, value = tokens[0], number(tokens[1], f"{tokens[0]} 手动参考价")
-        day, close_at, rest = parse_close_tail(tokens[2:], default_day, default_close, now_ms)
+        alias, value = tokens[0], number(tokens[1], f"{tokens[0]} 价格")
+        tail, rest = parse_close_tail(tokens[2:], default, now_ms)
         if rest:
             raise ValueError(f"无法识别「{' '.join(rest)}」\n{usage}")
-        result.append(CloseEntry(alias, value, day, close_at))
+        result.append(CloseEntry(alias, value, tail.day, tail.close_at, tail.currency))
     return result
 
 
@@ -670,7 +697,7 @@ class Bot:
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
-            "/setofficial": self.cmd_setofficial,
+            "/setofficial": self.cmd_setofficial, "/setexchange": self.cmd_setexchange,
         }
 
     def settings(self) -> dict:
@@ -893,17 +920,25 @@ class Bot:
         lines.append("官方收盘价仅作对照显示（相对官方涨跌），不参与触发判断；请与币安显示值同口径。")
         return "\n".join(lines)
 
+    def cmd_setexchange(self, req: Request) -> str:
+        lines = self.store_prices(req, "exchange")
+        lines.append("证券交易所收盘价仅作对照显示，不参与触发判断。带非美元货币时只展示、不计算涨跌；不自动换汇。")
+        return "\n".join(lines)
+
     def store_prices(self, req: Request, kind: str) -> list[str]:
         """Parse a (batch) price message and persist it under ``kind``; returns one reply line per record."""
-        label = PRICE_KINDS[kind][0]
+        label, command, _ = PRICE_KINDS[kind]
         now_ms = self.market.now_ms()
         today = beijing_day(now_ms / 1000)
         # Resolve and validate every line first so a typo in one line does not half-apply the batch.
         seen: dict[tuple[str, str], CloseEntry] = {}
-        for entry in parse_close_entries(req.raw, now_ms):
+        for entry in parse_close_entries(req.raw, now_ms, command):
             symbol = self.resolve_symbol(entry.alias)
+            if kind == "manual" and entry.currency not in SAME_UNIT:
+                raise ValueError(f"{symbol}：手动参考价必须与币安合约同口径，不能带 {entry.currency}；"
+                                 "交易所本币价格请用 /setexchange 记录")
             previous = seen.get((symbol, entry.day))
-            if previous and (previous.value, previous.close_at) != (entry.value, entry.close_at):
+            if previous and previous != entry:
                 raise ValueError(f"{symbol} 在 {entry.day} 出现了两条不同的记录，请只保留一条")
             seen[(symbol, entry.day)] = entry
         lines = []
@@ -911,22 +946,29 @@ class Bot:
             record = {"value": str(entry.value), "valid_date": day}
             if entry.close_at:
                 record["close_at"] = entry.close_at
+            if entry.currency:
+                record["currency"] = entry.currency
             self.store.put(f"{kind}:{symbol}:{day}", record)
             if kind == "manual":
                 self.snapshots.pop(symbol, None)
+            unit = f" {entry.currency}" if entry.currency else ""
             close = f"｜收盘 {entry.close_at[5:].replace('T', ' ')}（北京时间）" if entry.close_at else "｜未填收盘时间"
-            lines.append(f"✅ {symbol} {label}：{fmt(entry.value)}｜适用日 {day}（北京时间）{close}")
+            lines.append(f"✅ {symbol} {label}：{fmt(entry.value)}{unit}｜适用日 {day}（北京时间）{close}")
         missing = [s for s in self.config.symbols if not self.store.get(f"{kind}:{s}:{today}")]
-        if missing and (kind == "official" or self.settings()["mode"] == "manual"):
+        if missing and (kind in REFERENCE_KINDS or self.settings()["mode"] == "manual"):
             lines.append(f"今日（{today}）尚未设置{label}：" + "、".join(missing))
         return lines
 
-    def official_for(self, symbol: str, now_ms: int) -> Baseline | None:
-        """Today's official exchange close for ``symbol``, or None when not recorded."""
+    def reference_for(self, kind: str, symbol: str, now_ms: int) -> Baseline | None:
+        """Today's recorded reference close of ``kind`` for ``symbol``, or None when not recorded."""
         try:
-            return manual_baseline(self.store.get(f"official:{symbol}:{beijing_day(now_ms / 1000)}"), now_ms, "official")
+            return manual_baseline(self.store.get(f"{kind}:{symbol}:{beijing_day(now_ms / 1000)}"), now_ms, kind)
         except ValueError:
             return None
+
+    def references_for(self, symbol: str, now_ms: int) -> dict[str, Baseline]:
+        found = {kind: self.reference_for(kind, symbol, now_ms) for kind in REFERENCE_KINDS}
+        return {kind: ref for kind, ref in found.items() if ref is not None}
 
     def setclose_template(self, day: str) -> str:
         """A ready-to-edit batch /setclose covering every monitored symbol."""
@@ -960,7 +1002,8 @@ class Bot:
             change = percent(quote.price, base.value)
             lines.extend([f"最新成交：{fmt(quote.price)}｜基准：{fmt(base.value)}",
                           f"相对基准：{change:+.3f}%", base.label,
-                          official_line(quote.price, self.official_for(symbol, now_ms)),
+                          *(reference_line(kind, quote.price, self.reference_for(kind, symbol, now_ms))
+                            for kind in REFERENCE_KINDS),
                           f"行情时间：{stamp(quote.timestamp_ms)}（北京）｜{max(0, int(age))} 秒前"])
         lines.append("\n仅价格提醒；不会自动撤单/交易。日 K 于北京时间 08:00 换日。")
         return "\n".join(lines)
@@ -1036,7 +1079,7 @@ class Bot:
                 if not plan:
                     continue
                 text = alert_text(symbol, quote, base, change, threshold, plan.reason,
-                                  self.official_for(symbol, current_ms))
+                                  self.references_for(symbol, current_ms))
                 if await self.tell(sub["chat"], sub["thread"], text):
                     # Only mark a price alert as delivered AFTER Telegram accepts it.
                     # Avoid resurrecting state deleted by a command during delivery.
