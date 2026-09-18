@@ -32,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.2.1"
+VERSION = "1.2.3"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -136,14 +136,29 @@ class StockMarketInfo:
     name: str
     currency: str
     utc_offset: int
-    close_time: dt.time  # Regular session close in local time; the daily bar is final ~15 min later.
+    close_time: dt.time  # When the official closing price is fixed, local time; the bar is final ~15 min later.
+    tz_name: str = "北京时间"
+
+    def close_label(self, close_ms: int) -> str:
+        """'｜收盘 09-18 15:00（北京时间）', or with the venue's local time first when it differs."""
+        if not close_ms:
+            return ""
+        if self.utc_offset == 8:
+            return close_label(close_ms)
+        local = dt.datetime.fromtimestamp(close_ms / 1000, dt.timezone(dt.timedelta(hours=self.utc_offset)))
+        return f"｜收盘 {local.strftime('%m-%d %H:%M')}（{self.tz_name}）＝北京 {stamp(close_ms, seconds=False)}"
 
 
+# Official closing-price times, verified 2026-09:
+#   SSE/SZSE: continuous trading ends 15:00 (STAR after-hours fixed-price trading 15:05-15:30 uses that close).
+#   HKEX: closing auction 16:00-16:10, the closing price is fixed at 16:08-16:10.
+#   KRX: regular session 09:00-15:30 KST fixes the official close; the after-hours sessions added on
+#        2026-09-14 (15:40-16:00 close-price trading, 16:00-20:00 continuous) do not change it.
 STOCK_MARKETS = {
     "sh": StockMarketInfo("上交所", "CNY", 8, dt.time(15, 0)),
     "sz": StockMarketInfo("深交所", "CNY", 8, dt.time(15, 0)),
-    "hk": StockMarketInfo("港交所", "HKD", 8, dt.time(16, 0)),
-    "kr": StockMarketInfo("韩交所", "KRW", 9, dt.time(15, 30)),
+    "hk": StockMarketInfo("港交所", "HKD", 8, dt.time(16, 10)),
+    "kr": StockMarketInfo("韩交所", "KRW", 9, dt.time(15, 30), "韩国时间"),
 }
 # Underlying stocks of the default contracts (all listed as of 2026-09): Unitree 688836.SS,
 # SHEIN 0625.HK, CXMT 688825.SS, SK hynix 000660.KS.
@@ -333,24 +348,56 @@ async def http_get(url: str, timeout: int = 15, headers: dict[str, str] | None =
 
 @dataclass(frozen=True)
 class Quote:
+    """The price the bot judges by: the last trade when fresh, else Binance's mark price.
+
+    Thin contracts (e.g. HK0625USDT after the HK session) can go minutes without a trade while
+    the mark price keeps updating every second, so a quiet book no longer looks like a dead feed.
+    """
     price: D
     timestamp_ms: int
+    source: str = "last"        # "last" = 最新成交价, "mark" = 标记价
+    last_price: D | None = None  # The stale last trade, kept for display when source == "mark".
+    last_ms: int = 0
+
+    @property
+    def kind(self) -> str:
+        return "标记价" if self.source == "mark" else "最新成交"
+
+    @staticmethod
+    def _timestamp(row: dict, key: str, now_ms: int) -> int:
+        try:
+            timestamp = int(row[key])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("行情缺少有效时间戳，停止涨跌提醒") from None
+        if timestamp <= 0 or timestamp > now_ms + 30_000:
+            raise ValueError("行情时间戳异常，停止涨跌提醒")
+        return timestamp
 
     @classmethod
     def parse(cls, row: dict, symbol: str, now_ms: int, max_age: int) -> "Quote":
         if row.get("symbol") != symbol:
             raise ValueError(f"行情代码不匹配：{symbol}")
-        value = number(row.get("price"), "最新成交价")
-        try:
-            timestamp = int(row["time"])
-        except (KeyError, TypeError, ValueError):
-            raise ValueError("行情缺少有效时间戳，停止涨跌提醒") from None
-        if timestamp <= 0 or timestamp > now_ms + 30_000:
-            raise ValueError("行情时间戳异常，停止涨跌提醒")
-        age = (now_ms - timestamp) / 1000
-        if age > max_age:
-            raise ValueError(f"最新成交价已过期（{int(age)} 秒未更新），暂不发涨跌提醒")
-        return cls(value, timestamp)
+        last = number(row.get("price"), "最新成交价")
+        last_ms = cls._timestamp(row, "time", now_ms)
+        last_age = (now_ms - last_ms) / 1000
+        if last_age <= max_age:
+            return cls(last, last_ms)
+        if row.get("markPrice") is None:
+            raise ValueError(f"最新成交价已过期（{int(last_age)} 秒未更新），暂不发涨跌提醒")
+        mark = number(row.get("markPrice"), "标记价")
+        mark_ms = cls._timestamp(row, "markTime", now_ms)
+        mark_age = (now_ms - mark_ms) / 1000
+        if mark_age > max_age:
+            raise ValueError(f"最新成交价 {int(last_age)} 秒、标记价 {int(mark_age)} 秒未更新，暂不发涨跌提醒")
+        return cls(mark, mark_ms, "mark", last, last_ms)
+
+    def price_line(self, now_ms: int, base_value: D) -> str:
+        """'💰 最新 76.36｜基准 76.53', or the mark-price form when the last trade is stale."""
+        if self.source == "mark":
+            idle = max(0, int((now_ms - self.last_ms) / 1000))
+            return (f"💰 标记价 {bold(fmt(self.price))}｜基准 {fmt(base_value)}"
+                    f"（最新成交 {fmt(self.last_price)}，{idle} 秒无成交，改按标记价判断）")
+        return f"💰 最新 {bold(fmt(self.price))}｜基准 {fmt(base_value)}"
 
 
 @dataclass(frozen=True)
@@ -361,7 +408,12 @@ class Baseline:
     valid_until_ms: int
     close_ms: int = 0  # When the close behind this baseline happened; 0 = unknown.
     currency: str = ""  # Price unit when it differs from the contract's quote unit (reference prices only).
-    source: str = ""    # Where an automatically fetched reference price came from, e.g. "上交所688836·自动".
+    source: str = ""    # Where an automatically fetched reference price came from, e.g. "上交所688836·腾讯".
+    close_note: str = ""  # Preformatted close-time text (venue local + Beijing); empty = derive from close_ms.
+
+    @property
+    def close_text(self) -> str:
+        return self.close_note or close_label(self.close_ms)
 
 
 def daily_baseline(rows: Any, now_ms: int) -> Baseline:
@@ -381,7 +433,8 @@ def daily_baseline(rows: Any, now_ms: int) -> Baseline:
             value = number(row[4], "上一日收盘价")
             day = dt.datetime.fromtimestamp(opening / 1000, UTC).date().isoformat()
             return Baseline(value, f"daily:{day}:{value}",
-                            f"币安日 K 昨收｜{day}（UTC）" + close_label(boundary), boundary + DAY_MS, boundary)
+                            f"币安日 K 昨收｜{day}（UTC 日）｜收盘 {stamp(boundary, seconds=False)}（北京时间，即 UTC 00:00）",
+                            boundary + DAY_MS, boundary)
     raise ValueError("没有完整的上一 UTC 日日 K（可能新上市或接口数据未就绪）；不使用旧基准")
 
 
@@ -415,7 +468,7 @@ def reference_lines(kind: str, price: D, ref: Baseline | None, fx: "FxRates | No
     label, command, relative = PRICE_KINDS[kind]
     if ref is None:
         return [f"🏛 {label}：未设置（{command}）"]
-    tail = close_label(ref.close_ms) + (f"｜来源 {ref.source}" if ref.source else "")
+    tail = ref.close_text + (f"｜来源 {ref.source}" if ref.source else "")
     if ref.currency in SAME_UNIT:
         unit = f" {ref.currency}" if ref.currency else ""
         return [f"🏛 {label}：{bold(fmt(ref.value) + unit)}{tail}",
@@ -469,10 +522,21 @@ class Binance:
         self.clock_checked = time.monotonic()
 
     async def prices(self) -> dict[str, dict]:
-        data = await self.get("/fapi/v2/ticker/price")
+        """Last trade per symbol, plus the mark price (markPrice/markTime) when the index feed answers."""
+        data, marks = await asyncio.gather(self.get("/fapi/v2/ticker/price"),
+                                           self.get("/fapi/v1/premiumIndex"), return_exceptions=True)
+        if isinstance(data, BaseException):
+            raise data
         if not isinstance(data, list):
             raise ValueError("币安最新价接口没有返回合约列表")
-        return {r["symbol"]: r for r in data if isinstance(r, dict) and r.get("symbol") in self.config.symbols}
+        rows = {r["symbol"]: dict(r) for r in data if isinstance(r, dict) and r.get("symbol") in self.config.symbols}
+        if isinstance(marks, list):  # Optional: a mark-price outage must not stop last-trade alerts.
+            for mark in marks:
+                if isinstance(mark, dict) and mark.get("symbol") in rows and mark.get("markPrice") is not None:
+                    rows[mark["symbol"]].update(markPrice=mark["markPrice"], markTime=mark.get("time"))
+        elif isinstance(marks, BaseException):
+            LOG.debug("premiumIndex unavailable: %s", clean_error(marks))
+        return rows
 
     async def baseline(self, symbol: str, now_ms: int) -> Baseline:
         old = self.cached.get(symbol)
@@ -572,7 +636,8 @@ class StockMarket:
                 with contextlib.suppress(Exception):
                     self.closes[symbol] = Baseline(number(saved["value"], "收盘价"), saved["key"], saved["label"],
                                                    int(saved["valid_until_ms"]), int(saved["close_ms"]),
-                                                   saved.get("currency", ""), saved.get("source", ""))
+                                                   saved.get("currency", ""), saved.get("source", ""),
+                                                   saved.get("close_note", ""))
 
     @staticmethod
     def sources(ticker: StockTicker) -> list[tuple[str, str, dict[str, str]]]:
@@ -616,13 +681,15 @@ class StockMarket:
         when = str(day) if day else "上一交易日"
         return Baseline(close, f"exchange:{when}:{close}", f"证券交易所收盘价｜{when} {info.name}",
                         (close_ms or int(time.time() * 1000)) + DAY_MS, close_ms,
-                        "" if ticker.same_unit else info.currency, f"{info.name}{ticker.code}·{source}")
+                        "" if ticker.same_unit else info.currency, f"{info.name}{ticker.code}·{source}",
+                        info.close_label(close_ms))
 
     def remember(self, symbol: str, close: Baseline) -> None:
         if self.store:
             self.store.put(f"stock_close:{symbol}", {
                 "value": str(close.value), "key": close.key, "label": close.label, "valid_until_ms": close.valid_until_ms,
-                "close_ms": close.close_ms, "currency": close.currency, "source": close.source})
+                "close_ms": close.close_ms, "currency": close.currency, "source": close.source,
+                "close_note": close.close_note})
 
     async def refresh(self, now_ms: int, force: bool = False) -> None:
         if not self.config.tickers or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
@@ -745,7 +812,7 @@ def alert_text(symbol: str, quote: Quote, base: Baseline, change: D, threshold: 
     side = "上涨" if change > 0 else "下跌"
     lines = [f"{trend_mark(change, style)} {bold(f'{side}超过 {fmt(threshold)}%｜{NAMES.get(symbol, symbol)}')}",
              symbol, "",
-             f"💰 当前 {bold(fmt(quote.price))}｜基准 {fmt(base.value)}",
+             quote.price_line(quote.timestamp_ms, base.value),
              f"相对基准：{pct_text(change, style, strong=True)}"]
     for kind, ref in (references or {}).items():
         lines.extend(reference_lines(kind, quote.price, ref, fx, style))
@@ -1366,7 +1433,7 @@ class Bot:
                 lines.append("⚠️ 缓存已过期，等待有效的新行情/基准；不应据此判断当前涨跌")
                 continue
             change = percent(quote.price, base.value)
-            lines.extend([f"💰 最新 {bold(fmt(quote.price))}｜基准 {fmt(base.value)}",
+            lines.extend([quote.price_line(now_ms, base.value),
                           f"相对基准：{pct_text(change, style, strong=True)}",
                           f"📌 {base.label}"])
             for kind in REFERENCE_KINDS:
@@ -1563,7 +1630,7 @@ async def check_market(config: Config) -> int:
                 raise ValueError("未发现合约；未替换代码")
             quote = Quote.parse(rows[symbol], symbol, market.now_ms(), config.max_age)
             base = await market.baseline(symbol, market.now_ms())
-            print(f"OK {symbol}: last={quote.price}, daily_close={base.value}, "
+            print(f"OK {symbol}: {quote.kind}={quote.price}, daily_close={base.value}, "
                   f"change={percent(quote.price, base.value):+.4f}%, quote_time={stamp(quote.timestamp_ms)}, {base.label}")
         except Exception as error:
             failed = True
@@ -1576,7 +1643,7 @@ async def check_market(config: Config) -> int:
         close = stocks.closes.get(symbol)
         if close:
             print(f"OK {symbol} 证券交易所收盘价: {fmt(close.value)} {close.currency} "
-                  f"({close.label}, 收盘 {stamp(close.close_ms, seconds=False)} 北京, 来源 {close.source})")
+                  f"({close.label}{close.close_text}, 来源 {close.source})")
         else:
             failed = True
             print(f"FAIL {symbol} 证券交易所收盘价: {stocks.errors.get(symbol, '未知错误')}")
