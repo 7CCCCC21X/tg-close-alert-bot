@@ -92,6 +92,52 @@ def bounded_int(env: dict[str, str], key: str, default: int, low: int, high: int
 
 
 @dataclass(frozen=True)
+class StockTicker:
+    """Where to fetch a contract's underlying stock close: market prefix + exchange code."""
+    market: str          # sh / sz (Eastmoney A-share), hk (Eastmoney HKEX), kr (Naver KRX)
+    code: str
+    same_unit: bool = False  # True when the contract is quoted in the stock's own currency.
+
+
+@dataclass(frozen=True)
+class StockMarketInfo:
+    name: str
+    currency: str
+    utc_offset: int
+    close_time: dt.time  # Regular session close in local time; the daily bar is final ~15 min later.
+
+
+STOCK_MARKETS = {
+    "sh": StockMarketInfo("上交所", "CNY", 8, dt.time(15, 0)),
+    "sz": StockMarketInfo("深交所", "CNY", 8, dt.time(15, 0)),
+    "hk": StockMarketInfo("港交所", "HKD", 8, dt.time(16, 0)),
+    "kr": StockMarketInfo("韩交所", "KRW", 9, dt.time(15, 30)),
+}
+# Underlying stocks of the default contracts (all listed as of 2026-09): Unitree 688836.SS,
+# SHEIN 0625.HK, CXMT 688825.SS, SK hynix 000660.KS.
+DEFAULT_TICKERS = "UNITREEUSDT=sh:688836,HK0625USDT=hk:00625,CXMTUSDT=sh:688825,SKHYNIXUSDT=kr:000660"
+TICKER_RE = re.compile(r"(sh|sz|hk|kr):([0-9A-Za-z]{1,12})(:same)?", re.IGNORECASE)
+
+
+def parse_tickers(spec: str, symbols: tuple[str, ...]) -> dict[str, StockTicker]:
+    """EXCHANGE_TICKERS="SYMBOL=market:code[:same],..."; "off" disables automatic exchange closes."""
+    tickers: dict[str, StockTicker] = {}
+    if spec.strip().lower() in {"", "off", "none"}:
+        return tickers
+    for item in spec.split(","):
+        if not item.strip():
+            continue
+        symbol, _, ticker = item.partition("=")
+        symbol = symbol.strip().upper()
+        match = TICKER_RE.fullmatch(ticker.strip())
+        if not symbol or not match:
+            raise ValueError("EXCHANGE_TICKERS 格式：合约=市场:代码，如 SKHYNIXUSDT=kr:000660；市场取 sh/sz/hk/kr")
+        if symbol in symbols:  # Entries for unmonitored symbols are harmless and ignored.
+            tickers[symbol] = StockTicker(match.group(1).lower(), match.group(2), bool(match.group(3)))
+    return tickers
+
+
+@dataclass(frozen=True)
 class Config:
     token: str
     admin_id: int
@@ -105,6 +151,7 @@ class Config:
     max_age: int
     baseline_mode: str
     base_url: str
+    tickers: dict[str, "StockTicker"]
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -134,6 +181,7 @@ class Config:
             min_gap=bounded_int(e, "MIN_ALERT_GAP_SECONDS", 30, 0, 3600),
             max_age=bounded_int(e, "MAX_PRICE_AGE_SECONDS", 120, 5, 3600),
             baseline_mode=mode, base_url=url,
+            tickers=parse_tickers(e.get("EXCHANGE_TICKERS", DEFAULT_TICKERS), symbols),
         )
 
 
@@ -171,21 +219,23 @@ class RemoteError(Exception):
         self.retry_after = max(0, retry_after)
 
 
-def _http_json(url: str, payload: dict | None = None, timeout: int = 15) -> Any:
+BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+
+
+def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
+              headers: dict[str, str] | None = None) -> bytes:
+    """GET (or POST ``payload`` as JSON) and return the body; HTTP/network failures become RemoteError."""
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={
         "User-Agent": f"CloseAlert/{VERSION}", "Accept": "application/json",
-        **({"Content-Type": "application/json"} if data is not None else {}),
+        **({"Content-Type": "application/json"} if data is not None else {}), **(headers or {}),
     })
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             raw = response.read(8_000_001)
             if len(raw) > 8_000_000:
                 raise RemoteError("接口返回的数据过大")
-            try:
-                return json.loads(raw)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                raise RemoteError("接口未返回有效 JSON") from None
+            return raw
     except urllib.error.HTTPError as error:
         retry = 0
         try:
@@ -212,8 +262,19 @@ def _http_json(url: str, payload: dict | None = None, timeout: int = 15) -> Any:
         raise RemoteError(f"网络错误 ({type(error).__name__})") from None
 
 
+def _http_json(url: str, payload: dict | None = None, timeout: int = 15) -> Any:
+    try:
+        return json.loads(_http_get(url, payload, timeout))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise RemoteError("接口未返回有效 JSON") from None
+
+
 async def http_json(url: str, payload: dict | None = None, timeout: int = 15) -> Any:
     return await asyncio.to_thread(_http_json, url, payload, timeout)
+
+
+async def http_get(url: str, timeout: int = 15, headers: dict[str, str] | None = None) -> bytes:
+    return await asyncio.to_thread(_http_get, url, None, timeout, headers)
 
 
 @dataclass(frozen=True)
@@ -246,6 +307,7 @@ class Baseline:
     valid_until_ms: int
     close_ms: int = 0  # When the close behind this baseline happened; 0 = unknown.
     currency: str = ""  # Price unit when it differs from the contract's quote unit (reference prices only).
+    source: str = ""    # Where an automatically fetched reference price came from, e.g. "上交所688836·自动".
 
 
 def daily_baseline(rows: Any, now_ms: int) -> Baseline:
@@ -305,7 +367,7 @@ def reference_line(kind: str, price: D, ref: Baseline | None) -> str:
         body = f"{fmt(ref.value)}{' ' + ref.currency if ref.currency else ''}｜{relative}：{percent(price, ref.value):+.3f}%"
     else:
         body = f"{fmt(ref.value)} {ref.currency}｜币种不同，不计算涨跌"
-    return f"{label}：{body}" + close_label(ref.close_ms)
+    return f"{label}：{body}" + close_label(ref.close_ms) + (f"｜来源 {ref.source}" if ref.source else "")
 
 
 class Binance:
@@ -361,6 +423,87 @@ class Binance:
         baseline = daily_baseline(rows, now_ms)
         self.cached[symbol] = baseline
         return baseline
+
+
+def parse_daily_bars(market: str, raw: bytes) -> list[tuple[dt.date, D]]:
+    """(date, close) per daily bar, oldest first, from the market's data source."""
+    bars: list[tuple[dt.date, D]] = []
+    if market == "kr":
+        # Naver: <item data="20260917|open|high|low|close|volume" /> (EUC-KR page, digits are ASCII)
+        for date, close in re.findall(rb'data="(\d{8})\|[^|"]*\|[^|"]*\|[^|"]*\|([0-9.]+)\|', raw):
+            bars.append((dt.datetime.strptime(date.decode(), "%Y%m%d").date(), number(close.decode(), "收盘价")))
+    else:
+        # Eastmoney: {"data": {"klines": ["2026-09-17,open,close,high,low,...", ...]}}
+        try:
+            klines = json.loads(raw)["data"]["klines"]
+        except (ValueError, KeyError, TypeError):
+            raise ValueError("日 K 接口返回格式异常（代码可能不存在）") from None
+        for line in klines:
+            parts = str(line).split(",")
+            if len(parts) >= 3:
+                bars.append((dt.date.fromisoformat(parts[0]), number(parts[2], "收盘价")))
+    if not bars:
+        raise ValueError("日 K 接口没有返回任何交易日")
+    return bars
+
+
+def last_completed_bar(bars: list[tuple[dt.date, D]], info: StockMarketInfo, now_ms: int) -> tuple[dt.date, D]:
+    """Newest bar whose session has ended; today's bar counts only 15 minutes after the close."""
+    tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+    local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
+    final_from = dt.datetime.combine(local.date(), info.close_time, tz) + dt.timedelta(minutes=15)
+    for day, close in sorted(bars, reverse=True):
+        if day < local.date() or (day == local.date() and local >= final_from):
+            return day, close
+    raise ValueError("还没有已完结的交易日")
+
+
+class StockMarket:
+    """Fetches each contract's underlying stock close from its exchange's public daily-bar feed.
+
+    Read-only and best effort: a failure only blanks that symbol's reference line.
+    """
+    REFRESH_SECONDS = 600
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.closes: dict[str, Baseline] = {}
+        self.errors: dict[str, str] = {}
+        self.refreshed = -1e9
+
+    @staticmethod
+    def url(ticker: StockTicker) -> str:
+        if ticker.market == "kr":
+            return ("https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=10&symbol="
+                    + urllib.parse.quote(ticker.code))
+        prefix = {"sh": "1", "sz": "0", "hk": "116"}[ticker.market]
+        return ("https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=10"
+                "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&secid="
+                + urllib.parse.quote(f"{prefix}.{ticker.code}"))
+
+    async def fetch(self, symbol: str, ticker: StockTicker, now_ms: int) -> Baseline:
+        info = STOCK_MARKETS[ticker.market]
+        raw = await http_get(self.url(ticker), headers={"User-Agent": BROWSER_UA, "Accept": "*/*"})
+        day, close = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
+        tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+        close_ms = int(dt.datetime.combine(day, info.close_time, tz).timestamp() * 1000)
+        return Baseline(close, f"exchange:{day}:{close}", f"证券交易所收盘价｜{day} {info.name}",
+                        close_ms + DAY_MS, close_ms, "" if ticker.same_unit else info.currency,
+                        f"{info.name}{ticker.code}·自动")
+
+    async def refresh(self, now_ms: int, force: bool = False) -> None:
+        if not self.config.tickers or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
+            return
+        self.refreshed = time.monotonic()
+
+        async def one(symbol: str, ticker: StockTicker) -> None:
+            try:
+                self.closes[symbol] = await self.fetch(symbol, ticker, now_ms)
+                self.errors.pop(symbol, None)
+            except Exception as error:  # Keep the last good close; report the failure alongside it.
+                self.errors[symbol] = clean_error(error)
+
+        await asyncio.gather(*(one(s, t) for s, t in self.config.tickers.items()))
 
 
 @dataclass(frozen=True)
@@ -686,6 +829,7 @@ class Bot:
     def __init__(self, config: Config, store: Store, market: Binance, telegram: Telegram):
         self.config, self.store, self.market, self.telegram = config, store, market, telegram
         self.snapshots: dict[str, dict] = {}
+        self.stocks = StockMarket(config)
         self.stopping = asyncio.Event()
         self.started = time.time()
         self.last_cycle = 0.0
@@ -960,11 +1104,19 @@ class Bot:
         return lines
 
     def reference_for(self, kind: str, symbol: str, now_ms: int) -> Baseline | None:
-        """Today's recorded reference close of ``kind`` for ``symbol``, or None when not recorded."""
+        """Today's reference close of ``kind`` for ``symbol``: a manual record wins over the fetched one."""
         try:
             return manual_baseline(self.store.get(f"{kind}:{symbol}:{beijing_day(now_ms / 1000)}"), now_ms, kind)
         except ValueError:
-            return None
+            return self.stocks.closes.get(symbol) if kind == "exchange" else None
+
+    def reference_status(self, kind: str, symbol: str, price: D, now_ms: int) -> str:
+        ref = self.reference_for(kind, symbol, now_ms)
+        error = self.stocks.errors.get(symbol) if kind == "exchange" else None
+        if ref is None and error:
+            return f"证券交易所收盘价：自动获取失败（{error}）；可用 /setexchange 手动记录"
+        line = reference_line(kind, price, ref)
+        return line + f"｜⚠️ 最近刷新失败：{error}" if error and ref and ref.source else line
 
     def references_for(self, symbol: str, now_ms: int) -> dict[str, Baseline]:
         found = {kind: self.reference_for(kind, symbol, now_ms) for kind in REFERENCE_KINDS}
@@ -1002,8 +1154,7 @@ class Bot:
             change = percent(quote.price, base.value)
             lines.extend([f"最新成交：{fmt(quote.price)}｜基准：{fmt(base.value)}",
                           f"相对基准：{change:+.3f}%", base.label,
-                          *(reference_line(kind, quote.price, self.reference_for(kind, symbol, now_ms))
-                            for kind in REFERENCE_KINDS),
+                          *(self.reference_status(kind, symbol, quote.price, now_ms) for kind in REFERENCE_KINDS),
                           f"行情时间：{stamp(quote.timestamp_ms)}（北京）｜{max(0, int(age))} 秒前"])
         lines.append("\n仅价格提醒；不会自动撤单/交易。日 K 于北京时间 08:00 换日。")
         return "\n".join(lines)
@@ -1025,6 +1176,8 @@ class Bot:
                 if sub.get("active"):
                     await self.notice(sub_id, sub, "币安行情接口", text)
             return
+
+        await self.stocks.refresh(now_ms)  # Best effort; failures are reported per symbol in /status.
 
         async def collect(symbol: str) -> tuple[str, dict]:
             try:
@@ -1198,6 +1351,16 @@ async def check_market(config: Config) -> int:
             failed = True
             print(f"FAIL {symbol}: {clean_error(error)}")
     print("口径：币安上一 UTC 日日 K，不是股票交易所正式昨收。")
+    stocks = StockMarket(config)
+    await stocks.refresh(market.now_ms(), force=True)
+    for symbol, ticker in config.tickers.items():
+        close = stocks.closes.get(symbol)
+        if close:
+            print(f"OK {symbol} 证券交易所收盘价: {fmt(close.value)} {close.currency} "
+                  f"({close.label}, 收盘 {stamp(close.close_ms, seconds=False)} 北京, 来源 {close.source})")
+        else:
+            failed = True
+            print(f"FAIL {symbol} 证券交易所收盘价: {stocks.errors.get(symbol, '未知错误')}")
     return int(failed)
 
 
