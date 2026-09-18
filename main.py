@@ -32,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.2.4"
+VERSION = "1.3.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -217,6 +217,7 @@ class Config:
     tickers: dict[str, "StockTicker"]
     color_style: str
     fx_manual: dict[str, D]
+    hsi_futures: bool = True  # Show the Hang Seng Index futures quote (night session after HK close).
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -251,6 +252,7 @@ class Config:
             baseline_mode=mode, base_url=url,
             tickers=parse_tickers(e.get("EXCHANGE_TICKERS", DEFAULT_TICKERS), symbols),
             color_style=style, fx_manual=parse_fx(e.get("FX_RATES", "")),
+            hsi_futures=e.get("HSI_FUTURES", "on").strip().lower() not in {"off", "0", "false", "no"},
         )
 
 
@@ -783,6 +785,156 @@ class FxRates:
 
 
 @dataclass(frozen=True)
+class FuturesQuote:
+    """One index-futures quote (the front/main contract) plus the cash index for the basis."""
+    name: str
+    last: D
+    prev_settle: D | None
+    open: D | None
+    high: D | None
+    low: D | None
+    quoted_ms: int
+    source: str
+    spot: D | None = None
+    spot_source: str = ""
+
+    @property
+    def change(self) -> D | None:
+        return self.last - self.prev_settle if self.prev_settle else None
+
+    @property
+    def basis(self) -> D | None:
+        """Futures minus cash index: positive = 高水 (premium), negative = 低水 (discount)."""
+        return self.last - self.spot if self.spot is not None else None
+
+
+def hk_futures_session(now_ms: int) -> str:
+    """HKEX HSI futures: day session 09:15-16:30, after-hours (夜市) 17:15-03:00 next day, HK time."""
+    local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).time()
+    if local >= dt.time(17, 15) or local < dt.time(3, 0):
+        return "夜市"
+    if dt.time(9, 15) <= local <= dt.time(16, 30):
+        return "日市"
+    return "休市"
+
+
+def parse_eastmoney_quote(raw: bytes) -> dict[str, Any]:
+    """push2 stock/get with fltt=2: {"data": {"f43": last, "f44": high, "f45": low, "f46": open, "f60": prev, "f86": ts}}"""
+    try:
+        data = json.loads(raw)["data"]
+    except (ValueError, KeyError, TypeError):
+        raise ValueError("东方财富报价格式异常") from None
+    if not isinstance(data, dict) or data.get("f43") in (None, "-"):
+        raise ValueError("东方财富没有该合约的报价")
+    return data
+
+
+def _opt(value: Any) -> D | None:
+    try:
+        return number(value, "行情", zero_ok=True) if value not in (None, "", "-") else None
+    except ValueError:
+        return None
+
+
+class IndexFutures:
+    """Hang Seng Index futures (main contract, incl. the 17:15-03:00 after-hours session) with the
+    cash index for the 高水/低水 basis. Eastmoney first, Sina as fallback; read-only, best effort."""
+    REFRESH_SECONDS = 60
+    EM = "https://push2.eastmoney.com/api/qt/stock/get?fltt=2&invt=2&fields=f43,f44,f45,f46,f57,f58,f60,f86&secid="
+    FUTURES_SOURCES = (("东方财富", EM + "134.HSI_M", {"Referer": "https://quote.eastmoney.com/"}),
+                       ("新浪", "https://hq.sinajs.cn/list=hf_HSI", {"Referer": "https://finance.sina.com.cn/"}))
+    SPOT_SOURCES = (("东方财富", EM + "100.HSI", {"Referer": "https://quote.eastmoney.com/"}),
+                    ("腾讯", "https://qt.gtimg.cn/q=hkHSI", {"Referer": "https://gu.qq.com/"}),
+                    ("新浪", "https://hq.sinajs.cn/list=rt_hkHSI", {"Referer": "https://finance.sina.com.cn/"}))
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.quote: FuturesQuote | None = None
+        self.error = ""
+        self.refreshed = -1e9
+
+    @staticmethod
+    def parse_futures(source: str, raw: bytes, now_ms: int) -> FuturesQuote:
+        if source == "东方财富":
+            d = parse_eastmoney_quote(raw)
+            quoted_ms = int(d["f86"]) * 1000 if str(d.get("f86", "")).isdigit() else now_ms
+            return FuturesQuote(str(d.get("f58") or "恒指期货主力"), number(d["f43"], "恒指期货"), _opt(d.get("f60")),
+                                _opt(d.get("f46")), _opt(d.get("f44")), _opt(d.get("f45")), quoted_ms, source)
+        # Sina hf_HSI: last, ?, bid, ask, high, low, time, prev settle, open, open interest, ..., name, date
+        match = re.search(r'="([^"]*)"', raw.decode("gbk", errors="ignore"))
+        fields = match.group(1).split(",") if match else []
+        if len(fields) < 15 or not fields[0]:
+            raise ValueError("新浪恒指期货报价为空")
+        try:
+            quoted = dt.datetime.strptime(f"{fields[14]} {fields[6]}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=BEIJING)
+            quoted_ms = int(quoted.timestamp() * 1000)
+        except ValueError:
+            quoted_ms = now_ms
+        return FuturesQuote(fields[13] or "恒指期货", number(fields[0], "恒指期货"), _opt(fields[7]), _opt(fields[8]),
+                            _opt(fields[4]), _opt(fields[5]), quoted_ms, source)
+
+    @staticmethod
+    def parse_spot(source: str, raw: bytes) -> D:
+        if source == "东方财富":
+            return number(parse_eastmoney_quote(raw)["f43"], "恒生指数")
+        text = raw.decode("gbk", errors="ignore")
+        match = re.search(r'="([^"]*)"', text)
+        if not match or not match.group(1).strip():
+            raise ValueError(f"{source}恒生指数报价为空")
+        fields = match.group(1).split("~" if source == "腾讯" else ",")
+        try:
+            return number(fields[3] if source == "腾讯" else fields[6], "恒生指数")
+        except IndexError:
+            raise ValueError(f"{source}恒生指数格式异常") from None
+
+    async def _first(self, sources: tuple, parse) -> Any:
+        failures = []
+        for name, url, extra in sources:
+            try:
+                raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                return parse(name, raw)
+            except Exception as error:
+                failures.append(f"{name}: {clean_error(error)}")
+        raise ValueError("；".join(failures))
+
+    async def refresh(self, now_ms: int, force: bool = False) -> None:
+        if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
+            return
+        self.refreshed = time.monotonic()
+        try:
+            quote: FuturesQuote = await self._first(self.FUTURES_SOURCES, lambda n, r: self.parse_futures(n, r, now_ms))
+        except Exception as error:
+            self.error = clean_error(error)
+            return
+        try:
+            spot = await self._first(self.SPOT_SOURCES, self.parse_spot)
+            quote = FuturesQuote(**{**quote.__dict__, "spot": spot})
+        except Exception as error:  # Basis is a nice-to-have; the futures quote alone is still shown.
+            LOG.debug("HSI spot unavailable: %s", clean_error(error))
+        self.quote, self.error = quote, ""
+
+    def line(self, now_ms: int, style: str) -> str:
+        if not self.enabled:
+            return ""
+        q = self.quote
+        if q is None:
+            return f"📈 恒指期货：⚠️ 获取失败（{self.error}）" if self.error else "📈 恒指期货：⏳ 等待首次获取"
+        parts = [f"📈 恒指期货 {q.name}（{hk_futures_session(q.quoted_ms)}）：{bold(fmt(q.last))}"]
+        if q.change is not None and q.prev_settle:
+            pct = q.change / q.prev_settle * 100
+            parts[0] += f" {trend_mark(pct, style)} {q.change:+,.0f}（{pct:+.2f}%）"
+        if q.basis is not None:
+            water = "高水" if q.basis > 0 else "低水" if q.basis < 0 else "平水"
+            parts.append(f"{water} {abs(q.basis):,.0f}（恒指 {fmt(q.spot)}）")
+        ohl = [f"开 {fmt(v)}" if k == "开" else f"{k} {fmt(v)}" for k, v in (("开", q.open), ("高", q.high), ("低", q.low)) if v]
+        if ohl:
+            parts.append(" ".join(ohl))
+        parts.append(f"{stamp(q.quoted_ms, seconds=False)} 更新（{q.source}）")
+        line = "｜".join(parts)
+        return line + f"｜⚠️ 最近刷新失败：{self.error}" if self.error else line
+
+
+@dataclass(frozen=True)
 class Plan:
     reason: str
     next_state: dict
@@ -823,8 +975,8 @@ def alert_plan(state: dict | None, baseline_key: str, change: D, now: float,
 
 def alert_text(symbol: str, quote: Quote, base: Baseline, change: D, threshold: D, reason: str,
                references: dict[str, Baseline] | None = None, fx: "FxRates | None" = None,
-               style: str = "cn") -> str:
-    """Alert body with bold sentinels; send it with html=True."""
+               style: str = "cn", context: list[str] | None = None) -> str:
+    """Alert body with bold sentinels; send it with html=True. ``context`` = extra market lines."""
     side = "上涨" if change > 0 else "下跌"
     lines = [f"{trend_mark(change, style)} {bold(f'{side}超过 {fmt(threshold)}%｜{NAMES.get(symbol, symbol)}')}",
              symbol, "",
@@ -832,6 +984,7 @@ def alert_text(symbol: str, quote: Quote, base: Baseline, change: D, threshold: 
              f"相对基准：{pct_text(change, style, strong=True)}"]
     for kind, ref in (references or {}).items():
         lines.extend(reference_lines(kind, quote.price, ref, fx, style))
+    lines += [line for line in (context or []) if line]
     lines += [f"📌 {base.label}", f"📝 原因：{reason}",
               f"⏱ 行情时间：{stamp(quote.timestamp_ms)}（北京时间）",
               "⚠️ 合约行情提示，不代表股票官方收盘结算结果。"]
@@ -1122,6 +1275,7 @@ class Bot:
         self.snapshots: dict[str, dict] = {}
         self.stocks = StockMarket(config, store)
         self.fx = FxRates(config.fx_manual)
+        self.hsi = IndexFutures(config.hsi_futures)
         self.stopping = asyncio.Event()
         self.started = time.time()
         self.last_cycle = 0.0
@@ -1413,6 +1567,13 @@ class Bot:
             lines.append(f"⚠️ 最近一次刷新失败，沿用上次数据：{error}")
         return lines
 
+    def context_lines(self, symbol: str, now_ms: int) -> list[str]:
+        """Market-context lines for an alert: the HSI futures quote for Hong Kong-listed underlyings."""
+        ticker = self.config.tickers.get(symbol)
+        if self.config.hsi_futures and ticker and ticker.market == "hk" and self.hsi.quote:
+            return [self.hsi.line(now_ms, self.config.color_style)]
+        return []
+
     def references_for(self, symbol: str, now_ms: int) -> dict[str, Baseline]:
         found = {kind: self.reference_for(kind, symbol, now_ms) for kind in REFERENCE_KINDS}
         return {kind: ref for kind, ref in found.items() if ref is not None}
@@ -1434,6 +1595,8 @@ class Bot:
         active = "🟢 已订阅" if sub and sub.get("active") else "⏸ 未订阅/已暂停"
         style = self.config.color_style
         lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(), f"📊 图例：{legend(style)}"]
+        if self.config.hsi_futures:
+            lines.append(self.hsi.line(now_ms, style))
         for symbol in self.config.symbols:
             snapshot = self.snapshots.get(symbol)
             lines.append("\n" + bold(f"📍 {NAMES.get(symbol, symbol)}｜{symbol}"))
@@ -1478,7 +1641,7 @@ class Bot:
             return
 
         # Best effort; failures are reported in /status and never block price alerts.
-        await asyncio.gather(self.stocks.refresh(now_ms), self.fx.refresh())
+        await asyncio.gather(self.stocks.refresh(now_ms), self.fx.refresh(), self.hsi.refresh(now_ms))
 
         async def collect(symbol: str) -> tuple[str, dict]:
             try:
@@ -1533,7 +1696,8 @@ class Bot:
                 if not plan:
                     continue
                 text = alert_text(symbol, quote, base, change, threshold, plan.reason,
-                                  self.references_for(symbol, current_ms), self.fx, self.config.color_style)
+                                  self.references_for(symbol, current_ms), self.fx, self.config.color_style,
+                                  self.context_lines(symbol, current_ms))
                 if await self.tell(sub["chat"], sub["thread"], text, html_mode=True):
                     # Only mark a price alert as delivered AFTER Telegram accepts it.
                     # Avoid resurrecting state deleted by a command during delivery.
@@ -1655,6 +1819,9 @@ async def check_market(config: Config) -> int:
     stocks, fx = StockMarket(config), FxRates(config.fx_manual)
     await asyncio.gather(stocks.refresh(market.now_ms(), force=True), fx.refresh(force=True))
     print(fx.summary())
+    hsi = IndexFutures(config.hsi_futures)
+    await hsi.refresh(market.now_ms(), force=True)
+    print(hsi.line(market.now_ms(), config.color_style).replace(B0, "").replace(B1, ""))
     for symbol, ticker in config.tickers.items():
         close = stocks.closes.get(symbol)
         if close:
