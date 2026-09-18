@@ -32,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -518,52 +518,125 @@ def last_completed_bar(bars: list[tuple[dt.date, D]], info: StockMarketInfo, now
     raise ValueError("还没有已完结的交易日")
 
 
-class StockMarket:
-    """Fetches each contract's underlying stock close from its exchange's public daily-bar feed.
+def parse_quote_close(source: str, market: str, raw: bytes, info: StockMarketInfo,
+                      now_ms: int) -> tuple[dt.date | None, D]:
+    """Tencent/Sina realtime quotes give the last price, previous close and quote time.
 
-    Read-only and best effort: a failure only blanks that symbol's reference line.
+    After the session is final the last price is that day's close; while a session runs the
+    previous close is the latest completed one (its exact date is unknown, hence None).
+    """
+    text = raw.decode("gbk", errors="ignore")
+    match = re.search(r'="([^"]*)"', text)
+    if not match or not match.group(1).strip():
+        raise ValueError(f"{source}行情为空（代码可能不存在）")
+    fields = match.group(1).split("~" if source == "腾讯" else ",")
+    try:
+        if source == "腾讯":
+            current, previous, when = fields[3], fields[4], fields[30]
+            digits = re.sub(r"\D", "", when)[:12]  # 20260918150003 or 2026/09/18 16:08:11
+            quoted = dt.datetime.strptime(digits[:12], "%Y%m%d%H%M")
+        elif market == "hk":  # Sina rt_hk: ..., prev[3], ..., current[6], ..., date[17], time[18]
+            current, previous = fields[6], fields[3]
+            quoted = dt.datetime.strptime(f"{fields[17]} {fields[18]}", "%Y/%m/%d %H:%M:%S")
+        else:  # Sina A-share: name, open, prev[2], current[3], ..., date[30], time[31]
+            current, previous = fields[3], fields[2]
+            quoted = dt.datetime.strptime(f"{fields[30]} {fields[31]}", "%Y-%m-%d %H:%M:%S")
+    except (IndexError, ValueError):
+        raise ValueError(f"{source}行情格式异常") from None
+    tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+    local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
+    final_from = dt.datetime.combine(local.date(), info.close_time, tz) + dt.timedelta(minutes=15)
+    if quoted.date() < local.date() or (quoted.date() == local.date() and local >= final_from):
+        return quoted.date(), number(current, "收盘价")
+    return None, number(previous, "昨收价")
+
+
+class StockMarket:
+    """Fetches each contract's underlying stock close from public quote feeds.
+
+    Sources are tried in order with a retry each; the last good close is persisted so a
+    restart or a flaky feed does not blank the reference line. Read-only and best effort.
     """
     REFRESH_SECONDS = 600
+    ATTEMPTS = 2
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, store: "Store | None" = None):
         self.config = config
+        self.store = store
         self.closes: dict[str, Baseline] = {}
         self.errors: dict[str, str] = {}
         self.refreshed = -1e9
+        for symbol in config.tickers:
+            saved = store.get(f"stock_close:{symbol}") if store else None
+            if saved:
+                with contextlib.suppress(Exception):
+                    self.closes[symbol] = Baseline(number(saved["value"], "收盘价"), saved["key"], saved["label"],
+                                                   int(saved["valid_until_ms"]), int(saved["close_ms"]),
+                                                   saved.get("currency", ""), saved.get("source", ""))
 
     @staticmethod
-    def url(ticker: StockTicker) -> str:
+    def sources(ticker: StockTicker) -> list[tuple[str, str, dict[str, str]]]:
+        """(name, url, extra headers) in preference order."""
+        code = urllib.parse.quote(ticker.code)
         if ticker.market == "kr":
-            return ("https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=10&symbol="
-                    + urllib.parse.quote(ticker.code))
-        prefix = {"sh": "1", "sz": "0", "hk": "116"}[ticker.market]
-        return ("https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=10"
-                "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&secid="
-                + urllib.parse.quote(f"{prefix}.{ticker.code}"))
+            return [("Naver", f"https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=10&symbol={code}",
+                     {"Referer": "https://finance.naver.com/"})]
+        secid = {"sh": "1", "sz": "0", "hk": "116"}[ticker.market] + "." + ticker.code
+        sina = ("rt_hk" if ticker.market == "hk" else ticker.market) + ticker.code
+        return [
+            ("东方财富", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=10"
+                         "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&secid=" + urllib.parse.quote(secid),
+             {"Referer": "https://quote.eastmoney.com/"}),
+            ("腾讯", f"https://qt.gtimg.cn/q={ticker.market}{code}", {"Referer": "https://gu.qq.com/"}),
+            ("新浪", f"https://hq.sinajs.cn/list={sina}", {"Referer": "https://finance.sina.com.cn/"}),
+        ]
 
     async def fetch(self, symbol: str, ticker: StockTicker, now_ms: int) -> Baseline:
         info = STOCK_MARKETS[ticker.market]
-        raw = await http_get(self.url(ticker), headers={"User-Agent": BROWSER_UA, "Accept": "*/*"})
-        day, close = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
+        failures = []
+        for name, url, extra in self.sources(ticker):
+            for attempt in range(self.ATTEMPTS):
+                try:
+                    raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                    if name in {"东方财富", "Naver"}:
+                        day, close = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
+                    else:
+                        day, close = parse_quote_close(name, ticker.market, raw, info, now_ms)
+                    return self.baseline(ticker, info, name, day, close)
+                except Exception as error:
+                    failures.append(f"{name}: {clean_error(error)}")
+                    if attempt + 1 < self.ATTEMPTS:
+                        await asyncio.sleep(1.5)
+        raise ValueError("；".join(dict.fromkeys(failures)))
+
+    @staticmethod
+    def baseline(ticker: StockTicker, info: StockMarketInfo, source: str, day: dt.date | None, close: D) -> Baseline:
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
-        close_ms = int(dt.datetime.combine(day, info.close_time, tz).timestamp() * 1000)
-        return Baseline(close, f"exchange:{day}:{close}", f"证券交易所收盘价｜{day} {info.name}",
-                        close_ms + DAY_MS, close_ms, "" if ticker.same_unit else info.currency,
-                        f"{info.name}{ticker.code}·自动")
+        close_ms = int(dt.datetime.combine(day, info.close_time, tz).timestamp() * 1000) if day else 0
+        when = str(day) if day else "上一交易日"
+        return Baseline(close, f"exchange:{when}:{close}", f"证券交易所收盘价｜{when} {info.name}",
+                        (close_ms or int(time.time() * 1000)) + DAY_MS, close_ms,
+                        "" if ticker.same_unit else info.currency, f"{info.name}{ticker.code}·{source}")
+
+    def remember(self, symbol: str, close: Baseline) -> None:
+        if self.store:
+            self.store.put(f"stock_close:{symbol}", {
+                "value": str(close.value), "key": close.key, "label": close.label, "valid_until_ms": close.valid_until_ms,
+                "close_ms": close.close_ms, "currency": close.currency, "source": close.source})
 
     async def refresh(self, now_ms: int, force: bool = False) -> None:
         if not self.config.tickers or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
             return
         self.refreshed = time.monotonic()
-
-        async def one(symbol: str, ticker: StockTicker) -> None:
+        for index, (symbol, ticker) in enumerate(self.config.tickers.items()):
+            if index:
+                await asyncio.sleep(0.5)  # Spread requests out; feeds drop bursts from one IP.
             try:
                 self.closes[symbol] = await self.fetch(symbol, ticker, now_ms)
                 self.errors.pop(symbol, None)
+                self.remember(symbol, self.closes[symbol])
             except Exception as error:  # Keep the last good close; report the failure alongside it.
                 self.errors[symbol] = clean_error(error)
-
-        await asyncio.gather(*(one(s, t) for s, t in self.config.tickers.items()))
 
 
 class FxRates:
@@ -964,7 +1037,7 @@ class Bot:
     def __init__(self, config: Config, store: Store, market: Binance, telegram: Telegram):
         self.config, self.store, self.market, self.telegram = config, store, market, telegram
         self.snapshots: dict[str, dict] = {}
-        self.stocks = StockMarket(config)
+        self.stocks = StockMarket(config, store)
         self.fx = FxRates(config.fx_manual)
         self.stopping = asyncio.Event()
         self.started = time.time()
