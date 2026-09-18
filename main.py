@@ -268,19 +268,34 @@ def daily_baseline(rows: Any, now_ms: int) -> Baseline:
     raise ValueError("没有完整的上一 UTC 日日 K（可能新上市或接口数据未就绪）；不使用旧基准")
 
 
-def manual_baseline(record: dict | None, now_ms: int) -> Baseline:
+# Two kinds of user-entered daily prices share one record format and one command grammar:
+#   manual   -> the alert baseline in manual mode (same quote unit as the Binance contract)
+#   official -> the exchange's official close, shown for reference next to the baseline
+PRICE_KINDS = {"manual": ("手动参考价", "/setclose"), "official": ("官方收盘价", "/setofficial")}
+
+
+def manual_baseline(record: dict | None, now_ms: int, kind: str = "manual") -> Baseline:
+    label, command = PRICE_KINDS[kind]
     today = beijing_day(now_ms / 1000)
     if not record or record.get("valid_date") != today:
-        raise ValueError(f"缺少 {today} 的手动基准；请用 /setclose 设置，不能沿用过期价格")
-    value = number(record.get("value"), "手动基准")
+        raise ValueError(f"缺少 {today} 的{label}；请用 {command} 设置，不能沿用过期价格")
+    value = number(record.get("value"), label)
     until = dt.datetime.combine(dt.date.fromisoformat(today) + dt.timedelta(days=1),
                                 dt.time(), BEIJING)
     close_ms = 0
     with contextlib.suppress(ValueError, TypeError):  # Older records have no close time.
         close_ms = int(dt.datetime.fromisoformat(str(record.get("close_at"))).replace(tzinfo=BEIJING).timestamp() * 1000)
-    return Baseline(value, f"manual:{today}:{value}",
-                    f"手动参考价｜适用日 {today}（北京时间）" + close_label(close_ms),
+    return Baseline(value, f"{kind}:{today}:{value}",
+                    f"{label}｜适用日 {today}（北京时间）" + close_label(close_ms),
                     int(until.timestamp() * 1000), close_ms)
+
+
+def official_line(price: D, official: Baseline | None) -> str:
+    """One line comparing the live price with the exchange's official close, if one is recorded."""
+    if official is None:
+        return "官方收盘价：未设置（/setofficial）"
+    return (f"官方收盘价：{fmt(official.value)}｜相对官方：{percent(price, official.value):+.3f}%"
+            + close_label(official.close_ms))
 
 
 class Binance:
@@ -377,11 +392,13 @@ def alert_plan(state: dict | None, baseline_key: str, change: D, now: float,
     return s, Plan(reason, next_state)
 
 
-def alert_text(symbol: str, quote: Quote, base: Baseline, change: D, threshold: D, reason: str) -> str:
+def alert_text(symbol: str, quote: Quote, base: Baseline, change: D, threshold: D, reason: str,
+               official: Baseline | None = None) -> str:
     side = "📈 上涨" if change > 0 else "📉 下跌"
+    extra = official_line(quote.price, official) + "\n" if official else ""
     return (f"{side}超过 {fmt(threshold)}%｜{NAMES.get(symbol, symbol)}\n{symbol}\n\n"
             f"当前成交价：{fmt(quote.price)}\n参考收盘价：{fmt(base.value)}\n"
-            f"相对基准：{change:+.3f}%\n\n{base.label}\n原因：{reason}\n"
+            f"相对基准：{change:+.3f}%\n{extra}\n{base.label}\n原因：{reason}\n"
             f"行情时间：{stamp(quote.timestamp_ms)}（北京时间）\n"
             "⚠️ 合约行情提示，不代表股票官方收盘结算结果。")
 
@@ -492,6 +509,8 @@ COMMANDS: tuple[Command, ...] = (
     Command("setclose", "设置手动参考价，可一次发多条", "UNITREE 75 09-17 16:00",
             "示例：75 是基准，09-17 16:00 是它的收盘时间（北京，可省略）\n"
             "  末尾再写 YYYY-MM-DD 可指定适用日（默认今天）；批量：每行一组，首行可写统一适用日"),
+    Command("setofficial", "记录交易所官方收盘价（对照显示）", "SHEIN 40 09-17 16:00",
+            "语法同 /setclose；显示在状态和提醒里，不参与触发判断"),
     Command("pause", "暂停当前订阅"),
     Command("resume", "恢复当前订阅"),
     Command("test", "发送测试消息，不代表行情正常"),
@@ -651,6 +670,7 @@ class Bot:
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
+            "/setofficial": self.cmd_setofficial,
         }
 
     def settings(self) -> dict:
@@ -862,6 +882,20 @@ class Bot:
         return reply
 
     def cmd_setclose(self, req: Request) -> str:
+        lines = self.store_prices(req, "manual")
+        lines.append("这是你输入的参考价，未独立核验，不自动换汇。")
+        if self.settings()["mode"] != "manual":
+            lines.append("当前仍为日 K 模式；发 /mode manual 后才会使用这些价格。")
+        return "\n".join(lines)
+
+    def cmd_setofficial(self, req: Request) -> str:
+        lines = self.store_prices(req, "official")
+        lines.append("官方收盘价仅作对照显示（相对官方涨跌），不参与触发判断；请与币安显示值同口径。")
+        return "\n".join(lines)
+
+    def store_prices(self, req: Request, kind: str) -> list[str]:
+        """Parse a (batch) price message and persist it under ``kind``; returns one reply line per record."""
+        label = PRICE_KINDS[kind][0]
         now_ms = self.market.now_ms()
         today = beijing_day(now_ms / 1000)
         # Resolve and validate every line first so a typo in one line does not half-apply the batch.
@@ -877,18 +911,22 @@ class Bot:
             record = {"value": str(entry.value), "valid_date": day}
             if entry.close_at:
                 record["close_at"] = entry.close_at
-            self.store.put(f"manual:{symbol}:{day}", record)
-            self.snapshots.pop(symbol, None)
+            self.store.put(f"{kind}:{symbol}:{day}", record)
+            if kind == "manual":
+                self.snapshots.pop(symbol, None)
             close = f"｜收盘 {entry.close_at[5:].replace('T', ' ')}（北京时间）" if entry.close_at else "｜未填收盘时间"
-            lines.append(f"✅ {symbol} 参考价：{fmt(entry.value)}｜适用日 {day}（北京时间）{close}")
-        lines.append("这是你输入的参考价，未独立核验，不自动换汇。")
-        if self.settings()["mode"] != "manual":
-            lines.append("当前仍为日 K 模式；发 /mode manual 后才会使用这些价格。")
-        else:
-            missing = [s for s in self.config.symbols if not self.store.get(f"manual:{s}:{today}")]
-            if missing:
-                lines.append(f"今日（{today}）尚未设置：" + "、".join(missing))
-        return "\n".join(lines)
+            lines.append(f"✅ {symbol} {label}：{fmt(entry.value)}｜适用日 {day}（北京时间）{close}")
+        missing = [s for s in self.config.symbols if not self.store.get(f"{kind}:{s}:{today}")]
+        if missing and (kind == "official" or self.settings()["mode"] == "manual"):
+            lines.append(f"今日（{today}）尚未设置{label}：" + "、".join(missing))
+        return lines
+
+    def official_for(self, symbol: str, now_ms: int) -> Baseline | None:
+        """Today's official exchange close for ``symbol``, or None when not recorded."""
+        try:
+            return manual_baseline(self.store.get(f"official:{symbol}:{beijing_day(now_ms / 1000)}"), now_ms, "official")
+        except ValueError:
+            return None
 
     def setclose_template(self, day: str) -> str:
         """A ready-to-edit batch /setclose covering every monitored symbol."""
@@ -922,6 +960,7 @@ class Bot:
             change = percent(quote.price, base.value)
             lines.extend([f"最新成交：{fmt(quote.price)}｜基准：{fmt(base.value)}",
                           f"相对基准：{change:+.3f}%", base.label,
+                          official_line(quote.price, self.official_for(symbol, now_ms)),
                           f"行情时间：{stamp(quote.timestamp_ms)}（北京）｜{max(0, int(age))} 秒前"])
         lines.append("\n仅价格提醒；不会自动撤单/交易。日 K 于北京时间 08:00 换日。")
         return "\n".join(lines)
@@ -996,7 +1035,8 @@ class Bot:
                     self.store.put(state_key, passive)
                 if not plan:
                     continue
-                text = alert_text(symbol, quote, base, change, threshold, plan.reason)
+                text = alert_text(symbol, quote, base, change, threshold, plan.reason,
+                                  self.official_for(symbol, current_ms))
                 if await self.tell(sub["chat"], sub["thread"], text):
                     # Only mark a price alert as delivered AFTER Telegram accepts it.
                     # Avoid resurrecting state deleted by a command during delivery.
