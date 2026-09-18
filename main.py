@@ -12,6 +12,7 @@ import contextlib
 import copy
 import datetime as dt
 import decimal
+import html
 import json
 import logging
 import os
@@ -31,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -71,6 +72,37 @@ def stamp(ms: int | float, seconds: bool = True) -> str:
 
 def close_label(close_ms: int) -> str:
     return f"｜收盘 {stamp(close_ms, seconds=False)}（北京时间）" if close_ms else ""
+
+
+# --- presentation helpers -----------------------------------------------------------------------
+# Messages are composed as plain text; bold spans are marked with sentinels and turned into HTML
+# tags only after escaping, so symbols, error strings and prices can never break the markup.
+B0, B1 = "\x01", "\x02"
+
+
+def bold(text: Any) -> str:
+    return f"{B0}{text}{B1}"
+
+
+def to_html(text: str) -> str:
+    return html.escape(text, quote=False).replace(B0, "<b>").replace(B1, "</b>")
+
+
+def trend_mark(change: D, style: str) -> str:
+    """Colour dot for a percentage move. cn = 红涨绿跌 (A-share convention), us = 绿涨红跌."""
+    if abs(change) < D("0.0005"):
+        return "⚪"
+    up = change > 0
+    return ("🔴" if up else "🟢") if style == "cn" else ("🟢" if up else "🔴")
+
+
+def pct_text(change: D, style: str, strong: bool = False) -> str:
+    body = f"{change:+.3f}%"
+    return f"{trend_mark(change, style)} {bold(body) if strong else body}"
+
+
+def legend(style: str) -> str:
+    return "🔴 涨 🟢 跌 ⚪ 平" if style == "cn" else "🟢 涨 🔴 跌 ⚪ 平"
 
 
 def clean_error(error: BaseException | str) -> str:
@@ -115,7 +147,23 @@ STOCK_MARKETS = {
 }
 # Underlying stocks of the default contracts (all listed as of 2026-09): Unitree 688836.SS,
 # SHEIN 0625.HK, CXMT 688825.SS, SK hynix 000660.KS.
-DEFAULT_TICKERS = "UNITREEUSDT=sh:688836,HK0625USDT=hk:00625,CXMTUSDT=sh:688825,SKHYNIXUSDT=kr:000660"
+# HK0625USDT is a quanto contract: its price is the HKD stock price itself, so it compares directly (:same).
+# The others are USD-denominated, so their exchange closes are converted with the FX rate first.
+DEFAULT_TICKERS = "UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:688825,SKHYNIXUSDT=kr:000660"
+
+
+def parse_fx(spec: str) -> dict[str, D]:
+    """FX_RATES="CNY=7.12,HKD=7.79": units of each currency per 1 USD; overrides the fetched rates."""
+    rates: dict[str, D] = {}
+    for item in spec.split(","):
+        if not item.strip():
+            continue
+        currency, _, value = item.partition("=")
+        currency = currency.strip().upper()
+        if currency not in CURRENCIES:
+            raise ValueError(f"FX_RATES 不支持的货币：{currency or item.strip()}")
+        rates[currency] = number(value.strip(), f"FX_RATES {currency}")
+    return rates
 TICKER_RE = re.compile(r"(sh|sz|hk|kr):([0-9A-Za-z]{1,12})(:same)?", re.IGNORECASE)
 
 
@@ -152,6 +200,8 @@ class Config:
     baseline_mode: str
     base_url: str
     tickers: dict[str, "StockTicker"]
+    color_style: str
+    fx_manual: dict[str, D]
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -170,6 +220,9 @@ class Config:
         threshold = number(e.get("ALERT_THRESHOLD_PCT", "1"), "ALERT_THRESHOLD_PCT")
         if not D("0.01") <= threshold <= D(100):
             raise ValueError("ALERT_THRESHOLD_PCT 必须在 0.01～100 之间，1 表示 1%")
+        style = e.get("COLOR_STYLE", "cn").strip().lower()
+        if style not in {"cn", "us"}:
+            raise ValueError("COLOR_STYLE 只能是 cn（红涨绿跌）或 us（绿涨红跌）")
         return cls(
             token=e.get("TELEGRAM_BOT_TOKEN", "").strip(),
             admin_id=bounded_int(e, "ADMIN_USER_ID", 0, 0, 10**15),
@@ -182,6 +235,7 @@ class Config:
             max_age=bounded_int(e, "MAX_PRICE_AGE_SECONDS", 120, 5, 3600),
             baseline_mode=mode, base_url=url,
             tickers=parse_tickers(e.get("EXCHANGE_TICKERS", DEFAULT_TICKERS), symbols),
+            color_style=style, fx_manual=parse_fx(e.get("FX_RATES", "")),
         )
 
 
@@ -333,12 +387,10 @@ def daily_baseline(rows: Any, now_ms: int) -> Baseline:
 
 # Two kinds of user-entered daily prices share one record format and one command grammar:
 #   manual   -> the alert baseline in manual mode (same quote unit as the Binance contract)
-#   official -> the exchange's official close, shown for reference next to the baseline
 #   exchange -> the securities exchange's close in its own currency (HKD, KRW, ...), for reference
 PRICE_KINDS = {"manual": ("手动参考价", "/setclose", ""),
-               "official": ("官方收盘价", "/setofficial", "相对官方"),
                "exchange": ("证券交易所收盘价", "/setexchange", "相对交易所")}
-REFERENCE_KINDS = ("official", "exchange")  # Shown next to the baseline, never used for triggering.
+REFERENCE_KINDS = ("exchange",)  # Shown next to the baseline, never used for triggering.
 
 
 def manual_baseline(record: dict | None, now_ms: int, kind: str = "manual") -> Baseline:
@@ -358,16 +410,24 @@ def manual_baseline(record: dict | None, now_ms: int, kind: str = "manual") -> B
                     int(until.timestamp() * 1000), close_ms, currency)
 
 
-def reference_line(kind: str, price: D, ref: Baseline | None) -> str:
-    """One line showing a recorded reference close; the deviation only when units are comparable."""
+def reference_lines(kind: str, price: D, ref: Baseline | None, fx: "FxRates | None", style: str) -> list[str]:
+    """Reference close + its deviation. Foreign-currency closes are converted to USD with the FX rate."""
     label, command, relative = PRICE_KINDS[kind]
     if ref is None:
-        return f"{label}：未设置（{command}）"
+        return [f"🏛 {label}：未设置（{command}）"]
+    tail = close_label(ref.close_ms) + (f"｜来源 {ref.source}" if ref.source else "")
     if ref.currency in SAME_UNIT:
-        body = f"{fmt(ref.value)}{' ' + ref.currency if ref.currency else ''}｜{relative}：{percent(price, ref.value):+.3f}%"
-    else:
-        body = f"{fmt(ref.value)} {ref.currency}｜币种不同，不计算涨跌"
-    return f"{label}：{body}" + close_label(ref.close_ms) + (f"｜来源 {ref.source}" if ref.source else "")
+        unit = f" {ref.currency}" if ref.currency else ""
+        return [f"🏛 {label}：{bold(fmt(ref.value) + unit)}{tail}",
+                f"{relative}：{pct_text(percent(price, ref.value), style, strong=True)}"]
+    rate = fx.rate(ref.currency) if fx else None
+    if rate is None:
+        return [f"🏛 {label}：{bold(f'{fmt(ref.value)} {ref.currency}')}{tail}",
+                f"{relative}：⚪ 暂无 {ref.currency} 汇率，无法折算"]
+    usd = (ref.value / rate).quantize(D("0.0001"))
+    return [f"🏛 {label}：{bold(f'{fmt(ref.value)} {ref.currency}')} ≈ {bold(fmt(usd) + ' USD')}"
+            f"（1 USD = {fmt(rate.quantize(D('0.0001')))} {ref.currency}）{tail}",
+            f"{relative}（折美元）：{pct_text(percent(price, usd), style, strong=True)}"]
 
 
 class Binance:
@@ -506,6 +566,66 @@ class StockMarket:
         await asyncio.gather(*(one(s, t) for s, t in self.config.tickers.items()))
 
 
+class FxRates:
+    """USD reference rates (units of currency per 1 USD) for converting exchange closes to USD.
+
+    Manual FX_RATES entries always win; fetched rates come from keyless public sources.
+    """
+    REFRESH_SECONDS = 6 * 3600
+    SOURCES = (("Frankfurter（欧洲央行参考汇率）",
+                "https://api.frankfurter.app/latest?from=USD&to=CNY,HKD,KRW,JPY,EUR,GBP,SGD,INR"),
+               ("open.er-api.com", "https://open.er-api.com/v6/latest/USD"))
+
+    def __init__(self, manual: dict[str, D] | None = None):
+        self.manual = dict(manual or {})
+        self.rates: dict[str, D] = {}
+        self.source = ""
+        self.updated = ""
+        self.error = ""
+        self.refreshed = -1e9
+
+    def rate(self, currency: str) -> D | None:
+        currency = currency.upper()
+        if currency in SAME_UNIT:
+            return D(1)
+        found = self.manual.get(currency) or self.rates.get(currency)
+        if found is None and currency == "CNH":  # Offshore yuan tracks onshore closely enough for display.
+            found = self.manual.get("CNY") or self.rates.get("CNY")
+        return found
+
+    def summary(self) -> str:
+        parts = []
+        if self.manual:
+            parts.append("手动汇率 " + "、".join(f"{c}={fmt(v)}" for c, v in self.manual.items()))
+        if self.rates:
+            parts.append(f"汇率来源 {self.source}（{self.updated or '时间未知'}）")
+        if self.error:
+            parts.append(f"⚠️ 汇率获取失败：{self.error}")
+        return "｜".join(parts) or "汇率：尚未获取"
+
+    async def refresh(self, force: bool = False) -> None:
+        if not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS:
+            return
+        self.refreshed = time.monotonic()
+        failures = []
+        for name, url in self.SOURCES:
+            try:
+                data = await http_json(url)
+                rates = data.get("rates") if isinstance(data, dict) else None
+                if not isinstance(rates, dict):
+                    raise ValueError("汇率接口未返回 rates")
+                parsed = {str(k).upper(): number(v, f"{k} 汇率") for k, v in rates.items()
+                          if str(k).upper() in CURRENCIES and isinstance(v, (int, float, str))}
+                if not parsed:
+                    raise ValueError("汇率接口没有所需货币")
+                self.rates, self.source, self.error = parsed, name, ""
+                self.updated = str(data.get("date") or data.get("time_last_update_utc") or "")[:32]
+                return
+            except Exception as error:
+                failures.append(f"{name}: {clean_error(error)}")
+        self.error = "；".join(failures)
+
+
 @dataclass(frozen=True)
 class Plan:
     reason: str
@@ -546,14 +666,20 @@ def alert_plan(state: dict | None, baseline_key: str, change: D, now: float,
 
 
 def alert_text(symbol: str, quote: Quote, base: Baseline, change: D, threshold: D, reason: str,
-               references: dict[str, Baseline] | None = None) -> str:
-    side = "📈 上涨" if change > 0 else "📉 下跌"
-    extra = "".join(reference_line(kind, quote.price, ref) + "\n" for kind, ref in (references or {}).items())
-    return (f"{side}超过 {fmt(threshold)}%｜{NAMES.get(symbol, symbol)}\n{symbol}\n\n"
-            f"当前成交价：{fmt(quote.price)}\n参考收盘价：{fmt(base.value)}\n"
-            f"相对基准：{change:+.3f}%\n{extra}\n{base.label}\n原因：{reason}\n"
-            f"行情时间：{stamp(quote.timestamp_ms)}（北京时间）\n"
-            "⚠️ 合约行情提示，不代表股票官方收盘结算结果。")
+               references: dict[str, Baseline] | None = None, fx: "FxRates | None" = None,
+               style: str = "cn") -> str:
+    """Alert body with bold sentinels; send it with html=True."""
+    side = "上涨" if change > 0 else "下跌"
+    lines = [f"{trend_mark(change, style)} {bold(f'{side}超过 {fmt(threshold)}%｜{NAMES.get(symbol, symbol)}')}",
+             symbol, "",
+             f"💰 当前 {bold(fmt(quote.price))}｜基准 {fmt(base.value)}",
+             f"相对基准：{pct_text(change, style, strong=True)}"]
+    for kind, ref in (references or {}).items():
+        lines.extend(reference_lines(kind, quote.price, ref, fx, style))
+    lines += [f"📌 {base.label}", f"📝 原因：{reason}",
+              f"⏱ 行情时间：{stamp(quote.timestamp_ms)}（北京时间）",
+              "⚠️ 合约行情提示，不代表股票官方收盘结算结果。"]
+    return "\n".join(lines)
 
 
 class Telegram:
@@ -582,12 +708,15 @@ class Telegram:
             finally:
                 self.next_send = max(self.next_send, time.monotonic() + 1.1)
 
-    async def send(self, chat: int, thread: int, text: str, reply_markup: dict | None = None) -> None:
-        # Plain text avoids HTML/Markdown escaping problems in symbols/errors.
+    async def send(self, chat: int, thread: int, text: str, reply_markup: dict | None = None,
+                   parse_mode: str | None = None) -> None:
+        # Plain text by default; HTML only for messages that were escaped with to_html().
         chunks = split_text(text)
         for index, chunk in enumerate(chunks):
             payload: dict[str, Any] = {"chat_id": chat, "text": chunk,
                                       "link_preview_options": {"is_disabled": True}}
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
             if thread:
                 payload["message_thread_id"] = thread
             if reply_markup and index == len(chunks) - 1:
@@ -662,8 +791,6 @@ COMMANDS: tuple[Command, ...] = (
     Command("setclose", "设置手动参考价，可一次发多条", "UNITREE 75 09-17 16:00",
             "示例：75 是基准，09-17 16:00 是它的收盘时间（北京，可省略）\n"
             "  末尾再写 YYYY-MM-DD 可指定适用日（默认今天）；批量：每行一组，首行可写统一适用日"),
-    Command("setofficial", "记录官方收盘价（对照显示）", "SHEIN 40 09-17 16:00",
-            "语法同 /setclose；显示在状态和提醒里，不参与触发判断"),
     Command("setexchange", "记录证券交易所收盘价，可带货币（对照显示）", "SKHYNIX 258000 KRW 09-17 14:30",
             "带 HKD/CNY/KRW 等非美元货币时只展示不算涨跌；不带货币按同口径算相对涨跌"),
     Command("pause", "暂停当前订阅"),
@@ -710,6 +837,14 @@ class Request:
     @property
     def sub_id(self) -> str:
         return subscription_key(self.chat, self.thread)
+
+
+@dataclass(frozen=True)
+class Reply:
+    """A command reply that needs more than plain text (inline keyboard and/or HTML formatting)."""
+    text: str
+    markup: dict | None = None
+    html: bool = False
 
 
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -830,6 +965,7 @@ class Bot:
         self.config, self.store, self.market, self.telegram = config, store, market, telegram
         self.snapshots: dict[str, dict] = {}
         self.stocks = StockMarket(config)
+        self.fx = FxRates(config.fx_manual)
         self.stopping = asyncio.Event()
         self.started = time.time()
         self.last_cycle = 0.0
@@ -841,7 +977,7 @@ class Bot:
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
-            "/setofficial": self.cmd_setofficial, "/setexchange": self.cmd_setexchange,
+            "/setexchange": self.cmd_setexchange,
         }
 
     def settings(self) -> dict:
@@ -883,9 +1019,13 @@ class Bot:
             LOG.warning("%s", clean_error(text))
             self.last_log[key] = now
 
-    async def tell(self, chat: int, thread: int, text: str, reply_markup: dict | None = None) -> bool:
+    async def tell(self, chat: int, thread: int, text: str, reply_markup: dict | None = None,
+                   html_mode: bool = False) -> bool:
         try:
-            await self.telegram.send(chat, thread, text, reply_markup)
+            if html_mode:
+                await self.telegram.send(chat, thread, to_html(text), reply_markup, "HTML")
+            else:
+                await self.telegram.send(chat, thread, text, reply_markup)
             return True
         except Exception as error:
             self.log_limited("telegram_send", f"Telegram 发送失败：{clean_error(error)}")
@@ -929,15 +1069,17 @@ class Bot:
             if req.command in {"/id", "/help"}:
                 await self.public_id_notice(req)
             return
-        markup = None
+        markup, html_mode = None, False
         try:
             handler = self.handlers.get(req.command)
             reply = handler(req) if handler else "未知命令。发送 /help 查看用法。"
             if isinstance(reply, tuple):  # (text, inline keyboard) card
                 reply, markup = reply
+            elif isinstance(reply, Reply):
+                reply, markup, html_mode = reply.text, reply.markup, reply.html
         except (ValueError, decimal.InvalidOperation) as error:
             reply = "❌ " + clean_error(error)
-        await self.tell(req.chat, req.thread, reply, markup)
+        await self.tell(req.chat, req.thread, reply, markup, html_mode)
 
     async def process_callback(self, query: dict) -> None:
         """Handle a tap on a card button (callback_query)."""
@@ -988,8 +1130,8 @@ class Bot:
     def cmd_id(self, req: Request) -> str:
         return id_text(req.user_id, req.chat, req.thread)
 
-    def cmd_status(self, req: Request) -> str:
-        return self.status(req.sub_id)
+    def cmd_status(self, req: Request) -> "Reply":
+        return Reply(self.status(req.sub_id), html=True)
 
     def cmd_test(self, req: Request) -> str:
         return "✅ TG 测试消息发送成功。\n此测试仅验证推送，行情是否正常请看 /status。"
@@ -1059,11 +1201,6 @@ class Bot:
             lines.append("当前仍为日 K 模式；发 /mode manual 后才会使用这些价格。")
         return "\n".join(lines)
 
-    def cmd_setofficial(self, req: Request) -> str:
-        lines = self.store_prices(req, "official")
-        lines.append("官方收盘价仅作对照显示（相对官方涨跌），不参与触发判断；请与币安显示值同口径。")
-        return "\n".join(lines)
-
     def cmd_setexchange(self, req: Request) -> str:
         lines = self.store_prices(req, "exchange")
         lines.append("证券交易所收盘价仅作对照显示，不参与触发判断。带非美元货币时只展示、不计算涨跌；不自动换汇。")
@@ -1110,13 +1247,15 @@ class Bot:
         except ValueError:
             return self.stocks.closes.get(symbol) if kind == "exchange" else None
 
-    def reference_status(self, kind: str, symbol: str, price: D, now_ms: int) -> str:
+    def reference_status(self, kind: str, symbol: str, price: D, now_ms: int) -> list[str]:
         ref = self.reference_for(kind, symbol, now_ms)
         error = self.stocks.errors.get(symbol) if kind == "exchange" else None
         if ref is None and error:
-            return f"证券交易所收盘价：自动获取失败（{error}）；可用 /setexchange 手动记录"
-        line = reference_line(kind, price, ref)
-        return line + f"｜⚠️ 最近刷新失败：{error}" if error and ref and ref.source else line
+            return [f"🏛 证券交易所收盘价：⚠️ 自动获取失败（{error}）；可用 /setexchange 手动记录"]
+        lines = reference_lines(kind, price, ref, self.fx, self.config.color_style)
+        if error and ref and ref.source:
+            lines.append(f"⚠️ 最近一次刷新失败，沿用上次数据：{error}")
+        return lines
 
     def references_for(self, symbol: str, now_ms: int) -> dict[str, Baseline]:
         found = {kind: self.reference_for(kind, symbol, now_ms) for kind in REFERENCE_KINDS}
@@ -1129,19 +1268,21 @@ class Bot:
     def config_summary(self) -> str:
         settings = self.settings()
         mode = "币安上一 UTC 日日 K 收盘（非股票正式昨收）" if settings["mode"] == "binance_daily" else "手动同口径参考价（每日核对）"
-        return (f"基准：{mode}\n触发：严格超过 ±{fmt(settings['threshold'])}%｜每 {self.config.poll} 秒检查"
-                f"\n周期提醒：{settings['cooldown']} 秒（0=关闭）")
+        return (f"⚙️ 基准：{mode}\n🎯 触发：严格超过 ±{fmt(settings['threshold'])}%｜每 {self.config.poll} 秒检查"
+                f"｜周期提醒 {settings['cooldown']} 秒（0=关闭）")
 
     def status(self, sub_id: str) -> str:
+        """Status card with bold sentinels; send it with html_mode=True."""
         now_ms = self.market.now_ms()
         sub = self.subscriptions().get(sub_id)
-        active = "已订阅" if sub and sub.get("active") else "未订阅/已暂停"
-        lines = [f"📡 监控状态 v{VERSION}｜{active}", self.config_summary()]
+        active = "🟢 已订阅" if sub and sub.get("active") else "⏸ 未订阅/已暂停"
+        style = self.config.color_style
+        lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(), f"📊 图例：{legend(style)}"]
         for symbol in self.config.symbols:
             snapshot = self.snapshots.get(symbol)
-            lines.append(f"\n{NAMES.get(symbol, symbol)}｜{symbol}")
+            lines.append("\n" + bold(f"📍 {NAMES.get(symbol, symbol)}｜{symbol}"))
             if not snapshot:
-                lines.append("等待首次采样或基准切换后的刷新")
+                lines.append("⏳ 等待首次采样或基准切换后的刷新")
                 continue
             if "error" in snapshot:
                 lines.append("⚠️ " + snapshot["error"])
@@ -1152,11 +1293,14 @@ class Bot:
                 lines.append("⚠️ 缓存已过期，等待有效的新行情/基准；不应据此判断当前涨跌")
                 continue
             change = percent(quote.price, base.value)
-            lines.extend([f"最新成交：{fmt(quote.price)}｜基准：{fmt(base.value)}",
-                          f"相对基准：{change:+.3f}%", base.label,
-                          *(self.reference_status(kind, symbol, quote.price, now_ms) for kind in REFERENCE_KINDS),
-                          f"行情时间：{stamp(quote.timestamp_ms)}（北京）｜{max(0, int(age))} 秒前"])
-        lines.append("\n仅价格提醒；不会自动撤单/交易。日 K 于北京时间 08:00 换日。")
+            lines.extend([f"💰 最新 {bold(fmt(quote.price))}｜基准 {fmt(base.value)}",
+                          f"相对基准：{pct_text(change, style, strong=True)}",
+                          f"📌 {base.label}"])
+            for kind in REFERENCE_KINDS:
+                lines.extend(self.reference_status(kind, symbol, quote.price, now_ms))
+            lines.append(f"⏱ 行情 {stamp(quote.timestamp_ms)}（北京）｜{max(0, int(age))} 秒前")
+        lines.append("\n💱 " + self.fx.summary())
+        lines.append("仅价格提醒；不会自动撤单/交易。日 K 于北京时间 08:00 换日。")
         return "\n".join(lines)
 
     async def one_cycle(self) -> None:
@@ -1177,7 +1321,8 @@ class Bot:
                     await self.notice(sub_id, sub, "币安行情接口", text)
             return
 
-        await self.stocks.refresh(now_ms)  # Best effort; failures are reported per symbol in /status.
+        # Best effort; failures are reported in /status and never block price alerts.
+        await asyncio.gather(self.stocks.refresh(now_ms), self.fx.refresh())
 
         async def collect(symbol: str) -> tuple[str, dict]:
             try:
@@ -1232,8 +1377,8 @@ class Bot:
                 if not plan:
                     continue
                 text = alert_text(symbol, quote, base, change, threshold, plan.reason,
-                                  self.references_for(symbol, current_ms))
-                if await self.tell(sub["chat"], sub["thread"], text):
+                                  self.references_for(symbol, current_ms), self.fx, self.config.color_style)
+                if await self.tell(sub["chat"], sub["thread"], text, html_mode=True):
                     # Only mark a price alert as delivered AFTER Telegram accepts it.
                     # Avoid resurrecting state deleted by a command during delivery.
                     if self.settings() == settings and self.subscriptions().get(sub_id, {}).get("active"):
@@ -1351,8 +1496,9 @@ async def check_market(config: Config) -> int:
             failed = True
             print(f"FAIL {symbol}: {clean_error(error)}")
     print("口径：币安上一 UTC 日日 K，不是股票交易所正式昨收。")
-    stocks = StockMarket(config)
-    await stocks.refresh(market.now_ms(), force=True)
+    stocks, fx = StockMarket(config), FxRates(config.fx_manual)
+    await asyncio.gather(stocks.refresh(market.now_ms(), force=True), fx.refresh(force=True))
+    print(fx.summary())
     for symbol, ticker in config.tickers.items():
         close = stocks.closes.get(symbol)
         if close:
