@@ -171,7 +171,8 @@ STATE_DB=/data/bot.sqlite3
 | `/subscribe` | 订阅当前私聊或当前群话题 |
 | `/unsubscribe` | 取消当前订阅并删除其去重状态 |
 | `/status` 或 `/price` | 查询四个合约的行情、基准和错误状态 |
-| `/threshold 1` | 设为严格超过 ±1% 提醒 |
+| `/threshold` | 弹出阈值卡片，点选 ±0.3%～±10% 档位即时生效，当前档位带 ✅ |
+| `/threshold 1` | 设为严格超过 ±1% 提醒（自定义任意数值） |
 | `/cooldown 300` | 持续超过阈值，每 300 秒提醒 |
 | `/cooldown 0` | 关闭周期重复提醒，仍保留首次、重新触发及扩大档位提醒 |
 | `/mode daily` | 自动币安上一完整 UTC 日日 K 模式 |

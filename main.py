@@ -390,21 +390,37 @@ class Telegram:
             raise RemoteError(f"Telegram: {clean_error(msg)}", int(retry))
         return data.get("result")
 
-    async def send(self, chat: int, thread: int, text: str) -> None:
+    async def paced(self, method: str, payload: dict) -> Any:
+        """Serialize outgoing messages and respect Telegram's per-chat send rate."""
+        async with self.lock:
+            await asyncio.sleep(max(0, self.next_send - time.monotonic()))
+            try:
+                return await self.call(method, payload)
+            except RemoteError as error:
+                self.next_send = time.monotonic() + max(1.1, error.retry_after)
+                raise
+            finally:
+                self.next_send = max(self.next_send, time.monotonic() + 1.1)
+
+    async def send(self, chat: int, thread: int, text: str, reply_markup: dict | None = None) -> None:
         # Plain text avoids HTML/Markdown escaping problems in symbols/errors.
-        for chunk in split_text(text):
-            async with self.lock:
-                await asyncio.sleep(max(0, self.next_send - time.monotonic()))
-                payload: dict[str, Any] = {"chat_id": chat, "text": chunk,
-                                          "link_preview_options": {"is_disabled": True}}
-                if thread:
-                    payload["message_thread_id"] = thread
-                try:
-                    await self.call("sendMessage", payload)
-                except RemoteError as error:
-                    self.next_send = time.monotonic() + max(1.1, error.retry_after)
-                    raise
-                self.next_send = time.monotonic() + 1.1
+        chunks = split_text(text)
+        for index, chunk in enumerate(chunks):
+            payload: dict[str, Any] = {"chat_id": chat, "text": chunk,
+                                      "link_preview_options": {"is_disabled": True}}
+            if thread:
+                payload["message_thread_id"] = thread
+            if reply_markup and index == len(chunks) - 1:
+                payload["reply_markup"] = reply_markup  # Buttons belong under the final chunk.
+            await self.paced("sendMessage", payload)
+
+    async def edit(self, chat: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
+        """Rewrite a card in place after a button press so it reflects the new selection."""
+        payload: dict[str, Any] = {"chat_id": chat, "message_id": message_id, "text": split_text(text)[0],
+                                   "link_preview_options": {"is_disabled": True}}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        await self.paced("editMessageText", payload)
 
 
 def split_text(text: str, limit: int = 3400) -> list[str]:
@@ -460,7 +476,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("subscribe", "在当前私聊/群组话题订阅"),
     Command("unsubscribe", "取消当前订阅"),
     Command("status", "查看合约、基准与数据状态"),
-    Command("threshold", "改为严格超过 ±1% 提醒", "1"),
+    Command("threshold", "改为严格超过 ±1% 提醒", "1", "不带数字则弹出档位按钮卡片，点选即可"),
     Command("cooldown", "持续超标每 300 秒提醒（0=关闭周期提醒）", "300"),
     Command("mode", "daily=币安上一 UTC 日日 K 收盘；manual=手动同口径参考价", "daily|manual"),
     Command("setclose", "设置手动参考价", "UNITREE 75 2026-09-18",
@@ -473,6 +489,17 @@ COMMANDS: tuple[Command, ...] = (
 )
 # Accepted spellings that are not listed in the menu.
 COMMAND_ALIASES = {"/start": "/help", "/price": "/status"}
+# Threshold choices offered as buttons on the /threshold card (percent deviation from the baseline).
+THRESHOLD_PRESETS = ("0.3", "0.5", "1", "1.5", "2", "3", "5", "10")
+
+
+def threshold_card(current: D) -> tuple[str, dict]:
+    """Card text + inline keyboard; the active preset is ticked."""
+    buttons = [{"text": ("✅ " if D(p) == current else "") + f"±{p}%", "callback_data": f"threshold:{p}"}
+               for p in THRESHOLD_PRESETS]
+    text = (f"📏 提醒阈值：跟上一日收盘价（基准）偏离多少才提醒\n当前：严格超过 ±{fmt(current)}%\n\n"
+            "点选下方档位即时生效；其他数值请发送 /threshold 0.8。")
+    return text, {"inline_keyboard": [buttons[i:i + 4] for i in range(0, len(buttons), 4)]}
 
 HELP = "📡 合约昨收偏离提醒\n\n" + "\n".join(c.help_line() for c in COMMANDS) + """
 
@@ -555,9 +582,9 @@ class Bot:
             LOG.warning("%s", clean_error(text))
             self.last_log[key] = now
 
-    async def tell(self, chat: int, thread: int, text: str) -> bool:
+    async def tell(self, chat: int, thread: int, text: str, reply_markup: dict | None = None) -> bool:
         try:
-            await self.telegram.send(chat, thread, text)
+            await self.telegram.send(chat, thread, text, reply_markup)
             return True
         except Exception as error:
             self.log_limited("telegram_send", f"Telegram 发送失败：{clean_error(error)}")
@@ -600,12 +627,46 @@ class Bot:
             if req.command in {"/id", "/help"}:
                 await self.public_id_notice(req)
             return
+        markup = None
         try:
             handler = self.handlers.get(req.command)
             reply = handler(req) if handler else "未知命令。发送 /help 查看用法。"
+            if isinstance(reply, tuple):  # (text, inline keyboard) card
+                reply, markup = reply
         except (ValueError, decimal.InvalidOperation) as error:
             reply = "❌ " + clean_error(error)
-        await self.tell(req.chat, req.thread, reply)
+        await self.tell(req.chat, req.thread, reply, markup)
+
+    async def process_callback(self, query: dict) -> None:
+        """Handle a tap on a card button (callback_query)."""
+        query_id = str(query.get("id", ""))
+        message = query.get("message") or {}
+
+        async def answer(text: str, alert: bool = False) -> None:
+            with contextlib.suppress(Exception):  # A missed toast must not abort the update.
+                await self.telegram.call("answerCallbackQuery",
+                                         {"callback_query_id": query_id, "text": text[:200], "show_alert": alert})
+
+        if not is_admin(query, self.config):
+            await answer("仅管理员可以修改设置")
+            return
+        kind, _, value = str(query.get("data", "")).partition(":")
+        try:
+            if kind != "threshold":
+                raise ValueError("未知操作，请重新发送命令")
+            toast = self.apply_threshold(value)
+            text, markup = threshold_card(D(self.settings()["threshold"]))
+        except (ValueError, decimal.InvalidOperation) as error:
+            await answer("❌ " + clean_error(error), alert=True)
+            return
+        await answer(toast)
+        if message.get("message_id") and message.get("chat"):
+            try:
+                await self.telegram.edit(int(message["chat"]["id"]), int(message["message_id"]), text, markup)
+            except RemoteError as error:
+                # "message is not modified" when re-selecting the current preset is harmless.
+                if "not modified" not in str(error):
+                    self.log_limited("telegram_edit", f"卡片更新失败：{clean_error(error)}")
 
     async def public_id_notice(self, req: Request) -> None:
         now = time.monotonic()
@@ -652,10 +713,16 @@ class Bot:
         self.store.delete_prefix(f"notice:{req.sub_id}:")
         return "✅ 已取消当前私聊/话题的订阅。"
 
-    def cmd_threshold(self, req: Request) -> str:
+    def cmd_threshold(self, req: Request) -> str | tuple[str, dict]:
+        if not req.args:
+            return threshold_card(D(self.settings()["threshold"]))
         if len(req.args) != 1:
-            raise ValueError("用法：/threshold 1（1 表示 1%）")
-        value = number(req.args[0].rstrip("%"), "阈值")
+            raise ValueError("用法：/threshold 1（1 表示 1%），或直接发 /threshold 选择档位")
+        return self.apply_threshold(req.args[0])
+
+    def apply_threshold(self, raw: str) -> str:
+        """Validate and persist a new global threshold; shared by the command and the card buttons."""
+        value = number(raw.rstrip("%"), "阈值")
         if not D("0.01") <= value <= D(100):
             raise ValueError("阈值必须在 0.01～100 之间")
         self.update_settings(threshold=str(value))
@@ -821,28 +888,35 @@ class Bot:
                 self.last_log["heartbeat"] = time.monotonic()
             await self.wait(max(0.1, self.config.poll - (time.monotonic() - started)))
 
+    async def process_update(self, update: dict) -> None:
+        message = update.get("message")
+        if isinstance(message, dict):
+            # Do not execute old configuration commands left over from long downtime.
+            age = time.time() - float(message.get("date", time.time()))
+            if -60 <= age <= 900:
+                await self.process_message(message)
+            return
+        query = update.get("callback_query")
+        if isinstance(query, dict):  # A button tap is a live intent, so it is not age-filtered.
+            await self.process_callback(query)
+
     async def commands_loop(self) -> None:
         offset = int(self.store.get("telegram_offset", 0))
         failures = 0
         while not self.stopping.is_set():
             try:
                 updates = await self.telegram.call("getUpdates", {"offset": offset, "timeout": 25,
-                                                   "allowed_updates": ["message"]}, timeout=40)
+                                                   "allowed_updates": ["message", "callback_query"]}, timeout=40)
                 if not isinstance(updates, list):
                     raise ValueError("Telegram 更新格式异常")
                 failures = 0
                 for update in updates:
                     if self.stopping.is_set():
                         break
-                    message = update.get("message")
-                    if isinstance(message, dict):
-                        # Do not execute old configuration commands left over from long downtime.
-                        age = time.time() - float(message.get("date", time.time()))
-                        if -60 <= age <= 900:
-                            try:
-                                await self.process_message(message)
-                            except Exception as error:
-                                self.log_limited("command", "命令处理异常：" + clean_error(error))
+                    try:
+                        await self.process_update(update)
+                    except Exception as error:
+                        self.log_limited("command", "命令处理异常：" + clean_error(error))
                     offset = int(update["update_id"]) + 1
                     self.store.put("telegram_offset", offset)
             except Exception as error:
