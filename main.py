@@ -32,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -136,14 +136,29 @@ class StockMarketInfo:
     name: str
     currency: str
     utc_offset: int
-    close_time: dt.time  # Regular session close in local time; the daily bar is final ~15 min later.
+    close_time: dt.time  # When the official closing price is fixed, local time; the bar is final ~15 min later.
+    tz_name: str = "北京时间"
+
+    def close_label(self, close_ms: int) -> str:
+        """'｜收盘 09-18 15:00（北京时间）', or with the venue's local time first when it differs."""
+        if not close_ms:
+            return ""
+        if self.utc_offset == 8:
+            return close_label(close_ms)
+        local = dt.datetime.fromtimestamp(close_ms / 1000, dt.timezone(dt.timedelta(hours=self.utc_offset)))
+        return f"｜收盘 {local.strftime('%m-%d %H:%M')}（{self.tz_name}）＝北京 {stamp(close_ms, seconds=False)}"
 
 
+# Official closing-price times, verified 2026-09:
+#   SSE/SZSE: continuous trading ends 15:00 (STAR after-hours fixed-price trading 15:05-15:30 uses that close).
+#   HKEX: closing auction 16:00-16:10, the closing price is fixed at 16:08-16:10.
+#   KRX: regular session 09:00-15:30 KST fixes the official close; the after-hours sessions added on
+#        2026-09-14 (15:40-16:00 close-price trading, 16:00-20:00 continuous) do not change it.
 STOCK_MARKETS = {
     "sh": StockMarketInfo("上交所", "CNY", 8, dt.time(15, 0)),
     "sz": StockMarketInfo("深交所", "CNY", 8, dt.time(15, 0)),
-    "hk": StockMarketInfo("港交所", "HKD", 8, dt.time(16, 0)),
-    "kr": StockMarketInfo("韩交所", "KRW", 9, dt.time(15, 30)),
+    "hk": StockMarketInfo("港交所", "HKD", 8, dt.time(16, 10)),
+    "kr": StockMarketInfo("韩交所", "KRW", 9, dt.time(15, 30), "韩国时间"),
 }
 # Underlying stocks of the default contracts (all listed as of 2026-09): Unitree 688836.SS,
 # SHEIN 0625.HK, CXMT 688825.SS, SK hynix 000660.KS.
@@ -393,7 +408,12 @@ class Baseline:
     valid_until_ms: int
     close_ms: int = 0  # When the close behind this baseline happened; 0 = unknown.
     currency: str = ""  # Price unit when it differs from the contract's quote unit (reference prices only).
-    source: str = ""    # Where an automatically fetched reference price came from, e.g. "上交所688836·自动".
+    source: str = ""    # Where an automatically fetched reference price came from, e.g. "上交所688836·腾讯".
+    close_note: str = ""  # Preformatted close-time text (venue local + Beijing); empty = derive from close_ms.
+
+    @property
+    def close_text(self) -> str:
+        return self.close_note or close_label(self.close_ms)
 
 
 def daily_baseline(rows: Any, now_ms: int) -> Baseline:
@@ -413,7 +433,8 @@ def daily_baseline(rows: Any, now_ms: int) -> Baseline:
             value = number(row[4], "上一日收盘价")
             day = dt.datetime.fromtimestamp(opening / 1000, UTC).date().isoformat()
             return Baseline(value, f"daily:{day}:{value}",
-                            f"币安日 K 昨收｜{day}（UTC）" + close_label(boundary), boundary + DAY_MS, boundary)
+                            f"币安日 K 昨收｜{day}（UTC 日）｜收盘 {stamp(boundary, seconds=False)}（北京时间，即 UTC 00:00）",
+                            boundary + DAY_MS, boundary)
     raise ValueError("没有完整的上一 UTC 日日 K（可能新上市或接口数据未就绪）；不使用旧基准")
 
 
@@ -447,7 +468,7 @@ def reference_lines(kind: str, price: D, ref: Baseline | None, fx: "FxRates | No
     label, command, relative = PRICE_KINDS[kind]
     if ref is None:
         return [f"🏛 {label}：未设置（{command}）"]
-    tail = close_label(ref.close_ms) + (f"｜来源 {ref.source}" if ref.source else "")
+    tail = ref.close_text + (f"｜来源 {ref.source}" if ref.source else "")
     if ref.currency in SAME_UNIT:
         unit = f" {ref.currency}" if ref.currency else ""
         return [f"🏛 {label}：{bold(fmt(ref.value) + unit)}{tail}",
@@ -615,7 +636,8 @@ class StockMarket:
                 with contextlib.suppress(Exception):
                     self.closes[symbol] = Baseline(number(saved["value"], "收盘价"), saved["key"], saved["label"],
                                                    int(saved["valid_until_ms"]), int(saved["close_ms"]),
-                                                   saved.get("currency", ""), saved.get("source", ""))
+                                                   saved.get("currency", ""), saved.get("source", ""),
+                                                   saved.get("close_note", ""))
 
     @staticmethod
     def sources(ticker: StockTicker) -> list[tuple[str, str, dict[str, str]]]:
@@ -659,13 +681,15 @@ class StockMarket:
         when = str(day) if day else "上一交易日"
         return Baseline(close, f"exchange:{when}:{close}", f"证券交易所收盘价｜{when} {info.name}",
                         (close_ms or int(time.time() * 1000)) + DAY_MS, close_ms,
-                        "" if ticker.same_unit else info.currency, f"{info.name}{ticker.code}·{source}")
+                        "" if ticker.same_unit else info.currency, f"{info.name}{ticker.code}·{source}",
+                        info.close_label(close_ms))
 
     def remember(self, symbol: str, close: Baseline) -> None:
         if self.store:
             self.store.put(f"stock_close:{symbol}", {
                 "value": str(close.value), "key": close.key, "label": close.label, "valid_until_ms": close.valid_until_ms,
-                "close_ms": close.close_ms, "currency": close.currency, "source": close.source})
+                "close_ms": close.close_ms, "currency": close.currency, "source": close.source,
+                "close_note": close.close_note})
 
     async def refresh(self, now_ms: int, force: bool = False) -> None:
         if not self.config.tickers or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
@@ -1619,7 +1643,7 @@ async def check_market(config: Config) -> int:
         close = stocks.closes.get(symbol)
         if close:
             print(f"OK {symbol} 证券交易所收盘价: {fmt(close.value)} {close.currency} "
-                  f"({close.label}, 收盘 {stamp(close.close_ms, seconds=False)} 北京, 来源 {close.source})")
+                  f"({close.label}{close.close_text}, 来源 {close.source})")
         else:
             failed = True
             print(f"FAIL {symbol} 证券交易所收盘价: {stocks.errors.get(symbol, '未知错误')}")
