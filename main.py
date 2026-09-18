@@ -64,8 +64,13 @@ def beijing_day(now: float | None = None) -> str:
     return dt.datetime.fromtimestamp(time.time() if now is None else now, BEIJING).date().isoformat()
 
 
-def stamp(ms: int | float) -> str:
-    return dt.datetime.fromtimestamp(float(ms) / 1000, BEIJING).strftime("%m-%d %H:%M:%S")
+def stamp(ms: int | float, seconds: bool = True) -> str:
+    """Beijing-time stamp such as 09-17 16:00:00, or 09-17 16:00 without seconds."""
+    return dt.datetime.fromtimestamp(float(ms) / 1000, BEIJING).strftime("%m-%d %H:%M:%S" if seconds else "%m-%d %H:%M")
+
+
+def close_label(close_ms: int) -> str:
+    return f"｜收盘 {stamp(close_ms, seconds=False)}（北京时间）" if close_ms else ""
 
 
 def clean_error(error: BaseException | str) -> str:
@@ -239,6 +244,7 @@ class Baseline:
     key: str
     label: str
     valid_until_ms: int
+    close_ms: int = 0  # When the close behind this baseline happened; 0 = unknown.
 
 
 def daily_baseline(rows: Any, now_ms: int) -> Baseline:
@@ -258,7 +264,7 @@ def daily_baseline(rows: Any, now_ms: int) -> Baseline:
             value = number(row[4], "上一日收盘价")
             day = dt.datetime.fromtimestamp(opening / 1000, UTC).date().isoformat()
             return Baseline(value, f"daily:{day}:{value}",
-                            f"币安日 K 昨收｜{day}（UTC）", boundary + DAY_MS)
+                            f"币安日 K 昨收｜{day}（UTC）" + close_label(boundary), boundary + DAY_MS, boundary)
     raise ValueError("没有完整的上一 UTC 日日 K（可能新上市或接口数据未就绪）；不使用旧基准")
 
 
@@ -269,8 +275,12 @@ def manual_baseline(record: dict | None, now_ms: int) -> Baseline:
     value = number(record.get("value"), "手动基准")
     until = dt.datetime.combine(dt.date.fromisoformat(today) + dt.timedelta(days=1),
                                 dt.time(), BEIJING)
+    close_ms = 0
+    with contextlib.suppress(ValueError, TypeError):  # Older records have no close time.
+        close_ms = int(dt.datetime.fromisoformat(str(record.get("close_at"))).replace(tzinfo=BEIJING).timestamp() * 1000)
     return Baseline(value, f"manual:{today}:{value}",
-                    f"手动参考价｜适用日 {today}（北京时间）", int(until.timestamp() * 1000))
+                    f"手动参考价｜适用日 {today}（北京时间）" + close_label(close_ms),
+                    int(until.timestamp() * 1000), close_ms)
 
 
 class Binance:
@@ -479,9 +489,9 @@ COMMANDS: tuple[Command, ...] = (
     Command("threshold", "改为严格超过 ±1% 提醒", "1", "不带数字则弹出档位按钮卡片，点选即可"),
     Command("cooldown", "持续超标每 300 秒提醒（0=关闭周期提醒）", "300"),
     Command("mode", "daily=币安上一 UTC 日日 K 收盘；manual=手动同口径参考价", "daily|manual"),
-    Command("setclose", "设置手动参考价，可一次发多条", "UNITREE 75 2026-09-18",
-            "示例：75 是基准；日期是适用日，不是收盘发生日\n"
-            "  批量：每行一组「合约 价格」，首行可写统一适用日"),
+    Command("setclose", "设置手动参考价，可一次发多条", "UNITREE 75 09-17 16:00",
+            "示例：75 是基准，09-17 16:00 是它的收盘时间（北京，可省略）\n"
+            "  末尾再写 YYYY-MM-DD 可指定适用日（默认今天）；批量：每行一组，首行可写统一适用日"),
     Command("pause", "暂停当前订阅"),
     Command("resume", "恢复当前订阅"),
     Command("test", "发送测试消息，不代表行情正常"),
@@ -544,24 +554,86 @@ def short_name(symbol: str) -> str:
     return min(aliases, key=len) if aliases else symbol
 
 
-def parse_close_entries(raw: str, default_day: str) -> list[tuple[str, D, str]]:
-    """Parse "SYMBOL PRICE [DATE]" entries separated by newlines/commas; a leading date applies to all.
+SHORT_DATE_RE = re.compile(r"\d{1,2}-\d{1,2}")
+TIME_RE = re.compile(r"\d{1,2}:\d{2}")
 
-    Returns (alias, price, day) triples without touching the store, so a bad line rejects the whole batch.
+
+@dataclass(frozen=True)
+class CloseEntry:
+    alias: str
+    value: D
+    day: str        # Applicable Beijing calendar day (YYYY-MM-DD).
+    close_at: str   # Beijing close datetime "YYYY-MM-DDTHH:MM", or "" when not given.
+
+
+def parse_close_time(date_token: str, time_token: str, now_ms: int) -> str:
+    """'2026-09-17 16:00' or '09-17 16:00' (Beijing) -> 'YYYY-MM-DDTHH:MM'; must not be in the future."""
+    now = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+    try:
+        if DATE_RE.fullmatch(date_token):
+            day = dt.date.fromisoformat(date_token)
+        else:
+            month, dom = (int(p) for p in date_token.split("-"))
+            day = dt.date(now.year, month, dom)
+            if day > now.date():  # e.g. "12-31" typed in early January
+                day = dt.date(now.year - 1, month, dom)
+        hour, minute = (int(p) for p in time_token.split(":"))
+        moment = dt.datetime.combine(day, dt.time(hour, minute), BEIJING)
+    except ValueError:
+        raise ValueError(f"收盘时间格式应为 MM-DD HH:MM 或 YYYY-MM-DD HH:MM：{date_token} {time_token}") from None
+    if moment > now + dt.timedelta(minutes=5):
+        raise ValueError(f"收盘时间不能晚于当前时间：{date_token} {time_token}")
+    return moment.strftime("%Y-%m-%dT%H:%M")
+
+
+def parse_close_tail(tokens: list[str], day: str, close_at: str, now_ms: int) -> tuple[str, str, list[str]]:
+    """Consume leading date/time tokens: a date followed by HH:MM is the close time, a lone date the day.
+
+    Returns (day, close_at, remaining tokens).
     """
+    i = 0
+    while i < len(tokens):
+        token, following = tokens[i], tokens[i + 1] if i + 1 < len(tokens) else ""
+        if (DATE_RE.fullmatch(token) or SHORT_DATE_RE.fullmatch(token)) and TIME_RE.fullmatch(following):
+            close_at = parse_close_time(token, following, now_ms)
+            i += 2
+        elif DATE_RE.fullmatch(token):
+            day = parse_day(token)
+            i += 1
+        else:
+            break
+    return day, close_at, tokens[i:]
+
+
+def parse_close_entries(raw: str, now_ms: int) -> list[CloseEntry]:
+    """Parse "SYMBOL PRICE [收盘日期 HH:MM] [适用日]" entries separated by newlines/commas.
+
+    Leading date/time tokens before the first symbol apply to every entry that has none of its own.
+    Nothing is stored here, so a bad line rejects the whole batch.
+    """
+    today = beijing_day(now_ms / 1000)
+    usage = ("用法：/setclose UNITREE 75 [收盘时间 MM-DD HH:MM] [适用日期 YYYY-MM-DD]\n"
+             "批量：每行（或用逗号分隔）一组「合约 价格 [收盘时间]」，最前面可写统一适用日/收盘时间，例如\n"
+             f"/setclose {today}\nUNITREE 75 09-17 16:00\nSHEIN 40 09-17 16:00\n"
+             "价格须与币安显示值同口径；不自动换汇")
     entries = [e.split() for e in re.split(r"[\n\r,，;；]+", raw) if e.strip()]
-    if entries and DATE_RE.fullmatch(entries[0][0]):
-        default_day = parse_day(entries[0][0])
-        entries[0] = entries[0][1:]
+    default_day, default_close = today, ""
+    if entries:
+        default_day, default_close, entries[0] = parse_close_tail(entries[0], today, "", now_ms)
         if not entries[0]:
             entries.pop(0)
-    if not entries or any(len(e) not in {2, 3} for e in entries):
-        raise ValueError("用法：/setclose UNITREE 75 [适用日期 YYYY-MM-DD]\n"
-                         "批量：每行（或用逗号分隔）一组「合约 价格」，最前面可写统一适用日，例如\n"
-                         f"/setclose {default_day}\nUNITREE 75\nSHEIN 40\n"
-                         "价格须与币安显示值同口径；不自动换汇")
-    return [(e[0], number(e[1], f"{e[0]} 手动参考价"), parse_day(e[2]) if len(e) == 3 else default_day)
-            for e in entries]
+    if not entries:
+        raise ValueError(usage)
+    result = []
+    for tokens in entries:
+        if len(tokens) < 2:
+            raise ValueError(usage)
+        alias, value = tokens[0], number(tokens[1], f"{tokens[0]} 手动参考价")
+        day, close_at, rest = parse_close_tail(tokens[2:], default_day, default_close, now_ms)
+        if rest:
+            raise ValueError(f"无法识别「{' '.join(rest)}」\n{usage}")
+        result.append(CloseEntry(alias, value, day, close_at))
+    return result
 
 
 class Bot:
@@ -784,25 +856,31 @@ class Bot:
         self.store.delete_prefix("alert:")
         reply = "✅ " + self.config_summary()
         if settings["mode"] == "manual":
-            reply += ("\n请设置参考价（可一次发全部，把“价格”替换成数值）。缺失/过期的合约不发涨跌提醒。\n"
+            reply += ("\n请设置参考价：复制下面模板，把“价格”换成数值，“MM-DD HH:MM”换成该价格的收盘时间"
+                      "（北京时间，可删掉不填）。缺失/过期的合约不发涨跌提醒。\n"
                       + self.setclose_template(beijing_day(self.market.now_ms() / 1000)))
         return reply
 
     def cmd_setclose(self, req: Request) -> str:
-        today = beijing_day(self.market.now_ms() / 1000)
+        now_ms = self.market.now_ms()
+        today = beijing_day(now_ms / 1000)
         # Resolve and validate every line first so a typo in one line does not half-apply the batch.
-        records = [(self.resolve_symbol(alias), value, day)
-                   for alias, value, day in parse_close_entries(req.raw, today)]
-        seen: dict[tuple[str, str], D] = {}
-        for symbol, value, day in records:
-            if (symbol, day) in seen and seen[(symbol, day)] != value:
-                raise ValueError(f"{symbol} 在 {day} 出现了两个不同的价格，请只保留一个")
-            seen[(symbol, day)] = value
+        seen: dict[tuple[str, str], CloseEntry] = {}
+        for entry in parse_close_entries(req.raw, now_ms):
+            symbol = self.resolve_symbol(entry.alias)
+            previous = seen.get((symbol, entry.day))
+            if previous and (previous.value, previous.close_at) != (entry.value, entry.close_at):
+                raise ValueError(f"{symbol} 在 {entry.day} 出现了两条不同的记录，请只保留一条")
+            seen[(symbol, entry.day)] = entry
         lines = []
-        for (symbol, day), value in seen.items():
-            self.store.put(f"manual:{symbol}:{day}", {"value": str(value), "valid_date": day})
+        for (symbol, day), entry in seen.items():
+            record = {"value": str(entry.value), "valid_date": day}
+            if entry.close_at:
+                record["close_at"] = entry.close_at
+            self.store.put(f"manual:{symbol}:{day}", record)
             self.snapshots.pop(symbol, None)
-            lines.append(f"✅ {symbol} 参考价：{fmt(value)}｜适用日 {day}（北京时间）")
+            close = f"｜收盘 {entry.close_at[5:].replace('T', ' ')}（北京时间）" if entry.close_at else "｜未填收盘时间"
+            lines.append(f"✅ {symbol} 参考价：{fmt(entry.value)}｜适用日 {day}（北京时间）{close}")
         lines.append("这是你输入的参考价，未独立核验，不自动换汇。")
         if self.settings()["mode"] != "manual":
             lines.append("当前仍为日 K 模式；发 /mode manual 后才会使用这些价格。")
@@ -814,7 +892,7 @@ class Bot:
 
     def setclose_template(self, day: str) -> str:
         """A ready-to-edit batch /setclose covering every monitored symbol."""
-        return f"/setclose {day}\n" + "\n".join(f"{short_name(s)} 价格" for s in self.config.symbols)
+        return f"/setclose {day}\n" + "\n".join(f"{short_name(s)} 价格 MM-DD HH:MM" for s in self.config.symbols)
 
     def config_summary(self) -> str:
         settings = self.settings()
