@@ -179,6 +179,7 @@ STATE_DB=/data/bot.sqlite3
 | `/mode manual` | 手动参考价模式 |
 | `/setclose UNITREE 75` | 为北京时间今天设置该合约参考价 75 |
 | `/setclose UNITREE 75 2026-09-18` | 为指定适用日期设置参考价，日期不是收盘发生日 |
+| `/setclose 2026-09-18` + 多行 `合约 价格` | 一次批量设置全部合约的参考价 |
 | `/pause` | 暂停当前订阅 |
 | `/resume` | 恢复当前订阅 |
 | `/test` | 仅测试消息能否发到当前私聊/话题 |
@@ -193,12 +194,15 @@ STATE_DB=/data/bot.sqlite3
 
 ```text
 /mode manual
-/setclose UNITREE 75
-/setclose HK0625 40
-/setclose CXMT 8
-/setclose SKHYNIX 1300
+/setclose 2026-09-18
+UNITREE 75
+SHEIN 40
+CXMT 8
+SKHYNIX 1300
 /status
 ```
+
+`/setclose` 可以一次发多条：每行（或用逗号分隔）一组「合约 价格」，首行单独写一个日期表示统一适用日，某一行末尾再写日期可单独覆盖。全部行校验通过才写入，有一行写错则整批不生效。仍然支持单条 `/setclose UNITREE 75`。发 `/mode manual` 时机器人会回一份包含全部合约的模板，把“价格”替换成数值后发回即可。
 
 省略日期时默认适用北京时间今天。也可以提前给次日设置；程序按适用日期分别保存，不覆盖今天的价格。
 

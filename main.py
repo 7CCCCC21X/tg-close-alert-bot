@@ -479,8 +479,9 @@ COMMANDS: tuple[Command, ...] = (
     Command("threshold", "改为严格超过 ±1% 提醒", "1", "不带数字则弹出档位按钮卡片，点选即可"),
     Command("cooldown", "持续超标每 300 秒提醒（0=关闭周期提醒）", "300"),
     Command("mode", "daily=币安上一 UTC 日日 K 收盘；manual=手动同口径参考价", "daily|manual"),
-    Command("setclose", "设置手动参考价", "UNITREE 75 2026-09-18",
-            "示例：75 是基准；日期是适用日，不是收盘发生日"),
+    Command("setclose", "设置手动参考价，可一次发多条", "UNITREE 75 2026-09-18",
+            "示例：75 是基准；日期是适用日，不是收盘发生日\n"
+            "  批量：每行一组「合约 价格」，首行可写统一适用日"),
     Command("pause", "暂停当前订阅"),
     Command("resume", "恢复当前订阅"),
     Command("test", "发送测试消息，不代表行情正常"),
@@ -520,10 +521,47 @@ class Request:
     chat: int
     thread: int
     user_id: int
+    raw: str = ""  # Argument text with line breaks kept, for multi-line commands such as /setclose.
 
     @property
     def sub_id(self) -> str:
         return subscription_key(self.chat, self.thread)
+
+
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def parse_day(value: str) -> str:
+    try:
+        return dt.date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise ValueError(f"日期格式应为 YYYY-MM-DD：{value}") from None
+
+
+def short_name(symbol: str) -> str:
+    """Shortest ASCII alias for a symbol, used in examples (UNITREEUSDT -> UNITREE)."""
+    aliases = [a for a, s in ALIASES.items() if s == symbol and a.isascii()]
+    return min(aliases, key=len) if aliases else symbol
+
+
+def parse_close_entries(raw: str, default_day: str) -> list[tuple[str, D, str]]:
+    """Parse "SYMBOL PRICE [DATE]" entries separated by newlines/commas; a leading date applies to all.
+
+    Returns (alias, price, day) triples without touching the store, so a bad line rejects the whole batch.
+    """
+    entries = [e.split() for e in re.split(r"[\n\r,，;；]+", raw) if e.strip()]
+    if entries and DATE_RE.fullmatch(entries[0][0]):
+        default_day = parse_day(entries[0][0])
+        entries[0] = entries[0][1:]
+        if not entries[0]:
+            entries.pop(0)
+    if not entries or any(len(e) not in {2, 3} for e in entries):
+        raise ValueError("用法：/setclose UNITREE 75 [适用日期 YYYY-MM-DD]\n"
+                         "批量：每行（或用逗号分隔）一组「合约 价格」，最前面可写统一适用日，例如\n"
+                         f"/setclose {default_day}\nUNITREE 75\nSHEIN 40\n"
+                         "价格须与币安显示值同口径；不自动换汇")
+    return [(e[0], number(e[1], f"{e[0]} 手动参考价"), parse_day(e[2]) if len(e) == 3 else default_day)
+            for e in entries]
 
 
 class Bot:
@@ -615,7 +653,8 @@ class Bot:
             return None
         chat, thread = target_from_message(message)
         user_id = int((message.get("from") or {}).get("id") or 0)
-        return Request(COMMAND_ALIASES.get(raw_command, raw_command), parts[1:], chat, thread, user_id)
+        return Request(COMMAND_ALIASES.get(raw_command, raw_command), parts[1:], chat, thread, user_id,
+                       raw=text[len(parts[0]):].strip())
 
     async def process_message(self, message: dict) -> None:
         req = self.parse_request(message)
@@ -745,24 +784,37 @@ class Bot:
         self.store.delete_prefix("alert:")
         reply = "✅ " + self.config_summary()
         if settings["mode"] == "manual":
-            reply += ("\n请逐个设置参考价。缺失/过期的合约不发涨跌提醒。\n/setclose UNITREE 75 "
-                      + beijing_day(self.market.now_ms() / 1000))
+            reply += ("\n请设置参考价（可一次发全部，把“价格”替换成数值）。缺失/过期的合约不发涨跌提醒。\n"
+                      + self.setclose_template(beijing_day(self.market.now_ms() / 1000)))
         return reply
 
     def cmd_setclose(self, req: Request) -> str:
-        if len(req.args) not in {2, 3}:
-            raise ValueError("用法：/setclose UNITREE 75 [适用日期 YYYY-MM-DD]\n价格须与币安显示值同口径；不自动换汇")
-        symbol = self.resolve_symbol(req.args[0])
-        value = number(req.args[1], "手动参考价")
-        day = req.args[2] if len(req.args) == 3 else beijing_day(self.market.now_ms() / 1000)
-        day = dt.date.fromisoformat(day).isoformat()
-        self.store.put(f"manual:{symbol}:{day}", {"value": str(value), "valid_date": day})
-        self.snapshots.pop(symbol, None)
-        reply = (f"✅ {symbol} 参考价：{fmt(value)}\n适用日：{day}（北京时间）"
-                 "\n这是你输入的参考价，未独立核验，不自动换汇。")
+        today = beijing_day(self.market.now_ms() / 1000)
+        # Resolve and validate every line first so a typo in one line does not half-apply the batch.
+        records = [(self.resolve_symbol(alias), value, day)
+                   for alias, value, day in parse_close_entries(req.raw, today)]
+        seen: dict[tuple[str, str], D] = {}
+        for symbol, value, day in records:
+            if (symbol, day) in seen and seen[(symbol, day)] != value:
+                raise ValueError(f"{symbol} 在 {day} 出现了两个不同的价格，请只保留一个")
+            seen[(symbol, day)] = value
+        lines = []
+        for (symbol, day), value in seen.items():
+            self.store.put(f"manual:{symbol}:{day}", {"value": str(value), "valid_date": day})
+            self.snapshots.pop(symbol, None)
+            lines.append(f"✅ {symbol} 参考价：{fmt(value)}｜适用日 {day}（北京时间）")
+        lines.append("这是你输入的参考价，未独立核验，不自动换汇。")
         if self.settings()["mode"] != "manual":
-            reply += "\n当前仍为日 K 模式；发 /mode manual 后才会使用此价格。"
-        return reply
+            lines.append("当前仍为日 K 模式；发 /mode manual 后才会使用这些价格。")
+        else:
+            missing = [s for s in self.config.symbols if not self.store.get(f"manual:{s}:{today}")]
+            if missing:
+                lines.append(f"今日（{today}）尚未设置：" + "、".join(missing))
+        return "\n".join(lines)
+
+    def setclose_template(self, day: str) -> str:
+        """A ready-to-edit batch /setclose covering every monitored symbol."""
+        return f"/setclose {day}\n" + "\n".join(f"{short_name(s)} 价格" for s in self.config.symbols)
 
     def config_summary(self) -> str:
         settings = self.settings()
