@@ -32,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -333,24 +333,56 @@ async def http_get(url: str, timeout: int = 15, headers: dict[str, str] | None =
 
 @dataclass(frozen=True)
 class Quote:
+    """The price the bot judges by: the last trade when fresh, else Binance's mark price.
+
+    Thin contracts (e.g. HK0625USDT after the HK session) can go minutes without a trade while
+    the mark price keeps updating every second, so a quiet book no longer looks like a dead feed.
+    """
     price: D
     timestamp_ms: int
+    source: str = "last"        # "last" = 最新成交价, "mark" = 标记价
+    last_price: D | None = None  # The stale last trade, kept for display when source == "mark".
+    last_ms: int = 0
+
+    @property
+    def kind(self) -> str:
+        return "标记价" if self.source == "mark" else "最新成交"
+
+    @staticmethod
+    def _timestamp(row: dict, key: str, now_ms: int) -> int:
+        try:
+            timestamp = int(row[key])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("行情缺少有效时间戳，停止涨跌提醒") from None
+        if timestamp <= 0 or timestamp > now_ms + 30_000:
+            raise ValueError("行情时间戳异常，停止涨跌提醒")
+        return timestamp
 
     @classmethod
     def parse(cls, row: dict, symbol: str, now_ms: int, max_age: int) -> "Quote":
         if row.get("symbol") != symbol:
             raise ValueError(f"行情代码不匹配：{symbol}")
-        value = number(row.get("price"), "最新成交价")
-        try:
-            timestamp = int(row["time"])
-        except (KeyError, TypeError, ValueError):
-            raise ValueError("行情缺少有效时间戳，停止涨跌提醒") from None
-        if timestamp <= 0 or timestamp > now_ms + 30_000:
-            raise ValueError("行情时间戳异常，停止涨跌提醒")
-        age = (now_ms - timestamp) / 1000
-        if age > max_age:
-            raise ValueError(f"最新成交价已过期（{int(age)} 秒未更新），暂不发涨跌提醒")
-        return cls(value, timestamp)
+        last = number(row.get("price"), "最新成交价")
+        last_ms = cls._timestamp(row, "time", now_ms)
+        last_age = (now_ms - last_ms) / 1000
+        if last_age <= max_age:
+            return cls(last, last_ms)
+        if row.get("markPrice") is None:
+            raise ValueError(f"最新成交价已过期（{int(last_age)} 秒未更新），暂不发涨跌提醒")
+        mark = number(row.get("markPrice"), "标记价")
+        mark_ms = cls._timestamp(row, "markTime", now_ms)
+        mark_age = (now_ms - mark_ms) / 1000
+        if mark_age > max_age:
+            raise ValueError(f"最新成交价 {int(last_age)} 秒、标记价 {int(mark_age)} 秒未更新，暂不发涨跌提醒")
+        return cls(mark, mark_ms, "mark", last, last_ms)
+
+    def price_line(self, now_ms: int, base_value: D) -> str:
+        """'💰 最新 76.36｜基准 76.53', or the mark-price form when the last trade is stale."""
+        if self.source == "mark":
+            idle = max(0, int((now_ms - self.last_ms) / 1000))
+            return (f"💰 标记价 {bold(fmt(self.price))}｜基准 {fmt(base_value)}"
+                    f"（最新成交 {fmt(self.last_price)}，{idle} 秒无成交，改按标记价判断）")
+        return f"💰 最新 {bold(fmt(self.price))}｜基准 {fmt(base_value)}"
 
 
 @dataclass(frozen=True)
@@ -469,10 +501,21 @@ class Binance:
         self.clock_checked = time.monotonic()
 
     async def prices(self) -> dict[str, dict]:
-        data = await self.get("/fapi/v2/ticker/price")
+        """Last trade per symbol, plus the mark price (markPrice/markTime) when the index feed answers."""
+        data, marks = await asyncio.gather(self.get("/fapi/v2/ticker/price"),
+                                           self.get("/fapi/v1/premiumIndex"), return_exceptions=True)
+        if isinstance(data, BaseException):
+            raise data
         if not isinstance(data, list):
             raise ValueError("币安最新价接口没有返回合约列表")
-        return {r["symbol"]: r for r in data if isinstance(r, dict) and r.get("symbol") in self.config.symbols}
+        rows = {r["symbol"]: dict(r) for r in data if isinstance(r, dict) and r.get("symbol") in self.config.symbols}
+        if isinstance(marks, list):  # Optional: a mark-price outage must not stop last-trade alerts.
+            for mark in marks:
+                if isinstance(mark, dict) and mark.get("symbol") in rows and mark.get("markPrice") is not None:
+                    rows[mark["symbol"]].update(markPrice=mark["markPrice"], markTime=mark.get("time"))
+        elif isinstance(marks, BaseException):
+            LOG.debug("premiumIndex unavailable: %s", clean_error(marks))
+        return rows
 
     async def baseline(self, symbol: str, now_ms: int) -> Baseline:
         old = self.cached.get(symbol)
@@ -745,7 +788,7 @@ def alert_text(symbol: str, quote: Quote, base: Baseline, change: D, threshold: 
     side = "上涨" if change > 0 else "下跌"
     lines = [f"{trend_mark(change, style)} {bold(f'{side}超过 {fmt(threshold)}%｜{NAMES.get(symbol, symbol)}')}",
              symbol, "",
-             f"💰 当前 {bold(fmt(quote.price))}｜基准 {fmt(base.value)}",
+             quote.price_line(quote.timestamp_ms, base.value),
              f"相对基准：{pct_text(change, style, strong=True)}"]
     for kind, ref in (references or {}).items():
         lines.extend(reference_lines(kind, quote.price, ref, fx, style))
@@ -1366,7 +1409,7 @@ class Bot:
                 lines.append("⚠️ 缓存已过期，等待有效的新行情/基准；不应据此判断当前涨跌")
                 continue
             change = percent(quote.price, base.value)
-            lines.extend([f"💰 最新 {bold(fmt(quote.price))}｜基准 {fmt(base.value)}",
+            lines.extend([quote.price_line(now_ms, base.value),
                           f"相对基准：{pct_text(change, style, strong=True)}",
                           f"📌 {base.label}"])
             for kind in REFERENCE_KINDS:
@@ -1563,7 +1606,7 @@ async def check_market(config: Config) -> int:
                 raise ValueError("未发现合约；未替换代码")
             quote = Quote.parse(rows[symbol], symbol, market.now_ms(), config.max_age)
             base = await market.baseline(symbol, market.now_ms())
-            print(f"OK {symbol}: last={quote.price}, daily_close={base.value}, "
+            print(f"OK {symbol}: {quote.kind}={quote.price}, daily_close={base.value}, "
                   f"change={percent(quote.price, base.value):+.4f}%, quote_time={stamp(quote.timestamp_ms)}, {base.label}")
         except Exception as error:
             failed = True
