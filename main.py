@@ -32,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -222,6 +222,13 @@ def parse_tickers(spec: str, symbols: tuple[str, ...]) -> dict[str, StockTicker]
     return tickers
 
 
+BASELINE_MODES = {
+    "binance_daily": "币安上一 UTC 日日 K 收盘（非股票正式昨收）",
+    "exchange_close": "币安合约在证券交易所收盘时刻的价格（与股票收盘同一时点）",
+    "manual": "手动同口径参考价（每日核对）",
+}
+
+
 @dataclass(frozen=True)
 class Config:
     token: str
@@ -251,8 +258,8 @@ class Config:
         if not symbols or len(symbols) > 30 or any(not re.fullmatch(r"[A-Z0-9_]{3,40}", s) for s in symbols):
             raise ValueError("SYMBOLS 应为 1～30 个逗号分隔的币安合约代码")
         mode = e.get("BASELINE_MODE", "binance_daily").strip()
-        if mode not in {"binance_daily", "manual"}:
-            raise ValueError("BASELINE_MODE 只能是 binance_daily 或 manual")
+        if mode not in BASELINE_MODES:
+            raise ValueError("BASELINE_MODE 只能是 binance_daily、manual 或 exchange_close")
         url = e.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/")
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.query or parsed.fragment:
@@ -525,6 +532,7 @@ class Binance:
     def __init__(self, config: Config):
         self.config = config
         self.cached: dict[str, Baseline] = {}
+        self.at_cache: dict[tuple[str, int], tuple[D, str]] = {}
         self.offset_ms = 0
         self.clock_checked = 0.0
         self.blocked_until = 0.0
@@ -576,6 +584,32 @@ class Binance:
         elif isinstance(marks, BaseException):
             LOG.debug("premiumIndex unavailable: %s", clean_error(marks))
         return rows
+
+    async def price_at(self, symbol: str, at_ms: int) -> tuple[D, str]:
+        """The contract price at the instant ``at_ms``: close of the 1-minute candle ending then.
+
+        Thin contracts may have no trade in that minute, so the mark-price candle is the fallback.
+        Returns (price, "成交价" | "标记价"). Cached per symbol and instant.
+        """
+        key = (symbol, at_ms)
+        if key in self.at_cache:
+            return self.at_cache[key]
+        start = at_ms - 60_000
+        for path, kind in (("/fapi/v1/klines", "成交价"), ("/fapi/v1/markPriceKlines", "标记价")):
+            rows = await self.get(path, symbol=symbol, interval="1m", startTime=start, endTime=at_ms - 1, limit=1)
+            if not isinstance(rows, list) or not rows or not isinstance(rows[0], list) or len(rows[0]) < 6:
+                continue
+            row = rows[0]
+            try:
+                if int(row[0]) != start or (kind == "成交价" and D(str(row[5])) <= 0):
+                    continue  # Wrong candle, or no trade in that minute.
+                result = number(row[4], "币安收盘时刻价格"), kind
+            except (ValueError, TypeError, decimal.InvalidOperation):
+                continue
+            self.at_cache = {k: v for k, v in self.at_cache.items() if k[0] != symbol}  # one instant per symbol
+            self.at_cache[key] = result
+            return result
+        raise ValueError(f"币安没有 {stamp(at_ms, seconds=False)}（北京时间）那一分钟的 K 线")
 
     async def baseline(self, symbol: str, now_ms: int) -> Baseline:
         old = self.cached.get(symbol)
@@ -1338,7 +1372,8 @@ COMMANDS: tuple[Command, ...] = (
     Command("status", "查看合约、基准与数据状态"),
     Command("threshold", "改为严格超过 ±1% 提醒", "1", "不带数字则弹出档位按钮卡片，点选即可"),
     Command("cooldown", "持续超标每 300 秒提醒（0=关闭周期提醒）", "300"),
-    Command("mode", "daily=币安上一 UTC 日日 K 收盘；manual=手动同口径参考价", "daily|manual"),
+    Command("mode", "daily=币安上一 UTC 日日 K 收盘；exchange=币安合约在证券交易所收盘时刻的价格；manual=手动参考价",
+            "daily|exchange|manual"),
     Command("setclose", "设置手动参考价，可一次发多条", "UNITREE 75 09-17 16:00",
             "示例：75 是基准，09-17 16:00 是它的收盘时间（北京，可省略）\n"
             "  末尾再写 YYYY-MM-DD 可指定适用日（默认今天）；批量：每行一组，首行可写统一适用日"),
@@ -1552,6 +1587,37 @@ class Bot:
         subs[req.sub_id] = {"chat": req.chat, "thread": req.thread, "active": active}
         self.store.put("subscriptions", subs)
 
+    def exchange_close_ms(self, symbol: str, now_ms: int) -> tuple[int, StockMarketInfo, str]:
+        """The instant the underlying's exchange last fixed a closing price (session complete).
+
+        Uses the fetched exchange bar when available so the baseline and the exchange close
+        share one timestamp; otherwise falls back to the venue's weekday close-time calendar.
+        """
+        ticker = self.config.tickers.get(symbol)
+        if not ticker:
+            raise ValueError("该合约未配置证券交易所代码（EXCHANGE_TICKERS），无法按交易所收盘时刻取基准")
+        info = STOCK_MARKETS[ticker.market]
+        ref = self.stocks.closes.get(symbol)
+        if ref and ref.close_ms and ref.close_ms + 15 * 60_000 <= now_ms:
+            return ref.close_ms, info, f"{info.name}{ticker.code}"
+        tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+        local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
+        for back in range(0, 10):
+            day = local.date() - dt.timedelta(days=back)
+            candidate = dt.datetime.combine(day, info.close_time, tz)
+            if day.weekday() < 5 and candidate + dt.timedelta(minutes=15) <= local:
+                return int(candidate.timestamp() * 1000), info, f"{info.name}{ticker.code}·按日历推算"
+        raise ValueError("找不到最近的交易所收盘时刻")
+
+    async def exchange_time_baseline(self, symbol: str, now_ms: int) -> Baseline:
+        """Binance contract price at the underlying exchange's latest close: same instant as the
+        exchange close, so 相对基准 and 相对交易所 are directly comparable."""
+        close_ms, info, source = self.exchange_close_ms(symbol, now_ms)
+        price, kind = await self.market.price_at(symbol, close_ms)
+        return Baseline(price, f"exchange_time:{close_ms}:{price}",
+                        f"币安合约{kind}@{info.name}收盘时刻" + info.close_label(close_ms) + f"｜{source}",
+                        close_ms + 4 * DAY_MS, close_ms)
+
     def manual_baseline_for(self, symbol: str, now_ms: int) -> Baseline:
         day = beijing_day(now_ms / 1000)
         return manual_baseline(self.store.get(f"manual:{symbol}:{day}"), now_ms)
@@ -1736,12 +1802,19 @@ class Bot:
 
     def cmd_mode(self, req: Request) -> str:
         choice = req.args[0].lower() if len(req.args) == 1 else ""
-        if choice not in {"daily", "binance_daily", "manual"}:
-            raise ValueError("用法：/mode daily 或 /mode manual")
-        settings = self.update_settings(mode="manual" if choice == "manual" else "binance_daily")
+        aliases = {"daily": "binance_daily", "binance_daily": "binance_daily", "manual": "manual",
+                   "exchange": "exchange_close", "exchange_close": "exchange_close", "stock": "exchange_close"}
+        if choice not in aliases:
+            raise ValueError("用法：/mode daily、/mode exchange 或 /mode manual")
+        settings = self.update_settings(mode=aliases[choice])
         self.snapshots.clear()
         self.store.delete_prefix("alert:")
         reply = "✅ " + self.config_summary()
+        if settings["mode"] == "exchange_close":
+            missing = [s for s in self.config.symbols if s not in self.config.tickers]
+            reply += "\n基准取币安合约在标的交易所最近一次收盘时刻的价格，与“证券交易所收盘价”同一时点，两者可直接对比。"
+            if missing:
+                reply += "\n⚠️ 未配置交易所代码、无法取基准的合约：" + "、".join(missing) + "（见 EXCHANGE_TICKERS）"
         if settings["mode"] == "manual":
             reply += ("\n请设置参考价：复制下面模板，把“价格”换成数值，“MM-DD HH:MM”换成该价格的收盘时间"
                       "（北京时间，可删掉不填）。缺失/过期的合约不发涨跌提醒。\n"
@@ -1846,7 +1919,7 @@ class Bot:
 
     def config_summary(self) -> str:
         settings = self.settings()
-        mode = "币安上一 UTC 日日 K 收盘（非股票正式昨收）" if settings["mode"] == "binance_daily" else "手动同口径参考价（每日核对）"
+        mode = BASELINE_MODES.get(settings["mode"], settings["mode"])
         return (f"⚙️ 基准：{mode}\n🎯 触发：严格超过 ±{fmt(settings['threshold'])}%｜每 {self.config.poll} 秒检查"
                 f"｜周期提醒 {settings['cooldown']} 秒（0=关闭）")
 
@@ -1917,6 +1990,8 @@ class Bot:
                 quote = Quote.parse(rows[symbol], symbol, now_ms, self.config.max_age)
                 if settings["mode"] == "binance_daily":
                     base = await self.market.baseline(symbol, now_ms)
+                elif settings["mode"] == "exchange_close":
+                    base = await self.exchange_time_baseline(symbol, now_ms)
                 else:
                     base = self.manual_baseline_for(symbol, now_ms)
                 return symbol, {"quote": quote, "baseline": base}
