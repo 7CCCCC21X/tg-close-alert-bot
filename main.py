@@ -32,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -920,6 +920,13 @@ class FuturesQuote:
         return self.last - self.spot if self.spot is not None else None
 
 
+def stale_note(quoted_ms: int, now_ms: int, tz: dt.tzinfo) -> str:
+    """'｜⚠️ 非今日数据' when the quote's local calendar day is earlier than today's."""
+    quoted = dt.datetime.fromtimestamp(quoted_ms / 1000, tz).date()
+    today = dt.datetime.fromtimestamp(now_ms / 1000, tz).date()
+    return "｜⚠️ 非今日数据" if quoted < today else ""
+
+
 def hk_futures_session(now_ms: int) -> str:
     """HKEX HSI futures: day session 09:15-16:30, after-hours (夜市) 17:15-03:00 next day, HK time."""
     local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).time()
@@ -1034,18 +1041,18 @@ class IndexFutures:
         q = self.quote
         if q is None:
             return f"📈 恒指期货 ⚠️ 获取失败（{self.error}）" if self.error else "📈 恒指期货 ⏳ 等待首次获取"
-        parts = [f"📈 恒指期货 {hk_futures_session(q.quoted_ms)} {bold(fmt(q.last))}"]
+        parts = [f"📈 {bold('恒指期货 ' + hk_futures_session(q.quoted_ms))} {bold(fmt(q.last))}"]
         if q.spot is not None:
             local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).time()
             cash_open = dt.time(9, 30) <= local <= dt.time(16, 10)
             water = "高水" if q.basis > 0 else "低水" if q.basis < 0 else "平水"
-            parts[0] += (f" → 恒指{'' if cash_open else '收盘'} {fmt(q.spot)} {pct_text(percent(q.last, q.spot), style)}"
+            parts[0] += (f" → 恒指{'' if cash_open else '收盘'} {bold(fmt(q.spot))} {pct_text(percent(q.last, q.spot), style)}"
                          f"（{water} {abs(q.basis):,.0f}）")
             if q.spot_prev:
                 parts.append(f"恒指当日 {pct_text(percent(q.spot, q.spot_prev), style)}")
         if q.change is not None and q.prev_settle:
             parts.append(f"期货昨结 {pct_text(q.change / q.prev_settle * 100, style)}（{q.change:+,.0f}）")
-        parts.append(f"{hhmm(q.quoted_ms)} {q.source}")
+        parts.append(f"{stamp(q.quoted_ms, seconds=False)} {q.source}" + stale_note(q.quoted_ms, now_ms, BEIJING))
         line = "｜".join(parts)
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error)}" if self.error else line
 
@@ -1250,11 +1257,12 @@ class KospiIndex:
         if q is None:
             return f"🇰🇷 KOSPI ⚠️ 获取失败（{self.error}）" if self.error else "🇰🇷 KOSPI ⏳ 等待首次获取"
         status = q.status or krx_session(now_ms)
-        line = f"🇰🇷 KOSPI {status} {bold(fmt(q.last))}"
+        line = f"🇰🇷 {bold('KOSPI ' + status)} {bold(fmt(q.last))}"
         if q.change is not None and q.prev_close:
-            line += f" → 昨收 {fmt(q.prev_close)} {pct_text(q.change / q.prev_close * 100, style)}（{q.change:+,.2f}）"
-        local = dt.datetime.fromtimestamp(q.quoted_ms / 1000, dt.timezone(dt.timedelta(hours=9)))
-        line += f"｜{local.strftime('%H:%M')} 韩国时间 {q.source}"
+            line += f" → 昨收 {bold(fmt(q.prev_close))} {pct_text(q.change / q.prev_close * 100, style)}（{q.change:+,.2f}）"
+        kst = dt.timezone(dt.timedelta(hours=9))
+        local = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst)
+        line += f"｜{local.strftime('%m-%d %H:%M')} 韩国时间 {q.source}" + stale_note(q.quoted_ms, now_ms, kst)
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error)}" if self.error else line
 
 
