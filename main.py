@@ -32,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -913,6 +913,8 @@ class FuturesQuote:
     spot: D | None = None
     spot_source: str = ""
     spot_prev: D | None = None  # Cash index previous close, for the index's own day move.
+    water: D | None = None      # Premium/discount as published by the source (etnet), signed.
+    exchange_contract: bool = True  # False for CFD fallbacks that are not the HKEX contract.
 
     @property
     def change(self) -> D | None:
@@ -921,7 +923,68 @@ class FuturesQuote:
     @property
     def basis(self) -> D | None:
         """Futures minus cash index: positive = 高水 (premium), negative = 低水 (discount)."""
+        if self.water is not None:
+            return self.water
         return self.last - self.spot if self.spot is not None else None
+
+
+def page_text(raw: bytes) -> str:
+    """Visible text of an HTML page: scripts/styles dropped, tags to spaces, entities decoded."""
+    for encoding in ("utf-8", "big5hkscs", "big5"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode("utf-8", errors="ignore")
+    text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", text)
+    text = html.unescape(re.sub(r"(?s)<[^>]+>", " ", text))
+    return re.sub(r"\s+", " ", text)
+
+
+ETNET_NUM = r"([\d,]+(?:\.\d+)?)"
+
+
+def parse_etnet_futures(raw: bytes, now_ms: int) -> "FuturesQuote":
+    """etnet 指數期貨 page: HKEX HSI futures (日市/夜市 blocks) plus 恒生指數現貨.
+
+    Parsed from visible text so markup changes do not matter. The block with the newest
+    timestamp is used; its published 高水/低水 is kept as the basis.
+    """
+    text = page_text(raw)
+    spot = spot_prev = None
+    spot_block = re.search(r"恒生指數現貨(.{0,400})", text)
+    if spot_block:
+        m = re.search(r"[▲▼]?\s*([\d,]+\.\d+)\s*[+-]?[\d,.]+\s*\(", spot_block.group(1))
+        spot = number(m.group(1).replace(",", ""), "恒生指數") if m else None
+        m = re.search(r"前收市\s*[:：]\s*" + ETNET_NUM, spot_block.group(1))
+        spot_prev = number(m.group(1).replace(",", ""), "恒指前收") if m else None
+    candidates = []
+    pattern = (r"恒生指數期貨\((\d{2}/\d{4})\)\s*(日市|夜市)(.*?)"
+               r"(?=恒生指數期貨\(\d{2}/\d{4}\)\s*(?:日市|夜市)|未平倉|恒生指數現貨|$)")
+    for month, session, body in re.findall(pattern, text, flags=re.S):
+        m = re.search(r"[▲▼]?\s*([\d,]{4,})\s*([+-]?[\d,]+)\s*\(\s*([+-]?[\d.]+)%\s*\)", body)
+        if not m:
+            continue
+        def field(label: str) -> D | None:
+            f = re.search(label + r"\s*[:：]\s*" + ETNET_NUM, body)
+            return number(f.group(1).replace(",", ""), label, zero_ok=True) if f else None
+        water = None
+        w = re.search(r"(高水|低水|平水)\s*(\d+)?", body)
+        if w:
+            water = D(w.group(2) or 0) * (-1 if w.group(1) == "低水" else 1)
+        stamp_match = re.search(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2})", body)
+        quoted_ms = now_ms
+        if stamp_match:
+            quoted = dt.datetime.strptime(stamp_match.group(1), "%Y/%m/%d %H:%M").replace(tzinfo=BEIJING)
+            quoted_ms = int(quoted.timestamp() * 1000)
+        candidates.append(FuturesQuote(
+            f"恒指期货({month}){session}", number(m.group(1).replace(",", ""), "恒指期货"), field("前收市"),
+            field("開市"), field("最高"), field("最低"), quoted_ms, "etnet", spot, "etnet", spot_prev, water))
+    if not candidates:
+        raise ValueError("etnet 页面没有找到恒指期货报价")
+    return max(candidates, key=lambda q: q.quoted_ms)
 
 
 def stale_note(quoted_ms: int, now_ms: int, tz: dt.tzinfo) -> str:
@@ -964,8 +1027,11 @@ class IndexFutures:
     cash index for the 高水/低水 basis. Eastmoney first, Sina as fallback; read-only, best effort."""
     REFRESH_SECONDS = 60
     EM = "https://push2.eastmoney.com/api/qt/stock/get?fltt=2&invt=2&fields=f43,f44,f45,f46,f57,f58,f60,f86&secid="
-    FUTURES_SOURCES = (("东方财富", EM + "134.HSI_M", {"Referer": "https://quote.eastmoney.com/"}),
-                       ("新浪", "https://hq.sinajs.cn/list=hf_HSI", {"Referer": "https://finance.sina.com.cn/"}))
+    # etnet is the HKEX-designated free real-time site the user checks against; Sina hf_HSI is a CFD,
+    # not the HKEX contract (it prints decimals), so it is only a last-resort, clearly labelled fallback.
+    FUTURES_SOURCES = (("etnet", "https://www.etnet.com.hk/www/tc/futures/index.php", {"Referer": "https://www.etnet.com.hk/"}),
+                       ("东方财富", EM + "134.HSI_M", {"Referer": "https://quote.eastmoney.com/"}),
+                       ("新浪CFD", "https://hq.sinajs.cn/list=hf_HSI", {"Referer": "https://finance.sina.com.cn/"}))
     SPOT_SOURCES = (("东方财富", EM + "100.HSI", {"Referer": "https://quote.eastmoney.com/"}),
                     ("腾讯", "https://qt.gtimg.cn/q=hkHSI", {"Referer": "https://gu.qq.com/"}),
                     ("新浪", "https://hq.sinajs.cn/list=rt_hkHSI", {"Referer": "https://finance.sina.com.cn/"}))
@@ -978,6 +1044,8 @@ class IndexFutures:
 
     @staticmethod
     def parse_futures(source: str, raw: bytes, now_ms: int) -> FuturesQuote:
+        if source == "etnet":
+            return parse_etnet_futures(raw, now_ms)
         if source == "东方财富":
             d = parse_eastmoney_quote(raw)
             quoted_ms = int(d["f86"]) * 1000 if str(d.get("f86", "")).isdigit() else now_ms
@@ -994,7 +1062,7 @@ class IndexFutures:
         except ValueError:
             quoted_ms = now_ms
         return FuturesQuote(fields[13] or "恒指期货", number(fields[0], "恒指期货"), _opt(fields[7]), _opt(fields[8]),
-                            _opt(fields[4]), _opt(fields[5]), quoted_ms, source)
+                            _opt(fields[4]), _opt(fields[5]), quoted_ms, source, exchange_contract=False)
 
     @staticmethod
     def parse_spot(source: str, raw: bytes) -> tuple[D, D | None]:
@@ -1033,8 +1101,9 @@ class IndexFutures:
             self.error = clean_error(error)
             return
         try:
-            spot, spot_prev = await self._first(self.SPOT_SOURCES, self.parse_spot)
-            quote = FuturesQuote(**{**quote.__dict__, "spot": spot, "spot_prev": spot_prev})
+            if quote.spot is None:  # etnet already carries the cash index
+                spot, spot_prev = await self._first(self.SPOT_SOURCES, self.parse_spot)
+                quote = FuturesQuote(**{**quote.__dict__, "spot": spot, "spot_prev": spot_prev})
         except Exception as error:  # Basis is a nice-to-have; the futures quote alone is still shown.
             LOG.debug("HSI spot unavailable: %s", clean_error(error))
         self.quote, self.error = quote, ""
@@ -1055,8 +1124,9 @@ class IndexFutures:
             if q.spot_prev:
                 parts.append(f"恒指当日 {pct_text(percent(q.spot, q.spot_prev), style)}")
         if q.change is not None and q.prev_settle:
-            parts.append(f"期货昨结 {pct_text(q.change / q.prev_settle * 100, style)}（{q.change:+,.0f}）")
-        parts.append(f"{stamp(q.quoted_ms, seconds=False)} {q.source}" + stale_note(q.quoted_ms, now_ms, BEIJING))
+            parts.append(f"期货前收 {bold(fmt(q.prev_settle))} {pct_text(q.change / q.prev_settle * 100, style)}（{q.change:+,.0f}）")
+        source = q.source if q.exchange_contract else f"{q.source}·非港交所合约，仅参考"
+        parts.append(f"{stamp(q.quoted_ms, seconds=False)} {source}" + stale_note(q.quoted_ms, now_ms, BEIJING))
         line = "｜".join(parts)
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error)}" if self.error else line
 
