@@ -32,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.6.2"
+VERSION = "1.7.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -223,6 +223,8 @@ TICKER_RE = re.compile(r"(sh|sz|hk|kr):([0-9A-Za-z]{1,12})(:same)?", re.IGNORECA
 
 # Hyperliquid HIP-3 markets for the same underlyings (trade.xyz dex). Unknown names simply show "未找到".
 DEFAULT_HL_TICKERS = "UNITREEUSDT=xyz:UNITREE,HK0625USDT=xyz:SHEIN,CXMTUSDT=xyz:CXMT,SKHYNIXUSDT=xyz:SKHX"
+# Index perps on Hyperliquid compared with the cash index (KR200 = KOSPI 200); "off" disables.
+DEFAULT_HL_INDEX = "KR200=xyz:KR200"
 HL_TICKER_RE = re.compile(r"(?:([A-Za-z0-9_]{1,16}):)?([A-Za-z0-9_.-]{1,24})")
 
 
@@ -289,6 +291,7 @@ class Config:
     hsi_futures: bool = True  # Show the Hang Seng Index futures quote (night session after HK close).
     hl_tickers: dict[str, tuple[str, str]] = field(default_factory=dict)  # symbol -> (dex, coin) on Hyperliquid
     kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
+    hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -329,6 +332,7 @@ class Config:
             hsi_futures=e.get("HSI_FUTURES", "on").strip().lower() not in {"off", "0", "false", "no"},
             hl_tickers=parse_hl_tickers(e.get("HL_TICKERS", DEFAULT_HL_TICKERS), symbols),
             kospi_index=e.get("KOSPI_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
+            hl_index=parse_hl_tickers(e.get("HL_INDEX", DEFAULT_HL_INDEX), ("KR200",)),
         )
 
 
@@ -1223,11 +1227,15 @@ class KospiIndex:
     SOURCES = (("Naver", "https://polling.finance.naver.com/api/realtime/domestic/index/KOSPI",
                 {"Referer": "https://finance.naver.com/"}),
                ("东方财富", IndexFutures.EM + "100.KS11", {"Referer": "https://quote.eastmoney.com/"}))
+    SOURCES_200 = (("Naver", "https://polling.finance.naver.com/api/realtime/domestic/index/KPI200",
+                    {"Referer": "https://finance.naver.com/"}),)
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
         self.quote: IndexQuote | None = None
+        self.quote200: IndexQuote | None = None  # KOSPI 200, the index behind Hyperliquid's KR200 perp
         self.error = ""
+        self.error200 = ""
         self.refreshed = -1e9
 
     @staticmethod
@@ -1240,15 +1248,18 @@ class KospiIndex:
         if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
             return
         self.refreshed = time.monotonic()
+        self.quote, self.error = await self._fetch(self.SOURCES, now_ms, self.quote)
+        self.quote200, self.error200 = await self._fetch(self.SOURCES_200, now_ms, self.quote200)
+
+    async def _fetch(self, sources: tuple, now_ms: int, previous: IndexQuote | None) -> tuple[IndexQuote | None, str]:
         failures = []
-        for name, url, extra in self.SOURCES:
+        for name, url, extra in sources:
             try:
                 raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
-                self.quote, self.error = self.parse(name, raw, now_ms), ""
-                return
+                return self.parse(name, raw, now_ms), ""
             except Exception as error:
                 failures.append(f"{name}: {clean_error(error)}")
-        self.error = "；".join(failures)
+        return previous, "；".join(failures)
 
     def line(self, now_ms: int, style: str) -> str:
         if not self.enabled:
@@ -1264,6 +1275,27 @@ class KospiIndex:
         local = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst)
         line += f"｜{local.strftime('%m-%d %H:%M')} 韩国时间 {q.source}" + stale_note(q.quoted_ms, now_ms, kst)
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error)}" if self.error else line
+
+    def line200(self, now_ms: int, style: str, hl: "HlQuote | None", hl_note: str = "") -> str:
+        """KOSPI 200 versus Hyperliquid's KR200 perp, the 24/7 price for the same index."""
+        if not self.enabled:
+            return ""
+        q = self.quote200
+        if q is None:
+            return f"🇰🇷 KOSPI200 ⚠️ 获取失败（{brief_error(self.error200)}）" if self.error200 else "🇰🇷 KOSPI200 ⏳ 等待首次获取"
+        status = q.status or krx_session(now_ms)
+        line = f"🇰🇷 {bold('KOSPI200 ' + status)} {bold(fmt(q.last))}"
+        if q.change is not None and q.prev_close:
+            line += f" → 昨收 {bold(fmt(q.prev_close))} {pct_text(q.change / q.prev_close * 100, style)}"
+        if hl is not None:
+            meta = f"（24h {pct_text(hl.day_change, style)}）" if hl.day_change is not None else ""
+            line += f"｜🌊 HL {hl.coin.split(':')[-1]} {bold(fmt(hl.mark))} → 相对 KOSPI200 {pct_text(percent(hl.mark, q.last), style)}{meta}"
+        elif hl_note:
+            line += f"｜🌊 HL {brief_error(hl_note, 40)}"
+        kst = dt.timezone(dt.timedelta(hours=9))
+        local = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst)
+        line += f"｜{local.strftime('%m-%d %H:%M')} 韩国时间 {q.source}" + stale_note(q.quoted_ms, now_ms, kst)
+        return line + f"｜⚠️ 刷新失败：{brief_error(self.error200)}" if self.error200 else line
 
 
 @dataclass(frozen=True)
@@ -1605,7 +1637,7 @@ class Bot:
         self.stocks = StockMarket(config, store)
         self.fx = FxRates(config.fx_manual)
         self.hsi = IndexFutures(config.hsi_futures)
-        self.hl = Hyperliquid(config.hl_tickers)
+        self.hl = Hyperliquid({**config.hl_tickers, **config.hl_index})
         self.kospi = KospiIndex(config.kospi_index)
         self.stopping = asyncio.Event()
         self.started = time.time()
@@ -1949,6 +1981,9 @@ class Bot:
         usd, note = self.usd_price(symbol, price)
         return self.hl.line(symbol, usd, self.config.color_style, note)
 
+    def kospi_line200(self, now_ms: int) -> str:
+        return self.kospi.line200(now_ms, self.config.color_style, self.hl.quotes.get("KR200"), self.hl.notes.get("KR200", ""))
+
     def context_lines(self, symbol: str, now_ms: int, price: D | None = None) -> list[str]:
         """Market-context lines for an alert: HSI futures for Hong Kong-listed underlyings, Hyperliquid quote."""
         lines = []
@@ -1957,6 +1992,8 @@ class Bot:
             lines.append(self.hsi.line(now_ms, self.config.color_style))
         if self.config.kospi_index and ticker and ticker.market == "kr" and self.kospi.quote:
             lines.append(self.kospi.line(now_ms, self.config.color_style))
+        if self.config.kospi_index and ticker and ticker.market == "kr" and self.kospi.quote200:
+            lines.append(self.kospi_line200(now_ms))
         if price is not None and symbol in self.hl.quotes:
             lines.append(self.hl_line(symbol, price))
         return lines
@@ -1989,6 +2026,7 @@ class Bot:
             lines.append(self.hsi.line(now_ms, style))
         if self.config.kospi_index:
             lines.append(self.kospi.line(now_ms, style))
+            lines.append(self.kospi_line200(now_ms))
         for symbol in self.config.symbols:
             snapshot = self.snapshots.get(symbol)
             lines.append("\n" + bold(f"📍 {NAMES.get(symbol, symbol)}｜{symbol}"))
@@ -2223,10 +2261,11 @@ async def check_market(config: Config) -> int:
     kospi = KospiIndex(config.kospi_index)
     await kospi.refresh(market.now_ms(), force=True)
     print(kospi.line(market.now_ms(), config.color_style).replace(B0, "").replace(B1, ""))
-    hl = Hyperliquid(config.hl_tickers)
+    hl = Hyperliquid({**config.hl_tickers, **config.hl_index})
     await hl.refresh(force=True)
     for symbol in config.hl_tickers:
         print(hl.line(symbol, None, config.color_style).replace(B0, "").replace(B1, ""))
+    print(kospi.line200(market.now_ms(), config.color_style, hl.quotes.get("KR200"), hl.notes.get("KR200", "")).replace(B0, "").replace(B1, ""))
     for symbol, ticker in config.tickers.items():
         close = stocks.closes.get(symbol)
         if close:
