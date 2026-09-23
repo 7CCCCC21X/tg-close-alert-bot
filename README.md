@@ -262,6 +262,22 @@ SKHYNIX 258000 KRW 09-17 14:30
 
 数据源按“东方财富（`push2.eastmoney.com`，`secid=134.HSI_M`）→ 新浪（`hq.sinajs.cn/list=hf_HSI`）”顺序尝试；恒生指数现货按“东方财富 `100.HSI` → 腾讯 `hkHSI` → 新浪 `rt_hkHSI`”尝试，现货取不到时只显示期货、不显示高低水。每 60 秒刷新一次；`HSI_FUTURES=off` 可关闭。港交所的 etnet 页面没有公开接口，这里用的是提供同一份港交所数据的第三方免费接口。
 
+### Hyperliquid 参考价
+
+每个合约下面还会显示 Hyperliquid 上同一标的永续合约的行情，作为币安之外的第二个参考：标记价、预言机价、24 小时涨跌、每小时资金费率，以及币安现价相对 Hyperliquid 标记价的偏差（港币计价的 quanto 合约会先按汇率折成美元再比）：
+
+```text
+🌊 Hyperliquid xyz:SKHX：标记 1,353.45｜预言机 1,352.9｜24h 🔴 +1.004%｜资金费率 0.0013%/h｜相对 HL：🟢 -1.526%
+```
+
+数据来自 Hyperliquid 官方公开接口 `POST https://api.hyperliquid.xyz/info`（`metaAndAssetCtxs`，带 `dex` 参数读取 HIP-3 市场），无需密钥，每 30 秒刷新，每个 dex 一次请求。映射由 `HL_TICKERS` 控制，格式 `合约=dex:币种`，默认：
+
+```text
+HL_TICKERS=UNITREEUSDT=xyz:UNITREE,HK0625USDT=xyz:SHEIN,CXMTUSDT=xyz:CXMT,SKHYNIXUSDT=xyz:SKHX
+```
+
+其中 SK 海力士（`xyz:SKHX`）和长鑫（`xyz:CXMT`）是 trade.xyz 上已确认的市场；宇树和希音的代码未经确认，若该 dex 上没有这个名字，`/status` 会显示“未找到市场 xyz:UNITREE（该 dex 共 N 个市场，相近：…）”，按提示把正确的名字填进 `HL_TICKERS` 即可。设为 `off` 关闭。
+
 ### 汇率与颜色
 
 汇率每 6 小时刷新一次，来源为免费无需密钥的 Frankfurter（欧洲央行参考汇率，`api.frankfurter.app`），失败时改用 `open.er-api.com`；`/status` 底部显示汇率来源和日期。环境变量 `FX_RATES=CNY=7.12,HKD=7.79,KRW=1390`（每 1 美元兑多少该货币）可手动指定并优先于自动汇率。
