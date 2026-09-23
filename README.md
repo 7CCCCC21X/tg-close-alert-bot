@@ -109,7 +109,7 @@ ALERT_COOLDOWN_SECONDS=300
 ALERT_STEP_PCT=1
 MIN_ALERT_GAP_SECONDS=30
 MAX_PRICE_AGE_SECONDS=120
-BASELINE_MODE=binance_daily
+BASELINE_MODE=exchange_close
 STATE_DB=/data/bot.sqlite3
 EXCHANGE_TICKERS=UNITREEUSDT=sh:688836,HK0625USDT=hk:00625,CXMTUSDT=sh:688825,SKHYNIXUSDT=kr:000660
 ```
@@ -177,6 +177,7 @@ EXCHANGE_TICKERS=UNITREEUSDT=sh:688836,HK0625USDT=hk:00625,CXMTUSDT=sh:688825,SK
 | `/cooldown 300` | 持续超过阈值，每 300 秒提醒 |
 | `/cooldown 0` | 关闭周期重复提醒，仍保留首次、重新触发及扩大档位提醒 |
 | `/mode daily` | 自动币安上一完整 UTC 日日 K 模式 |
+| `/mode exchange` | 基准取币安合约在标的证券交易所收盘时刻的价格，与“证券交易所收盘价”同一时点，两个百分比可直接对比 |
 | `/mode manual` | 手动参考价模式 |
 | `/setclose UNITREE 75` | 为北京时间今天设置该合约参考价 75 |
 | `/setclose UNITREE 75 09-17 16:00` | 设置参考价并记录它的收盘时间（北京时间），会显示在状态和提醒里 |
@@ -188,6 +189,12 @@ EXCHANGE_TICKERS=UNITREEUSDT=sh:688836,HK0625USDT=hk:00625,CXMTUSDT=sh:688825,SK
 | `/test` | 仅测试消息能否发到当前私聊/话题 |
 | `/id` | 显示自己的用户 ID、当前聊天 ID、话题 ID |
 | `/help` | 查看帮助 |
+
+## 按证券交易所收盘时刻取基准（/mode exchange）
+
+日 K 模式的基准是币安合约在 UTC 0 点（北京 08:00）的价格，而“证券交易所收盘价”是股票当天收市时的价格，两者不是同一时点，所以“相对基准”和“相对交易所”会有差。发 `/mode exchange` 后，基准改为币安合约在标的交易所最近一次收盘时刻的价格：上交所 15:00、港交所 16:10、韩交所 15:30（当地时间），从币安该分钟的 1 分钟 K 线收盘价取；那一分钟没有成交时改用标记价 K 线，并在基准说明里标明“成交价”或“标记价”。
+
+收盘时刻优先取自动获取的交易所日 K（与“证券交易所收盘价”共用同一个时间戳），获取不到时按工作日日历推算（法定假日可能误判，状态里会标“按日历推算”）。当天的收盘要在收盘 15 分钟后才生效，之前沿用上一交易日。没有配置 `EXCHANGE_TICKERS` 的合约在此模式下不发提醒，并在状态里说明。配置了 `EXCHANGE_TICKERS`（默认已配置四个）时这就是默认模式；想回到 UTC 日 K 基准发 `/mode daily`，或设 `BASELINE_MODE=binance_daily`。
 
 ## 成交稀疏时的标记价
 
@@ -262,6 +269,32 @@ SKHYNIX 258000 KRW 09-17 14:30
 
 数据源按“东方财富（`push2.eastmoney.com`，`secid=134.HSI_M`）→ 新浪（`hq.sinajs.cn/list=hf_HSI`）”顺序尝试；恒生指数现货按“东方财富 `100.HSI` → 腾讯 `hkHSI` → 新浪 `rt_hkHSI`”尝试，现货取不到时只显示期货、不显示高低水。每 60 秒刷新一次；`HSI_FUTURES=off` 可关闭。港交所的 etnet 页面没有公开接口，这里用的是提供同一份港交所数据的第三方免费接口。
 
+### KOSPI 综合指数
+
+`/status` 顶部（恒指期货下面）和韩股标的（`SKHYNIXUSDT`）的涨跌提醒里显示 KOSPI 综合指数：点位、相对昨收的涨跌、开高低、韩国时间的更新时刻和交易状态，例如：
+
+```text
+🇰🇷 KOSPI 综合指数（已收盘）：3,371.89 🔴 +12.34（+0.37%）｜开 3,360.1 高 3,380.5 低 3,355.2｜09-23 15:30 韩国时间更新（Naver）
+```
+
+数据源按“Naver 指数实时接口（`polling.finance.naver.com/api/realtime/domestic/index/KOSPI`）→ 东方财富（`100.KS11`）”尝试，每 60 秒刷新；`KOSPI_INDEX=off` 关闭。韩交所正规交易 09:00–15:30 韩国时间，指数在收盘后不再变动；16:00–20:00 的盘后交易不计入指数。如需 KOSPI 200 夜间期货（18:00–次日 06:00）可以再加。
+
+### Hyperliquid 参考价
+
+每个合约下面还会显示 Hyperliquid 上同一标的永续合约的行情，作为币安之外的第二个参考：标记价、预言机价、24 小时涨跌、每小时资金费率，以及币安现价相对 Hyperliquid 标记价的偏差（港币计价的 quanto 合约会先按汇率折成美元再比）：
+
+```text
+🌊 Hyperliquid xyz:SKHX：标记 1,353.45｜预言机 1,352.9｜24h 🔴 +1.004%｜资金费率 0.0013%/h｜相对 HL：🟢 -1.526%
+```
+
+数据来自 Hyperliquid 官方公开接口 `POST https://api.hyperliquid.xyz/info`（`metaAndAssetCtxs`，带 `dex` 参数读取 HIP-3 市场），无需密钥，每 30 秒刷新，每个 dex 一次请求。映射由 `HL_TICKERS` 控制，格式 `合约=dex:币种`，默认：
+
+```text
+HL_TICKERS=UNITREEUSDT=xyz:UNITREE,HK0625USDT=xyz:SHEIN,CXMTUSDT=xyz:CXMT,SKHYNIXUSDT=xyz:SKHX
+```
+
+其中 SK 海力士（`xyz:SKHX`）和长鑫（`xyz:CXMT`）是 trade.xyz 上已确认的市场；宇树和希音的代码未经确认，若该 dex 上没有这个名字，`/status` 会显示“未找到市场 xyz:UNITREE（该 dex 共 N 个市场，相近：…）”，按提示把正确的名字填进 `HL_TICKERS` 即可。设为 `off` 关闭。
+
 ### 汇率与颜色
 
 汇率每 6 小时刷新一次，来源为免费无需密钥的 Frankfurter（欧洲央行参考汇率，`api.frankfurter.app`），失败时改用 `open.er-api.com`；`/status` 底部显示汇率来源和日期。环境变量 `FX_RATES=CNY=7.12,HKD=7.79,KRW=1390`（每 1 美元兑多少该货币）可手动指定并优先于自动汇率。
@@ -297,7 +330,7 @@ SKHYNIX 258000 KRW 09-17 14:30
 | `ALERT_STEP_PCT` | `1` | 超过阈值后每扩大多少个百分点进入新提醒档位，0 关闭 |
 | `MIN_ALERT_GAP_SECONDS` | `30` | 同一订阅同一合约两次提醒的最短间隔 |
 | `MAX_PRICE_AGE_SECONDS` | `120` | 最新成交时间戳允许的最大年龄 |
-| `BASELINE_MODE` | `binance_daily` | `binance_daily` 或 `manual` |
+| `BASELINE_MODE` | 配置了 `EXCHANGE_TICKERS` 时为 `exchange_close`，否则 `binance_daily` | `exchange_close`、`binance_daily` 或 `manual` |
 | `STATE_DB` | 本地 `./data/bot.sqlite3`；Docker `/data/bot.sqlite3` | SQLite 文件位置 |
 
 通过 TG 命令修改的阈值、冷却和模式会保存到 Volume，并**优先于对应环境变量默认值**。以后要修改它们，直接发 TG 命令；只改 Railway 对应默认变量不一定覆盖已有持久设置。

@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.3.0"
+VERSION = "1.5.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -182,6 +182,28 @@ def parse_fx(spec: str) -> dict[str, D]:
 TICKER_RE = re.compile(r"(sh|sz|hk|kr):([0-9A-Za-z]{1,12})(:same)?", re.IGNORECASE)
 
 
+# Hyperliquid HIP-3 markets for the same underlyings (trade.xyz dex). Unknown names simply show "未找到".
+DEFAULT_HL_TICKERS = "UNITREEUSDT=xyz:UNITREE,HK0625USDT=xyz:SHEIN,CXMTUSDT=xyz:CXMT,SKHYNIXUSDT=xyz:SKHX"
+HL_TICKER_RE = re.compile(r"(?:([A-Za-z0-9_]{1,16}):)?([A-Za-z0-9_.-]{1,24})")
+
+
+def parse_hl_tickers(spec: str, symbols: tuple[str, ...]) -> dict[str, tuple[str, str]]:
+    """HL_TICKERS="SYMBOL=dex:COIN,..." (dex omitted = the main Hyperliquid perp dex); "off" disables."""
+    tickers: dict[str, tuple[str, str]] = {}
+    if spec.strip().lower() in {"", "off", "none"}:
+        return tickers
+    for item in spec.split(","):
+        if not item.strip():
+            continue
+        symbol, _, ticker = item.partition("=")
+        symbol, match = symbol.strip().upper(), HL_TICKER_RE.fullmatch(ticker.strip())
+        if not symbol or not match:
+            raise ValueError("HL_TICKERS 格式：合约=dex:币种，如 SKHYNIXUSDT=xyz:SKHX（主 dex 可省略 dex:）")
+        if symbol in symbols:
+            tickers[symbol] = ((match.group(1) or "").lower(), match.group(2).upper())
+    return tickers
+
+
 def parse_tickers(spec: str, symbols: tuple[str, ...]) -> dict[str, StockTicker]:
     """EXCHANGE_TICKERS="SYMBOL=market:code[:same],..."; "off" disables automatic exchange closes."""
     tickers: dict[str, StockTicker] = {}
@@ -198,6 +220,13 @@ def parse_tickers(spec: str, symbols: tuple[str, ...]) -> dict[str, StockTicker]
         if symbol in symbols:  # Entries for unmonitored symbols are harmless and ignored.
             tickers[symbol] = StockTicker(match.group(1).lower(), match.group(2), bool(match.group(3)))
     return tickers
+
+
+BASELINE_MODES = {
+    "binance_daily": "币安上一 UTC 日日 K 收盘（非股票正式昨收）",
+    "exchange_close": "币安合约在证券交易所收盘时刻的价格（与股票收盘同一时点）",
+    "manual": "手动同口径参考价（每日核对）",
+}
 
 
 @dataclass(frozen=True)
@@ -218,6 +247,8 @@ class Config:
     color_style: str
     fx_manual: dict[str, D]
     hsi_futures: bool = True  # Show the Hang Seng Index futures quote (night session after HK close).
+    hl_tickers: dict[str, tuple[str, str]] = field(default_factory=dict)  # symbol -> (dex, coin) on Hyperliquid
+    kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -226,9 +257,12 @@ class Config:
                         e.get("SYMBOLS", ",".join(NAMES)).split(",") if s.strip()))
         if not symbols or len(symbols) > 30 or any(not re.fullmatch(r"[A-Z0-9_]{3,40}", s) for s in symbols):
             raise ValueError("SYMBOLS 应为 1～30 个逗号分隔的币安合约代码")
-        mode = e.get("BASELINE_MODE", "binance_daily").strip()
-        if mode not in {"binance_daily", "manual"}:
-            raise ValueError("BASELINE_MODE 只能是 binance_daily 或 manual")
+        tickers = parse_tickers(e.get("EXCHANGE_TICKERS", DEFAULT_TICKERS), symbols)
+        # With exchange tickers configured the baseline defaults to the exchange-close instant, so the
+        # contract's deviation and the stock's close are measured from the same moment.
+        mode = e.get("BASELINE_MODE", "exchange_close" if tickers else "binance_daily").strip()
+        if mode not in BASELINE_MODES:
+            raise ValueError("BASELINE_MODE 只能是 binance_daily、manual 或 exchange_close")
         url = e.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/")
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.query or parsed.fragment:
@@ -250,9 +284,11 @@ class Config:
             min_gap=bounded_int(e, "MIN_ALERT_GAP_SECONDS", 30, 0, 3600),
             max_age=bounded_int(e, "MAX_PRICE_AGE_SECONDS", 120, 5, 3600),
             baseline_mode=mode, base_url=url,
-            tickers=parse_tickers(e.get("EXCHANGE_TICKERS", DEFAULT_TICKERS), symbols),
+            tickers=tickers,
             color_style=style, fx_manual=parse_fx(e.get("FX_RATES", "")),
             hsi_futures=e.get("HSI_FUTURES", "on").strip().lower() not in {"off", "0", "false", "no"},
+            hl_tickers=parse_hl_tickers(e.get("HL_TICKERS", DEFAULT_HL_TICKERS), symbols),
+            kospi_index=e.get("KOSPI_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
         )
 
 
@@ -499,6 +535,7 @@ class Binance:
     def __init__(self, config: Config):
         self.config = config
         self.cached: dict[str, Baseline] = {}
+        self.at_cache: dict[tuple[str, int], tuple[D, str]] = {}
         self.offset_ms = 0
         self.clock_checked = 0.0
         self.blocked_until = 0.0
@@ -550,6 +587,32 @@ class Binance:
         elif isinstance(marks, BaseException):
             LOG.debug("premiumIndex unavailable: %s", clean_error(marks))
         return rows
+
+    async def price_at(self, symbol: str, at_ms: int) -> tuple[D, str]:
+        """The contract price at the instant ``at_ms``: close of the 1-minute candle ending then.
+
+        Thin contracts may have no trade in that minute, so the mark-price candle is the fallback.
+        Returns (price, "成交价" | "标记价"). Cached per symbol and instant.
+        """
+        key = (symbol, at_ms)
+        if key in self.at_cache:
+            return self.at_cache[key]
+        start = at_ms - 60_000
+        for path, kind in (("/fapi/v1/klines", "成交价"), ("/fapi/v1/markPriceKlines", "标记价")):
+            rows = await self.get(path, symbol=symbol, interval="1m", startTime=start, endTime=at_ms - 1, limit=1)
+            if not isinstance(rows, list) or not rows or not isinstance(rows[0], list) or len(rows[0]) < 6:
+                continue
+            row = rows[0]
+            try:
+                if int(row[0]) != start or (kind == "成交价" and D(str(row[5])) <= 0):
+                    continue  # Wrong candle, or no trade in that minute.
+                result = number(row[4], "币安收盘时刻价格"), kind
+            except (ValueError, TypeError, decimal.InvalidOperation):
+                continue
+            self.at_cache = {k: v for k, v in self.at_cache.items() if k[0] != symbol}  # one instant per symbol
+            self.at_cache[key] = result
+            return result
+        raise ValueError(f"币安没有 {stamp(at_ms, seconds=False)}（北京时间）那一分钟的 K 线")
 
     async def baseline(self, symbol: str, now_ms: int) -> Baseline:
         old = self.cached.get(symbol)
@@ -935,6 +998,222 @@ class IndexFutures:
 
 
 @dataclass(frozen=True)
+class HlQuote:
+    """One Hyperliquid perp's context (USD-quoted)."""
+    coin: str          # Full market name, e.g. "xyz:SKHX"
+    mark: D
+    oracle: D | None
+    mid: D | None
+    prev_day: D | None
+    funding: D | None  # Hourly funding rate as a fraction (0.0000125 = 0.00125 %/h)
+    fetched_ms: int
+
+    @property
+    def day_change(self) -> D | None:
+        return percent(self.mark, self.prev_day) if self.prev_day else None
+
+
+class Hyperliquid:
+    """Reference quotes from Hyperliquid's public info endpoint (no key), one request per perp dex.
+
+    HIP-3 builder dexes (e.g. trade.xyz for equities) are queried with the "dex" parameter and
+    name markets "dex:COIN". Read-only, best effort; a missing market is a note, not an error.
+    """
+    URL = "https://api.hyperliquid.xyz/info"
+    REFRESH_SECONDS = 30
+
+    def __init__(self, tickers: dict[str, tuple[str, str]]):
+        self.tickers = dict(tickers)
+        self.quotes: dict[str, HlQuote] = {}
+        self.notes: dict[str, str] = {}   # symbol -> why there is no quote (not listed / fetch failed)
+        self.refreshed = -1e9
+
+    @staticmethod
+    def parse_dex(data: Any) -> dict[str, HlQuote]:
+        """metaAndAssetCtxs -> {COIN (upper, without dex prefix): HlQuote}."""
+        try:
+            universe, contexts = data[0]["universe"], data[1]
+        except (KeyError, IndexError, TypeError):
+            raise ValueError("Hyperliquid 返回格式异常") from None
+        quotes: dict[str, HlQuote] = {}
+        now_ms = int(time.time() * 1000)
+        for asset, ctx in zip(universe, contexts):
+            if not isinstance(asset, dict) or not isinstance(ctx, dict) or asset.get("isDelisted"):
+                continue
+            name = str(asset.get("name", ""))
+            try:
+                mark = number(ctx.get("markPx"), "标记价")
+            except ValueError:
+                continue
+            quotes[name.split(":")[-1].upper()] = HlQuote(
+                name, mark, _opt(ctx.get("oraclePx")), _opt(ctx.get("midPx")), _opt(ctx.get("prevDayPx")),
+                _opt(ctx.get("funding")), now_ms)
+        return quotes
+
+    async def refresh(self, force: bool = False) -> None:
+        if not self.tickers or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
+            return
+        self.refreshed = time.monotonic()
+        by_dex: dict[str, dict[str, HlQuote] | str] = {}
+        for dex in {dex for dex, _ in self.tickers.values()}:
+            payload: dict[str, Any] = {"type": "metaAndAssetCtxs"}
+            if dex:
+                payload["dex"] = dex
+            try:
+                by_dex[dex] = self.parse_dex(await http_json(self.URL, payload))
+            except Exception as error:
+                by_dex[dex] = clean_error(error)
+        for symbol, (dex, coin) in self.tickers.items():
+            result = by_dex.get(dex)
+            label = f"{dex}:{coin}" if dex else coin
+            if isinstance(result, str):  # Fetch failed: keep the last quote, remember the failure.
+                self.notes[symbol] = f"获取失败（{result}）"
+            elif coin in result:
+                self.quotes[symbol] = result[coin]
+                self.notes.pop(symbol, None)
+            else:
+                similar = [q.coin for k, q in result.items() if coin[:3] in k][:4]
+                hint = f"，相近：{'、'.join(similar)}" if similar else ""
+                self.notes[symbol] = f"未找到市场 {label}（该 dex 共 {len(result)} 个市场{hint}），可用 HL_TICKERS 指定"
+                self.quotes.pop(symbol, None)
+
+    def line(self, symbol: str, price_usd: D | None, style: str, unit_note: str = "") -> str:
+        if symbol not in self.tickers:
+            return ""
+        quote, note = self.quotes.get(symbol), self.notes.get(symbol)
+        if quote is None:
+            return f"🌊 Hyperliquid：{note or '⏳ 等待首次获取'}"
+        parts = [f"🌊 Hyperliquid {quote.coin}：标记 {bold(fmt(quote.mark))}"]
+        if quote.oracle is not None:
+            parts.append(f"预言机 {fmt(quote.oracle)}")
+        if quote.day_change is not None:
+            parts.append(f"24h {pct_text(quote.day_change, style)}")
+        if quote.funding is not None:
+            parts.append(f"资金费率 {fmt((quote.funding * 100).quantize(D('0.00001')))}%/h")
+        if price_usd is None:
+            parts.append("相对 HL：⚪ 暂无汇率，无法折算")
+        else:
+            parts.append(f"相对 HL{unit_note}：{pct_text(percent(price_usd, quote.mark), style, strong=True)}")
+        line = "｜".join(parts)
+        return line + f"｜⚠️ {note}" if note else line
+
+
+@dataclass(frozen=True)
+class IndexQuote:
+    """A cash index level with its previous close and session status."""
+    name: str
+    last: D
+    prev_close: D | None
+    open: D | None
+    high: D | None
+    low: D | None
+    quoted_ms: int
+    source: str
+    status: str = ""  # e.g. "交易中" / "已收盘"
+
+    @property
+    def change(self) -> D | None:
+        return self.last - self.prev_close if self.prev_close else None
+
+
+def naver_number(value: Any) -> D | None:
+    """Naver prints numbers with thousands separators ("3,371.89"); changes may be signed."""
+    if value in (None, ""):
+        return None
+    try:
+        result = D(str(value).replace(",", "").strip())
+    except decimal.InvalidOperation:
+        return None
+    return result if result.is_finite() else None
+
+
+def parse_naver_index(raw: bytes, now_ms: int) -> IndexQuote:
+    """polling.finance.naver.com/api/realtime/domestic/index/KOSPI -> {"datas": [{...}]}"""
+    try:
+        item = json.loads(raw)["datas"][0]
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise ValueError("Naver 指数返回格式异常") from None
+    last = number(str(item.get("closePrice", "")).replace(",", ""), "KOSPI")
+    change = naver_number(item.get("compareToPreviousClosePrice"))
+    direction = str((item.get("compareToPreviousPrice") or {}).get("code", ""))
+    ratio = str(item.get("fluctuationsRatio", ""))
+    if change is not None and (direction == "5" or ratio.startswith("-")):  # 5 = 하락 (falling)
+        change = -abs(change)
+    prev = last - change if change is not None else None
+    quoted_ms = now_ms
+    with contextlib.suppress(ValueError, TypeError):
+        quoted_ms = int(dt.datetime.fromisoformat(str(item.get("localTradedAt"))).timestamp() * 1000)
+    status = {"OPEN": "交易中", "CLOSE": "已收盘", "PREOPEN": "盘前"}.get(str(item.get("marketStatus", "")).upper(), "")
+    return IndexQuote(str(item.get("stockName") or "KOSPI"), last, prev, naver_number(item.get("openPrice")),
+                      naver_number(item.get("highPrice")), naver_number(item.get("lowPrice")), quoted_ms, "Naver", status)
+
+
+def parse_eastmoney_index(raw: bytes, now_ms: int, name: str) -> IndexQuote:
+    d = parse_eastmoney_quote(raw)
+    quoted_ms = int(d["f86"]) * 1000 if str(d.get("f86", "")).isdigit() else now_ms
+    return IndexQuote(str(d.get("f58") or name), number(d["f43"], name), _opt(d.get("f60")), _opt(d.get("f46")),
+                      _opt(d.get("f44")), _opt(d.get("f45")), quoted_ms, "东方财富")
+
+
+def krx_session(now_ms: int) -> str:
+    local = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=9))).time()
+    return "交易中" if dt.time(9, 0) <= local <= dt.time(15, 30) else "已收盘"
+
+
+class KospiIndex:
+    """KOSPI composite index: Naver's realtime index feed first, Eastmoney (100.KS11) as fallback."""
+    REFRESH_SECONDS = 60
+    SOURCES = (("Naver", "https://polling.finance.naver.com/api/realtime/domestic/index/KOSPI",
+                {"Referer": "https://finance.naver.com/"}),
+               ("东方财富", IndexFutures.EM + "100.KS11", {"Referer": "https://quote.eastmoney.com/"}))
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.quote: IndexQuote | None = None
+        self.error = ""
+        self.refreshed = -1e9
+
+    @staticmethod
+    def parse(source: str, raw: bytes, now_ms: int) -> IndexQuote:
+        if source == "Naver":
+            return parse_naver_index(raw, now_ms)
+        return parse_eastmoney_index(raw, now_ms, "韩国KOSPI")
+
+    async def refresh(self, now_ms: int, force: bool = False) -> None:
+        if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
+            return
+        self.refreshed = time.monotonic()
+        failures = []
+        for name, url, extra in self.SOURCES:
+            try:
+                raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                self.quote, self.error = self.parse(name, raw, now_ms), ""
+                return
+            except Exception as error:
+                failures.append(f"{name}: {clean_error(error)}")
+        self.error = "；".join(failures)
+
+    def line(self, now_ms: int, style: str) -> str:
+        if not self.enabled:
+            return ""
+        q = self.quote
+        if q is None:
+            return f"🇰🇷 KOSPI 综合指数：⚠️ 获取失败（{self.error}）" if self.error else "🇰🇷 KOSPI 综合指数：⏳ 等待首次获取"
+        status = q.status or krx_session(now_ms)
+        parts = [f"🇰🇷 KOSPI 综合指数（{status}）：{bold(fmt(q.last))}"]
+        if q.change is not None and q.prev_close:
+            pct = q.change / q.prev_close * 100
+            parts[0] += f" {trend_mark(pct, style)} {q.change:+,.2f}（{pct:+.2f}%）"
+        ohl = [f"{k} {fmt(v)}" for k, v in (("开", q.open), ("高", q.high), ("低", q.low)) if v]
+        if ohl:
+            parts.append(" ".join(ohl))
+        local = dt.datetime.fromtimestamp(q.quoted_ms / 1000, dt.timezone(dt.timedelta(hours=9)))
+        parts.append(f"{local.strftime('%m-%d %H:%M')} 韩国时间更新（{q.source}）")
+        line = "｜".join(parts)
+        return line + f"｜⚠️ 最近刷新失败：{self.error}" if self.error else line
+
+
+@dataclass(frozen=True)
 class Plan:
     reason: str
     next_state: dict
@@ -1096,7 +1375,8 @@ COMMANDS: tuple[Command, ...] = (
     Command("status", "查看合约、基准与数据状态"),
     Command("threshold", "改为严格超过 ±1% 提醒", "1", "不带数字则弹出档位按钮卡片，点选即可"),
     Command("cooldown", "持续超标每 300 秒提醒（0=关闭周期提醒）", "300"),
-    Command("mode", "daily=币安上一 UTC 日日 K 收盘；manual=手动同口径参考价", "daily|manual"),
+    Command("mode", "daily=币安上一 UTC 日日 K 收盘；exchange=币安合约在证券交易所收盘时刻的价格；manual=手动参考价",
+            "daily|exchange|manual"),
     Command("setclose", "设置手动参考价，可一次发多条", "UNITREE 75 09-17 16:00",
             "示例：75 是基准，09-17 16:00 是它的收盘时间（北京，可省略）\n"
             "  末尾再写 YYYY-MM-DD 可指定适用日（默认今天）；批量：每行一组，首行可写统一适用日"),
@@ -1276,6 +1556,8 @@ class Bot:
         self.stocks = StockMarket(config, store)
         self.fx = FxRates(config.fx_manual)
         self.hsi = IndexFutures(config.hsi_futures)
+        self.hl = Hyperliquid(config.hl_tickers)
+        self.kospi = KospiIndex(config.kospi_index)
         self.stopping = asyncio.Event()
         self.started = time.time()
         self.last_cycle = 0.0
@@ -1307,6 +1589,37 @@ class Bot:
         subs = self.subscriptions()
         subs[req.sub_id] = {"chat": req.chat, "thread": req.thread, "active": active}
         self.store.put("subscriptions", subs)
+
+    def exchange_close_ms(self, symbol: str, now_ms: int) -> tuple[int, StockMarketInfo, str]:
+        """The instant the underlying's exchange last fixed a closing price (session complete).
+
+        Uses the fetched exchange bar when available so the baseline and the exchange close
+        share one timestamp; otherwise falls back to the venue's weekday close-time calendar.
+        """
+        ticker = self.config.tickers.get(symbol)
+        if not ticker:
+            raise ValueError("该合约未配置证券交易所代码（EXCHANGE_TICKERS），无法按交易所收盘时刻取基准")
+        info = STOCK_MARKETS[ticker.market]
+        ref = self.stocks.closes.get(symbol)
+        if ref and ref.close_ms and ref.close_ms + 15 * 60_000 <= now_ms:
+            return ref.close_ms, info, f"{info.name}{ticker.code}"
+        tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+        local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
+        for back in range(0, 10):
+            day = local.date() - dt.timedelta(days=back)
+            candidate = dt.datetime.combine(day, info.close_time, tz)
+            if day.weekday() < 5 and candidate + dt.timedelta(minutes=15) <= local:
+                return int(candidate.timestamp() * 1000), info, f"{info.name}{ticker.code}·按日历推算"
+        raise ValueError("找不到最近的交易所收盘时刻")
+
+    async def exchange_time_baseline(self, symbol: str, now_ms: int) -> Baseline:
+        """Binance contract price at the underlying exchange's latest close: same instant as the
+        exchange close, so 相对基准 and 相对交易所 are directly comparable."""
+        close_ms, info, source = self.exchange_close_ms(symbol, now_ms)
+        price, kind = await self.market.price_at(symbol, close_ms)
+        return Baseline(price, f"exchange_time:{close_ms}:{price}",
+                        f"币安合约{kind}@{info.name}收盘时刻" + info.close_label(close_ms) + f"｜{source}",
+                        close_ms + 4 * DAY_MS, close_ms)
 
     def manual_baseline_for(self, symbol: str, now_ms: int) -> Baseline:
         day = beijing_day(now_ms / 1000)
@@ -1492,12 +1805,19 @@ class Bot:
 
     def cmd_mode(self, req: Request) -> str:
         choice = req.args[0].lower() if len(req.args) == 1 else ""
-        if choice not in {"daily", "binance_daily", "manual"}:
-            raise ValueError("用法：/mode daily 或 /mode manual")
-        settings = self.update_settings(mode="manual" if choice == "manual" else "binance_daily")
+        aliases = {"daily": "binance_daily", "binance_daily": "binance_daily", "manual": "manual",
+                   "exchange": "exchange_close", "exchange_close": "exchange_close", "stock": "exchange_close"}
+        if choice not in aliases:
+            raise ValueError("用法：/mode daily、/mode exchange 或 /mode manual")
+        settings = self.update_settings(mode=aliases[choice])
         self.snapshots.clear()
         self.store.delete_prefix("alert:")
         reply = "✅ " + self.config_summary()
+        if settings["mode"] == "exchange_close":
+            missing = [s for s in self.config.symbols if s not in self.config.tickers]
+            reply += "\n基准取币安合约在标的交易所最近一次收盘时刻的价格，与“证券交易所收盘价”同一时点，两者可直接对比。"
+            if missing:
+                reply += "\n⚠️ 未配置交易所代码、无法取基准的合约：" + "、".join(missing) + "（见 EXCHANGE_TICKERS）"
         if settings["mode"] == "manual":
             reply += ("\n请设置参考价：复制下面模板，把“价格”换成数值，“MM-DD HH:MM”换成该价格的收盘时间"
                       "（北京时间，可删掉不填）。缺失/过期的合约不发涨跌提醒。\n"
@@ -1508,7 +1828,7 @@ class Bot:
         lines = self.store_prices(req, "manual")
         lines.append("这是你输入的参考价，未独立核验，不自动换汇。")
         if self.settings()["mode"] != "manual":
-            lines.append("当前仍为日 K 模式；发 /mode manual 后才会使用这些价格。")
+            lines.append(f"当前基准为「{BASELINE_MODES.get(self.settings()['mode'], self.settings()['mode'])}」，不是手动模式；发 /mode manual 后才会使用这些价格。")
         return "\n".join(lines)
 
     def cmd_setexchange(self, req: Request) -> str:
@@ -1567,12 +1887,30 @@ class Bot:
             lines.append(f"⚠️ 最近一次刷新失败，沿用上次数据：{error}")
         return lines
 
-    def context_lines(self, symbol: str, now_ms: int) -> list[str]:
-        """Market-context lines for an alert: the HSI futures quote for Hong Kong-listed underlyings."""
+    def usd_price(self, symbol: str, price: D) -> tuple[D | None, str]:
+        """The contract price in USD: quanto contracts quoted in the stock's currency are converted."""
+        ticker = self.config.tickers.get(symbol)
+        if ticker and ticker.same_unit:
+            currency = STOCK_MARKETS[ticker.market].currency
+            rate = self.fx.rate(currency)
+            return (price / rate if rate else None), f"（币安价按 {currency} 汇率折美元）"
+        return price, ""
+
+    def hl_line(self, symbol: str, price: D) -> str:
+        usd, note = self.usd_price(symbol, price)
+        return self.hl.line(symbol, usd, self.config.color_style, note)
+
+    def context_lines(self, symbol: str, now_ms: int, price: D | None = None) -> list[str]:
+        """Market-context lines for an alert: HSI futures for Hong Kong-listed underlyings, Hyperliquid quote."""
+        lines = []
         ticker = self.config.tickers.get(symbol)
         if self.config.hsi_futures and ticker and ticker.market == "hk" and self.hsi.quote:
-            return [self.hsi.line(now_ms, self.config.color_style)]
-        return []
+            lines.append(self.hsi.line(now_ms, self.config.color_style))
+        if self.config.kospi_index and ticker and ticker.market == "kr" and self.kospi.quote:
+            lines.append(self.kospi.line(now_ms, self.config.color_style))
+        if price is not None and symbol in self.hl.quotes:
+            lines.append(self.hl_line(symbol, price))
+        return lines
 
     def references_for(self, symbol: str, now_ms: int) -> dict[str, Baseline]:
         found = {kind: self.reference_for(kind, symbol, now_ms) for kind in REFERENCE_KINDS}
@@ -1584,7 +1922,7 @@ class Bot:
 
     def config_summary(self) -> str:
         settings = self.settings()
-        mode = "币安上一 UTC 日日 K 收盘（非股票正式昨收）" if settings["mode"] == "binance_daily" else "手动同口径参考价（每日核对）"
+        mode = BASELINE_MODES.get(settings["mode"], settings["mode"])
         return (f"⚙️ 基准：{mode}\n🎯 触发：严格超过 ±{fmt(settings['threshold'])}%｜每 {self.config.poll} 秒检查"
                 f"｜周期提醒 {settings['cooldown']} 秒（0=关闭）")
 
@@ -1597,6 +1935,8 @@ class Bot:
         lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(), f"📊 图例：{legend(style)}"]
         if self.config.hsi_futures:
             lines.append(self.hsi.line(now_ms, style))
+        if self.config.kospi_index:
+            lines.append(self.kospi.line(now_ms, style))
         for symbol in self.config.symbols:
             snapshot = self.snapshots.get(symbol)
             lines.append("\n" + bold(f"📍 {NAMES.get(symbol, symbol)}｜{symbol}"))
@@ -1617,6 +1957,8 @@ class Bot:
                           f"📌 {base.label}"])
             for kind in REFERENCE_KINDS:
                 lines.extend(self.reference_status(kind, symbol, quote.price, now_ms))
+            if symbol in self.config.hl_tickers:
+                lines.append(self.hl_line(symbol, quote.price))
             lines.append(f"⏱ 行情 {stamp(quote.timestamp_ms)}（北京）｜{max(0, int(age))} 秒前")
         lines.append("\n💱 " + self.fx.summary())
         lines.append("仅价格提醒；不会自动撤单/交易。日 K 于北京时间 08:00 换日。")
@@ -1641,7 +1983,8 @@ class Bot:
             return
 
         # Best effort; failures are reported in /status and never block price alerts.
-        await asyncio.gather(self.stocks.refresh(now_ms), self.fx.refresh(), self.hsi.refresh(now_ms))
+        await asyncio.gather(self.stocks.refresh(now_ms), self.fx.refresh(), self.hsi.refresh(now_ms), self.hl.refresh(),
+                             self.kospi.refresh(now_ms))
 
         async def collect(symbol: str) -> tuple[str, dict]:
             try:
@@ -1650,6 +1993,8 @@ class Bot:
                 quote = Quote.parse(rows[symbol], symbol, now_ms, self.config.max_age)
                 if settings["mode"] == "binance_daily":
                     base = await self.market.baseline(symbol, now_ms)
+                elif settings["mode"] == "exchange_close":
+                    base = await self.exchange_time_baseline(symbol, now_ms)
                 else:
                     base = self.manual_baseline_for(symbol, now_ms)
                 return symbol, {"quote": quote, "baseline": base}
@@ -1697,7 +2042,7 @@ class Bot:
                     continue
                 text = alert_text(symbol, quote, base, change, threshold, plan.reason,
                                   self.references_for(symbol, current_ms), self.fx, self.config.color_style,
-                                  self.context_lines(symbol, current_ms))
+                                  self.context_lines(symbol, current_ms, quote.price))
                 if await self.tell(sub["chat"], sub["thread"], text, html_mode=True):
                     # Only mark a price alert as delivered AFTER Telegram accepts it.
                     # Avoid resurrecting state deleted by a command during delivery.
@@ -1822,6 +2167,13 @@ async def check_market(config: Config) -> int:
     hsi = IndexFutures(config.hsi_futures)
     await hsi.refresh(market.now_ms(), force=True)
     print(hsi.line(market.now_ms(), config.color_style).replace(B0, "").replace(B1, ""))
+    kospi = KospiIndex(config.kospi_index)
+    await kospi.refresh(market.now_ms(), force=True)
+    print(kospi.line(market.now_ms(), config.color_style).replace(B0, "").replace(B1, ""))
+    hl = Hyperliquid(config.hl_tickers)
+    await hl.refresh(force=True)
+    for symbol in config.hl_tickers:
+        print(hl.line(symbol, None, config.color_style).replace(B0, "").replace(B1, ""))
     for symbol, ticker in config.tickers.items():
         close = stocks.closes.get(symbol)
         if close:
