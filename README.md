@@ -109,7 +109,7 @@ ALERT_COOLDOWN_SECONDS=300
 ALERT_STEP_PCT=1
 MIN_ALERT_GAP_SECONDS=30
 MAX_PRICE_AGE_SECONDS=120
-BASELINE_MODE=binance_daily
+BASELINE_MODE=exchange_close
 STATE_DB=/data/bot.sqlite3
 EXCHANGE_TICKERS=UNITREEUSDT=sh:688836,HK0625USDT=hk:00625,CXMTUSDT=sh:688825,SKHYNIXUSDT=kr:000660
 ```
@@ -194,7 +194,7 @@ EXCHANGE_TICKERS=UNITREEUSDT=sh:688836,HK0625USDT=hk:00625,CXMTUSDT=sh:688825,SK
 
 日 K 模式的基准是币安合约在 UTC 0 点（北京 08:00）的价格，而“证券交易所收盘价”是股票当天收市时的价格，两者不是同一时点，所以“相对基准”和“相对交易所”会有差。发 `/mode exchange` 后，基准改为币安合约在标的交易所最近一次收盘时刻的价格：上交所 15:00、港交所 16:10、韩交所 15:30（当地时间），从币安该分钟的 1 分钟 K 线收盘价取；那一分钟没有成交时改用标记价 K 线，并在基准说明里标明“成交价”或“标记价”。
 
-收盘时刻优先取自动获取的交易所日 K（与“证券交易所收盘价”共用同一个时间戳），获取不到时按工作日日历推算（法定假日可能误判，状态里会标“按日历推算”）。当天的收盘要在收盘 15 分钟后才生效，之前沿用上一交易日。没有配置 `EXCHANGE_TICKERS` 的合约在此模式下不发提醒，并在状态里说明。环境变量 `BASELINE_MODE=exchange_close` 可设为默认。
+收盘时刻优先取自动获取的交易所日 K（与“证券交易所收盘价”共用同一个时间戳），获取不到时按工作日日历推算（法定假日可能误判，状态里会标“按日历推算”）。当天的收盘要在收盘 15 分钟后才生效，之前沿用上一交易日。没有配置 `EXCHANGE_TICKERS` 的合约在此模式下不发提醒，并在状态里说明。配置了 `EXCHANGE_TICKERS`（默认已配置四个）时这就是默认模式；想回到 UTC 日 K 基准发 `/mode daily`，或设 `BASELINE_MODE=binance_daily`。
 
 ## 成交稀疏时的标记价
 
@@ -330,7 +330,7 @@ HL_TICKERS=UNITREEUSDT=xyz:UNITREE,HK0625USDT=xyz:SHEIN,CXMTUSDT=xyz:CXMT,SKHYNI
 | `ALERT_STEP_PCT` | `1` | 超过阈值后每扩大多少个百分点进入新提醒档位，0 关闭 |
 | `MIN_ALERT_GAP_SECONDS` | `30` | 同一订阅同一合约两次提醒的最短间隔 |
 | `MAX_PRICE_AGE_SECONDS` | `120` | 最新成交时间戳允许的最大年龄 |
-| `BASELINE_MODE` | `binance_daily` | `binance_daily` 或 `manual` |
+| `BASELINE_MODE` | 配置了 `EXCHANGE_TICKERS` 时为 `exchange_close`，否则 `binance_daily` | `exchange_close`、`binance_daily` 或 `manual` |
 | `STATE_DB` | 本地 `./data/bot.sqlite3`；Docker `/data/bot.sqlite3` | SQLite 文件位置 |
 
 通过 TG 命令修改的阈值、冷却和模式会保存到 Volume，并**优先于对应环境变量默认值**。以后要修改它们，直接发 TG 命令；只改 Railway 对应默认变量不一定覆盖已有持久设置。

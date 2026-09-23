@@ -32,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -257,7 +257,10 @@ class Config:
                         e.get("SYMBOLS", ",".join(NAMES)).split(",") if s.strip()))
         if not symbols or len(symbols) > 30 or any(not re.fullmatch(r"[A-Z0-9_]{3,40}", s) for s in symbols):
             raise ValueError("SYMBOLS 应为 1～30 个逗号分隔的币安合约代码")
-        mode = e.get("BASELINE_MODE", "binance_daily").strip()
+        tickers = parse_tickers(e.get("EXCHANGE_TICKERS", DEFAULT_TICKERS), symbols)
+        # With exchange tickers configured the baseline defaults to the exchange-close instant, so the
+        # contract's deviation and the stock's close are measured from the same moment.
+        mode = e.get("BASELINE_MODE", "exchange_close" if tickers else "binance_daily").strip()
         if mode not in BASELINE_MODES:
             raise ValueError("BASELINE_MODE 只能是 binance_daily、manual 或 exchange_close")
         url = e.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/")
@@ -281,7 +284,7 @@ class Config:
             min_gap=bounded_int(e, "MIN_ALERT_GAP_SECONDS", 30, 0, 3600),
             max_age=bounded_int(e, "MAX_PRICE_AGE_SECONDS", 120, 5, 3600),
             baseline_mode=mode, base_url=url,
-            tickers=parse_tickers(e.get("EXCHANGE_TICKERS", DEFAULT_TICKERS), symbols),
+            tickers=tickers,
             color_style=style, fx_manual=parse_fx(e.get("FX_RATES", "")),
             hsi_futures=e.get("HSI_FUTURES", "on").strip().lower() not in {"off", "0", "false", "no"},
             hl_tickers=parse_hl_tickers(e.get("HL_TICKERS", DEFAULT_HL_TICKERS), symbols),
@@ -1825,7 +1828,7 @@ class Bot:
         lines = self.store_prices(req, "manual")
         lines.append("这是你输入的参考价，未独立核验，不自动换汇。")
         if self.settings()["mode"] != "manual":
-            lines.append("当前仍为日 K 模式；发 /mode manual 后才会使用这些价格。")
+            lines.append(f"当前基准为「{BASELINE_MODES.get(self.settings()['mode'], self.settings()['mode'])}」，不是手动模式；发 /mode manual 后才会使用这些价格。")
         return "\n".join(lines)
 
     def cmd_setexchange(self, req: Request) -> str:
