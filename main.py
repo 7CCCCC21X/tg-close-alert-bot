@@ -32,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -55,6 +55,16 @@ def number(value: Any, label: str = "数值", *, zero_ok: bool = False) -> D:
 def fmt(value: Any) -> str:
     value = D(str(value))
     return format(value, ",.8f").rstrip("0").rstrip(".")
+
+
+def fmt_price(value: Any) -> str:
+    """Contract prices trimmed for display: 4 decimals at or above 1, 6 below (feeds send 8+)."""
+    value = D(str(value))
+    return fmt(value.quantize(D("0.0001") if abs(value) >= 1 else D("0.000001")))
+
+
+def brief_error(text: str, limit: int = 60) -> str:
+    return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 def percent(price: D, baseline: D) -> D:
@@ -96,9 +106,38 @@ def trend_mark(change: D, style: str) -> str:
     return ("🔴" if up else "🟢") if style == "cn" else ("🟢" if up else "🔴")
 
 
-def pct_text(change: D, style: str, strong: bool = False) -> str:
-    body = f"{change:+.3f}%"
+def pct_text(change: D, style: str, strong: bool = False, digits: int = 2) -> str:
+    body = f"{change:+.{digits}f}%"
     return f"{trend_mark(change, style)} {bold(body) if strong else body}"
+
+
+def tree(rows: list[str]) -> list[str]:
+    """Prefix rows with ├ / └ so a block reads as one unit."""
+    rows = [r for r in rows if r]
+    return [("└ " if i == len(rows) - 1 else "├ ") + r for i, r in enumerate(rows)]
+
+
+def hhmm(ms: int | float) -> str:
+    return stamp(ms, seconds=False)[6:]
+
+
+def short_source(source: str) -> str:
+    """'上交所688836·腾讯' -> '腾讯'"""
+    return source.split("·")[-1] if source else ""
+
+
+def baseline_brief(base: "Baseline") -> str:
+    """Short origin of a baseline for the 基准 row: '15:00 交易所收盘时刻·成交价', '08:00 UTC日K', '手动·适用 09-23'."""
+    kind = base.key.split(":", 1)[0]
+    if kind == "manual":
+        return f"手动·适用 {base.key.split(':')[1][5:]}" + ("·" + hhmm(base.close_ms) + " 收" if base.close_ms else "")
+    when = stamp(base.close_ms, seconds=False) if base.close_ms else ""
+    if kind == "daily":
+        return f"{when} UTC日K换日".strip()
+    if kind == "exchange_time":
+        price_kind = "标记价" if "标记价" in base.label else "成交价"
+        return f"{when} 交易所收盘时刻·{price_kind}".strip()
+    return when or kind
 
 
 def legend(style: str) -> str:
@@ -222,6 +261,7 @@ def parse_tickers(spec: str, symbols: tuple[str, ...]) -> dict[str, StockTicker]
     return tickers
 
 
+BASELINE_SHORT = {"binance_daily": "UTC 日K（北京 08:00）", "exchange_close": "交易所收盘时刻", "manual": "手动参考价"}
 BASELINE_MODES = {
     "binance_daily": "币安上一 UTC 日日 K 收盘（非股票正式昨收）",
     "exchange_close": "币安合约在证券交易所收盘时刻的价格（与股票收盘同一时点）",
@@ -433,14 +473,15 @@ class Quote:
             raise ValueError(f"最新成交价 {int(last_age)} 秒、标记价 {int(mark_age)} 秒未更新，暂不发涨跌提醒")
         return cls(mark, mark_ms, "mark", last, last_ms, index)
 
-    def price_line(self, now_ms: int, base_value: D) -> str:
-        """'💰 最新 76.36｜基准 76.53｜币安指数 76.4', or the mark-price form when the last trade is stale."""
-        index = f"｜币安指数 {fmt(self.index_price)}" if self.index_price is not None else ""
+    def price_row(self, now_ms: int) -> str:
+        """'币安 73.20｜指数 73.205｜15:53:05（54 秒前）', noting when the mark price stands in."""
+        note = ""
         if self.source == "mark":
             idle = max(0, int((now_ms - self.last_ms) / 1000))
-            return (f"💰 标记价 {bold(fmt(self.price))}｜基准 {fmt(base_value)}{index}"
-                    f"（最新成交 {fmt(self.last_price)}，{idle} 秒无成交，改按标记价判断）")
-        return f"💰 最新 {bold(fmt(self.price))}｜基准 {fmt(base_value)}{index}"
+            note = f"（标记价·{idle} 秒无成交）"
+        index = f"｜指数 {fmt_price(self.index_price)}" if self.index_price is not None else ""
+        age = max(0, int((now_ms - self.timestamp_ms) / 1000))
+        return f"币安 {bold(fmt_price(self.price))}{note}{index}｜{stamp(self.timestamp_ms)}（{age} 秒前）"
 
 
 @dataclass(frozen=True)
@@ -507,28 +548,28 @@ def manual_baseline(record: dict | None, now_ms: int, kind: str = "manual") -> B
                     int(until.timestamp() * 1000), close_ms, currency)
 
 
-def reference_lines(kind: str, price: D, ref: Baseline | None, fx: "FxRates | None", style: str) -> list[str]:
-    """Reference close + its deviation. Foreign-currency closes are converted to USD with the FX rate."""
-    label, command, relative = PRICE_KINDS[kind]
+def reference_row(kind: str, price: D, ref: Baseline | None, fx: "FxRates | None", style: str,
+                  unit_note: str = "") -> str:
+    """'交易所 490.97 CNY ≈ 73.278（09-23 15:00 收·腾讯）→ 🟢 -0.11%｜当日 🔴 +0.36%'."""
+    label, command, _ = PRICE_KINDS[kind]
+    label = "交易所" if kind == "exchange" else label
     if ref is None:
-        return [f"🏛 {label}：未设置（{command}）"]
-    tail = ref.close_text + (f"｜来源 {ref.source}" if ref.source else "")
-    day_move = []
-    if ref.prev_value:  # The stock's own session move, so a contract/stock gap can be read as premium.
-        unit = f" {ref.currency}" if ref.currency else ""
-        day_move = [f"股票当日：{pct_text(percent(ref.value, ref.prev_value), style)}（昨收 {fmt(ref.prev_value)}{unit}）"]
+        return f"{label} 未设置（{command}）"
+    when = f"{stamp(ref.close_ms, seconds=False)} 收" if ref.close_ms else "上一交易日"
+    local = re.search(r"收盘 (\S+ \S+)（([^）]+)）", ref.close_note or "")
+    if local and local.group(2) != "北京时间":  # Non-Beijing venue: show its local close time.
+        when = f"{local.group(1)} {local.group(2)} 收"
+    meta = "·".join(x for x in (when, short_source(ref.source)) if x)
+    day = f"｜当日 {pct_text(percent(ref.value, ref.prev_value), style)}" if ref.prev_value else ""
     if ref.currency in SAME_UNIT:
         unit = f" {ref.currency}" if ref.currency else ""
-        return [f"🏛 {label}：{bold(fmt(ref.value) + unit)}{tail}", *day_move,
-                f"{relative}：{pct_text(percent(price, ref.value), style, strong=True)}"]
+        return f"{label} {bold(fmt(ref.value) + unit)}（{meta}）→ {pct_text(percent(price, ref.value), style)}{unit_note}{day}"
     rate = fx.rate(ref.currency) if fx else None
+    shown = bold(f"{fmt(ref.value)} {ref.currency}")
     if rate is None:
-        return [f"🏛 {label}：{bold(f'{fmt(ref.value)} {ref.currency}')}{tail}", *day_move,
-                f"{relative}：⚪ 暂无 {ref.currency} 汇率，无法折算"]
-    usd = (ref.value / rate).quantize(D("0.0001"))
-    return [f"🏛 {label}：{bold(f'{fmt(ref.value)} {ref.currency}')} ≈ {bold(fmt(usd) + ' USD')}"
-            f"（1 USD = {fmt(rate.quantize(D('0.0001')))} {ref.currency}）{tail}", *day_move,
-            f"{relative}（折美元）：{pct_text(percent(price, usd), style, strong=True)}"]
+        return f"{label} {shown}（{meta}）→ ⚪ 无 {ref.currency} 汇率{day}"
+    usd = (ref.value / rate).quantize(D("0.001"))
+    return f"{label} {shown} ≈ {fmt(usd)}（{meta}）→ {pct_text(percent(price, usd), style)}{day}"
 
 
 class Binance:
@@ -814,15 +855,22 @@ class FxRates:
             found = self.manual.get("CNY") or self.rates.get("CNY")
         return found
 
-    def summary(self) -> str:
+    def summary(self, currencies: tuple[str, ...] = ("CNY", "HKD", "KRW")) -> str:
+        """'1 USD = 6.7001 CNY · 7.79 HKD · 1,382.55 KRW（Frankfurter 09-22）'."""
+        shown = []
+        for currency in currencies:
+            rate = self.rate(currency)
+            if rate is not None and currency not in SAME_UNIT:
+                tag = "手动" if currency in self.manual else ""
+                shown.append(f"{fmt(rate.quantize(D('0.0001')))} {currency}{('（' + tag + '）') if tag else ''}")
         parts = []
-        if self.manual:
-            parts.append("手动汇率 " + "、".join(f"{c}={fmt(v)}" for c, v in self.manual.items()))
-        if self.rates:
-            parts.append(f"汇率来源 {self.source}（{self.updated or '时间未知'}）")
+        if shown:
+            parts.append("1 USD = " + " · ".join(shown))
+        if self.rates and any(c not in self.manual for c in currencies):
+            parts.append(f"{self.source.split('（')[0]} {self.updated[5:10] if len(self.updated) >= 10 else self.updated}".strip())
         if self.error:
             parts.append(f"⚠️ 汇率获取失败：{self.error}")
-        return "｜".join(parts) or "汇率：尚未获取"
+        return "｜".join(parts) if parts else "汇率尚未获取"
 
     async def refresh(self, force: bool = False) -> None:
         if not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS:
@@ -981,20 +1029,16 @@ class IndexFutures:
             return ""
         q = self.quote
         if q is None:
-            return f"📈 恒指期货：⚠️ 获取失败（{self.error}）" if self.error else "📈 恒指期货：⏳ 等待首次获取"
-        parts = [f"📈 恒指期货 {q.name}（{hk_futures_session(q.quoted_ms)}）：{bold(fmt(q.last))}"]
+            return f"📈 恒指期货 ⚠️ 获取失败（{self.error}）" if self.error else "📈 恒指期货 ⏳ 等待首次获取"
+        parts = [f"📈 恒指期货 {hk_futures_session(q.quoted_ms)} {bold(fmt(q.last))}"]
         if q.change is not None and q.prev_settle:
-            pct = q.change / q.prev_settle * 100
-            parts[0] += f" {trend_mark(pct, style)} {q.change:+,.0f}（{pct:+.2f}%）"
+            parts[0] += f" {pct_text(q.change / q.prev_settle * 100, style)}（{q.change:+,.0f}）"
         if q.basis is not None:
             water = "高水" if q.basis > 0 else "低水" if q.basis < 0 else "平水"
-            parts.append(f"{water} {abs(q.basis):,.0f}（恒指 {fmt(q.spot)}）")
-        ohl = [f"开 {fmt(v)}" if k == "开" else f"{k} {fmt(v)}" for k, v in (("开", q.open), ("高", q.high), ("低", q.low)) if v]
-        if ohl:
-            parts.append(" ".join(ohl))
-        parts.append(f"{stamp(q.quoted_ms, seconds=False)} 更新（{q.source}）")
+            parts.append(f"{water} {abs(q.basis):,.0f}")
+        parts.append(f"{hhmm(q.quoted_ms)} {q.source}")
         line = "｜".join(parts)
-        return line + f"｜⚠️ 最近刷新失败：{self.error}" if self.error else line
+        return line + f"｜⚠️ 刷新失败：{brief_error(self.error)}" if self.error else line
 
 
 @dataclass(frozen=True)
@@ -1078,24 +1122,21 @@ class Hyperliquid:
                 self.quotes.pop(symbol, None)
 
     def line(self, symbol: str, price_usd: D | None, style: str, unit_note: str = "") -> str:
+        """'HL 73.279（24h 🔴 +0.03%·费率 0.0006%/h）→ 🟢 -0.11%' as a block row."""
         if symbol not in self.tickers:
             return ""
         quote, note = self.quotes.get(symbol), self.notes.get(symbol)
         if quote is None:
-            return f"🌊 Hyperliquid：{note or '⏳ 等待首次获取'}"
-        parts = [f"🌊 Hyperliquid {quote.coin}：标记 {bold(fmt(quote.mark))}"]
-        if quote.oracle is not None:
-            parts.append(f"预言机 {fmt(quote.oracle)}")
+            return f"HL {note or '⏳ 等待首次获取'}"
+        meta = []
         if quote.day_change is not None:
-            parts.append(f"24h {pct_text(quote.day_change, style)}")
+            meta.append(f"24h {pct_text(quote.day_change, style)}")
         if quote.funding is not None:
-            parts.append(f"资金费率 {fmt((quote.funding * 100).quantize(D('0.00001')))}%/h")
-        if price_usd is None:
-            parts.append("相对 HL：⚪ 暂无汇率，无法折算")
-        else:
-            parts.append(f"相对 HL{unit_note}：{pct_text(percent(price_usd, quote.mark), style, strong=True)}")
-        line = "｜".join(parts)
-        return line + f"｜⚠️ {note}" if note else line
+            meta.append(f"费率 {fmt((quote.funding * 100).quantize(D('0.00001')))}%/h")
+        deviation = ("⚪ 无汇率" if price_usd is None
+                     else pct_text(percent(price_usd, quote.mark), style) + unit_note)
+        line = f"HL {bold(fmt(quote.mark))}" + (f"（{'·'.join(meta)}）" if meta else "") + f" → {deviation}"
+        return line + f"｜⚠️ {brief_error(note)}" if note else line
 
 
 @dataclass(frozen=True)
@@ -1198,19 +1239,14 @@ class KospiIndex:
             return ""
         q = self.quote
         if q is None:
-            return f"🇰🇷 KOSPI 综合指数：⚠️ 获取失败（{self.error}）" if self.error else "🇰🇷 KOSPI 综合指数：⏳ 等待首次获取"
+            return f"🇰🇷 KOSPI ⚠️ 获取失败（{self.error}）" if self.error else "🇰🇷 KOSPI ⏳ 等待首次获取"
         status = q.status or krx_session(now_ms)
-        parts = [f"🇰🇷 KOSPI 综合指数（{status}）：{bold(fmt(q.last))}"]
+        line = f"🇰🇷 KOSPI {status} {bold(fmt(q.last))}"
         if q.change is not None and q.prev_close:
-            pct = q.change / q.prev_close * 100
-            parts[0] += f" {trend_mark(pct, style)} {q.change:+,.2f}（{pct:+.2f}%）"
-        ohl = [f"{k} {fmt(v)}" for k, v in (("开", q.open), ("高", q.high), ("低", q.low)) if v]
-        if ohl:
-            parts.append(" ".join(ohl))
+            line += f" {pct_text(q.change / q.prev_close * 100, style)}（{q.change:+,.2f}）"
         local = dt.datetime.fromtimestamp(q.quoted_ms / 1000, dt.timezone(dt.timedelta(hours=9)))
-        parts.append(f"{local.strftime('%m-%d %H:%M')} 韩国时间更新（{q.source}）")
-        line = "｜".join(parts)
-        return line + f"｜⚠️ 最近刷新失败：{self.error}" if self.error else line
+        line += f"｜{local.strftime('%H:%M')} 韩国时间 {q.source}"
+        return line + f"｜⚠️ 刷新失败：{brief_error(self.error)}" if self.error else line
 
 
 @dataclass(frozen=True)
@@ -1255,19 +1291,15 @@ def alert_plan(state: dict | None, baseline_key: str, change: D, now: float,
 def alert_text(symbol: str, quote: Quote, base: Baseline, change: D, threshold: D, reason: str,
                references: dict[str, Baseline] | None = None, fx: "FxRates | None" = None,
                style: str = "cn", context: list[str] | None = None) -> str:
-    """Alert body with bold sentinels; send it with html=True. ``context`` = extra market lines."""
+    """Alert body with bold sentinels; send it with html=True. ``context`` = extra rows (HL, indices)."""
     side = "上涨" if change > 0 else "下跌"
-    lines = [f"{trend_mark(change, style)} {bold(f'{side}超过 {fmt(threshold)}%｜{NAMES.get(symbol, symbol)}')}",
-             symbol, "",
-             quote.price_line(quote.timestamp_ms, base.value),
-             f"相对基准：{pct_text(change, style, strong=True)}"]
-    for kind, ref in (references or {}).items():
-        lines.extend(reference_lines(kind, quote.price, ref, fx, style))
-    lines += [line for line in (context or []) if line]
-    lines += [f"📌 {base.label}", f"📝 原因：{reason}",
-              f"⏱ 行情时间：{stamp(quote.timestamp_ms)}（北京时间）",
-              "⚠️ 合约行情提示，不代表股票官方收盘结算结果。"]
-    return "\n".join(lines)
+    rows = [f"基准 {fmt(base.value)}（{baseline_brief(base)}）→ {pct_text(change, style, strong=True, digits=3)}"]
+    rows += [reference_row(kind, quote.price, ref, fx, style) for kind, ref in (references or {}).items()]
+    rows += [line for line in (context or []) if line]
+    rows.append(f"📝 {reason}")
+    return "\n".join([f"{trend_mark(change, style)} {bold(f'{side}超过 {fmt(threshold)}%｜{NAMES.get(symbol, symbol)}')}（{symbol}）",
+                      quote.price_row(quote.timestamp_ms), *tree(rows),
+                      "⚠️ 合约行情提示，不代表股票官方收盘结算结果。"])
 
 
 class Telegram:
@@ -1881,11 +1913,11 @@ class Bot:
         ref = self.reference_for(kind, symbol, now_ms)
         error = self.stocks.errors.get(symbol) if kind == "exchange" else None
         if ref is None and error:
-            return [f"🏛 证券交易所收盘价：⚠️ 自动获取失败（{error}）；可用 /setexchange 手动记录"]
-        lines = reference_lines(kind, price, ref, self.fx, self.config.color_style)
+            return [f"交易所 ⚠️ 获取失败（{error}）；可用 /setexchange 手动记录"]
+        rows = [reference_row(kind, price, ref, self.fx, self.config.color_style)]
         if error and ref and ref.source:
-            lines.append(f"⚠️ 最近一次刷新失败，沿用上次数据：{error}")
-        return lines
+            rows.append(f"⚠️ 交易所沿用上次数据，刷新失败：{brief_error(error)}")
+        return rows
 
     def usd_price(self, symbol: str, price: D) -> tuple[D | None, str]:
         """The contract price in USD: quanto contracts quoted in the stock's currency are converted."""
@@ -1893,7 +1925,7 @@ class Bot:
         if ticker and ticker.same_unit:
             currency = STOCK_MARKETS[ticker.market].currency
             rate = self.fx.rate(currency)
-            return (price / rate if rate else None), f"（币安价按 {currency} 汇率折美元）"
+            return (price / rate if rate else None), f"（{currency} 折美元）"
         return price, ""
 
     def hl_line(self, symbol: str, price: D) -> str:
@@ -1922,9 +1954,9 @@ class Bot:
 
     def config_summary(self) -> str:
         settings = self.settings()
-        mode = BASELINE_MODES.get(settings["mode"], settings["mode"])
-        return (f"⚙️ 基准：{mode}\n🎯 触发：严格超过 ±{fmt(settings['threshold'])}%｜每 {self.config.poll} 秒检查"
-                f"｜周期提醒 {settings['cooldown']} 秒（0=关闭）")
+        mode = BASELINE_SHORT.get(settings["mode"], settings["mode"])
+        return (f"⚙️ 基准 {mode}｜阈值 ±{fmt(settings['threshold'])}%｜每 {self.config.poll} 秒"
+                f"｜周期 {settings['cooldown']} 秒")
 
     def status(self, sub_id: str) -> str:
         """Status card with bold sentinels; send it with html_mode=True."""
@@ -1932,7 +1964,10 @@ class Bot:
         sub = self.subscriptions().get(sub_id)
         active = "🟢 已订阅" if sub and sub.get("active") else "⏸ 未订阅/已暂停"
         style = self.config.color_style
-        lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(), f"📊 图例：{legend(style)}"]
+        lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(),
+                 f"📊 {legend(style)}｜→ 后为币安现价相对该行价格"]
+        if self.settings()["mode"] == "binance_daily" and self.config.tickers:
+            lines.append("💡 /mode exchange 可把基准对齐到交易所收盘时刻")
         if self.config.hsi_futures:
             lines.append(self.hsi.line(now_ms, style))
         if self.config.kospi_index:
@@ -1941,27 +1976,28 @@ class Bot:
             snapshot = self.snapshots.get(symbol)
             lines.append("\n" + bold(f"📍 {NAMES.get(symbol, symbol)}｜{symbol}"))
             if not snapshot:
-                lines.append("⏳ 等待首次采样或基准切换后的刷新")
+                lines.append("└ ⏳ 等待首次采样或基准切换后的刷新")
                 continue
             if "error" in snapshot:
-                lines.append("⚠️ " + snapshot["error"])
+                lines.append("└ ⚠️ " + snapshot["error"])
                 continue
             quote, base = snapshot["quote"], snapshot["baseline"]
             age = (now_ms - quote.timestamp_ms) / 1000
             if age > self.config.max_age or now_ms >= base.valid_until_ms:
-                lines.append("⚠️ 缓存已过期，等待有效的新行情/基准；不应据此判断当前涨跌")
+                lines.append("└ ⚠️ 缓存已过期，等待有效的新行情/基准；不应据此判断当前涨跌")
                 continue
             change = percent(quote.price, base.value)
-            lines.extend([quote.price_line(now_ms, base.value),
-                          f"相对基准：{pct_text(change, style, strong=True)}",
-                          f"📌 {base.label}"])
+            rows = [quote.price_row(now_ms),
+                    f"基准 {fmt(base.value)}（{baseline_brief(base)}）→ {pct_text(change, style, strong=True, digits=3)}"]
             for kind in REFERENCE_KINDS:
-                lines.extend(self.reference_status(kind, symbol, quote.price, now_ms))
+                rows.extend(self.reference_status(kind, symbol, quote.price, now_ms))
             if symbol in self.config.hl_tickers:
-                lines.append(self.hl_line(symbol, quote.price))
-            lines.append(f"⏱ 行情 {stamp(quote.timestamp_ms)}（北京）｜{max(0, int(age))} 秒前")
-        lines.append("\n💱 " + self.fx.summary())
-        lines.append("仅价格提醒；不会自动撤单/交易。日 K 于北京时间 08:00 换日。")
+                rows.append(self.hl_line(symbol, quote.price))
+            lines.extend(tree(rows))
+        used = tuple(dict.fromkeys(STOCK_MARKETS[t.market].currency for t in self.config.tickers.values()
+                                   if not t.same_unit or True))
+        lines.append("\n💱 " + self.fx.summary(used or ("CNY", "HKD", "KRW")))
+        lines.append("仅价格提醒；不会自动撤单/交易。")
         return "\n".join(lines)
 
     async def one_cycle(self) -> None:
