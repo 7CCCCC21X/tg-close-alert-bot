@@ -32,7 +32,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -241,6 +241,7 @@ class Config:
     fx_manual: dict[str, D]
     hsi_futures: bool = True  # Show the Hang Seng Index futures quote (night session after HK close).
     hl_tickers: dict[str, tuple[str, str]] = field(default_factory=dict)  # symbol -> (dex, coin) on Hyperliquid
+    kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -277,6 +278,7 @@ class Config:
             color_style=style, fx_manual=parse_fx(e.get("FX_RATES", "")),
             hsi_futures=e.get("HSI_FUTURES", "on").strip().lower() not in {"off", "0", "false", "no"},
             hl_tickers=parse_hl_tickers(e.get("HL_TICKERS", DEFAULT_HL_TICKERS), symbols),
+            kospi_index=e.get("KOSPI_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
         )
 
 
@@ -1060,6 +1062,121 @@ class Hyperliquid:
 
 
 @dataclass(frozen=True)
+class IndexQuote:
+    """A cash index level with its previous close and session status."""
+    name: str
+    last: D
+    prev_close: D | None
+    open: D | None
+    high: D | None
+    low: D | None
+    quoted_ms: int
+    source: str
+    status: str = ""  # e.g. "交易中" / "已收盘"
+
+    @property
+    def change(self) -> D | None:
+        return self.last - self.prev_close if self.prev_close else None
+
+
+def naver_number(value: Any) -> D | None:
+    """Naver prints numbers with thousands separators ("3,371.89"); changes may be signed."""
+    if value in (None, ""):
+        return None
+    try:
+        result = D(str(value).replace(",", "").strip())
+    except decimal.InvalidOperation:
+        return None
+    return result if result.is_finite() else None
+
+
+def parse_naver_index(raw: bytes, now_ms: int) -> IndexQuote:
+    """polling.finance.naver.com/api/realtime/domestic/index/KOSPI -> {"datas": [{...}]}"""
+    try:
+        item = json.loads(raw)["datas"][0]
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise ValueError("Naver 指数返回格式异常") from None
+    last = number(str(item.get("closePrice", "")).replace(",", ""), "KOSPI")
+    change = naver_number(item.get("compareToPreviousClosePrice"))
+    direction = str((item.get("compareToPreviousPrice") or {}).get("code", ""))
+    ratio = str(item.get("fluctuationsRatio", ""))
+    if change is not None and (direction == "5" or ratio.startswith("-")):  # 5 = 하락 (falling)
+        change = -abs(change)
+    prev = last - change if change is not None else None
+    quoted_ms = now_ms
+    with contextlib.suppress(ValueError, TypeError):
+        quoted_ms = int(dt.datetime.fromisoformat(str(item.get("localTradedAt"))).timestamp() * 1000)
+    status = {"OPEN": "交易中", "CLOSE": "已收盘", "PREOPEN": "盘前"}.get(str(item.get("marketStatus", "")).upper(), "")
+    return IndexQuote(str(item.get("stockName") or "KOSPI"), last, prev, naver_number(item.get("openPrice")),
+                      naver_number(item.get("highPrice")), naver_number(item.get("lowPrice")), quoted_ms, "Naver", status)
+
+
+def parse_eastmoney_index(raw: bytes, now_ms: int, name: str) -> IndexQuote:
+    d = parse_eastmoney_quote(raw)
+    quoted_ms = int(d["f86"]) * 1000 if str(d.get("f86", "")).isdigit() else now_ms
+    return IndexQuote(str(d.get("f58") or name), number(d["f43"], name), _opt(d.get("f60")), _opt(d.get("f46")),
+                      _opt(d.get("f44")), _opt(d.get("f45")), quoted_ms, "东方财富")
+
+
+def krx_session(now_ms: int) -> str:
+    local = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=9))).time()
+    return "交易中" if dt.time(9, 0) <= local <= dt.time(15, 30) else "已收盘"
+
+
+class KospiIndex:
+    """KOSPI composite index: Naver's realtime index feed first, Eastmoney (100.KS11) as fallback."""
+    REFRESH_SECONDS = 60
+    SOURCES = (("Naver", "https://polling.finance.naver.com/api/realtime/domestic/index/KOSPI",
+                {"Referer": "https://finance.naver.com/"}),
+               ("东方财富", IndexFutures.EM + "100.KS11", {"Referer": "https://quote.eastmoney.com/"}))
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.quote: IndexQuote | None = None
+        self.error = ""
+        self.refreshed = -1e9
+
+    @staticmethod
+    def parse(source: str, raw: bytes, now_ms: int) -> IndexQuote:
+        if source == "Naver":
+            return parse_naver_index(raw, now_ms)
+        return parse_eastmoney_index(raw, now_ms, "韩国KOSPI")
+
+    async def refresh(self, now_ms: int, force: bool = False) -> None:
+        if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
+            return
+        self.refreshed = time.monotonic()
+        failures = []
+        for name, url, extra in self.SOURCES:
+            try:
+                raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                self.quote, self.error = self.parse(name, raw, now_ms), ""
+                return
+            except Exception as error:
+                failures.append(f"{name}: {clean_error(error)}")
+        self.error = "；".join(failures)
+
+    def line(self, now_ms: int, style: str) -> str:
+        if not self.enabled:
+            return ""
+        q = self.quote
+        if q is None:
+            return f"🇰🇷 KOSPI 综合指数：⚠️ 获取失败（{self.error}）" if self.error else "🇰🇷 KOSPI 综合指数：⏳ 等待首次获取"
+        status = q.status or krx_session(now_ms)
+        parts = [f"🇰🇷 KOSPI 综合指数（{status}）：{bold(fmt(q.last))}"]
+        if q.change is not None and q.prev_close:
+            pct = q.change / q.prev_close * 100
+            parts[0] += f" {trend_mark(pct, style)} {q.change:+,.2f}（{pct:+.2f}%）"
+        ohl = [f"{k} {fmt(v)}" for k, v in (("开", q.open), ("高", q.high), ("低", q.low)) if v]
+        if ohl:
+            parts.append(" ".join(ohl))
+        local = dt.datetime.fromtimestamp(q.quoted_ms / 1000, dt.timezone(dt.timedelta(hours=9)))
+        parts.append(f"{local.strftime('%m-%d %H:%M')} 韩国时间更新（{q.source}）")
+        line = "｜".join(parts)
+        return line + f"｜⚠️ 最近刷新失败：{self.error}" if self.error else line
+
+
+@dataclass(frozen=True)
 class Plan:
     reason: str
     next_state: dict
@@ -1402,6 +1519,7 @@ class Bot:
         self.fx = FxRates(config.fx_manual)
         self.hsi = IndexFutures(config.hsi_futures)
         self.hl = Hyperliquid(config.hl_tickers)
+        self.kospi = KospiIndex(config.kospi_index)
         self.stopping = asyncio.Event()
         self.started = time.time()
         self.last_cycle = 0.0
@@ -1712,6 +1830,8 @@ class Bot:
         ticker = self.config.tickers.get(symbol)
         if self.config.hsi_futures and ticker and ticker.market == "hk" and self.hsi.quote:
             lines.append(self.hsi.line(now_ms, self.config.color_style))
+        if self.config.kospi_index and ticker and ticker.market == "kr" and self.kospi.quote:
+            lines.append(self.kospi.line(now_ms, self.config.color_style))
         if price is not None and symbol in self.hl.quotes:
             lines.append(self.hl_line(symbol, price))
         return lines
@@ -1739,6 +1859,8 @@ class Bot:
         lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(), f"📊 图例：{legend(style)}"]
         if self.config.hsi_futures:
             lines.append(self.hsi.line(now_ms, style))
+        if self.config.kospi_index:
+            lines.append(self.kospi.line(now_ms, style))
         for symbol in self.config.symbols:
             snapshot = self.snapshots.get(symbol)
             lines.append("\n" + bold(f"📍 {NAMES.get(symbol, symbol)}｜{symbol}"))
@@ -1785,7 +1907,8 @@ class Bot:
             return
 
         # Best effort; failures are reported in /status and never block price alerts.
-        await asyncio.gather(self.stocks.refresh(now_ms), self.fx.refresh(), self.hsi.refresh(now_ms), self.hl.refresh())
+        await asyncio.gather(self.stocks.refresh(now_ms), self.fx.refresh(), self.hsi.refresh(now_ms), self.hl.refresh(),
+                             self.kospi.refresh(now_ms))
 
         async def collect(symbol: str) -> tuple[str, dict]:
             try:
@@ -1966,6 +2089,9 @@ async def check_market(config: Config) -> int:
     hsi = IndexFutures(config.hsi_futures)
     await hsi.refresh(market.now_ms(), force=True)
     print(hsi.line(market.now_ms(), config.color_style).replace(B0, "").replace(B1, ""))
+    kospi = KospiIndex(config.kospi_index)
+    await kospi.refresh(market.now_ms(), force=True)
+    print(kospi.line(market.now_ms(), config.color_style).replace(B0, "").replace(B1, ""))
     hl = Hyperliquid(config.hl_tickers)
     await hl.refresh(force=True)
     for symbol in config.hl_tickers:
