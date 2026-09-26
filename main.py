@@ -15,6 +15,7 @@ import decimal
 import html
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -32,7 +33,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -206,6 +207,23 @@ STOCK_MARKETS = {
 DEFAULT_TICKERS = "UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:688825,SKHYNIXUSDT=kr:000660"
 
 
+def parse_prob_vol(spec: str) -> dict[str, float]:
+    """PROB_VOL="UNITREEUSDT=3.5,HSI=1.2,KOSPI=2" — daily volatility in percent, overriding estimates."""
+    result: dict[str, float] = {}
+    for item in spec.split(","):
+        if not item.strip():
+            continue
+        key, _, value = item.partition("=")
+        try:
+            sigma = float(value) / 100
+        except ValueError:
+            raise ValueError(f"PROB_VOL 数值无效：{item.strip()}") from None
+        if not 0 < sigma < 1:
+            raise ValueError(f"PROB_VOL 应为 0～100 之间的日波动率百分比：{item.strip()}")
+        result[key.strip().upper()] = sigma
+    return result
+
+
 def parse_fx(spec: str) -> dict[str, D]:
     """FX_RATES="CNY=7.12,HKD=7.79": units of each currency per 1 USD; overrides the fetched rates."""
     rates: dict[str, D] = {}
@@ -289,6 +307,8 @@ class Config:
     color_style: str
     fx_manual: dict[str, D]
     hsi_futures: bool = True  # Show the Hang Seng Index futures quote (night session after HK close).
+    probability: bool = True  # Show model probabilities that the next close ends above/below the reference.
+    prob_vol: dict[str, float] = field(default_factory=dict)  # Daily σ overrides (fraction), keyed by symbol/HSI/KOSPI.
     hl_tickers: dict[str, tuple[str, str]] = field(default_factory=dict)  # symbol -> (dex, coin) on Hyperliquid
     kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
@@ -333,6 +353,8 @@ class Config:
             hl_tickers=parse_hl_tickers(e.get("HL_TICKERS", DEFAULT_HL_TICKERS), symbols),
             kospi_index=e.get("KOSPI_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
             hl_index=parse_hl_tickers(e.get("HL_INDEX", DEFAULT_HL_INDEX), ("KR200",)),
+            probability=e.get("PROBABILITY", "on").strip().lower() not in {"off", "0", "false", "no"},
+            prob_vol=parse_prob_vol(e.get("PROB_VOL", "")),
         )
 
 
@@ -550,6 +572,14 @@ def manual_baseline(record: dict | None, now_ms: int, kind: str = "manual") -> B
     return Baseline(value, f"{kind}:{today}:{value}",
                     f"{label}｜适用日 {today}（北京时间）" + close_label(close_ms),
                     int(until.timestamp() * 1000), close_ms, currency)
+
+
+def close_when(ref: "Baseline") -> str:
+    """'09-23 15:30 韩国时间' for non-Beijing venues, else '09-23 15:00'."""
+    local = re.search(r"收盘 (\S+ \S+)（([^）]+)）", ref.close_note or "")
+    if local and local.group(2) != "北京时间":
+        return f"{local.group(1)} {local.group(2)}"
+    return stamp(ref.close_ms, seconds=False) if ref.close_ms else "上一交易日"
 
 
 def reference_row(kind: str, price: D, ref: Baseline | None, fx: "FxRates | None", style: str,
@@ -1160,7 +1190,23 @@ class Hyperliquid:
         self.tickers = dict(tickers)
         self.quotes: dict[str, HlQuote] = {}
         self.notes: dict[str, str] = {}   # symbol -> why there is no quote (not listed / fetch failed)
+        self.at_cache: dict[tuple[str, int], D] = {}
         self.refreshed = -1e9
+
+    async def price_at(self, coin: str, at_ms: int) -> D:
+        """Close of the 1-minute candle ending at ``at_ms`` (the market's price at that instant)."""
+        key = (coin, at_ms)
+        if key in self.at_cache:
+            return self.at_cache[key]
+        rows = await http_json(self.URL, {"type": "candleSnapshot", "req": {
+            "coin": coin, "interval": "1m", "startTime": at_ms - 5 * 60_000, "endTime": at_ms}})
+        candles = [r for r in rows if isinstance(r, dict) and int(r.get("t", 0)) < at_ms] if isinstance(rows, list) else []
+        if not candles:
+            raise ValueError(f"Hyperliquid 没有 {coin} 在 {stamp(at_ms, seconds=False)} 的 K 线")
+        price = number(max(candles, key=lambda r: int(r["t"]))["c"], "HL 收盘时刻价格")
+        self.at_cache = {k: v for k, v in self.at_cache.items() if k[0] != coin}
+        self.at_cache[key] = price
+        return price
 
     @staticmethod
     def parse_dex(data: Any) -> dict[str, HlQuote]:
@@ -1368,6 +1414,159 @@ class KospiIndex:
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error200)}" if self.error200 else line
 
 
+# --- close-direction probability model ----------------------------------------------------------
+# effective = reference close × proxy_now / proxy_at_reference_close   (proxy: Binance / HL / futures)
+# P(strict up) = 1 − Φ(ln((ref + tick/2) / effective) / σ_remaining),  P(strict down) = Φ(ln((ref − tick/2) / effective) / σ)
+# σ_remaining = σ_daily × √(remaining session minutes / session minutes); a flat close pays each side half.
+SESSIONS = {  # continuous-trading intervals, local time
+    "sh": ((dt.time(9, 30), dt.time(11, 30)), (dt.time(13, 0), dt.time(15, 0))),
+    "sz": ((dt.time(9, 30), dt.time(11, 30)), (dt.time(13, 0), dt.time(15, 0))),
+    "hk": ((dt.time(9, 30), dt.time(12, 0)), (dt.time(13, 0), dt.time(16, 0))),
+    "kr": ((dt.time(9, 0), dt.time(15, 30)),),
+}
+PRIOR_VOL = {"sh": 0.035, "sz": 0.035, "hk": 0.03, "kr": 0.03, "HSI": 0.013, "KOSPI": 0.02}
+PRIOR_WEIGHT = 10  # pseudo-observations given to the prior when blending with estimated volatility
+
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def price_tick(market: str, price: D, index: bool = False) -> D:
+    """Minimum price step, so an exactly-flat close gets its own (small) probability."""
+    if index or market in {"sh", "sz"}:
+        return D("0.01")
+    table = {"hk": ((D("0.25"), "0.001"), (D("0.5"), "0.005"), (D(10), "0.01"), (D(20), "0.02"), (D(100), "0.05"),
+                    (D(200), "0.1"), (D(500), "0.2"), (D(1000), "0.5"), (D(2000), "1"), (D(5000), "2")),
+             "kr": ((D(2000), "1"), (D(5000), "5"), (D(20000), "10"), (D(50000), "50"), (D(200000), "100"),
+                    (D(500000), "500"))}
+    last = {"hk": "5", "kr": "1000"}
+    for bound, step in table.get(market, ()):
+        if price < bound:
+            return D(step)
+    return D(last.get(market, "0.01"))
+
+
+def session_remaining(market: str, now_ms: int, close_date: dt.date | None = None) -> tuple[float, dt.date]:
+    """(share of a full session's variance still ahead, target close date) for the next close.
+
+    Weekends are skipped; exchange holidays are not known, so the target may be a holiday.
+    """
+    info = STOCK_MARKETS[market]
+    tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+    local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
+    total = sum((dt.datetime.combine(local.date(), b) - dt.datetime.combine(local.date(), a)).seconds
+                for a, b in SESSIONS[market]) / 60
+    today = local.date()
+    finalised = local >= dt.datetime.combine(today, info.close_time, tz) + dt.timedelta(minutes=15)
+    if today.weekday() < 5 and not finalised and (close_date is None or close_date < today):
+        remaining = sum(max(0.0, (dt.datetime.combine(today, b, tz) - max(dt.datetime.combine(today, a, tz), local)).total_seconds())
+                        for a, b in SESSIONS[market]) / 60
+        return max(remaining, 1.0) / total, today
+    target = today + dt.timedelta(days=1)
+    while target.weekday() >= 5:
+        target += dt.timedelta(days=1)
+    return 1.0, target
+
+
+@dataclass(frozen=True)
+class CloseOdds:
+    """Model probability that the next close ends above / at / below the reference close."""
+    name: str
+    target: dt.date
+    ref: D
+    ref_note: str
+    proxy_note: str        # e.g. "币安 73.45 / 收盘时刻 72.81 → +0.879%"
+    effective: D
+    sigma_daily: float
+    sigma_note: str
+    remaining: float       # share of a session's variance left
+    up: float
+    flat: float
+    down: float
+    unit: str = ""
+
+    @property
+    def sigma(self) -> float:
+        return self.sigma_daily * math.sqrt(self.remaining)
+
+    @property
+    def z(self) -> float:
+        return math.log(float(self.effective / self.ref)) / self.sigma
+
+    @property
+    def fair_up(self) -> float:
+        return self.up + self.flat / 2
+
+    @property
+    def fair_down(self) -> float:
+        return self.down + self.flat / 2
+
+    def row(self) -> str:
+        """Compact status row: '🎲 09-28收 涨 41.0¢｜跌 59.0¢（有效 6,958.67·σ 3.02%）'."""
+        return (f"🎲 {self.target.strftime('%m-%d')}收 涨 {bold(f'{self.fair_up * 100:.1f}¢')}｜跌 {bold(f'{self.fair_down * 100:.1f}¢')}"
+                f"（有效 {fmt(self.effective.quantize(D('0.01')))}·σ {self.sigma * 100:.2f}%）")
+
+    def detail(self) -> list[str]:
+        unit = f" {self.unit}" if self.unit else ""
+        return [
+            f"参考收盘 {bold(fmt(self.ref) + unit)}（{self.ref_note}）→ 目标 {self.target.strftime('%m-%d')} 收盘",
+            f"代理 {self.proxy_note}",
+            f"有效价 {bold(fmt(self.effective.quantize(D('0.0001'))) + unit)}（{percent(self.effective, self.ref):+.3f}%）",
+            f"σ 日 {self.sigma_daily * 100:.2f}%（{self.sigma_note}）× √{self.remaining:.3f} = {self.sigma * 100:.2f}%｜z {self.z:+.3f}",
+            f"涨 {self.up * 100:.2f}%·平 {self.flat * 100:.2f}%·跌 {self.down * 100:.2f}% → 公平价 涨 {bold(f'{self.fair_up * 100:.1f}¢')} / 跌 {bold(f'{self.fair_down * 100:.1f}¢')}",
+        ]
+
+
+def close_odds(name: str, ref: D, effective: D, sigma_daily: float, remaining: float, target: dt.date, tick: D,
+               ref_note: str, proxy_note: str, sigma_note: str, unit: str = "") -> CloseOdds:
+    sigma = max(sigma_daily * math.sqrt(max(remaining, 1e-6)), 1e-9)
+    half = tick / 2
+    hi = math.log(float((ref + half) / effective)) / sigma
+    lo = math.log(float((ref - half) / effective)) / sigma if ref > half else -math.inf
+    up, down = 1 - norm_cdf(hi), norm_cdf(lo)
+    return CloseOdds(name, target, ref, ref_note, proxy_note, effective, sigma_daily, sigma_note, remaining,
+                     up, max(0.0, 1 - up - down), down, unit)
+
+
+def realised_vol(closes: list[D]) -> tuple[float, int]:
+    """Sample standard deviation of daily log returns, and the number of returns used."""
+    values = [float(c) for c in closes if c and c > 0]
+    returns = [math.log(b / a) for a, b in zip(values, values[1:])]
+    if len(returns) < 2:
+        return 0.0, len(returns)
+    mean = sum(returns) / len(returns)
+    return math.sqrt(sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)), len(returns)
+
+
+class VolBook:
+    """Daily volatility per asset: manual override, else recent realised volatility blended with a prior."""
+    REFRESH_SECONDS = 6 * 3600
+
+    def __init__(self, overrides: dict[str, float]):
+        self.overrides = dict(overrides)
+        self.estimates: dict[str, tuple[float, int, str]] = {}   # key -> (sigma, n, source)
+        self.refreshed: dict[str, float] = {}
+
+    def due(self, key: str) -> bool:
+        return key not in self.overrides and time.monotonic() - self.refreshed.get(key, -1e9) >= self.REFRESH_SECONDS
+
+    def record(self, key: str, closes: list[D], source: str) -> None:
+        sigma, n = realised_vol(closes)
+        self.estimates[key] = (sigma, n, source)
+        self.refreshed[key] = time.monotonic()
+
+    def get(self, key: str, prior_key: str) -> tuple[float, str]:
+        if key in self.overrides:
+            return self.overrides[key], "PROB_VOL 手动设定"
+        prior = PRIOR_VOL[prior_key]
+        sigma, n, source = self.estimates.get(key, (0.0, 0, ""))
+        if n < 2:
+            return prior, f"先验 {prior * 100:.1f}%，暂无历史"
+        blended = math.sqrt((n * sigma ** 2 + PRIOR_WEIGHT * prior ** 2) / (n + PRIOR_WEIGHT))
+        return blended, f"{source} {n} 日 {sigma * 100:.2f}% 与先验 {prior * 100:.1f}% 加权"
+
+
 @dataclass(frozen=True)
 class Plan:
     reason: str
@@ -1535,6 +1734,7 @@ COMMANDS: tuple[Command, ...] = (
             "带 HKD/CNY/KRW 等非美元货币时只展示不算涨跌；不带货币按同口径算相对涨跌"),
     Command("pause", "暂停当前订阅"),
     Command("resume", "恢复当前订阅"),
+    Command("prob", "查看各标的下个收盘涨跌概率及计算过程"),
     Command("test", "发送测试消息，不代表行情正常"),
     Command("id", "查看你的用户 ID、聊天 ID、话题 ID"),
     Command("help", "显示说明"),
@@ -1709,6 +1909,9 @@ class Bot:
         self.hsi = IndexFutures(config.hsi_futures)
         self.hl = Hyperliquid({**config.hl_tickers, **config.hl_index})
         self.kospi = KospiIndex(config.kospi_index)
+        self.vols = VolBook(config.prob_vol)
+        self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
+        self.anchor_tries: dict[str, float] = {}
         self.stopping = asyncio.Event()
         self.started = time.time()
         self.last_cycle = 0.0
@@ -1720,7 +1923,7 @@ class Bot:
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
-            "/setexchange": self.cmd_setexchange,
+            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob,
         }
 
     def settings(self) -> dict:
@@ -2051,6 +2254,175 @@ class Bot:
         usd, note = self.usd_price(symbol, price)
         return self.hl.line(symbol, usd, self.config.color_style, note)
 
+    # --- probability inputs and odds -----------------------------------------------------------------
+
+    async def refresh_odds_inputs(self, now_ms: int) -> None:
+        """Proxy prices at each reference close and volatility estimates (cached; best effort)."""
+        for symbol, ticker in self.config.tickers.items():
+            ref = self.reference_for("exchange", symbol, now_ms)
+            if ref and ref.close_ms and self.anchors.get(symbol, (0,))[0] != ref.close_ms and self.retry_ok(symbol):
+                with contextlib.suppress(Exception):
+                    price, _ = await self.market.price_at(symbol, ref.close_ms)
+                    self.anchors[symbol] = (ref.close_ms, price)
+            if self.vols.due(symbol):
+                self.vols.refreshed[symbol] = time.monotonic()  # one attempt per window even if it fails
+                with contextlib.suppress(Exception):
+                    rows = await self.market.get("/fapi/v1/klines", symbol=symbol, interval="1d", limit=31)
+                    closes = [number(r[4], "收盘") for r in rows[:-1] if isinstance(r, list) and len(r) > 4]
+                    self.vols.record(symbol, closes, "币安日K")
+        kospi, hl = self.kospi.quote, self.hl.quotes.get("KR200")
+        if kospi and hl:
+            close_ms = self.kospi_close_ms(kospi)
+            if self.anchors.get("KOSPI", (0,))[0] != close_ms and self.retry_ok("KOSPI"):
+                with contextlib.suppress(Exception):
+                    self.anchors["KOSPI"] = (close_ms, await self.hl.price_at(hl.coin, close_ms))
+        q = self.hsi.quote
+        if q and q.spot is not None:
+            close_date = self.hk_cash_close_date(now_ms)
+            local = dt.datetime.fromtimestamp(q.quoted_ms / 1000, BEIJING)
+            close_ms = int(dt.datetime.combine(close_date, dt.time(16, 10), BEIJING).timestamp() * 1000)
+            # First futures print after the cash close = the futures level the close is anchored to.
+            if (hk_futures_session(q.quoted_ms) != "夜市" and local.date() == close_date and local.time() >= dt.time(16, 10)
+                    and self.anchors.get("HSI", (0,))[0] != close_ms):
+                self.anchors["HSI"] = (close_ms, q.last)
+
+        for key, url, market in (("KOSPI", "https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=40&symbol=KOSPI", "kr"),
+                                 ("HSI", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=40"
+                                         "&fields1=f1&fields2=f51,f52,f53&secid=100.HSI", "hk")):
+            if self.vols.due(key):
+                self.vols.refreshed[key] = time.monotonic()  # one attempt per window even if it fails
+                with contextlib.suppress(Exception):
+                    raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*"})
+                    self.vols.record(key, [c for _, c in parse_daily_bars(market, raw)], "指数日K")
+
+    def retry_ok(self, key: str, every: float = 60) -> bool:
+        """Throttle failing anchor lookups to one attempt per minute per key."""
+        now = time.monotonic()
+        if now - self.anchor_tries.get(key, -1e9) < every:
+            return False
+        self.anchor_tries[key] = now
+        return True
+
+    @staticmethod
+    def kospi_close_ms(q: IndexQuote) -> int:
+        kst = dt.timezone(dt.timedelta(hours=9))
+        day = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst).date()
+        return int(dt.datetime.combine(day, dt.time(15, 30), kst).timestamp() * 1000)
+
+    @staticmethod
+    def hk_cash_close_date(now_ms: int) -> dt.date:
+        local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+        day = local.date() if local.time() >= dt.time(16, 10) else local.date() - dt.timedelta(days=1)
+        while day.weekday() >= 5:
+            day -= dt.timedelta(days=1)
+        return day
+
+    def contract_odds(self, symbol: str, price: D, now_ms: int) -> CloseOdds | str | None:
+        ticker = self.config.tickers.get(symbol)
+        if not self.config.probability or not ticker:
+            return None
+        ref = self.reference_for("exchange", symbol, now_ms)
+        if ref is None or not ref.close_ms:
+            return "缺少带收盘时刻的交易所收盘价"
+        anchor = self.anchors.get(symbol)
+        if not anchor or anchor[0] != ref.close_ms:
+            return "等待币安在收盘时刻的价格"
+        info = STOCK_MARKETS[ticker.market]
+        close_date = dt.datetime.fromtimestamp(ref.close_ms / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset))).date()
+        remaining, target = session_remaining(ticker.market, now_ms, close_date)
+        sigma, sigma_note = self.vols.get(symbol, ticker.market)
+        move = percent(price, anchor[1])
+        return close_odds(NAMES.get(symbol, symbol), ref.value, ref.value * price / anchor[1], sigma, remaining, target,
+                          price_tick(ticker.market, ref.value), f"{close_when(ref)}·{short_source(ref.source)}",
+                          f"币安 {fmt_price(price)} / 收盘时刻 {fmt_price(anchor[1])} → {move:+.3f}%", sigma_note,
+                          "" if ticker.same_unit else (ref.currency or info.currency))
+
+    def hsi_odds(self, now_ms: int) -> CloseOdds | str | None:
+        q = self.hsi.quote
+        if not self.config.probability or not self.config.hsi_futures:
+            return None
+        if q is None or q.spot is None:
+            return "缺少恒指现货"
+        local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+        cash_open = local.weekday() < 5 and dt.time(9, 30) <= local.time() < dt.time(16, 10)
+        sigma, sigma_note = self.vols.get("HSI", "HSI")
+        if cash_open and q.spot_prev:
+            remaining, target = session_remaining("hk", now_ms, local.date() - dt.timedelta(days=1))
+            return close_odds("恒生指数", q.spot_prev, q.spot, sigma, remaining, target, D("0.01"), "昨收",
+                              f"恒指现货 {fmt(q.spot)}（盘中直接用现货）", sigma_note)
+        close_date = self.hk_cash_close_date(now_ms)
+        anchor, anchor_note = None, "收市时"
+        if hk_futures_session(q.quoted_ms) != "夜市":
+            anchor, anchor_note = q.last, "日市收市"  # No night trading yet: the close itself is the best estimate.
+        elif q.source == "etnet" and q.prev_settle:
+            anchor, anchor_note = q.prev_settle, "日市收市"  # night block's 前收市 = the day session before it
+        elif self.anchors.get("HSI") and dt.datetime.fromtimestamp(self.anchors["HSI"][0] / 1000, BEIJING).date() == close_date:
+            anchor = self.anchors["HSI"][1]
+        if anchor is None:
+            return "缺少期货在现货收市时的价格"
+        remaining, target = session_remaining("hk", now_ms, close_date)
+        return close_odds("恒生指数", q.spot, q.spot * q.last / anchor, sigma, remaining, target, D("0.01"),
+                          f"{close_date.strftime('%m-%d')} 收盘", f"恒指期货 {fmt(q.last)} / {anchor_note} {fmt(anchor)} → {percent(q.last, anchor):+.3f}%",
+                          sigma_note)
+
+    def kospi_odds(self, now_ms: int) -> CloseOdds | str | None:
+        k = self.kospi.quote
+        if not self.config.probability or not self.config.kospi_index:
+            return None
+        if k is None:
+            return "缺少 KOSPI"
+        sigma, sigma_note = self.vols.get("KOSPI", "KOSPI")
+        kst = dt.timezone(dt.timedelta(hours=9))
+        quoted_day = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date()
+        local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
+        if quoted_day == local.date() and krx_session(now_ms) == "交易中" and k.prev_close:
+            remaining, target = session_remaining("kr", now_ms, quoted_day - dt.timedelta(days=1))
+            return close_odds("KOSPI", k.prev_close, k.last, sigma, remaining, target, D("0.01"), "昨收",
+                              f"KOSPI 现货 {fmt(k.last)}（盘中直接用现货）", sigma_note)
+        hl, anchor = self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
+        remaining, target = session_remaining("kr", now_ms, quoted_day)
+        if hl is None:
+            return "缺少 HL KR200 代理"
+        if anchor and anchor[0] == self.kospi_close_ms(k):
+            base, base_note = anchor[1], "收盘时刻"
+        elif self.kospi.quote200:
+            base, base_note = self.kospi.quote200.last, "KOSPI200 收盘（HL 收盘时刻价格暂缺）"
+        else:
+            return "等待 HL KR200 在收盘时刻的价格"
+        return close_odds("KOSPI", k.last, k.last * hl.mark / base, sigma, remaining, target, D("0.01"),
+                          f"{quoted_day.strftime('%m-%d')} 收盘",
+                          f"HL KR200 {fmt(hl.mark)} / {base_note} {fmt(base)} → {percent(hl.mark, base):+.3f}%（KOSPI200 代理，存在基差）",
+                          sigma_note)
+
+    @staticmethod
+    def odds_row(odds: CloseOdds | str | None, label: str = "") -> str:
+        if odds is None:
+            return ""
+        prefix = f"🎲 {label} " if label else "🎲 "
+        if isinstance(odds, str):
+            return f"{prefix}概率暂缺：{odds}"
+        return odds.row().replace("🎲 ", prefix, 1)
+
+    def cmd_prob(self, req: Request) -> "Reply":
+        if not self.config.probability:
+            return Reply("概率功能已关闭（PROBABILITY=off）。")
+        now_ms = self.market.now_ms()
+        lines = [f"🎲 {bold('收盘涨跌概率（模型参考，非投资建议）')}",
+                 "有效价 = 参考收盘 × 代理现价 / 代理在参考收盘时刻的价格",
+                 "P(涨) = 1 − Φ(ln((参考+半跳)/有效) / σ剩余)，平盘两边各计一半"]
+        items = [("恒生指数", self.hsi_odds(now_ms)), ("KOSPI", self.kospi_odds(now_ms))]
+        for symbol in self.config.symbols:
+            snapshot = self.snapshots.get(symbol) or {}
+            quote = snapshot.get("quote")
+            items.append((f"{NAMES.get(symbol, symbol)}｜{symbol}", self.contract_odds(symbol, quote.price, now_ms) if quote else "等待行情"))
+        for title, odds in items:
+            if odds is None:
+                continue
+            lines.append("\n" + bold(f"📍 {title}"))
+            lines.extend(tree(odds.detail() if isinstance(odds, CloseOdds) else [f"概率暂缺：{odds}"]))
+        lines.append("\n⚠️ 目标日按工作日推算、未计交易所假期；σ 为历史估计；代理与结算标的之间有基差。")
+        return Reply("\n".join(lines), html=True)
+
     def kospi_line200(self, now_ms: int) -> str:
         return self.kospi.line200(now_ms, self.config.color_style, self.hl.quotes.get("KR200"), self.hl.notes.get("KR200", ""))
 
@@ -2094,9 +2466,12 @@ class Bot:
             lines.append("💡 /mode exchange 可把基准对齐到交易所收盘时刻")
         if self.config.hsi_futures:
             lines.append(self.hsi.line(now_ms, style))
+            lines.append(self.odds_row(self.hsi_odds(now_ms), "恒指"))
         if self.config.kospi_index:
             lines.append(self.kospi.line(now_ms, style))
             lines.append(self.kospi_line200(now_ms))
+            lines.append(self.odds_row(self.kospi_odds(now_ms), "KOSPI"))
+        lines = [line for line in lines if line]
         for symbol in self.config.symbols:
             snapshot = self.snapshots.get(symbol)
             lines.append("\n" + bold(f"📍 {NAMES.get(symbol, symbol)}｜{symbol}"))
@@ -2118,6 +2493,7 @@ class Bot:
                 rows.extend(self.reference_status(kind, symbol, quote.price, now_ms))
             if symbol in self.config.hl_tickers:
                 rows.append(self.hl_line(symbol, quote.price))
+            rows.append(self.odds_row(self.contract_odds(symbol, quote.price, now_ms)))
             lines.extend(tree(rows))
         used = tuple(dict.fromkeys(STOCK_MARKETS[t.market].currency for t in self.config.tickers.values()
                                    if not t.same_unit or True))
@@ -2168,6 +2544,9 @@ class Bot:
         if self.settings() != settings:
             return
         self.snapshots = collected
+        if self.config.probability:
+            with contextlib.suppress(Exception):  # Probabilities are informational; never block alerts.
+                await self.refresh_odds_inputs(now_ms)
         for sub_id, sub in self.subscriptions().items():
             if not sub.get("active"):
                 continue
