@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.12.3"
+VERSION = "1.12.4"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -248,13 +248,13 @@ def parse_holidays(env: dict[str, str]) -> dict[str, frozenset]:
             "kr": parse_dates(env.get("HOLIDAYS_KR", DEFAULT_HOLIDAYS["KR"]), "HOLIDAYS_KR")}
 
 
-def parse_beta(value: str) -> float:
+def parse_beta(value: str, name: str = "A50_BETA") -> float:
     try:
         beta = float(value)
     except ValueError:
-        raise ValueError("A50_BETA 必须是数字，如 0.8") from None
+        raise ValueError(f"{name} 必须是数字，如 0.8") from None
     if not 0 < beta <= 3:
-        raise ValueError("A50_BETA 应在 0～3 之间")
+        raise ValueError(f"{name} 应在 0～3 之间")
     return beta
 
 
@@ -362,6 +362,7 @@ class Config:
     prob_vol: dict[str, float] = field(default_factory=dict)  # Daily σ overrides (fraction), keyed by symbol/HSI/KOSPI.
     sse_index: bool = True  # Shanghai Composite with the FTSE China A50 futures as after-hours proxy.
     a50_beta: float = 0.8   # Composite move per unit of A50 move when mapping the proxy.
+    kospi_beta: float = 1.0  # KOSPI move per unit of HL KR200 (KOSPI 200 perp) move.
     holidays: dict[str, frozenset] = field(default_factory=dict)  # market -> non-trading weekdays
     web_port: int = 0        # Read-only probability web page; 0 = disabled. Railway injects PORT.
     web_token: str = ""      # Secret path segment; generated and persisted when empty.
@@ -417,6 +418,7 @@ class Config:
             prob_vol=parse_prob_vol(e.get("PROB_VOL", "")),
             sse_index=e.get("SSE_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
             a50_beta=parse_beta(e.get("A50_BETA", "0.8")),
+            kospi_beta=parse_beta(e.get("KOSPI_BETA", "1"), "KOSPI_BETA"),
             holidays=parse_holidays(e),
             web_port=0 if e.get("WEB", "on").strip().lower() in {"off", "0", "false", "no"}
             else bounded_int(e, "WEB_PORT", int(e.get("PORT") or 0), 0, 65535),
@@ -445,6 +447,10 @@ class Store:
         with self.conn:
             self.conn.execute("INSERT INTO records(k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                               (key, json.dumps(value, ensure_ascii=False)))
+
+    def items(self, prefix: str) -> list[tuple[str, Any]]:
+        rows = self.conn.execute("SELECT k, v FROM records WHERE substr(k,1,?)=? ORDER BY k", (len(prefix), prefix))
+        return [(k, json.loads(v)) for k, v in rows]
 
     def delete_prefix(self, prefix: str) -> None:
         with self.conn:
@@ -535,6 +541,68 @@ async def http_json(url: str, payload: dict | None = None, timeout: int = 15) ->
 
 async def http_get(url: str, timeout: int = 15, headers: dict[str, str] | None = None) -> bytes:
     return await _blocking(_http_get, url, None, timeout, headers)
+
+
+SOURCE_TIMEOUT = 8  # seconds per quote-feed request: working feeds answer in < 1 s, a dead one must not cost 15
+
+
+class SourceHealth:
+    """Per-host cooldown for quote feeds. A host that keeps failing (e.g. Eastmoney dropping or 502-ing
+    requests from an overseas server) is moved behind the other sources of the same data for a while,
+    instead of costing a timeout at the front of every refresh. It is still tried when nothing else
+    answers, and it returns to its normal place once the cooldown ends or any request to it succeeds."""
+    FAILS = 2           # consecutive failures before a host is moved to the back
+    BASE = 60           # first cooldown (seconds), doubled per further failure
+    MAX = 600           # short enough that a recovered preferred feed (A50 futures vs the CFD) is back soon
+
+    def __init__(self) -> None:
+        self.hosts: dict[str, list] = {}  # host -> [consecutive failures, cool until (monotonic), last error]
+
+    @staticmethod
+    def host(url: str) -> str:
+        return urllib.parse.urlsplit(url).hostname or url
+
+    def cooling(self, url: str) -> float:
+        state = self.hosts.get(self.host(url))
+        return max(0.0, state[1] - time.monotonic()) if state else 0.0
+
+    def record(self, url: str, error: str = "") -> None:
+        host = self.host(url)
+        if not error:
+            self.hosts.pop(host, None)
+            return
+        state = self.hosts.setdefault(host, [0, 0.0, ""])
+        state[0] += 1
+        state[2] = error
+        if state[0] >= self.FAILS:
+            state[1] = time.monotonic() + min(self.MAX, self.BASE * 2 ** (state[0] - self.FAILS))
+
+    def order(self, sources: Any) -> list:
+        """(name, url, ...) tuples with cooling hosts moved to the back (the most-failed last), otherwise
+        in preference order."""
+        def rank(source: Any) -> int:
+            state = self.hosts.get(self.host(source[1]))
+            return state[0] if state and self.cooling(source[1]) > 0 else 0
+        return sorted(sources, key=rank)
+
+    def lines(self) -> list[str]:
+        now = time.monotonic()
+        return [f"  ⏸️ {host}：连续失败 {n} 次，排到最后还剩 {int(until - now)} 秒｜{brief_error(error, 60)}"
+                for host, (n, until, error) in sorted(self.hosts.items()) if until > now]
+
+
+SOURCE_HEALTH = SourceHealth()
+
+
+async def fetch_source(url: str, extra: dict[str, str] | None = None) -> bytes:
+    """GET one quote-feed URL with a browser UA and the short feed timeout, recording the host's health."""
+    try:
+        raw = await http_get(url, timeout=SOURCE_TIMEOUT, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **(extra or {})})
+    except (RemoteError, TimeoutError, OSError) as error:
+        SOURCE_HEALTH.record(url, clean_error(error) or type(error).__name__)
+        raise
+    SOURCE_HEALTH.record(url)
+    return raw
 
 
 @dataclass(frozen=True)
@@ -901,10 +969,13 @@ class StockMarket:
     async def fetch(self, symbol: str, ticker: StockTicker, now_ms: int) -> Baseline:
         info = STOCK_MARKETS[ticker.market]
         failures = []
-        for name, url, extra in self.sources(ticker):
-            for attempt in range(self.ATTEMPTS):
+        # One pass over every source (hosts in cooldown last); only when all of them failed, one more pass.
+        for attempt in range(self.ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(1.5)
+            for name, url, extra in SOURCE_HEALTH.order(self.sources(ticker)):
                 try:
-                    raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                    raw = await fetch_source(url, extra)
                     if name in {"东方财富", "Naver"}:
                         day, close, prev = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
                     else:
@@ -912,8 +983,6 @@ class StockMarket:
                     return self.baseline(ticker, info, name, day, close, prev)
                 except Exception as error:
                     failures.append(f"{name}: {clean_error(error)}")
-                    if attempt + 1 < self.ATTEMPTS:
-                        await asyncio.sleep(1.5)
         raise ValueError("；".join(dict.fromkeys(failures)))
 
     @staticmethod
@@ -934,9 +1003,9 @@ class StockMarket:
                 "close_ms": close.close_ms, "currency": close.currency, "source": close.source,
                 "close_note": close.close_note, "prev_value": str(close.prev_value) if close.prev_value else ""})
 
-    async def refresh(self, now_ms: int, force: bool = False) -> None:
+    async def refresh(self, now_ms: int, force: bool = False) -> bool | None:
         if not self.config.tickers or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
-            return
+            return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         for index, (symbol, ticker) in enumerate(self.config.tickers.items()):
             if index:
@@ -997,9 +1066,9 @@ class FxRates:
             parts.append(f"⚠️ 汇率获取失败：{self.error}")
         return "｜".join(parts) if parts else "汇率尚未获取"
 
-    async def refresh(self, force: bool = False) -> None:
+    async def refresh(self, force: bool = False) -> bool | None:
         if not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS:
-            return
+            return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         failures = []
         for name, url in self.SOURCES:
@@ -1265,17 +1334,17 @@ class IndexFutures:
 
     async def _first(self, sources: tuple, parse) -> Any:
         failures = []
-        for name, url, extra in sources:
+        for name, url, extra in SOURCE_HEALTH.order(sources):
             try:
-                raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                raw = await fetch_source(url, extra)
                 return parse(name, raw)
             except Exception as error:
                 failures.append(f"{name}: {clean_error(error)}")
         raise ValueError("；".join(failures))
 
-    async def refresh(self, now_ms: int, force: bool = False) -> None:
+    async def refresh(self, now_ms: int, force: bool = False) -> bool | None:
         if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
-            return
+            return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         try:
             quote: FuturesQuote = await self._first(self.FUTURES_SOURCES,
@@ -1333,6 +1402,12 @@ class HlQuote:
         return percent(self.mark, self.prev_day) if self.prev_day else None
 
 
+def kr200_price(hl: HlQuote) -> tuple[D, str]:
+    """The KR200 price compared with the anchor. The anchor is a traded candle close, so the book mid
+    (where trades happen) is used rather than the mark, which leans on the oracle while Korea is shut."""
+    return (hl.mid, "中间价") if hl.mid else (hl.mark, "标记价")
+
+
 class Hyperliquid:
     """Reference quotes from Hyperliquid's public info endpoint (no key), one request per perp dex.
 
@@ -1346,16 +1421,21 @@ class Hyperliquid:
         self.tickers = dict(tickers)
         self.quotes: dict[str, HlQuote] = {}
         self.notes: dict[str, str] = {}   # symbol -> why there is no quote (not listed / fetch failed)
-        self.at_cache: dict[tuple[str, int], D] = {}
+        self.at_cache: dict[tuple[str, int, str], D] = {}
         self.refreshed = -1e9
 
-    async def price_at(self, coin: str, at_ms: int) -> D:
-        """Close of the 1-minute candle ending at ``at_ms`` (the market's price at that instant)."""
-        key = (coin, at_ms)
+    async def price_at(self, coin: str, at_ms: int, interval: str = "1m") -> D:
+        """Close of the candle ending at ``at_ms`` (the market's price at that instant).
+
+        Hyperliquid only serves the latest 5,000 candles per interval (about 3.5 days of 1-minute bars),
+        so after a long holiday the 5-minute candle ending at the same instant is the fallback.
+        """
+        key = (coin, at_ms, interval)
         if key in self.at_cache:
             return self.at_cache[key]
+        minutes = {"1m": 1, "5m": 5, "15m": 15}[interval]
         rows = await http_json(self.URL, {"type": "candleSnapshot", "req": {
-            "coin": coin, "interval": "1m", "startTime": at_ms - 5 * 60_000, "endTime": at_ms}})
+            "coin": coin, "interval": interval, "startTime": at_ms - 5 * minutes * 60_000, "endTime": at_ms}})
         candles = [r for r in rows if isinstance(r, dict) and int(r.get("t", 0)) < at_ms] if isinstance(rows, list) else []
         if not candles:
             raise ValueError(f"Hyperliquid 没有 {coin} 在 {stamp(at_ms, seconds=False)} 的 K 线")
@@ -1386,9 +1466,9 @@ class Hyperliquid:
                 _opt(ctx.get("funding")), now_ms)
         return quotes
 
-    async def refresh(self, force: bool = False) -> None:
+    async def refresh(self, force: bool = False) -> bool | None:
         if not self.tickers or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
-            return
+            return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         by_dex: dict[str, dict[str, HlQuote] | str] = {}
         for dex in {dex for dex, _ in self.tickers.values()}:
@@ -1711,17 +1791,17 @@ class CnIndex:
     async def _first(self, sources: tuple, parse, now_ms: int, previous) -> tuple[Any, str, str]:
         """(result, error when every source failed, failures of the sources tried before the one that answered)."""
         failures = []
-        for name, url, extra in sources:
+        for name, url, extra in SOURCE_HEALTH.order(sources):
             try:
-                raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                raw = await fetch_source(url, extra)
                 return parse(name, raw, now_ms), "", "；".join(failures)
             except Exception as error:
                 failures.append(f"{name}: {clean_error(error)}")
         return previous, "；".join(failures), ""
 
-    async def refresh(self, now_ms: int, force: bool = False) -> None:
+    async def refresh(self, now_ms: int, force: bool = False) -> bool | None:
         if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
-            return
+            return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         self.quote, self.error, _ = await self._first(self.SSE_SOURCES, parse_cn_index, now_ms, self.quote)
         self.a50, self.a50_error, self.a50_skipped = await self._first(self.A50_SOURCES, self.parse_a50, now_ms, self.a50)
@@ -1748,9 +1828,9 @@ class CnIndex:
             return
         self.daily_refreshed = time.monotonic()
         failures = []
-        for name, url, extra in self.DAILY_SOURCES:
+        for name, url, extra in SOURCE_HEALTH.order(self.DAILY_SOURCES):
             try:
-                raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                raw = await fetch_source(url, extra)
                 bars = [(day, close) for day, close in parse_cn_daily(name, raw)
                         if day <= dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()]
                 day, close, prev = last_completed_bar(bars, STOCK_MARKETS["sh"], now_ms)
@@ -1779,7 +1859,7 @@ class CnIndex:
     async def _a50_bar_at(self, day: dt.date, template: str, label: str) -> D:
         url = template.format(beg=(day - dt.timedelta(days=1)).strftime("%Y%m%d"),
                               end=(day + dt.timedelta(days=1)).strftime("%Y%m%d"))
-        raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Referer": "https://quote.eastmoney.com/"})
+        raw = await fetch_source(url, {"Referer": "https://quote.eastmoney.com/"})
         try:
             data = json.loads(raw)["data"]
             if not a50_code_ok(data.get("code")):
@@ -1800,7 +1880,7 @@ class CnIndex:
 
     async def a50_sina_five_minute_at(self, day: dt.date) -> D:
         """Sina hf_CHA50CFD 5-minute bar stamped 15:00 on ``day`` (same record as the Sina live quote)."""
-        raw = await http_get(self.A50_SINA_FIVE_MINUTES, headers={"User-Agent": BROWSER_UA, "Referer": "https://finance.sina.com.cn/"})
+        raw = await fetch_source(self.A50_SINA_FIVE_MINUTES, {"Referer": "https://finance.sina.com.cn/"})
         bars = parse_sina_bars(raw)
         wanted = f"{day.isoformat()} 15:00"
         for when, close in bars:
@@ -1891,18 +1971,18 @@ class KospiIndex:
             return parse_naver_index(raw, now_ms)
         return parse_eastmoney_index(raw, now_ms, "韩国KOSPI")
 
-    async def refresh(self, now_ms: int, force: bool = False) -> None:
+    async def refresh(self, now_ms: int, force: bool = False) -> bool | None:
         if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
-            return
+            return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         self.quote, self.error = await self._fetch(self.SOURCES, now_ms, self.quote)
         self.quote200, self.error200 = await self._fetch(self.SOURCES_200, now_ms, self.quote200)
 
     async def _fetch(self, sources: tuple, now_ms: int, previous: IndexQuote | None) -> tuple[IndexQuote | None, str]:
         failures = []
-        for name, url, extra in sources:
+        for name, url, extra in SOURCE_HEALTH.order(sources):
             try:
-                raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                raw = await fetch_source(url, extra)
                 return self.parse(name, raw, now_ms), ""
             except Exception as error:
                 failures.append(f"{name}: {clean_error(error)}")
@@ -2040,6 +2120,13 @@ class CloseOdds:
     flat: float
     down: float
     unit: str = ""
+    beta: float = 1.0      # proxy coefficient used for the effective price
+    mode: str = "盘中"     # "盘中" = live index vs previous close; "盘后" = mapped from an after-hours proxy
+
+    @property
+    def move(self) -> float:
+        """The proxy's own log move since the anchor (before β)."""
+        return math.log(float(self.effective / self.ref)) / self.beta
 
     @property
     def sigma(self) -> float:
@@ -2074,14 +2161,110 @@ class CloseOdds:
 
 
 def close_odds(name: str, ref: D, effective: D, sigma_daily: float, remaining: float, target: dt.date, tick: D,
-               ref_note: str, proxy_note: str, sigma_note: str, unit: str = "") -> CloseOdds:
+               ref_note: str, proxy_note: str, sigma_note: str, unit: str = "", beta: float = 1.0,
+               mode: str = "盘中") -> CloseOdds:
     sigma = max(sigma_daily * math.sqrt(max(remaining, 1e-6)), 1e-9)
     half = tick / 2
     hi = math.log(float((ref + half) / effective)) / sigma
     lo = math.log(float((ref - half) / effective)) / sigma if ref > half else -math.inf
     up, down = 1 - norm_cdf(hi), norm_cdf(lo)
     return CloseOdds(name, target, ref, ref_note, proxy_note, effective, sigma_daily, sigma_note, remaining,
-                     up, max(0.0, 1 - up - down), down, unit)
+                     up, max(0.0, 1 - up - down), down, unit, beta, mode)
+
+
+PRED_EVERY_MS = 30 * 60_000   # one saved prediction snapshot per index per 30 minutes
+CALIB_MIN_DAYS = 10           # walk-forward: target days used only for training before the first test day
+
+
+def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[str]:
+    """Score saved predictions against the official closes, per index and mode.
+
+    Brier / log loss of the live model versus a coin flip, a reliability table, and a fit of
+    ln(close/ref) = a + b·(proxy log move) + e with e ~ N(0, k²·R). The fit is scored walk-forward by
+    target day (each day is predicted only from days already closed) and is never applied automatically.
+    Snapshots of the same target day are strongly correlated: the real sample size is the day count.
+    """
+    lines: list[str] = []
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for p in preds:
+        groups.setdefault((p["key"], p.get("mode", "")), []).append(p)
+    for (key, mode), rows in sorted(groups.items()):
+        done = [dict(r, close=outcomes[f"{key}:{r['target']}"]) for r in rows if f"{key}:{r['target']}" in outcomes]
+        days = sorted({r["target"] for r in done})
+        lines.append(f"📐 {key}·{mode}：快照 {len(rows)} 条（{len({r['target'] for r in rows})} 个目标日），"
+                     f"已有结果 {len(done)} 条 / {len(days)} 日")
+        if not done:
+            continue
+        for r in done:
+            r["hit"] = 1.0 if r["close"] > r["ref"] else 0.5 if r["close"] == r["ref"] else 0.0
+            r["y"] = math.log(r["close"] / r["ref"])
+
+        def scores(ps: list[float], hits: list[float]) -> tuple[float, float]:
+            brier = sum((p - h) ** 2 for p, h in zip(ps, hits)) / len(ps)
+            loss = -sum(h * math.log(min(max(p, 1e-6), 1 - 1e-6)) + (1 - h) * math.log(min(max(1 - p, 1e-6), 1 - 1e-6))
+                        for p, h in zip(ps, hits)) / len(ps)
+            return brier, loss
+        brier, loss = scores([r["up"] for r in done], [r["hit"] for r in done])
+        lines.append(f"  现行模型：Brier {brier:.3f}（抛硬币 0.250）｜对数损失 {loss:.3f}（0.693）")
+        bins = []
+        for lo in (0.0, 0.2, 0.4, 0.6, 0.8):
+            sel = [r for r in done if lo <= r["up"] < lo + 0.2 or (lo == 0.8 and r["up"] == 1.0)]
+            if sel:
+                bins.append(f"{lo * 100:.0f}–{lo * 100 + 20:.0f}%：预测 {sum(r['up'] for r in sel) / len(sel) * 100:.0f}% "
+                            f"实际 {sum(r['hit'] for r in sel) / len(sel) * 100:.0f}%（{len(sel)} 条/{len({r['target'] for r in sel})} 日）")
+        lines.append("  校准：" + "；".join(bins))
+        if mode != "盘后" or len(days) < 3:
+            continue
+        fit = fit_proxy(done)
+        if fit:
+            a, b, k = fit
+            beta_now = sum(r["beta"] for r in done) / len(done)
+            sigma_now = sum(r["sigma"] for r in done) / len(done)
+            lines.append(f"  全样本拟合：系数 b {b:.2f}（现用 β {beta_now:g}）｜截距 {a * 100:+.3f}%｜"
+                         f"残差 σ {k * 100:.2f}%/日（现用 σ 均值 {sigma_now * 100:.2f}%）")
+        if len(days) < CALIB_MIN_DAYS + 5:
+            lines.append(f"  逐日向前检验：目标日 {len(days)} 个，至少要 {CALIB_MIN_DAYS + 5} 个才下结论")
+            continue
+        tested, fitted = [], []
+        for day in days[CALIB_MIN_DAYS:]:
+            fit = fit_proxy([r for r in done if r["target"] < day])
+            if not fit:
+                continue
+            a, b, k = fit
+            for r in (r for r in done if r["target"] == day):
+                tested.append(r)
+                fitted.append(norm_cdf((a + b * r["move"]) / max(k * math.sqrt(max(r["R"], 1e-6)), 1e-9)))
+        if tested:
+            old = scores([r["up"] for r in tested], [r["hit"] for r in tested])
+            new = scores(fitted, [r["hit"] for r in tested])
+            lines.append(f"  逐日向前检验（{len({r['target'] for r in tested})} 日 {len(tested)} 条）：拟合模型 Brier {new[0]:.3f} / "
+                         f"对数损失 {new[1]:.3f}，现行 {old[0]:.3f} / {old[1]:.3f}")
+    return lines or ["📐 还没有保存的预测快照（每个指数每 30 分钟存一条，需要概率功能开启）"]
+
+
+def fit_proxy(rows: list[dict]) -> tuple[float, float, float] | None:
+    """Weighted OLS of y = a + b·move, and k with e ~ N(0, k²·R): (a, b, k); None when underdetermined.
+
+    Each target day carries the same total weight (its snapshots share one outcome), and the degrees
+    of freedom are counted in days, so many snapshots of few days do not look like a large sample.
+    """
+    per_day: dict[str, int] = {}
+    for r in rows:
+        per_day[r["target"]] = per_day.get(r["target"], 0) + 1
+    days = len(per_day)
+    if days < 3:
+        return None
+    ws = [1 / per_day[r["target"]] for r in rows]
+    xs, ys = [r["move"] for r in rows], [r["y"] for r in rows]
+    total = sum(ws)
+    mx, my = sum(w * x for w, x in zip(ws, xs)) / total, sum(w * y for w, y in zip(ws, ys)) / total
+    sxx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
+    if sxx <= 0:
+        return None
+    b = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys)) / sxx
+    a = my - b * mx
+    k2 = sum(w * (y - a - b * x) ** 2 / max(r["R"], 1e-6) for w, x, y, r in zip(ws, xs, ys, rows)) / (days - 2)
+    return a, b, math.sqrt(k2) if k2 > 0 else 1e-9
 
 
 def realised_vol(closes: list[D]) -> tuple[float, int]:
@@ -2508,6 +2691,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("resume", "恢复当前订阅"),
     Command("prob", "查看各标的下个收盘涨跌概率及计算过程"),
     Command("web", "获取概率网页链接（自动刷新）"),
+    Command("calib", "用已保存的预测快照和实际收盘给概率模型打分（Brier/校准/逐日向前拟合）"),
     Command("diag", "逐个检测数据源（币安/交易所/上证/A50/恒指/KOSPI/HL/汇率），找出哪里出问题"),
     Command("test", "发送测试消息，不代表行情正常"),
     Command("id", "查看你的用户 ID、聊天 ID、话题 ID"),
@@ -2695,6 +2879,8 @@ class Bot:
         self.reference_pool: ThreadPoolExecutor | None = None
         self.reference_state: dict[str, dict] = {}  # per background feed: last success, last error, duration
         self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
+        self.kospi_anchor_note, self.kospi_anchor_error = "", ""
+        self.pred_last: dict[str, int] = {}  # index -> ms of the last saved prediction snapshot
         self.a50_anchor_note = "15:00"
         self.a50_anchor_error = ""  # why the last anchor lookup failed (shown in /diag and the odds row)
         self.a50_anchor_source = "东方财富"
@@ -2710,7 +2896,7 @@ class Bot:
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
-            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag,
+            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/calib": self.cmd_calib,
         }
 
     def settings(self) -> dict:
@@ -3096,10 +3282,7 @@ class Bot:
                     self.vols.record(symbol, closes, "币安日K")
         kospi, hl = self.kospi.quote, self.hl.quotes.get("KR200")
         if kospi and hl:
-            close_ms = self.kospi_close_ms(kospi)
-            if self.anchors.get("KOSPI", (0,))[0] != close_ms and self.retry_ok("KOSPI"):
-                with contextlib.suppress(Exception):
-                    self.anchors["KOSPI"] = (close_ms, await self.hl.price_at(hl.coin, close_ms))
+            await self.kospi_anchor(kospi, hl)
         q = self.hsi.quote
         if q and q.spot is not None:
             close_date = self.hk_cash_close_date(now_ms, self.hsi.holidays)
@@ -3184,7 +3367,7 @@ class Bot:
             self.vols.refreshed[key] = time.monotonic()
             for url, kind in urls:
                 try:
-                    raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*"})
+                    raw = await fetch_source(url)
                     if kind == "tencent":
                         days = json.loads(raw)["data"]["hkHSI"]
                         closes = [number(r[2], "收盘") for r in (days.get("day") or days.get("qfqday") or []) if len(r) > 2]
@@ -3195,6 +3378,74 @@ class Bot:
                         break
                 except Exception:
                     continue
+        self.record_predictions(now_ms)
+
+    def record_predictions(self, now_ms: int) -> None:
+        """Save what each index model saw and said (every 30 min), and each official close as it becomes
+        known, so the model can later be scored against real outcomes (/calib)."""
+        for key, odds_of in (("SSE", self.sse_odds), ("KOSPI", self.kospi_odds), ("HSI", self.hsi_odds)):
+            odds = odds_of(now_ms)
+            if not isinstance(odds, CloseOdds) or now_ms - self.pred_last.get(key, -PRED_EVERY_MS) < PRED_EVERY_MS:
+                continue
+            self.pred_last[key] = now_ms
+            self.store.put(f"pred:{key}:{now_ms}", {
+                "key": key, "t": now_ms, "target": odds.target.isoformat(), "mode": odds.mode, "ref": float(odds.ref),
+                "eff": float(odds.effective), "move": odds.move, "beta": odds.beta, "sigma": odds.sigma_daily,
+                "R": odds.remaining, "up": odds.fair_up, "proxy": odds.proxy_note})
+        if self.cn.close:
+            self.store.put(f"outcome:SSE:{self.cn.close.day.isoformat()}", float(self.cn.close.value))
+        k = self.kospi.quote
+        kst = dt.timezone(dt.timedelta(hours=9))
+        if k and dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).time() >= dt.time(15, 30):
+            self.store.put(f"outcome:KOSPI:{dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date().isoformat()}", float(k.last))
+        q, local = self.hsi.quote, dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+        if (q and q.spot is not None and not self.hsi.error and local.time() >= dt.time(16, 15)
+                and self.hk_cash_close_date(now_ms, self.hsi.holidays) == local.date()):
+            self.store.put(f"outcome:HSI:{local.date().isoformat()}", float(q.spot))
+
+    def calibration_text(self) -> str:
+        preds = [v for _, v in self.store.items("pred:")]
+        outcomes = {k.removeprefix("outcome:"): float(v) for k, v in self.store.items("outcome:")}
+        return "\n".join(["📐 概率模型回测（只评估，不会自动改参数）"] + calibration_report(preds, outcomes))
+
+    async def cmd_calib(self, req: Request) -> str:
+        return self.calibration_text()
+
+    async def kospi_anchor(self, kospi: IndexQuote, hl: HlQuote) -> None:
+        """HL KR200 at the KOSPI 15:30 close, from the same perp as the live proxy, persisted across restarts.
+
+        Order: saved record → 1-minute candle → 5-minute candle (same instant, survives longer on HL)
+        → the live mark recorded within two minutes after the close.
+        """
+        close_ms = self.kospi_close_ms(kospi)
+        if 0 <= hl.fetched_ms - close_ms <= 2 * 60_000 and not self.store.get(f"kr200_print:{close_ms}"):
+            self.store.put(f"kr200_print:{close_ms}", [hl.fetched_ms, str(kr200_price(hl)[0])])  # too late to catch afterwards
+        if self.anchors.get("KOSPI", (0,))[0] == close_ms:
+            return
+        saved = self.store.get("anchor:KOSPI", ())
+        with contextlib.suppress(ValueError, TypeError, IndexError, decimal.InvalidOperation):
+            if int(saved[0]) == close_ms and D(str(saved[1])) > 0:
+                self.anchors["KOSPI"] = (close_ms, D(str(saved[1])))
+                self.kospi_anchor_note = str(saved[2]) if len(saved) > 2 else "15:30"
+                return
+        if not self.retry_ok("KOSPI"):
+            return
+        price, note, failures = None, "", []
+        for interval, label in (("1m", "15:30 一分钟K"), ("5m", "15:30 五分钟K")):
+            try:
+                price, note = await self.hl.price_at(hl.coin, close_ms, interval), label
+                break
+            except Exception as error:
+                failures.append(clean_error(error))
+        printed = self.store.get(f"kr200_print:{close_ms}")
+        if price is None and printed:
+            with contextlib.suppress(ValueError, TypeError, IndexError, decimal.InvalidOperation):
+                price, note = D(str(printed[1])), "15:30 后两分钟内实时价近似"
+        self.kospi_anchor_error = "；".join(failures) if price is None else ""
+        if price is not None:
+            self.anchors["KOSPI"] = (close_ms, price)
+            self.kospi_anchor_note = note
+            self.store.put("anchor:KOSPI", [close_ms, str(price), note])
 
     def retry_ok(self, key: str, every: float = 60) -> bool:
         """Throttle failing anchor lookups to one attempt per minute per key."""
@@ -3262,7 +3513,8 @@ class Bot:
         effective = close.value * D(str(math.exp(beta * move)))
         return close_odds("上证指数", close.value, effective, sigma, remaining, target, D("0.01"),
                           f"{ref_note}·{close.source}",
-                          f"A50 {fmt(a50.last)} / {base_note} {fmt(base)} → {percent(a50.last, base):+.3f}% × β {beta:g}", sigma_note)
+                          f"A50 {fmt(a50.last)} / {base_note} {fmt(base)} → {percent(a50.last, base):+.3f}% × β {beta:g}", sigma_note,
+                          beta=beta, mode="盘后")
 
     @staticmethod
     def kospi_close_ms(q: IndexQuote) -> int:
@@ -3327,7 +3579,9 @@ class Bot:
         remaining, target = session_remaining("hk", now_ms, close_date, self.config.holidays.get("hk", frozenset()))
         return close_odds("恒生指数", q.spot, q.spot * q.last / anchor, sigma, remaining, target, D("0.01"),
                           f"{close_date.strftime('%m-%d')} 收盘", f"恒指期货 {fmt(q.last)} / {anchor_note} {fmt(anchor)} → {percent(q.last, anchor):+.3f}%",
-                          sigma_note)
+                          sigma_note, mode="盘后")
+
+    HL_STALE_MS = 10 * 60_000  # an HL mark older than this (refresh failing) is not used for new probabilities
 
     def kospi_odds(self, now_ms: int) -> CloseOdds | str | None:
         k = self.kospi.quote
@@ -3344,19 +3598,27 @@ class Bot:
             return close_odds("KOSPI", k.prev_close, k.last, sigma, remaining, target, D("0.01"), "昨收",
                               f"KOSPI 现货 {fmt(k.last)}（盘中直接用现货）", sigma_note)
         hl, anchor = self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
-        remaining, target = session_remaining("kr", now_ms, quoted_day, self.config.holidays.get("kr", frozenset()))
+        holidays = self.config.holidays.get("kr", frozenset())
+        remaining, target = session_remaining("kr", now_ms, quoted_day, holidays)
+        expected = expected_close_date("kr", now_ms, holidays)
+        if quoted_day < expected or (quoted_day == local.date() and local.time() < dt.time(15, 30)):
+            return f"KOSPI 基准停在 {stamp(k.quoted_ms, seconds=False)}，应为 {expected.strftime('%m-%d')} 收盘；暂不输出概率"
         if hl is None:
             return "缺少 HL KR200 代理"
-        if anchor and anchor[0] == self.kospi_close_ms(k):
-            base, base_note = anchor[1], "收盘时刻"
-        elif self.kospi.quote200:
-            base, base_note = self.kospi.quote200.last, "KOSPI200 收盘（HL 收盘时刻价格暂缺）"
-        else:
-            return "等待 HL KR200 在收盘时刻的价格"
-        return close_odds("KOSPI", k.last, k.last * hl.mark / base, sigma, remaining, target, D("0.01"),
+        if now_ms - hl.fetched_ms > self.HL_STALE_MS:
+            return f"HL KR200 报价已超 10 分钟未更新（最后 {stamp(hl.fetched_ms, seconds=False)}），暂不输出新概率"
+        if not (anchor and anchor[0] == self.kospi_close_ms(k)):
+            # Never divide the perp by the KOSPI200 cash level: their basis would be read as a move.
+            why = f"：{brief_error(self.kospi_anchor_error, 90)}" if self.kospi_anchor_error else ""
+            return f"缺少 HL KR200 在 {quoted_day.strftime('%m-%d')} 15:30 的同源锚点{why}；暂不输出概率"
+        base, base_note = anchor[1], "收盘时刻" if self.kospi_anchor_note == "15:30 一分钟K" else self.kospi_anchor_note
+        price, kind = kr200_price(hl)
+        beta = self.config.kospi_beta
+        effective = k.last * D(str(math.exp(beta * math.log(float(price / base)))))
+        return close_odds("KOSPI", k.last, effective, sigma, remaining, target, D("0.01"),
                           f"{quoted_day.strftime('%m-%d')} 收盘",
-                          f"HL KR200 {fmt(hl.mark)} / {base_note} {fmt(base)} → {percent(hl.mark, base):+.3f}%（KOSPI200 代理，存在基差）",
-                          sigma_note)
+                          f"HL KR200 {kind} {fmt(price)} / {base_note} {fmt(base)} → {percent(price, base):+.3f}%"
+                          + (f" × β {beta:g}" if beta != 1 else "") + "（KOSPI200 代理）", sigma_note, beta=beta, mode="盘后")
 
     @staticmethod
     def odds_row(odds: CloseOdds | str | None, label: str = "") -> str:
@@ -3634,7 +3896,7 @@ class Bot:
         probes: list[tuple[str, str, Any, Any]] = []
 
         def get(url: str, extra: dict[str, str]) -> Any:
-            return lambda: http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+            return lambda: fetch_source(url, extra)  # a probe's outcome also updates the host's cooldown
 
         def when(ms: int) -> str:
             return stamp(ms, seconds=False) + stale_note(ms, now_ms, BEIJING)
@@ -3785,12 +4047,21 @@ class Bot:
                 if not state:
                     lines.append(f"  ⏳ {name}：尚未运行")
                     continue
+                running = time.time() - state["running_since"] if state.get("running_since") else 0.0
+                if not state["runs"]:
+                    lines.append(f"  ⏳ {name}：首轮进行中（已 {running:.0f}s）" if running else f"  ⏳ {name}：尚未完成首轮")
+                    continue
                 ok_ago = f"{int(time.time() - state['ok_at'])} 秒前成功" if state["ok_at"] else "从未成功"
                 mark = "❌" if state["error"] and state["error_at"] >= state["ok_at"] else "✅"
                 err = f"｜最近错误：{brief_error(state['error'], 80)}" if state["error"] else ""
-                lines.append(f"  {mark} {name}：{ok_ago}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{err}")
+                busy = f"｜本轮进行中 {running:.0f}s" if running >= 1 else ""
+                lines.append(f"  {mark} {name}：{ok_ago}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{busy}{err}")
         else:
             lines.append("🔄 后台刷新：未启动（命令行诊断或测试环境）")
+        cooling = SOURCE_HEALTH.lines()
+        if cooling:
+            lines.append("⏸️ 暂时排到最后的源（连续失败；其余源优先，全部失败时仍会尝试）")
+            lines.extend(cooling)
         lines.append("📌 当前使用中的数据")
         if self.config.sse_index:
             close = self.cn.close
@@ -3806,9 +4077,23 @@ class Bot:
                          + (f"｜最近查找失败：{brief_error(self.a50_anchor_error, 120)}" if self.a50_anchor_error else ""))
             odds = self.sse_odds(now_ms)
             if isinstance(odds, CloseOdds):
-                lines.append(f"  上证概率：涨 {odds.fair_up * 100:.1f}¢（有效 {fmt(odds.effective.quantize(D('0.01')))}）")
+                lines.append(f"  上证概率：涨 {odds.fair_up * 100:.1f}¢（有效 {fmt(odds.effective.quantize(D('0.01')))}·σ {odds.sigma * 100:.2f}%·{odds.sigma_note}）")
             elif odds is not None:
                 lines.append(f"  上证概率：暂缺——{odds}")
+        if self.config.kospi_index:
+            k, hl, anchor = self.kospi.quote, self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
+            lines.append(f"  KOSPI 基准：{f'{fmt(k.last)}｜{stamp(k.quoted_ms, seconds=False)}｜{k.source}' if k else '无'}"
+                         + (f"｜错误：{brief_error(self.kospi.error, 80)}" if self.kospi.error else ""))
+            lines.append(f"  KR200 代理：{f'{fmt(kr200_price(hl)[0])}（HL {hl.coin} {kr200_price(hl)[1]}；标记价 {fmt(hl.mark)}）｜{int((now_ms - hl.fetched_ms) / 1000)} 秒前' if hl else '无'}")
+            lines.append(f"  KR200 锚点：{f'{fmt(anchor[1])} @ {stamp(anchor[0], seconds=False)}（{self.kospi_anchor_note}·HL）' if anchor else '无'}"
+                         + (f"｜最近查找失败：{brief_error(self.kospi_anchor_error, 120)}" if self.kospi_anchor_error else ""))
+            sigma, note = self.vols.get("KOSPI", "KOSPI")
+            lines.append(f"  KOSPI 波动率：{sigma * 100:.2f}%（{note}）")
+            odds = self.kospi_odds(now_ms)
+            if isinstance(odds, CloseOdds):
+                lines.append(f"  KOSPI 概率：涨 {odds.fair_up * 100:.1f}¢（有效 {fmt(odds.effective.quantize(D('0.01')))}）")
+            elif odds is not None:
+                lines.append(f"  KOSPI 概率：暂缺——{odds}")
         if self.config.hsi_futures and (self.hsi.quote or self.hsi.error):
             q = self.hsi.quote
             lines.append(f"  恒指期货：{f'{q.session_name(self.hsi.holidays)} {fmt(q.last)}｜{stamp(q.quoted_ms, seconds=False)}｜{q.source}' if q else '无'}"
@@ -3864,17 +4149,25 @@ class Bot:
         try:
             while not self.stopping.is_set():
                 started = time.monotonic()
-                state = self.reference_state.setdefault(name, {"ok_at": 0.0, "error": "", "error_at": 0.0, "ms": 0, "runs": 0})
+                state = self.reference_state.setdefault(name, {"ok_at": 0.0, "error": "", "error_at": 0.0, "ms": 0,
+                                                               "runs": 0, "running_since": 0.0})
+                state["running_since"] = time.time()
+                ran = True
                 try:
-                    await asyncio.wait_for(job(), timeout=REFERENCE_TIMEOUT)
-                    state.update(ok_at=time.time(), error="")
+                    # False = not due yet: a skipped tick is not a run and must not overwrite the last timing
+                    ran = await asyncio.wait_for(job(), timeout=REFERENCE_TIMEOUT) is not False
+                    if ran:
+                        state.update(ok_at=time.time(), error="")
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:  # failures are shown in /status by each feed; keep the last good data
                     text = clean_error(error) or type(error).__name__
                     state.update(error=text, error_at=time.time())
                     self.log_limited(f"reference:{name}", f"参考数据 {name} 刷新异常：{text}")
-                state.update(ms=int((time.monotonic() - started) * 1000), runs=state["runs"] + 1)
+                finally:
+                    state["running_since"] = 0.0
+                if ran:
+                    state.update(ms=int((time.monotonic() - started) * 1000), runs=state["runs"] + 1)
                 await self.wait(REFERENCE_TICK)
         finally:
             HTTP_POOL.reset(token)
@@ -4060,6 +4353,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="只诊断币安最新价和昨日日 K；不发送 TG")
     parser.add_argument("--diag", action="store_true", help="逐个检测全部数据源并打印报告（同 /diag）；不发送 TG")
+    parser.add_argument("--calib", action="store_true", help="读取数据库里的预测快照与实际收盘，打印回测报告（同 /calib）")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     store = None
@@ -4069,6 +4363,10 @@ def main() -> int:
             return asyncio.run(check_market(config))
         if args.diag:
             return asyncio.run(run_diagnostics(config))
+        if args.calib:
+            store = Store(config.db_path)
+            print(Bot(config, store, Binance(config), None).calibration_text())  # type: ignore[arg-type]
+            return 0
         if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", config.token):
             raise ValueError("请在 Railway Variables 配置 TELEGRAM_BOT_TOKEN，不要写进代码或提交到 GitHub")
         store = Store(config.db_path)

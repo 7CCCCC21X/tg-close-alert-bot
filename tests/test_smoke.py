@@ -22,7 +22,7 @@ async def run():
     methods = [c[0] for c in tg.calls]
     assert methods == ["setMyCommands", "setChatMenuButton"], methods
     cmds = tg.calls[0][1]["commands"]
-    assert len(cmds) == 16 and "diag" in [c["command"] for c in cmds]
+    assert len(cmds) == 17 and "diag" in [c["command"] for c in cmds]
     for c in cmds:
         assert re.fullmatch(r"[a-z0-9_]{1,32}", c["command"]), c
         assert 1 <= len(c["description"]) <= 256, c

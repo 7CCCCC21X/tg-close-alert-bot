@@ -79,6 +79,7 @@ async def run():
 
     # 2) only the Sina CFD answers: different instrument -> no odds, and the message says why
     m.http_get = feed(quote_ok=False, kline_ok=False)
+    m.SOURCE_HEALTH.hosts.clear()  # keep the preference order of this scenario (cooldown is tested in test_stock2)
     await bot.cn.refresh(NOW, force=True)
     assert bot.cn.a50.source == "新浪CFD" and "东方财富K线: 网络错误" in bot.cn.a50_skipped
     msg = bot.sse_odds(NOW)
@@ -86,8 +87,9 @@ async def run():
     status_line = m.to_html(bot.cn.a50_line(NOW, "cn", None))
     assert "新浪CFD·非交易所合约，仅参考" in status_line and "前序源未取到：东方财富: HTTP 403" in status_line
 
-    # 3) Eastmoney quote works again -> odds straight away, the skipped note disappears
+    # 3) Eastmoney quote works again (after its cooldown) -> odds straight away, the skipped note disappears
     m.http_get = feed()
+    m.SOURCE_HEALTH.hosts.clear()
     await bot.cn.refresh(NOW, force=True)
     assert bot.cn.a50.source == "东方财富" and not bot.cn.a50_skipped
     assert isinstance(bot.sse_odds(NOW), m.CloseOdds)
