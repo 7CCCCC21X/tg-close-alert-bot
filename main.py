@@ -14,10 +14,12 @@ import datetime as dt
 import decimal
 import html
 import json
+import hmac
 import logging
 import math
 import os
 import re
+import secrets
 import signal
 import sqlite3
 import sys
@@ -33,7 +35,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -353,6 +355,9 @@ class Config:
     sse_index: bool = True  # Shanghai Composite with the FTSE China A50 futures as after-hours proxy.
     a50_beta: float = 0.8   # Composite move per unit of A50 move when mapping the proxy.
     holidays: dict[str, frozenset] = field(default_factory=dict)  # market -> non-trading weekdays
+    web_port: int = 0        # Read-only probability web page; 0 = disabled. Railway injects PORT.
+    web_token: str = ""      # Secret path segment; generated and persisted when empty.
+    web_base: str = ""       # Public base URL, e.g. https://xxx.up.railway.app
     hl_tickers: dict[str, tuple[str, str]] = field(default_factory=dict)  # symbol -> (dex, coin) on Hyperliquid
     kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
@@ -368,6 +373,9 @@ class Config:
         # With exchange tickers configured the baseline defaults to the exchange-close instant, so the
         # contract's deviation and the stock's close are measured from the same moment.
         mode = e.get("BASELINE_MODE", "exchange_close" if tickers else "binance_daily").strip()
+        token = e.get("WEB_TOKEN", "").strip()
+        if token and not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", token):
+            raise ValueError("WEB_TOKEN 应为 16～64 位字母、数字、- 或 _")
         if mode not in BASELINE_MODES:
             raise ValueError("BASELINE_MODE 只能是 binance_daily、manual 或 exchange_close")
         url = e.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/")
@@ -402,6 +410,11 @@ class Config:
             sse_index=e.get("SSE_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
             a50_beta=parse_beta(e.get("A50_BETA", "0.8")),
             holidays=parse_holidays(e),
+            web_port=0 if e.get("WEB", "on").strip().lower() in {"off", "0", "false", "no"}
+            else bounded_int(e, "WEB_PORT", int(e.get("PORT") or 0), 0, 65535),
+            web_token=e.get("WEB_TOKEN", "").strip(),
+            web_base=(e.get("WEB_BASE_URL", "").strip().rstrip("/")
+                      or (f"https://{e['RAILWAY_PUBLIC_DOMAIN'].strip()}" if e.get("RAILWAY_PUBLIC_DOMAIN", "").strip() else "")),
         )
 
 
@@ -1763,6 +1776,130 @@ class VolBook:
         return blended, f"{source} {n} 日 {sigma * 100:.2f}% 与先验 {prior * 100:.1f}% 加权"
 
 
+# --- read-only probability web page -------------------------------------------------------------
+WEB_PAGE = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>收盘涨跌概率</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--text:#1d2125;--muted:#6b737c;--line:#e3e6ea;--up:#d93a3a;--down:#1f9d55;--flat:#9aa3ad}
+@media (prefers-color-scheme:dark){:root{--bg:#121417;--card:#1c1f23;--text:#e8eaed;--muted:#9aa3ad;--line:#2c3137}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+header{padding:16px;max-width:1100px;margin:0 auto}h1{font-size:20px;margin:0 0 4px}
+.meta{color:var(--muted);font-size:13px}.meta span{margin-right:12px}
+main{max-width:1100px;margin:0 auto;padding:0 16px 24px;display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+.top{display:flex;justify-content:space-between;align-items:baseline;gap:8px}.name{font-weight:600}.target{color:var(--muted);font-size:13px;white-space:nowrap}
+.odds{display:flex;justify-content:space-between;margin:10px 0 6px;font-variant-numeric:tabular-nums}
+.odds b{font-size:24px}.u{color:var(--up)}.d{color:var(--down)}
+.bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--line)}
+.bar i{display:block;height:100%}
+dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:10px 0 0;font-size:13px}dt{color:var(--muted)}dd{margin:0;font-variant-numeric:tabular-nums;word-break:break-word}
+.missing{color:var(--muted)}.warn{color:#c77c00}
+footer{max-width:1100px;margin:0 auto;padding:0 16px 24px;color:var(--muted);font-size:12px}
+</style></head><body>
+<header><h1>收盘涨跌概率</h1><div class="meta" id="meta">加载中…</div></header>
+<main id="cards"></main>
+<footer id="foot">模型参考，非投资建议。</footer>
+<script>
+const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
+function pct(x){return (x*100).toFixed(1)}
+function card(it,style){
+  const c=$("div","card"),top=$("div","top");
+  top.append($("div","name",it.name),$("div","target",it.target?("目标 "+it.target+" 收盘"):""));c.append(top);
+  if(it.missing){c.append($("p","missing","概率暂缺："+it.missing));return c}
+  const upCls=style==="us"?"d":"u",dnCls=style==="us"?"u":"d";
+  const o=$("div","odds"),a=$("div"),b=$("div");
+  a.append($("span","","涨 "));const ua=$("b",upCls,pct(it.fair_up)+"¢");a.append(ua);
+  b.append($("span","","跌 "));const db=$("b",dnCls,pct(it.fair_down)+"¢");b.append(db);o.append(a,b);c.append(o);
+  const bar=$("div","bar"),iu=$("i"),iff=$("i"),idn=$("i");
+  iu.style.width=(it.up*100)+"%";iu.style.background="var(--"+(style==="us"?"down":"up")+")";
+  iff.style.width=(it.flat*100)+"%";iff.style.background="var(--flat)";
+  idn.style.width=(it.down*100)+"%";idn.style.background="var(--"+(style==="us"?"up":"down")+")";
+  bar.append(iu,iff,idn);c.append(bar);
+  const dl=$("dl");const row=(k,v)=>{dl.append($("dt","",k),$("dd","",v))};
+  row("参考收盘",it.ref+(it.unit?" "+it.unit:"")+"（"+it.ref_note+"）");
+  row("有效价",it.effective+(it.unit?" "+it.unit:"")+"（"+(it.move>=0?"+":"")+it.move.toFixed(3)+"%）");
+  row("代理",it.proxy_note);
+  row("σ","日 "+(it.sigma_daily*100).toFixed(2)+"% × √"+it.remaining.toFixed(3)+" = "+(it.sigma*100).toFixed(2)+"%（"+it.sigma_note+"）");
+  row("严格涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%，z "+it.z.toFixed(3));
+  c.append(dl);return c}
+async function load(){
+  try{
+    const r=await fetch(location.pathname.replace(/\/$/,"")+"/data.json",{cache:"no-store"});
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    const d=await r.json();const box=document.getElementById("cards");box.replaceChildren(...d.items.map(it=>card(it,d.color_style)));
+    const m=document.getElementById("meta");m.replaceChildren($("span","","更新 "+d.generated_at),$("span","","基准 "+d.mode),$("span","","v"+d.version));
+    document.getElementById("foot").textContent=d.note;
+  }catch(e){const m=document.getElementById("meta");m.replaceChildren($("span","warn","刷新失败："+e.message+"，稍后自动重试"))}
+}
+load();setInterval(load,10000);
+</script></body></html>"""
+
+
+class WebServer:
+    """Tiny read-only HTTP server (stdlib asyncio) for the probability page.
+
+    Routes: /health, /p/<token> (HTML), /p/<token>/data.json (JSON). Everything else is 404, the
+    token is compared in constant time, and responses are no-store with a restrictive CSP.
+    """
+    MAX_HEADER_BYTES = 8192
+
+    def __init__(self, bot: "Bot", port: int, token: str):
+        self.bot, self.port, self.token = bot, port, token
+        self.server: asyncio.base_events.Server | None = None
+
+    async def start(self) -> int:
+        self.server = await asyncio.start_server(self.handle, "0.0.0.0", self.port)
+        self.port = self.server.sockets[0].getsockname()[1]
+        return self.port
+
+    async def stop(self) -> None:
+        if self.server:
+            self.server.close()
+            with contextlib.suppress(Exception):
+                await self.server.wait_closed()
+
+    def route(self, method: str, path: str) -> tuple[int, str, bytes]:
+        if method not in {"GET", "HEAD"}:
+            return 405, "text/plain; charset=utf-8", b"method not allowed"
+        if path in {"/", "/health"}:
+            return 200, "text/plain; charset=utf-8", b"ok"
+        parts = path.strip("/").split("/")
+        if len(parts) in {2, 3} and parts[0] == "p" and hmac.compare_digest(parts[1], self.token):
+            if len(parts) == 2:
+                return 200, "text/html; charset=utf-8", WEB_PAGE.encode("utf-8")
+            if parts[2] == "data.json":
+                body = json.dumps(self.bot.odds_payload(), ensure_ascii=False).encode("utf-8")
+                return 200, "application/json; charset=utf-8", body
+        return 404, "text/plain; charset=utf-8", b"not found"
+
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
+            if len(head) > self.MAX_HEADER_BYTES:
+                raise ValueError("header too large")
+            method, target, _ = head.split(b"\r\n", 1)[0].decode("latin-1").split(" ", 2)
+            status, ctype, body = self.route(method.upper(), urllib.parse.urlsplit(target).path)
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ValueError):
+            status, ctype, body, method = 400, "text/plain; charset=utf-8", b"bad request", "GET"
+        except Exception as error:  # Never let a page request touch the bot's loops.
+            LOG.warning("web request failed: %s", clean_error(error))
+            status, ctype, body, method = 500, "text/plain; charset=utf-8", b"error", "GET"
+        reason = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed", 500: "Internal Server Error"}[status]
+        headers = (f"HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n"
+                   "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
+                   "X-Robots-Tag: noindex\r\nContent-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; "
+                   "script-src 'unsafe-inline'; img-src 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n")
+        with contextlib.suppress(Exception):
+            writer.write(headers.encode("latin-1") + (b"" if method.upper() == "HEAD" else body))
+            await writer.drain()
+        with contextlib.suppress(Exception):
+            writer.close()
+            await writer.wait_closed()
+
+
 @dataclass(frozen=True)
 class Plan:
     reason: str
@@ -1931,6 +2068,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("pause", "暂停当前订阅"),
     Command("resume", "恢复当前订阅"),
     Command("prob", "查看各标的下个收盘涨跌概率及计算过程"),
+    Command("web", "获取概率网页链接（自动刷新）"),
     Command("test", "发送测试消息，不代表行情正常"),
     Command("id", "查看你的用户 ID、聊天 ID、话题 ID"),
     Command("help", "显示说明"),
@@ -2106,6 +2244,11 @@ class Bot:
         self.hl = Hyperliquid({**config.hl_tickers, **config.hl_index})
         self.kospi = KospiIndex(config.kospi_index)
         self.cn = CnIndex(config.sse_index)
+        self.web_token = config.web_token or self.store.get("web_token") or ""
+        if config.web_port and not self.web_token:
+            self.web_token = secrets.token_urlsafe(18)
+            self.store.put("web_token", self.web_token)
+        self.web: WebServer | None = None
         self.vols = VolBook(config.prob_vol)
         self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
         self.anchor_tries: dict[str, float] = {}
@@ -2120,7 +2263,7 @@ class Bot:
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
-            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob,
+            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web,
         }
 
     def settings(self) -> dict:
@@ -2663,6 +2806,51 @@ class Bot:
             return f"{prefix}概率暂缺：{odds}"
         return odds.row().replace("🎲 ", prefix, 1)
 
+    def odds_items(self, now_ms: int) -> list[tuple[str, CloseOdds | str]]:
+        items = [("恒生指数", self.hsi_odds(now_ms)), ("KOSPI", self.kospi_odds(now_ms)), ("上证指数", self.sse_odds(now_ms))]
+        for symbol in self.config.symbols:
+            snapshot = self.snapshots.get(symbol) or {}
+            quote = snapshot.get("quote")
+            items.append((f"{NAMES.get(symbol, symbol)}｜{symbol}", self.contract_odds(symbol, quote.price, now_ms) if quote else "等待行情"))
+        return [(title, odds) for title, odds in items if odds is not None]
+
+    def odds_payload(self) -> dict:
+        """JSON for the web page: one entry per item, numbers raw, text already plain."""
+        now_ms = self.market.now_ms()
+        items = []
+        for title, odds in (self.odds_items(now_ms) if self.config.probability else []):
+            if isinstance(odds, str):
+                items.append({"name": title, "missing": odds})
+                continue
+            items.append({
+                "name": title, "target": odds.target.strftime("%m-%d"), "unit": odds.unit,
+                "ref": fmt(odds.ref), "ref_note": odds.ref_note, "effective": fmt(odds.effective.quantize(D("0.0001"))),
+                "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note,
+                "sigma_daily": odds.sigma_daily, "sigma": odds.sigma, "remaining": odds.remaining, "sigma_note": odds.sigma_note,
+                "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
+                "fair_up": odds.fair_up, "fair_down": odds.fair_down,
+            })
+        return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION,
+                "mode": BASELINE_SHORT.get(self.settings()["mode"], self.settings()["mode"]),
+                "color_style": self.config.color_style, "items": items,
+                "note": ("模型参考，非投资建议。有效价 = 参考收盘 × 代理现价 ÷ 代理在参考收盘时刻的价格；"
+                         "P(涨) = 1 − Φ(ln((参考+半跳)/有效)/σ剩余)，平盘两边各计一半。目标日跳过周末和已配置的交易所假期。"
+                         if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")}
+
+    def web_url(self) -> str:
+        path = f"/p/{self.web_token}"
+        return f"{self.config.web_base}{path}" if self.config.web_base else path
+
+    def cmd_web(self, req: Request) -> str:
+        if not self.config.web_port or not self.web_token:
+            return ("网页未开启：需要一个监听端口。Railway 会自动提供 PORT；其他环境请设置 WEB_PORT。"
+                    "设置 WEB=off 可显式关闭。")
+        if not self.config.web_base:
+            return (f"网页已在端口 {self.config.web_port} 运行，但还没有公网域名。\n"
+                    "Railway：服务 Settings → Networking → Generate Domain，重新部署后再发 /web；"
+                    f"或设置 WEB_BASE_URL。\n路径：{self.web_url()}")
+        return f"📊 概率网页（每 10 秒自动刷新，链接含私密令牌，请勿转发）：\n{self.web_url()}"
+
     def cmd_prob(self, req: Request) -> "Reply":
         if not self.config.probability:
             return Reply("概率功能已关闭（PROBABILITY=off）。")
@@ -2670,12 +2858,7 @@ class Bot:
         lines = [f"🎲 {bold('收盘涨跌概率（模型参考，非投资建议）')}",
                  "有效价 = 参考收盘 × 代理现价 / 代理在参考收盘时刻的价格",
                  "P(涨) = 1 − Φ(ln((参考+半跳)/有效) / σ剩余)，平盘两边各计一半"]
-        items = [("恒生指数", self.hsi_odds(now_ms)), ("KOSPI", self.kospi_odds(now_ms)), ("上证指数", self.sse_odds(now_ms))]
-        for symbol in self.config.symbols:
-            snapshot = self.snapshots.get(symbol) or {}
-            quote = snapshot.get("quote")
-            items.append((f"{NAMES.get(symbol, symbol)}｜{symbol}", self.contract_odds(symbol, quote.price, now_ms) if quote else "等待行情"))
-        for title, odds in items:
+        for title, odds in self.odds_items(now_ms):
             if odds is None:
                 continue
             lines.append("\n" + bold(f"📍 {title}"))
@@ -2942,12 +3125,23 @@ class Bot:
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, self.stopping.set)
         tasks = [asyncio.create_task(self.monitor_loop()), asyncio.create_task(self.commands_loop())]
+        if self.config.web_port:
+            try:
+                self.web = WebServer(self, self.config.web_port, self.web_token)
+                port = await self.web.start()
+                LOG.info("Probability page listening on port %s (%s)", port,
+                         "public URL via /web" if self.config.web_base else "no public domain yet")
+            except OSError as error:
+                LOG.warning("概率网页启动失败（不影响提醒）：%s", clean_error(error))
+                self.web = None
         try:
             await self.stopping.wait()
         finally:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self.web:
+                await self.web.stop()
             LOG.info("Stopped safely")
 
 

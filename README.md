@@ -187,6 +187,7 @@ EXCHANGE_TICKERS=UNITREEUSDT=sh:688836,HK0625USDT=hk:00625,CXMTUSDT=sh:688825,SK
 | `/pause` | 暂停当前订阅 |
 | `/resume` | 恢复当前订阅 |
 | `/prob` | 查看各标的下个收盘涨跌概率及计算过程 |
+| `/web` | 获取概率网页链接（自动刷新，需在 Railway 生成域名） |
 | `/test` | 仅测试消息能否发到当前私聊/话题 |
 | `/id` | 显示自己的用户 ID、当前聊天 ID、话题 ID |
 | `/help` | 查看帮助 |
@@ -310,6 +311,22 @@ HL_TICKERS=UNITREEUSDT=xyz:UNITREE,HK0625USDT=xyz:SHEIN,CXMTUSDT=xyz:CXMT,SKHYNI
 ```
 
 其中 SK 海力士（`xyz:SKHX`）和长鑫（`xyz:CXMT`）是 trade.xyz 上已确认的市场；宇树和希音的代码未经确认，若该 dex 上没有这个名字，`/status` 会显示“未找到市场 xyz:UNITREE（该 dex 共 N 个市场，相近：…）”，按提示把正确的名字填进 `HL_TICKERS` 即可。设为 `off` 关闭。
+
+### 概率网页（/web）
+
+机器人自带一个只读网页，显示和 `/prob` 相同的概率，每 10 秒自动刷新，手机上可以直接打开。发 `/web`（已加入菜单）获取链接。
+
+在 Railway 上开启：
+
+1. 服务 **Settings → Networking → Generate Domain**。Railway 会自动注入 `PORT` 和 `RAILWAY_PUBLIC_DOMAIN`，程序据此监听端口并生成链接，不需要手动填变量。
+2. 重新部署后发 `/web`，得到形如 `https://xxx.up.railway.app/p/<令牌>` 的链接。
+
+说明：
+
+- 链接里的令牌第一次启动时随机生成并保存在 SQLite，重新部署不变；想换就设置 `WEB_TOKEN`（16～64 位字母数字）。没有令牌的路径一律返回 404，令牌按常量时间比较。
+- 网页只读，不能修改任何设置，也不展示订阅或 Telegram 信息；响应带 `no-store`、`noindex`、`no-referrer` 和限制性的 CSP。
+- 其他部署环境用 `WEB_PORT` 指定端口、`WEB_BASE_URL` 指定公网地址；`WEB=off` 关闭。
+- `/health` 返回 `ok`，可以作为健康检查路径。
 
 ### 上证指数与 A50 夜盘
 
