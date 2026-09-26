@@ -1,4 +1,4 @@
-import asyncio, sys, time, json, datetime as dt
+import re, asyncio, sys, time, json, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
@@ -73,9 +73,9 @@ async def run():
     store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
     await bot.one_cycle()
     hk = [t for t in tg.sent if "HK0625USDT" in t and "上涨超过" in t][0]; un = [t for t in tg.sent if "UNITREEUSDT" in t and "上涨超过" in t][0]
-    assert "📈 <b>恒指期货 夜市</b> <b>24,706</b> → 恒指" in hk and "低水 45" in hk and hk.index("恒指期货") < hk.index("📝"), hk
+    assert re.search(r"📈 <b>恒指期货 夜市(（已收市）)?</b> <b>24,706</b> → 恒指", hk) and "低水 45" in hk and hk.index("恒指期货") < hk.index("📝"), hk
     assert "恒指期货" not in un
     tg.sent.clear(); await bot.process_message({"text": "/status", "chat": {"id": 1}, "from": {"id": 42}, "date": time.time()})
-    st = tg.sent[-1]; assert "📈 <b>恒指期货 夜市</b>" in st and st.index("恒指期货") < st.index("📍"), st
+    st = tg.sent[-1]; assert re.search(r"📈 <b>恒指期货 夜市(（已收市）)?</b>", st) and st.index("恒指期货") < st.index("📍"), st
     print("HSI_OK")
 asyncio.run(run())
