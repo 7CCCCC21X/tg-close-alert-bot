@@ -248,13 +248,13 @@ def parse_holidays(env: dict[str, str]) -> dict[str, frozenset]:
             "kr": parse_dates(env.get("HOLIDAYS_KR", DEFAULT_HOLIDAYS["KR"]), "HOLIDAYS_KR")}
 
 
-def parse_beta(value: str) -> float:
+def parse_beta(value: str, name: str = "A50_BETA") -> float:
     try:
         beta = float(value)
     except ValueError:
-        raise ValueError("A50_BETA 必须是数字，如 0.8") from None
+        raise ValueError(f"{name} 必须是数字，如 0.8") from None
     if not 0 < beta <= 3:
-        raise ValueError("A50_BETA 应在 0～3 之间")
+        raise ValueError(f"{name} 应在 0～3 之间")
     return beta
 
 
@@ -362,6 +362,7 @@ class Config:
     prob_vol: dict[str, float] = field(default_factory=dict)  # Daily σ overrides (fraction), keyed by symbol/HSI/KOSPI.
     sse_index: bool = True  # Shanghai Composite with the FTSE China A50 futures as after-hours proxy.
     a50_beta: float = 0.8   # Composite move per unit of A50 move when mapping the proxy.
+    kospi_beta: float = 1.0  # KOSPI move per unit of HL KR200 (KOSPI 200 perp) move.
     holidays: dict[str, frozenset] = field(default_factory=dict)  # market -> non-trading weekdays
     web_port: int = 0        # Read-only probability web page; 0 = disabled. Railway injects PORT.
     web_token: str = ""      # Secret path segment; generated and persisted when empty.
@@ -417,6 +418,7 @@ class Config:
             prob_vol=parse_prob_vol(e.get("PROB_VOL", "")),
             sse_index=e.get("SSE_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
             a50_beta=parse_beta(e.get("A50_BETA", "0.8")),
+            kospi_beta=parse_beta(e.get("KOSPI_BETA", "1"), "KOSPI_BETA"),
             holidays=parse_holidays(e),
             web_port=0 if e.get("WEB", "on").strip().lower() in {"off", "0", "false", "no"}
             else bounded_int(e, "WEB_PORT", int(e.get("PORT") or 0), 0, 65535),
@@ -445,6 +447,10 @@ class Store:
         with self.conn:
             self.conn.execute("INSERT INTO records(k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                               (key, json.dumps(value, ensure_ascii=False)))
+
+    def items(self, prefix: str) -> list[tuple[str, Any]]:
+        rows = self.conn.execute("SELECT k, v FROM records WHERE substr(k,1,?)=? ORDER BY k", (len(prefix), prefix))
+        return [(k, json.loads(v)) for k, v in rows]
 
     def delete_prefix(self, prefix: str) -> None:
         with self.conn:
@@ -1396,6 +1402,12 @@ class HlQuote:
         return percent(self.mark, self.prev_day) if self.prev_day else None
 
 
+def kr200_price(hl: HlQuote) -> tuple[D, str]:
+    """The KR200 price compared with the anchor. The anchor is a traded candle close, so the book mid
+    (where trades happen) is used rather than the mark, which leans on the oracle while Korea is shut."""
+    return (hl.mid, "中间价") if hl.mid else (hl.mark, "标记价")
+
+
 class Hyperliquid:
     """Reference quotes from Hyperliquid's public info endpoint (no key), one request per perp dex.
 
@@ -2108,6 +2120,13 @@ class CloseOdds:
     flat: float
     down: float
     unit: str = ""
+    beta: float = 1.0      # proxy coefficient used for the effective price
+    mode: str = "盘中"     # "盘中" = live index vs previous close; "盘后" = mapped from an after-hours proxy
+
+    @property
+    def move(self) -> float:
+        """The proxy's own log move since the anchor (before β)."""
+        return math.log(float(self.effective / self.ref)) / self.beta
 
     @property
     def sigma(self) -> float:
@@ -2142,14 +2161,110 @@ class CloseOdds:
 
 
 def close_odds(name: str, ref: D, effective: D, sigma_daily: float, remaining: float, target: dt.date, tick: D,
-               ref_note: str, proxy_note: str, sigma_note: str, unit: str = "") -> CloseOdds:
+               ref_note: str, proxy_note: str, sigma_note: str, unit: str = "", beta: float = 1.0,
+               mode: str = "盘中") -> CloseOdds:
     sigma = max(sigma_daily * math.sqrt(max(remaining, 1e-6)), 1e-9)
     half = tick / 2
     hi = math.log(float((ref + half) / effective)) / sigma
     lo = math.log(float((ref - half) / effective)) / sigma if ref > half else -math.inf
     up, down = 1 - norm_cdf(hi), norm_cdf(lo)
     return CloseOdds(name, target, ref, ref_note, proxy_note, effective, sigma_daily, sigma_note, remaining,
-                     up, max(0.0, 1 - up - down), down, unit)
+                     up, max(0.0, 1 - up - down), down, unit, beta, mode)
+
+
+PRED_EVERY_MS = 30 * 60_000   # one saved prediction snapshot per index per 30 minutes
+CALIB_MIN_DAYS = 10           # walk-forward: target days used only for training before the first test day
+
+
+def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[str]:
+    """Score saved predictions against the official closes, per index and mode.
+
+    Brier / log loss of the live model versus a coin flip, a reliability table, and a fit of
+    ln(close/ref) = a + b·(proxy log move) + e with e ~ N(0, k²·R). The fit is scored walk-forward by
+    target day (each day is predicted only from days already closed) and is never applied automatically.
+    Snapshots of the same target day are strongly correlated: the real sample size is the day count.
+    """
+    lines: list[str] = []
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for p in preds:
+        groups.setdefault((p["key"], p.get("mode", "")), []).append(p)
+    for (key, mode), rows in sorted(groups.items()):
+        done = [dict(r, close=outcomes[f"{key}:{r['target']}"]) for r in rows if f"{key}:{r['target']}" in outcomes]
+        days = sorted({r["target"] for r in done})
+        lines.append(f"📐 {key}·{mode}：快照 {len(rows)} 条（{len({r['target'] for r in rows})} 个目标日），"
+                     f"已有结果 {len(done)} 条 / {len(days)} 日")
+        if not done:
+            continue
+        for r in done:
+            r["hit"] = 1.0 if r["close"] > r["ref"] else 0.5 if r["close"] == r["ref"] else 0.0
+            r["y"] = math.log(r["close"] / r["ref"])
+
+        def scores(ps: list[float], hits: list[float]) -> tuple[float, float]:
+            brier = sum((p - h) ** 2 for p, h in zip(ps, hits)) / len(ps)
+            loss = -sum(h * math.log(min(max(p, 1e-6), 1 - 1e-6)) + (1 - h) * math.log(min(max(1 - p, 1e-6), 1 - 1e-6))
+                        for p, h in zip(ps, hits)) / len(ps)
+            return brier, loss
+        brier, loss = scores([r["up"] for r in done], [r["hit"] for r in done])
+        lines.append(f"  现行模型：Brier {brier:.3f}（抛硬币 0.250）｜对数损失 {loss:.3f}（0.693）")
+        bins = []
+        for lo in (0.0, 0.2, 0.4, 0.6, 0.8):
+            sel = [r for r in done if lo <= r["up"] < lo + 0.2 or (lo == 0.8 and r["up"] == 1.0)]
+            if sel:
+                bins.append(f"{lo * 100:.0f}–{lo * 100 + 20:.0f}%：预测 {sum(r['up'] for r in sel) / len(sel) * 100:.0f}% "
+                            f"实际 {sum(r['hit'] for r in sel) / len(sel) * 100:.0f}%（{len(sel)} 条/{len({r['target'] for r in sel})} 日）")
+        lines.append("  校准：" + "；".join(bins))
+        if mode != "盘后" or len(days) < 3:
+            continue
+        fit = fit_proxy(done)
+        if fit:
+            a, b, k = fit
+            beta_now = sum(r["beta"] for r in done) / len(done)
+            sigma_now = sum(r["sigma"] for r in done) / len(done)
+            lines.append(f"  全样本拟合：系数 b {b:.2f}（现用 β {beta_now:g}）｜截距 {a * 100:+.3f}%｜"
+                         f"残差 σ {k * 100:.2f}%/日（现用 σ 均值 {sigma_now * 100:.2f}%）")
+        if len(days) < CALIB_MIN_DAYS + 5:
+            lines.append(f"  逐日向前检验：目标日 {len(days)} 个，至少要 {CALIB_MIN_DAYS + 5} 个才下结论")
+            continue
+        tested, fitted = [], []
+        for day in days[CALIB_MIN_DAYS:]:
+            fit = fit_proxy([r for r in done if r["target"] < day])
+            if not fit:
+                continue
+            a, b, k = fit
+            for r in (r for r in done if r["target"] == day):
+                tested.append(r)
+                fitted.append(norm_cdf((a + b * r["move"]) / max(k * math.sqrt(max(r["R"], 1e-6)), 1e-9)))
+        if tested:
+            old = scores([r["up"] for r in tested], [r["hit"] for r in tested])
+            new = scores(fitted, [r["hit"] for r in tested])
+            lines.append(f"  逐日向前检验（{len({r['target'] for r in tested})} 日 {len(tested)} 条）：拟合模型 Brier {new[0]:.3f} / "
+                         f"对数损失 {new[1]:.3f}，现行 {old[0]:.3f} / {old[1]:.3f}")
+    return lines or ["📐 还没有保存的预测快照（每个指数每 30 分钟存一条，需要概率功能开启）"]
+
+
+def fit_proxy(rows: list[dict]) -> tuple[float, float, float] | None:
+    """Weighted OLS of y = a + b·move, and k with e ~ N(0, k²·R): (a, b, k); None when underdetermined.
+
+    Each target day carries the same total weight (its snapshots share one outcome), and the degrees
+    of freedom are counted in days, so many snapshots of few days do not look like a large sample.
+    """
+    per_day: dict[str, int] = {}
+    for r in rows:
+        per_day[r["target"]] = per_day.get(r["target"], 0) + 1
+    days = len(per_day)
+    if days < 3:
+        return None
+    ws = [1 / per_day[r["target"]] for r in rows]
+    xs, ys = [r["move"] for r in rows], [r["y"] for r in rows]
+    total = sum(ws)
+    mx, my = sum(w * x for w, x in zip(ws, xs)) / total, sum(w * y for w, y in zip(ws, ys)) / total
+    sxx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
+    if sxx <= 0:
+        return None
+    b = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys)) / sxx
+    a = my - b * mx
+    k2 = sum(w * (y - a - b * x) ** 2 / max(r["R"], 1e-6) for w, x, y, r in zip(ws, xs, ys, rows)) / (days - 2)
+    return a, b, math.sqrt(k2) if k2 > 0 else 1e-9
 
 
 def realised_vol(closes: list[D]) -> tuple[float, int]:
@@ -2576,6 +2691,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("resume", "恢复当前订阅"),
     Command("prob", "查看各标的下个收盘涨跌概率及计算过程"),
     Command("web", "获取概率网页链接（自动刷新）"),
+    Command("calib", "用已保存的预测快照和实际收盘给概率模型打分（Brier/校准/逐日向前拟合）"),
     Command("diag", "逐个检测数据源（币安/交易所/上证/A50/恒指/KOSPI/HL/汇率），找出哪里出问题"),
     Command("test", "发送测试消息，不代表行情正常"),
     Command("id", "查看你的用户 ID、聊天 ID、话题 ID"),
@@ -2764,6 +2880,7 @@ class Bot:
         self.reference_state: dict[str, dict] = {}  # per background feed: last success, last error, duration
         self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
         self.kospi_anchor_note, self.kospi_anchor_error = "", ""
+        self.pred_last: dict[str, int] = {}  # index -> ms of the last saved prediction snapshot
         self.a50_anchor_note = "15:00"
         self.a50_anchor_error = ""  # why the last anchor lookup failed (shown in /diag and the odds row)
         self.a50_anchor_source = "东方财富"
@@ -2779,7 +2896,7 @@ class Bot:
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
-            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag,
+            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/calib": self.cmd_calib,
         }
 
     def settings(self) -> dict:
@@ -3261,6 +3378,38 @@ class Bot:
                         break
                 except Exception:
                     continue
+        self.record_predictions(now_ms)
+
+    def record_predictions(self, now_ms: int) -> None:
+        """Save what each index model saw and said (every 30 min), and each official close as it becomes
+        known, so the model can later be scored against real outcomes (/calib)."""
+        for key, odds_of in (("SSE", self.sse_odds), ("KOSPI", self.kospi_odds), ("HSI", self.hsi_odds)):
+            odds = odds_of(now_ms)
+            if not isinstance(odds, CloseOdds) or now_ms - self.pred_last.get(key, -PRED_EVERY_MS) < PRED_EVERY_MS:
+                continue
+            self.pred_last[key] = now_ms
+            self.store.put(f"pred:{key}:{now_ms}", {
+                "key": key, "t": now_ms, "target": odds.target.isoformat(), "mode": odds.mode, "ref": float(odds.ref),
+                "eff": float(odds.effective), "move": odds.move, "beta": odds.beta, "sigma": odds.sigma_daily,
+                "R": odds.remaining, "up": odds.fair_up, "proxy": odds.proxy_note})
+        if self.cn.close:
+            self.store.put(f"outcome:SSE:{self.cn.close.day.isoformat()}", float(self.cn.close.value))
+        k = self.kospi.quote
+        kst = dt.timezone(dt.timedelta(hours=9))
+        if k and dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).time() >= dt.time(15, 30):
+            self.store.put(f"outcome:KOSPI:{dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date().isoformat()}", float(k.last))
+        q, local = self.hsi.quote, dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+        if (q and q.spot is not None and not self.hsi.error and local.time() >= dt.time(16, 15)
+                and self.hk_cash_close_date(now_ms, self.hsi.holidays) == local.date()):
+            self.store.put(f"outcome:HSI:{local.date().isoformat()}", float(q.spot))
+
+    def calibration_text(self) -> str:
+        preds = [v for _, v in self.store.items("pred:")]
+        outcomes = {k.removeprefix("outcome:"): float(v) for k, v in self.store.items("outcome:")}
+        return "\n".join(["📐 概率模型回测（只评估，不会自动改参数）"] + calibration_report(preds, outcomes))
+
+    async def cmd_calib(self, req: Request) -> str:
+        return self.calibration_text()
 
     async def kospi_anchor(self, kospi: IndexQuote, hl: HlQuote) -> None:
         """HL KR200 at the KOSPI 15:30 close, from the same perp as the live proxy, persisted across restarts.
@@ -3270,7 +3419,7 @@ class Bot:
         """
         close_ms = self.kospi_close_ms(kospi)
         if 0 <= hl.fetched_ms - close_ms <= 2 * 60_000 and not self.store.get(f"kr200_print:{close_ms}"):
-            self.store.put(f"kr200_print:{close_ms}", [hl.fetched_ms, str(hl.mark)])  # too late to catch afterwards
+            self.store.put(f"kr200_print:{close_ms}", [hl.fetched_ms, str(kr200_price(hl)[0])])  # too late to catch afterwards
         if self.anchors.get("KOSPI", (0,))[0] == close_ms:
             return
         saved = self.store.get("anchor:KOSPI", ())
@@ -3291,7 +3440,7 @@ class Bot:
         printed = self.store.get(f"kr200_print:{close_ms}")
         if price is None and printed:
             with contextlib.suppress(ValueError, TypeError, IndexError, decimal.InvalidOperation):
-                price, note = D(str(printed[1])), "15:30 后两分钟内标记价近似"
+                price, note = D(str(printed[1])), "15:30 后两分钟内实时价近似"
         self.kospi_anchor_error = "；".join(failures) if price is None else ""
         if price is not None:
             self.anchors["KOSPI"] = (close_ms, price)
@@ -3364,7 +3513,8 @@ class Bot:
         effective = close.value * D(str(math.exp(beta * move)))
         return close_odds("上证指数", close.value, effective, sigma, remaining, target, D("0.01"),
                           f"{ref_note}·{close.source}",
-                          f"A50 {fmt(a50.last)} / {base_note} {fmt(base)} → {percent(a50.last, base):+.3f}% × β {beta:g}", sigma_note)
+                          f"A50 {fmt(a50.last)} / {base_note} {fmt(base)} → {percent(a50.last, base):+.3f}% × β {beta:g}", sigma_note,
+                          beta=beta, mode="盘后")
 
     @staticmethod
     def kospi_close_ms(q: IndexQuote) -> int:
@@ -3429,7 +3579,7 @@ class Bot:
         remaining, target = session_remaining("hk", now_ms, close_date, self.config.holidays.get("hk", frozenset()))
         return close_odds("恒生指数", q.spot, q.spot * q.last / anchor, sigma, remaining, target, D("0.01"),
                           f"{close_date.strftime('%m-%d')} 收盘", f"恒指期货 {fmt(q.last)} / {anchor_note} {fmt(anchor)} → {percent(q.last, anchor):+.3f}%",
-                          sigma_note)
+                          sigma_note, mode="盘后")
 
     HL_STALE_MS = 10 * 60_000  # an HL mark older than this (refresh failing) is not used for new probabilities
 
@@ -3448,7 +3598,11 @@ class Bot:
             return close_odds("KOSPI", k.prev_close, k.last, sigma, remaining, target, D("0.01"), "昨收",
                               f"KOSPI 现货 {fmt(k.last)}（盘中直接用现货）", sigma_note)
         hl, anchor = self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
-        remaining, target = session_remaining("kr", now_ms, quoted_day, self.config.holidays.get("kr", frozenset()))
+        holidays = self.config.holidays.get("kr", frozenset())
+        remaining, target = session_remaining("kr", now_ms, quoted_day, holidays)
+        expected = expected_close_date("kr", now_ms, holidays)
+        if quoted_day < expected or (quoted_day == local.date() and local.time() < dt.time(15, 30)):
+            return f"KOSPI 基准停在 {stamp(k.quoted_ms, seconds=False)}，应为 {expected.strftime('%m-%d')} 收盘；暂不输出概率"
         if hl is None:
             return "缺少 HL KR200 代理"
         if now_ms - hl.fetched_ms > self.HL_STALE_MS:
@@ -3458,10 +3612,13 @@ class Bot:
             why = f"：{brief_error(self.kospi_anchor_error, 90)}" if self.kospi_anchor_error else ""
             return f"缺少 HL KR200 在 {quoted_day.strftime('%m-%d')} 15:30 的同源锚点{why}；暂不输出概率"
         base, base_note = anchor[1], "收盘时刻" if self.kospi_anchor_note == "15:30 一分钟K" else self.kospi_anchor_note
-        return close_odds("KOSPI", k.last, k.last * hl.mark / base, sigma, remaining, target, D("0.01"),
+        price, kind = kr200_price(hl)
+        beta = self.config.kospi_beta
+        effective = k.last * D(str(math.exp(beta * math.log(float(price / base)))))
+        return close_odds("KOSPI", k.last, effective, sigma, remaining, target, D("0.01"),
                           f"{quoted_day.strftime('%m-%d')} 收盘",
-                          f"HL KR200 {fmt(hl.mark)} / {base_note} {fmt(base)} → {percent(hl.mark, base):+.3f}%（KOSPI200 代理，存在基差）",
-                          sigma_note)
+                          f"HL KR200 {kind} {fmt(price)} / {base_note} {fmt(base)} → {percent(price, base):+.3f}%"
+                          + (f" × β {beta:g}" if beta != 1 else "") + "（KOSPI200 代理）", sigma_note, beta=beta, mode="盘后")
 
     @staticmethod
     def odds_row(odds: CloseOdds | str | None, label: str = "") -> str:
@@ -3927,7 +4084,7 @@ class Bot:
             k, hl, anchor = self.kospi.quote, self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
             lines.append(f"  KOSPI 基准：{f'{fmt(k.last)}｜{stamp(k.quoted_ms, seconds=False)}｜{k.source}' if k else '无'}"
                          + (f"｜错误：{brief_error(self.kospi.error, 80)}" if self.kospi.error else ""))
-            lines.append(f"  KR200 代理：{f'{fmt(hl.mark)}（HL {hl.coin} 标记价）｜{int((now_ms - hl.fetched_ms) / 1000)} 秒前' if hl else '无'}")
+            lines.append(f"  KR200 代理：{f'{fmt(kr200_price(hl)[0])}（HL {hl.coin} {kr200_price(hl)[1]}；标记价 {fmt(hl.mark)}）｜{int((now_ms - hl.fetched_ms) / 1000)} 秒前' if hl else '无'}")
             lines.append(f"  KR200 锚点：{f'{fmt(anchor[1])} @ {stamp(anchor[0], seconds=False)}（{self.kospi_anchor_note}·HL）' if anchor else '无'}"
                          + (f"｜最近查找失败：{brief_error(self.kospi_anchor_error, 120)}" if self.kospi_anchor_error else ""))
             sigma, note = self.vols.get("KOSPI", "KOSPI")
@@ -4196,6 +4353,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="只诊断币安最新价和昨日日 K；不发送 TG")
     parser.add_argument("--diag", action="store_true", help="逐个检测全部数据源并打印报告（同 /diag）；不发送 TG")
+    parser.add_argument("--calib", action="store_true", help="读取数据库里的预测快照与实际收盘，打印回测报告（同 /calib）")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     store = None
@@ -4205,6 +4363,10 @@ def main() -> int:
             return asyncio.run(check_market(config))
         if args.diag:
             return asyncio.run(run_diagnostics(config))
+        if args.calib:
+            store = Store(config.db_path)
+            print(Bot(config, store, Binance(config), None).calibration_text())  # type: ignore[arg-type]
+            return 0
         if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", config.token):
             raise ValueError("请在 Railway Variables 配置 TELEGRAM_BOT_TOKEN，不要写进代码或提交到 GitHub")
         store = Store(config.db_path)

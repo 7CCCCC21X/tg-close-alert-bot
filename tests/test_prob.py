@@ -108,7 +108,7 @@ async def run():
     tg.sent.clear(); await bot.process_message({"text": "/prob", "chat": {"id": 1}, "from": {"id": 42}, "date": time.time()})
     pr = tg.sent[-1]
     assert "<b>📍 KOSPI</b>" in pr and "参考收盘 <b>7,080.92</b>（09-23 收盘）→ 目标 09-28 收盘" in pr and "σ 日 3.02%（PROB_VOL 手动设定）× √1.000 = 3.02%｜z -0.576" in pr, pr
-    assert "HL KR200 1,107.15 / 收盘时刻 1,126.6 → -1.726%（KOSPI200 代理，存在基差）" in pr and "公平价 涨 <b>28.2¢</b> / 跌 <b>71.8¢</b>" in pr, pr
+    assert "HL KR200 标记价 1,107.15 / 收盘时刻 1,126.6 → -1.726%（KOSPI200 代理）" in pr and "公平价 涨 <b>28.2¢</b> / 跌 <b>71.8¢</b>" in pr, pr
     assert "<b>📍 SK 海力士｜SKHYNIXUSDT</b>" in pr and "参考收盘 <b>1,857,000 KRW</b>（09-23 15:30 韩国时间·Naver）" in pr and "币安日K 30 日" in pr, pr
     assert "📍 恒生指数" not in pr  # HSI disabled
     # --- KR200 anchor: restart, 5-minute fallback, recorded mark, never the KOSPI200 cash level ---------
@@ -139,7 +139,7 @@ async def run():
     await bot5.kospi_anchor(k, at_close)  # the live mark seen right after the close is recorded ...
     bot5.anchors.clear(); bot5.retry_ok = lambda key, every=60: True
     await bot5.kospi_anchor(k, hl)          # ... and used when the candles are gone
-    assert bot5.anchors["KOSPI"] == (close_ms, D("1126.9")) and bot5.kospi_anchor_note == "15:30 后两分钟内标记价近似"
+    assert bot5.anchors["KOSPI"] == (close_ms, D("1126.9")) and bot5.kospi_anchor_note == "15:30 后两分钟内实时价近似"
     # a stale HL mark (refresh failing) gives no new probability
     bot.hl.quotes["KR200"] = dataclasses.replace(hl, fetched_ms=now - 11 * 60_000)
     assert "HL KR200 报价已超 10 分钟未更新" in bot.kospi_odds(now)
