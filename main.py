@@ -1032,6 +1032,10 @@ class FuturesQuote:
     spot_prev: D | None = None  # Cash index previous close, for the index's own day move.
     water: D | None = None      # Premium/discount as published by the source (etnet), signed.
     exchange_contract: bool = True  # False for CFD fallbacks that are not the HKEX contract.
+    session: str = ""           # "日市" / "夜市" when the source says which block this is; else derived from the time
+
+    def session_name(self, holidays: frozenset = frozenset()) -> str:
+        return self.session or hk_futures_session(self.quoted_ms, holidays)
 
     @property
     def change(self) -> D | None:
@@ -1063,11 +1067,13 @@ def page_text(raw: bytes) -> str:
 ETNET_NUM = r"([\d,]+(?:\.\d+)?)"
 
 
-def parse_etnet_futures(raw: bytes, now_ms: int) -> "FuturesQuote":
+def parse_etnet_futures(raw: bytes, now_ms: int, holidays: frozenset = frozenset()) -> "FuturesQuote":
     """etnet 指數期貨 page: HKEX HSI futures (日市/夜市 blocks) plus 恒生指數現貨.
 
-    Parsed from visible text so markup changes do not matter. The block with the newest
-    timestamp is used; its published 高水/低水 is kept as the basis.
+    Parsed from visible text so markup changes do not matter. On the live page the block times
+    are drawn inside the chart images, not the text, so the newer block is found from the prices:
+    a night session that followed the day block opens from the day block's last price (its 前收市),
+    while last night's block shares the day block's 前收市. Its published 高水/低水 is kept as the basis.
     """
     text = page_text(raw)
     spot = spot_prev = None
@@ -1092,16 +1098,33 @@ def parse_etnet_futures(raw: bytes, now_ms: int) -> "FuturesQuote":
         if w:
             water = D(w.group(2) or 0) * (-1 if w.group(1) == "低水" else 1)
         stamp_match = re.search(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2})", body)
-        quoted_ms = now_ms
+        quoted_ms = 0
         if stamp_match:
             quoted = dt.datetime.strptime(stamp_match.group(1), "%Y/%m/%d %H:%M").replace(tzinfo=BEIJING)
             quoted_ms = int(quoted.timestamp() * 1000)
         candidates.append(FuturesQuote(
             f"恒指期货({month}){session}", number(m.group(1).replace(",", ""), "恒指期货"), field("前收市"),
-            field("開市"), field("最高"), field("最低"), quoted_ms, "etnet", spot, "etnet", spot_prev, water))
+            field("開市"), field("最高"), field("最低"), quoted_ms, "etnet", spot, "etnet", spot_prev, water,
+            session=session))
     if not candidates:
         raise ValueError("etnet 页面没有找到恒指期货报价")
-    return max(candidates, key=lambda q: q.quoted_ms)
+    if all(q.quoted_ms for q in candidates):
+        return max(candidates, key=lambda q: q.quoted_ms)
+    day = next((q for q in candidates if q.session == "日市"), None)
+    night = next((q for q in candidates if q.session == "夜市"), None)
+    if day and night:
+        if night.prev_settle == day.last and night.prev_settle != day.prev_settle:
+            chosen = night   # tonight's (or last night's, after 03:00) session followed this day block
+        elif night.prev_settle == day.prev_settle and night.prev_settle != day.last:
+            chosen = day     # the night block is the one before this day session
+        else:
+            chosen = night if hk_futures_session(now_ms, holidays) == "夜市" else day
+    else:
+        chosen = day or night
+    if not chosen.quoted_ms:  # time unknown: now while its session runs, else when that session last ended
+        live = hk_futures_session(now_ms, holidays) == chosen.session
+        chosen = dataclasses.replace(chosen, quoted_ms=now_ms if live else hk_session_end(chosen.session, now_ms, holidays))
+    return chosen
 
 
 def stale_note(quoted_ms: int, now_ms: int, tz: dt.tzinfo) -> str:
@@ -1111,14 +1134,36 @@ def stale_note(quoted_ms: int, now_ms: int, tz: dt.tzinfo) -> str:
     return "｜⚠️ 非今日数据" if quoted < today else ""
 
 
-def hk_futures_session(now_ms: int) -> str:
-    """HKEX HSI futures: day session 09:15-16:30, after-hours (夜市) 17:15-03:00 next day, HK time."""
-    local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).time()
-    if local >= dt.time(17, 15) or local < dt.time(3, 0):
+def hk_trading_day(day: dt.date, holidays: frozenset = frozenset()) -> bool:
+    return day.weekday() < 5 and day not in holidays
+
+
+def hk_futures_session(now_ms: int, holidays: frozenset = frozenset()) -> str:
+    """HKEX HSI futures: day session 09:15-16:30, after-hours (夜市) 17:15-03:00 next day, HK time.
+    Sessions only start on trading days, so Friday's night ends Saturday 03:00 and weekends are shut."""
+    moment = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+    local, today = moment.time(), moment.date()
+    if local >= dt.time(17, 15) and hk_trading_day(today, holidays):
         return "夜市"
-    if dt.time(9, 15) <= local <= dt.time(16, 30):
+    if local < dt.time(3, 0) and hk_trading_day(today - dt.timedelta(days=1), holidays):
+        return "夜市"
+    if dt.time(9, 15) <= local <= dt.time(16, 30) and hk_trading_day(today, holidays):
         return "日市"
     return "休市"
+
+
+def hk_session_end(session: str, now_ms: int, holidays: frozenset = frozenset()) -> int:
+    """When the latest finished ``session`` ("日市"/"夜市") ended, at or before ``now_ms``."""
+    local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+    day = local.date()
+    for _ in range(30):
+        if hk_trading_day(day, holidays):
+            end = (dt.datetime.combine(day, dt.time(16, 30), BEIJING) if session == "日市"
+                   else dt.datetime.combine(day + dt.timedelta(days=1), dt.time(3, 0), BEIJING))
+            if end <= local:
+                return int(end.timestamp() * 1000)
+        day -= dt.timedelta(days=1)
+    return now_ms
 
 
 def parse_eastmoney_quote(raw: bytes) -> dict[str, Any]:
@@ -1153,16 +1198,17 @@ class IndexFutures:
                     ("腾讯", "https://qt.gtimg.cn/q=hkHSI", {"Referer": "https://gu.qq.com/"}),
                     ("新浪", "https://hq.sinajs.cn/list=rt_hkHSI", {"Referer": "https://finance.sina.com.cn/"}))
 
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled: bool = True, holidays: frozenset = frozenset()):
         self.enabled = enabled
+        self.holidays = holidays
         self.quote: FuturesQuote | None = None
         self.error = ""
         self.refreshed = -1e9
 
     @staticmethod
-    def parse_futures(source: str, raw: bytes, now_ms: int) -> FuturesQuote:
+    def parse_futures(source: str, raw: bytes, now_ms: int, holidays: frozenset = frozenset()) -> FuturesQuote:
         if source == "etnet":
-            return parse_etnet_futures(raw, now_ms)
+            return parse_etnet_futures(raw, now_ms, holidays)
         if source == "东方财富":
             d = parse_eastmoney_quote(raw)
             quoted_ms = int(d["f86"]) * 1000 if str(d.get("f86", "")).isdigit() else now_ms
@@ -1213,7 +1259,8 @@ class IndexFutures:
             return
         self.refreshed = time.monotonic()
         try:
-            quote: FuturesQuote = await self._first(self.FUTURES_SOURCES, lambda n, r: self.parse_futures(n, r, now_ms))
+            quote: FuturesQuote = await self._first(self.FUTURES_SOURCES,
+                                                    lambda n, r: self.parse_futures(n, r, now_ms, self.holidays))
         except Exception as error:
             self.error = clean_error(error)
             return
@@ -1231,10 +1278,13 @@ class IndexFutures:
         q = self.quote
         if q is None:
             return f"📈 恒指期货 ⚠️ 获取失败（{self.error}）" if self.error else "📈 恒指期货 ⏳ 等待首次获取"
-        parts = [f"📈 {bold('恒指期货 ' + hk_futures_session(q.quoted_ms))} {bold(fmt(q.last))}"]
+        session = q.session_name(self.holidays)
+        if session in ("日市", "夜市") and hk_futures_session(now_ms, self.holidays) != session:
+            session += "（已收市）"
+        parts = [f"📈 {bold('恒指期货 ' + session)} {bold(fmt(q.last))}"]
         if q.spot is not None:
-            local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).time()
-            cash_open = dt.time(9, 30) <= local <= dt.time(16, 10)
+            local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+            cash_open = hk_trading_day(local.date(), self.holidays) and dt.time(9, 30) <= local.time() <= dt.time(16, 10)
             water = "高水" if q.basis > 0 else "低水" if q.basis < 0 else "平水"
             parts[0] += (f" → 恒指{'' if cash_open else '收盘'} {bold(fmt(q.spot))} {pct_text(percent(q.last, q.spot), style)}"
                          f"（{water} {abs(q.basis):,.0f}）")
@@ -2487,7 +2537,7 @@ class Bot:
         self.snapshots: dict[str, dict] = {}
         self.stocks = StockMarket(config, store)
         self.fx = FxRates(config.fx_manual)
-        self.hsi = IndexFutures(config.hsi_futures)
+        self.hsi = IndexFutures(config.hsi_futures, config.holidays.get("hk", frozenset()))
         self.hl = Hyperliquid({**config.hl_tickers, **config.hl_index})
         self.kospi = KospiIndex(config.kospi_index)
         self.cn = CnIndex(config.sse_index, config.holidays.get("sh", frozenset()))
@@ -2905,11 +2955,11 @@ class Bot:
                     self.anchors["KOSPI"] = (close_ms, await self.hl.price_at(hl.coin, close_ms))
         q = self.hsi.quote
         if q and q.spot is not None:
-            close_date = self.hk_cash_close_date(now_ms)
+            close_date = self.hk_cash_close_date(now_ms, self.hsi.holidays)
             local = dt.datetime.fromtimestamp(q.quoted_ms / 1000, BEIJING)
             close_ms = int(dt.datetime.combine(close_date, dt.time(16, 10), BEIJING).timestamp() * 1000)
             # First futures print after the cash close = the futures level the close is anchored to.
-            if (hk_futures_session(q.quoted_ms) != "夜市" and local.date() == close_date and local.time() >= dt.time(16, 10)
+            if (q.session_name(self.hsi.holidays) != "夜市" and local.date() == close_date and local.time() >= dt.time(16, 10)
                     and self.anchors.get("HSI", (0,))[0] != close_ms):
                 self.anchors["HSI"] = (close_ms, q.last)
 
@@ -3048,10 +3098,10 @@ class Bot:
         return int(dt.datetime.combine(day, dt.time(15, 30), kst).timestamp() * 1000)
 
     @staticmethod
-    def hk_cash_close_date(now_ms: int) -> dt.date:
+    def hk_cash_close_date(now_ms: int, holidays: frozenset = frozenset()) -> dt.date:
         local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
         day = local.date() if local.time() >= dt.time(16, 10) else local.date() - dt.timedelta(days=1)
-        while day.weekday() >= 5:
+        while not hk_trading_day(day, holidays):
             day -= dt.timedelta(days=1)
         return day
 
@@ -3081,19 +3131,22 @@ class Bot:
             return None
         if q is None or q.spot is None:
             return "缺少恒指现货"
+        holidays = self.hsi.holidays
         local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
-        cash_open = local.weekday() < 5 and dt.time(9, 30) <= local.time() < dt.time(16, 10)
+        cash_open = hk_trading_day(local.date(), holidays) and dt.time(9, 30) <= local.time() < dt.time(16, 10)
         sigma, sigma_note = self.vols.get("HSI", "HSI")
         if cash_open and q.spot_prev:
             remaining, target = session_remaining("hk", now_ms, local.date() - dt.timedelta(days=1), self.config.holidays.get("hk", frozenset()))
             return close_odds("恒生指数", q.spot_prev, q.spot, sigma, remaining, target, D("0.01"), "昨收",
                               f"恒指现货 {fmt(q.spot)}（盘中直接用现货）", sigma_note)
-        close_date = self.hk_cash_close_date(now_ms)
+        close_date = self.hk_cash_close_date(now_ms, holidays)
         anchor, anchor_note = None, "收市时"
-        if hk_futures_session(q.quoted_ms) != "夜市":
+        if q.session_name(holidays) != "夜市":
             anchor, anchor_note = q.last, "日市收市"  # No night trading yet: the close itself is the best estimate.
         elif q.source == "etnet" and q.prev_settle:
-            anchor, anchor_note = q.prev_settle, "日市收市"  # night block's 前收市 = the day session before it
+            # The night block's 前收市 is the day session it followed. Only valid when that day is the
+            # cash close being mapped; the block choice in parse_etnet_futures guarantees it.
+            anchor, anchor_note = q.prev_settle, "日市收市"
         elif self.anchors.get("HSI") and dt.datetime.fromtimestamp(self.anchors["HSI"][0] / 1000, BEIJING).date() == close_date:
             anchor = self.anchors["HSI"][1]
         if anchor is None:
