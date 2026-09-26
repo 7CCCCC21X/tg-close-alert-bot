@@ -222,13 +222,13 @@ async def run():
     # Without a dated anchor, a quote's previous close cannot prove the 15:00 A50 price.
     bot.anchors.pop("A50")
     x.a50 = m.IndexQuote("A50期货", D("14200"), D("14300"), None, None, None, bj(2026, 9, 28, 22, 0), "东方财富")
-    assert "缺少 09-28 15:00 的 A50 历史锚点" in bot.sse_odds(bj(2026, 9, 28, 22, 5))
+    assert "缺少 09-28 15:00 的 A50 锚点（东方财富 1 分钟及 5 分钟 K均未取得" in bot.sse_odds(bj(2026, 9, 28, 22, 5))
     x.a50 = m.IndexQuote("A50期货", D("14250"), D("14300"), None, None, None, bj(2026, 9, 28, 16, 29), "东方财富")
-    assert "缺少 09-28 15:00 的 A50 历史锚点" in bot.sse_odds(bj(2026, 9, 28, 16, 40))
+    assert "缺少 09-28 15:00 的 A50 锚点（东方财富 1 分钟及 5 分钟 K均未取得" in bot.sse_odds(bj(2026, 9, 28, 16, 40))
     # A50 trading on the 09-25 holiday with no 09-24 15:00 anchor -> explained, no guess
     x.close = m.DailyClose(dt.date(2026, 9, 24), D("3888.37"), D("3870.10"), "腾讯日K", 0)
     x.a50 = m.IndexQuote("A50期货", D("14250"), D("14300"), None, None, None, bj(2026, 9, 25, 11, 58), "东方财富")
-    assert "缺少 09-24 15:00 的 A50 历史锚点" in bot.sse_odds(bj(2026, 9, 25, 12, 0))
+    assert "缺少 09-24 15:00 的 A50 锚点（东方财富 1 分钟及 5 分钟 K均未取得" in bot.sse_odds(bj(2026, 9, 25, 12, 0))
     assert x.a50_stale(bj(2026, 9, 26, 16, 0))  # Friday afternoon/night trading is missing
     assert "A50 报价已超 10 分钟未更新" in bot.sse_odds(bj(2026, 9, 26, 16, 0))
     x.a50 = m.IndexQuote("A50期货", D("14297"), D("14300"), None, None, None, bj(2026, 9, 26, 5, 6), "东方财富")

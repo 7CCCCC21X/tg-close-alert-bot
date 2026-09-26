@@ -87,7 +87,7 @@ async def run():
     assert "🚨 整组全部失败（该数据当前拿不到）：交易所收盘·UNITREE、Hyperliquid、汇率" in text, text
     partial = [l for l in text.splitlines() if l.startswith("⚠️ 其余失败的源")][0]
     assert partial == ("⚠️ 其余失败的源（同组有别的源顶上）：上证实时·新浪、上证实时·东方财富、上证日K·东方财富日K、"
-                       "A50实时·东方财富、A50实时·新浪CFD、A50锚点·东方财富1分钟K 09-24 15:00"), partial
+                       "A50实时·东方财富、A50实时·新浪CFD、A50锚点·东方财富1分钟K 09-24 15:00、A50锚点·新浪5分钟K 09-24 15:00"), partial
     assert "【A50实时】\n❌ 东方财富（" in text and "🔄 后台刷新：未启动" in text and "📌 当前使用中的数据" in text
 
     # every source down -> points at the deployment's network, not at the feeds
@@ -119,6 +119,9 @@ async def run():
     try: m._http_get("https://example.invalid/"); assert False
     except m.RemoteError as e: assert str(e) == "网络错误 (URLError: Tunnel connection failed: 403 Forbidden)", e
     urllib.request.urlopen = saved
+    # GBK answers (Sina/Tencent) are shown readably, not as mojibake
+    assert "富时中国A50期货" in m.raw_snippet('var hq_str_hf_CHA50CFD="1,,2026-09-26,富时中国A50期货";'.encode("gbk"))
+    assert m.raw_snippet("上证指数".encode("utf-8")) == "上证指数"
     print("DIAG_OK")
 
 
