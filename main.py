@@ -38,7 +38,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.12.1"
+VERSION = "1.12.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -1505,6 +1505,19 @@ def a50_last_session_end(now_ms: int) -> int:
     return int(dt.datetime.combine(end_day, end_time, BEIJING).timestamp() * 1000)
 
 
+def a50_code_ok(code: Any) -> bool:
+    """Eastmoney labels SGX A50 contracts CN00Y (continuous), CN2610, ...; an empty code is tolerated,
+    anything else (another contract) is not."""
+    code = str(code or "").strip().upper()
+    return not code or code.startswith("CN")
+
+
+def a50_family(source: str) -> str:
+    """Quotes from the same contract share a family: Eastmoney's quote and its K lines are both the SGX
+    futures; Sina's CFD is a different instrument and never mixes with them."""
+    return "东方财富" if source.startswith("东方财富") else source
+
+
 def parse_cn_index(source: str, raw: bytes, now_ms: int, name: str = "上证指数") -> IndexQuote:
     """Tencent v_sh000001 / Sina hq_str_sh000001 / Eastmoney push2 -> IndexQuote (last, prev close, time).
 
@@ -1601,7 +1614,12 @@ class CnIndex:
     SSE_SOURCES = (("腾讯", "https://qt.gtimg.cn/q=sh000001", {"Referer": "https://gu.qq.com/"}),
                    ("新浪", "https://hq.sinajs.cn/list=sh000001", {"Referer": "https://finance.sina.com.cn/"}),
                    ("东方财富", IndexFutures.EM + "1.000001", {"Referer": "https://quote.eastmoney.com/"}))
+    # The live A50 price: Eastmoney's quote, else the latest bar of the same contract's 1-minute K line
+    # (another Eastmoney host, same futures, so it can still be mapped against the Eastmoney anchor),
+    # and Sina's CFD only as a labelled last resort that is never mixed with a futures anchor.
     A50_SOURCES = (("东方财富", IndexFutures.EM + "104.CN00Y", {"Referer": "https://quote.eastmoney.com/"}),
+                   ("东方财富K线", "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=104.CN00Y&klt=1&fqt=0"
+                                  "&lmt=30&end=20500101&fields1=f1&fields2=f51,f52,f53", {"Referer": "https://quote.eastmoney.com/"}),
                    ("新浪CFD", "https://hq.sinajs.cn/list=hf_CHA50CFD", {"Referer": "https://finance.sina.com.cn/"}))
     A50_MINUTES = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=104.CN00Y&klt=1&fqt=0"
                    "&fields1=f1&fields2=f51,f52,f53&beg={beg}&end={end}")
@@ -1617,6 +1635,7 @@ class CnIndex:
         self.bars: list[tuple[dt.date, D]] = []
         self.error = ""
         self.a50_error = ""
+        self.a50_skipped = ""  # why earlier A50 sources failed when a later one answered
         self.daily_error = ""
         self.refreshed = -1e9
         self.daily_refreshed = -1e9
@@ -1625,13 +1644,22 @@ class CnIndex:
     def parse_a50(source: str, raw: bytes, now_ms: int) -> IndexQuote:
         if source == "东方财富":
             data = parse_eastmoney_quote(raw)
-            code = str(data.get("f57") or "CN00Y")
-            if code != "CN00Y":
-                raise ValueError(f"东方财富返回的代码不是 A50 连续合约 CN00Y（{clean_error(code)}）")
+            if not a50_code_ok(data.get("f57")):
+                raise ValueError(f"东方财富返回的代码不是 A50 合约（{clean_error(str(data.get('f57')))}）")
             if not str(data.get("f86", "")).isdigit():
                 raise ValueError("东方财富 A50 报价缺少行情时间")
             q = parse_eastmoney_index(raw, now_ms, "A50期货")
             return IndexQuote("A50期货", q.last, q.prev_close, q.open, q.high, q.low, q.quoted_ms, source)
+        if source == "东方财富K线":  # latest finished 1-minute bar: "2026-09-26 05:15,open,close"
+            try:
+                data = json.loads(raw)["data"]
+                if not a50_code_ok(data.get("code")):
+                    raise ValueError(f"代码不是 A50 合约（{data.get('code')}）")
+                when, _, close = str(data["klines"][-1]).split(",")[:3]
+                quoted_ms = int(dt.datetime.strptime(when, "%Y-%m-%d %H:%M").replace(tzinfo=BEIJING).timestamp() * 1000)
+            except (ValueError, KeyError, IndexError, TypeError, AttributeError) as error:
+                raise ValueError(f"东方财富 A50 K 线格式异常：{clean_error(error)}") from None
+            return IndexQuote("A50期货", number(close, "A50"), None, None, None, None, quoted_ms, source)
         # Sina hf_: last, ?, bid, ask, high, low, time, prev settle, open, ..., name [13], date [14]
         match = re.search(r'(\w+)="([^"]*)"', raw.decode("gbk", errors="ignore"))
         if match and not match.group(1).endswith("CHA50CFD"):
@@ -1647,22 +1675,25 @@ class CnIndex:
         return IndexQuote("A50期货", number(fields[0], "A50"), _opt(fields[7]), _opt(fields[8]), _opt(fields[4]),
                           _opt(fields[5]), quoted_ms, source)
 
-    async def _first(self, sources: tuple, parse, now_ms: int, previous):
+    async def _first(self, sources: tuple, parse, now_ms: int, previous) -> tuple[Any, str, str]:
+        """(result, error when every source failed, failures of the sources tried before the one that answered)."""
         failures = []
         for name, url, extra in sources:
             try:
                 raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
-                return parse(name, raw, now_ms), ""
+                return parse(name, raw, now_ms), "", "；".join(failures)
             except Exception as error:
                 failures.append(f"{name}: {clean_error(error)}")
-        return previous, "；".join(failures)
+        return previous, "；".join(failures), ""
 
     async def refresh(self, now_ms: int, force: bool = False) -> None:
         if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
             return
         self.refreshed = time.monotonic()
-        self.quote, self.error = await self._first(self.SSE_SOURCES, parse_cn_index, now_ms, self.quote)
-        self.a50, self.a50_error = await self._first(self.A50_SOURCES, self.parse_a50, now_ms, self.a50)
+        self.quote, self.error, _ = await self._first(self.SSE_SOURCES, parse_cn_index, now_ms, self.quote)
+        self.a50, self.a50_error, self.a50_skipped = await self._first(self.A50_SOURCES, self.parse_a50, now_ms, self.a50)
+        if self.a50_skipped:
+            LOG.info("A50 fell back to %s: %s", self.a50.source if self.a50 else "-", self.a50_skipped)
         await self.refresh_daily(now_ms, force)
 
     def expected_close(self, now_ms: int) -> dt.date:
@@ -1716,8 +1747,8 @@ class CnIndex:
         raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Referer": "https://quote.eastmoney.com/"})
         try:
             data = json.loads(raw)["data"]
-            if data.get("code") != "CN00Y":
-                raise ValueError("返回代码不是 A50 连续合约 CN00Y")
+            if not a50_code_ok(data.get("code")):
+                raise ValueError("返回代码不是 A50 合约")
             klines = data["klines"]
         except (ValueError, KeyError, TypeError, AttributeError):
             raise ValueError(f"A50 {label}返回格式或代码异常") from None
@@ -1786,6 +1817,8 @@ class CnIndex:
         line += f"｜{stamp(a.quoted_ms, seconds=False)} {source}" + stale_note(a.quoted_ms, now_ms, BEIJING)
         if self.a50_stale(now_ms):
             line += "｜⚠️ 报价已超 10 分钟未更新"
+        if self.a50_skipped and not self.a50_error:
+            line += f"｜⚠️ 前序源未取到：{brief_error(self.a50_skipped, 90)}"
         return line + f"｜⚠️ 刷新失败：{brief_error(self.a50_error)}" if self.a50_error else line
 
 
@@ -2990,18 +3023,24 @@ class Bot:
                     except Exception:
                         a50 = self.cn.a50
                         if a50 and 0 <= a50.quoted_ms - close_ms <= 5 * 60_000:
-                            price, note, source = a50.last, "15:00 后五分钟首笔近似", a50.source
+                            price, note, source = a50.last, "15:00 后五分钟首笔近似", a50_family(a50.source)
                 if price is not None:
                     self.anchors["A50"] = (close_ms, price)
                     self.a50_anchor_note, self.a50_anchor_source = note, source
                     self.store.put("anchor:A50", [close_ms, str(price), note, source])
             elif anchor and anchor[0] == close_ms and self.a50_anchor_note != "15:00" and self.retry_ok("A50-exact", every=600):
-                # Replace an approximate anchor when the one-minute history is available again.
-                with contextlib.suppress(Exception):
-                    price = await self.cn.a50_at(day)
-                    self.anchors["A50"] = (close_ms, price)
-                    self.a50_anchor_note, self.a50_anchor_source = "15:00", "东方财富"
-                    self.store.put("anchor:A50", [close_ms, str(price), "15:00", "东方财富"])
+                # Upgrade an approximate anchor: the exact 1-minute bar, else (for a CFD first print) the
+                # futures' own 5-minute bar, so it matches the Eastmoney futures quote again.
+                upgrades = [(self.cn.a50_at, "15:00")]
+                if self.a50_anchor_source != "东方财富":
+                    upgrades.append((self.cn.a50_five_minute_at, "15:00 五分钟K近似"))
+                for fetch, note in upgrades:
+                    with contextlib.suppress(Exception):
+                        price = await fetch(day)
+                        self.anchors["A50"] = (close_ms, price)
+                        self.a50_anchor_note, self.a50_anchor_source = note, "东方财富"
+                        self.store.put("anchor:A50", [close_ms, str(price), note, "东方财富"])
+                        break
         if self.vols.due("SSE") and len(self.cn.bars) > 2:  # the dated bars CnIndex already read
             self.vols.refreshed["SSE"] = time.monotonic()
             self.vols.record("SSE", [close for _, close in self.cn.bars], "上证日K")
@@ -3077,10 +3116,12 @@ class Bot:
         if a50.quoted_ms < close_ms:
             return f"A50 报价早于 {close_date.strftime('%m-%d')} 15:00 收盘，等待新报价"
         if anchor and anchor[0] == close_ms:
-            if self.a50_anchor_source != a50.source:
+            if a50_family(self.a50_anchor_source) != a50_family(a50.source):
                 if self.a50_anchor_source == "未知":
                     return "旧版 A50 锚点未记录合约来源，且历史 K 线暂不可核实；暂停概率以免混算"
-                return f"A50 锚点是{self.a50_anchor_source}，当前报价是{a50.source}；不同合约不能混算概率"
+                why = f"（东方财富未取到：{brief_error(self.cn.a50_skipped, 60)}）" if self.cn.a50_skipped else ""
+                return (f"A50 锚点来自{a50_family(self.a50_anchor_source)}期货，当前只有{a50.source}报价{why}；"
+                        "不同合约不能混算，暂不输出概率")
             base, base_note = anchor[1], self.a50_anchor_note
         else:
             return f"缺少 {close_date.strftime('%m-%d')} 15:00 的 A50 历史锚点（1 分钟及 5 分钟 K 均未取得），暂不输出概率"
@@ -3325,7 +3366,8 @@ class Bot:
             lines.append(self.cn.line(now_ms, style, holidays))
             anchor = self.anchors.get("A50")
             lines.append(self.cn.a50_line(now_ms, style, anchor[1] if anchor and anchor[0] == self.sse_close_ms()
-                                          and self.cn.a50 and self.a50_anchor_source == self.cn.a50.source else None,
+                                          and self.cn.a50 and a50_family(self.a50_anchor_source) == a50_family(self.cn.a50.source)
+                                          else None,
                                           self.a50_anchor_note))
             lines.append(self.odds_row(self.sse_odds(now_ms), "上证"))
         lines = [line for line in lines if line]

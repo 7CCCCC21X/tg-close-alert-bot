@@ -267,7 +267,10 @@ async def run():
     assert "旧版 A50 锚点未记录合约来源" in missing_bot.sse_odds(bj(2026, 9, 26, 16, 0))
     m.http_get = anchor_get
     x.a50 = m.IndexQuote("A50期货", D("14297"), D("14300"), None, None, None, bj(2026, 9, 26, 5, 6), "新浪CFD")
-    assert "不同合约不能混算概率" in bot.sse_odds(bj(2026, 9, 26, 16, 0))
+    assert bot.sse_odds(bj(2026, 9, 26, 16, 0)) == "A50 锚点来自东方财富期货，当前只有新浪CFD报价；不同合约不能混算，暂不输出概率"
+    # the same futures via Eastmoney's K line is not a different contract
+    x.a50 = m.IndexQuote("A50期货", D("14297"), None, None, None, None, bj(2026, 9, 26, 5, 6), "东方财富K线")
+    assert isinstance(bot.sse_odds(bj(2026, 9, 26, 16, 0)), m.CloseOdds)
     x.a50 = m.IndexQuote("A50期货", D("14297"), D("14300"), None, None, None, bj(2026, 9, 26, 5, 6), "东方财富")
     anchor_rows[1] = ["2026-09-24 15:00,14320,14318"]
     bot.anchor_tries.pop("A50-exact", None)
