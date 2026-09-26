@@ -54,8 +54,8 @@ async def run():
     await sm.refresh(now, force=True)
     c = sm.closes["UNITREEUSDT"]
     assert c.value == D("76.50") and c.source == "上交所688836·腾讯" and c.label == "证券交易所收盘价｜2026-09-18 上交所", c
-    assert [u for u in calls if "eastmoney" in u].__len__() == 2 and sum("gtimg" in u for u in calls) == 1  # retried once, then fell back
-    assert 1.5 in sleeps and "UNITREEUSDT" not in sm.errors
+    assert [u for u in calls if "eastmoney" in u].__len__() == 1 and sum("gtimg" in u for u in calls) == 1  # fell back at once
+    assert not sleeps and "UNITREEUSDT" not in sm.errors
     # persisted: a fresh StockMarket (restart) starts with the last good close
     saved = store.get("stock_close:UNITREEUSDT"); assert saved["value"] == "76.50" and saved["source"] == "上交所688836·腾讯"
     sm2 = m.StockMarket(cfg, store); assert sm2.closes["UNITREEUSDT"].value == D("76.50") and sm2.closes["UNITREEUSDT"].close_ms == c.close_ms
@@ -64,9 +64,18 @@ async def run():
     m.http_get = all_fail
     await sm2.refresh(now, force=True)
     e = sm2.errors["UNITREEUSDT"]; assert e.count("东方财富") == 1 and "腾讯" in e and "新浪" in e and sm2.closes["UNITREEUSDT"].value == D("76.50"), e
+    assert 1.5 in sleeps  # every source failed once -> one more pass after a pause
+    # Eastmoney keeps failing -> it is moved behind Tencent/Sina for a while instead of costing a timeout first
+    assert m.SOURCE_HEALTH.cooling("https://push2his.eastmoney.com/x") > 0
+    assert any("push2his.eastmoney.com" in line for line in m.SOURCE_HEALTH.lines())
     # session running: prev close with unknown date
     m.http_get = fake_get
+    calls.clear()
     await sm2.refresh(ms(2026, 9, 18, 11, 0), force=True)
+    assert calls and "gtimg" in calls[0] and not any("eastmoney" in u for u in calls), calls
+    # a success clears the cooldown (e.g. a /diag probe that got through)
+    m.SOURCE_HEALTH.record("https://push2his.eastmoney.com/y")
+    assert m.SOURCE_HEALTH.cooling("https://push2his.eastmoney.com/x") == 0
     c = sm2.closes["UNITREEUSDT"]; assert c.value == D("75.00") and c.close_ms == 0 and "上一交易日" in c.label and "UNITREEUSDT" not in sm2.errors, c
     row = m.reference_row("exchange", D("76"), c, m.FxRates({"CNY": D("7.1")}), "cn")
     assert "（上一交易日·腾讯）" in row, row

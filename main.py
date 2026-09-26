@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.12.3"
+VERSION = "1.12.4"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -537,6 +537,68 @@ async def http_get(url: str, timeout: int = 15, headers: dict[str, str] | None =
     return await _blocking(_http_get, url, None, timeout, headers)
 
 
+SOURCE_TIMEOUT = 8  # seconds per quote-feed request: working feeds answer in < 1 s, a dead one must not cost 15
+
+
+class SourceHealth:
+    """Per-host cooldown for quote feeds. A host that keeps failing (e.g. Eastmoney dropping or 502-ing
+    requests from an overseas server) is moved behind the other sources of the same data for a while,
+    instead of costing a timeout at the front of every refresh. It is still tried when nothing else
+    answers, and it returns to its normal place once the cooldown ends or any request to it succeeds."""
+    FAILS = 2           # consecutive failures before a host is moved to the back
+    BASE = 60           # first cooldown (seconds), doubled per further failure
+    MAX = 600           # short enough that a recovered preferred feed (A50 futures vs the CFD) is back soon
+
+    def __init__(self) -> None:
+        self.hosts: dict[str, list] = {}  # host -> [consecutive failures, cool until (monotonic), last error]
+
+    @staticmethod
+    def host(url: str) -> str:
+        return urllib.parse.urlsplit(url).hostname or url
+
+    def cooling(self, url: str) -> float:
+        state = self.hosts.get(self.host(url))
+        return max(0.0, state[1] - time.monotonic()) if state else 0.0
+
+    def record(self, url: str, error: str = "") -> None:
+        host = self.host(url)
+        if not error:
+            self.hosts.pop(host, None)
+            return
+        state = self.hosts.setdefault(host, [0, 0.0, ""])
+        state[0] += 1
+        state[2] = error
+        if state[0] >= self.FAILS:
+            state[1] = time.monotonic() + min(self.MAX, self.BASE * 2 ** (state[0] - self.FAILS))
+
+    def order(self, sources: Any) -> list:
+        """(name, url, ...) tuples with cooling hosts moved to the back (the most-failed last), otherwise
+        in preference order."""
+        def rank(source: Any) -> int:
+            state = self.hosts.get(self.host(source[1]))
+            return state[0] if state and self.cooling(source[1]) > 0 else 0
+        return sorted(sources, key=rank)
+
+    def lines(self) -> list[str]:
+        now = time.monotonic()
+        return [f"  ⏸️ {host}：连续失败 {n} 次，排到最后还剩 {int(until - now)} 秒｜{brief_error(error, 60)}"
+                for host, (n, until, error) in sorted(self.hosts.items()) if until > now]
+
+
+SOURCE_HEALTH = SourceHealth()
+
+
+async def fetch_source(url: str, extra: dict[str, str] | None = None) -> bytes:
+    """GET one quote-feed URL with a browser UA and the short feed timeout, recording the host's health."""
+    try:
+        raw = await http_get(url, timeout=SOURCE_TIMEOUT, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **(extra or {})})
+    except (RemoteError, TimeoutError, OSError) as error:
+        SOURCE_HEALTH.record(url, clean_error(error) or type(error).__name__)
+        raise
+    SOURCE_HEALTH.record(url)
+    return raw
+
+
 @dataclass(frozen=True)
 class Quote:
     """The price the bot judges by: the last trade when fresh, else Binance's mark price.
@@ -901,10 +963,13 @@ class StockMarket:
     async def fetch(self, symbol: str, ticker: StockTicker, now_ms: int) -> Baseline:
         info = STOCK_MARKETS[ticker.market]
         failures = []
-        for name, url, extra in self.sources(ticker):
-            for attempt in range(self.ATTEMPTS):
+        # One pass over every source (hosts in cooldown last); only when all of them failed, one more pass.
+        for attempt in range(self.ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(1.5)
+            for name, url, extra in SOURCE_HEALTH.order(self.sources(ticker)):
                 try:
-                    raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                    raw = await fetch_source(url, extra)
                     if name in {"东方财富", "Naver"}:
                         day, close, prev = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
                     else:
@@ -912,8 +977,6 @@ class StockMarket:
                     return self.baseline(ticker, info, name, day, close, prev)
                 except Exception as error:
                     failures.append(f"{name}: {clean_error(error)}")
-                    if attempt + 1 < self.ATTEMPTS:
-                        await asyncio.sleep(1.5)
         raise ValueError("；".join(dict.fromkeys(failures)))
 
     @staticmethod
@@ -934,9 +997,9 @@ class StockMarket:
                 "close_ms": close.close_ms, "currency": close.currency, "source": close.source,
                 "close_note": close.close_note, "prev_value": str(close.prev_value) if close.prev_value else ""})
 
-    async def refresh(self, now_ms: int, force: bool = False) -> None:
+    async def refresh(self, now_ms: int, force: bool = False) -> bool | None:
         if not self.config.tickers or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
-            return
+            return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         for index, (symbol, ticker) in enumerate(self.config.tickers.items()):
             if index:
@@ -997,9 +1060,9 @@ class FxRates:
             parts.append(f"⚠️ 汇率获取失败：{self.error}")
         return "｜".join(parts) if parts else "汇率尚未获取"
 
-    async def refresh(self, force: bool = False) -> None:
+    async def refresh(self, force: bool = False) -> bool | None:
         if not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS:
-            return
+            return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         failures = []
         for name, url in self.SOURCES:
@@ -1265,17 +1328,17 @@ class IndexFutures:
 
     async def _first(self, sources: tuple, parse) -> Any:
         failures = []
-        for name, url, extra in sources:
+        for name, url, extra in SOURCE_HEALTH.order(sources):
             try:
-                raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                raw = await fetch_source(url, extra)
                 return parse(name, raw)
             except Exception as error:
                 failures.append(f"{name}: {clean_error(error)}")
         raise ValueError("；".join(failures))
 
-    async def refresh(self, now_ms: int, force: bool = False) -> None:
+    async def refresh(self, now_ms: int, force: bool = False) -> bool | None:
         if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
-            return
+            return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         try:
             quote: FuturesQuote = await self._first(self.FUTURES_SOURCES,
@@ -1386,9 +1449,9 @@ class Hyperliquid:
                 _opt(ctx.get("funding")), now_ms)
         return quotes
 
-    async def refresh(self, force: bool = False) -> None:
+    async def refresh(self, force: bool = False) -> bool | None:
         if not self.tickers or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
-            return
+            return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         by_dex: dict[str, dict[str, HlQuote] | str] = {}
         for dex in {dex for dex, _ in self.tickers.values()}:
@@ -1711,17 +1774,17 @@ class CnIndex:
     async def _first(self, sources: tuple, parse, now_ms: int, previous) -> tuple[Any, str, str]:
         """(result, error when every source failed, failures of the sources tried before the one that answered)."""
         failures = []
-        for name, url, extra in sources:
+        for name, url, extra in SOURCE_HEALTH.order(sources):
             try:
-                raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                raw = await fetch_source(url, extra)
                 return parse(name, raw, now_ms), "", "；".join(failures)
             except Exception as error:
                 failures.append(f"{name}: {clean_error(error)}")
         return previous, "；".join(failures), ""
 
-    async def refresh(self, now_ms: int, force: bool = False) -> None:
+    async def refresh(self, now_ms: int, force: bool = False) -> bool | None:
         if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
-            return
+            return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         self.quote, self.error, _ = await self._first(self.SSE_SOURCES, parse_cn_index, now_ms, self.quote)
         self.a50, self.a50_error, self.a50_skipped = await self._first(self.A50_SOURCES, self.parse_a50, now_ms, self.a50)
@@ -1748,9 +1811,9 @@ class CnIndex:
             return
         self.daily_refreshed = time.monotonic()
         failures = []
-        for name, url, extra in self.DAILY_SOURCES:
+        for name, url, extra in SOURCE_HEALTH.order(self.DAILY_SOURCES):
             try:
-                raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                raw = await fetch_source(url, extra)
                 bars = [(day, close) for day, close in parse_cn_daily(name, raw)
                         if day <= dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()]
                 day, close, prev = last_completed_bar(bars, STOCK_MARKETS["sh"], now_ms)
@@ -1779,7 +1842,7 @@ class CnIndex:
     async def _a50_bar_at(self, day: dt.date, template: str, label: str) -> D:
         url = template.format(beg=(day - dt.timedelta(days=1)).strftime("%Y%m%d"),
                               end=(day + dt.timedelta(days=1)).strftime("%Y%m%d"))
-        raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Referer": "https://quote.eastmoney.com/"})
+        raw = await fetch_source(url, {"Referer": "https://quote.eastmoney.com/"})
         try:
             data = json.loads(raw)["data"]
             if not a50_code_ok(data.get("code")):
@@ -1800,7 +1863,7 @@ class CnIndex:
 
     async def a50_sina_five_minute_at(self, day: dt.date) -> D:
         """Sina hf_CHA50CFD 5-minute bar stamped 15:00 on ``day`` (same record as the Sina live quote)."""
-        raw = await http_get(self.A50_SINA_FIVE_MINUTES, headers={"User-Agent": BROWSER_UA, "Referer": "https://finance.sina.com.cn/"})
+        raw = await fetch_source(self.A50_SINA_FIVE_MINUTES, {"Referer": "https://finance.sina.com.cn/"})
         bars = parse_sina_bars(raw)
         wanted = f"{day.isoformat()} 15:00"
         for when, close in bars:
@@ -1891,18 +1954,18 @@ class KospiIndex:
             return parse_naver_index(raw, now_ms)
         return parse_eastmoney_index(raw, now_ms, "韩国KOSPI")
 
-    async def refresh(self, now_ms: int, force: bool = False) -> None:
+    async def refresh(self, now_ms: int, force: bool = False) -> bool | None:
         if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
-            return
+            return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         self.quote, self.error = await self._fetch(self.SOURCES, now_ms, self.quote)
         self.quote200, self.error200 = await self._fetch(self.SOURCES_200, now_ms, self.quote200)
 
     async def _fetch(self, sources: tuple, now_ms: int, previous: IndexQuote | None) -> tuple[IndexQuote | None, str]:
         failures = []
-        for name, url, extra in sources:
+        for name, url, extra in SOURCE_HEALTH.order(sources):
             try:
-                raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                raw = await fetch_source(url, extra)
                 return self.parse(name, raw, now_ms), ""
             except Exception as error:
                 failures.append(f"{name}: {clean_error(error)}")
@@ -3184,7 +3247,7 @@ class Bot:
             self.vols.refreshed[key] = time.monotonic()
             for url, kind in urls:
                 try:
-                    raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*"})
+                    raw = await fetch_source(url)
                     if kind == "tencent":
                         days = json.loads(raw)["data"]["hkHSI"]
                         closes = [number(r[2], "收盘") for r in (days.get("day") or days.get("qfqday") or []) if len(r) > 2]
@@ -3634,7 +3697,7 @@ class Bot:
         probes: list[tuple[str, str, Any, Any]] = []
 
         def get(url: str, extra: dict[str, str]) -> Any:
-            return lambda: http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+            return lambda: fetch_source(url, extra)  # a probe's outcome also updates the host's cooldown
 
         def when(ms: int) -> str:
             return stamp(ms, seconds=False) + stale_note(ms, now_ms, BEIJING)
@@ -3785,12 +3848,21 @@ class Bot:
                 if not state:
                     lines.append(f"  ⏳ {name}：尚未运行")
                     continue
+                running = time.time() - state["running_since"] if state.get("running_since") else 0.0
+                if not state["runs"]:
+                    lines.append(f"  ⏳ {name}：首轮进行中（已 {running:.0f}s）" if running else f"  ⏳ {name}：尚未完成首轮")
+                    continue
                 ok_ago = f"{int(time.time() - state['ok_at'])} 秒前成功" if state["ok_at"] else "从未成功"
                 mark = "❌" if state["error"] and state["error_at"] >= state["ok_at"] else "✅"
                 err = f"｜最近错误：{brief_error(state['error'], 80)}" if state["error"] else ""
-                lines.append(f"  {mark} {name}：{ok_ago}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{err}")
+                busy = f"｜本轮进行中 {running:.0f}s" if running >= 1 else ""
+                lines.append(f"  {mark} {name}：{ok_ago}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{busy}{err}")
         else:
             lines.append("🔄 后台刷新：未启动（命令行诊断或测试环境）")
+        cooling = SOURCE_HEALTH.lines()
+        if cooling:
+            lines.append("⏸️ 暂时排到最后的源（连续失败；其余源优先，全部失败时仍会尝试）")
+            lines.extend(cooling)
         lines.append("📌 当前使用中的数据")
         if self.config.sse_index:
             close = self.cn.close
@@ -3864,17 +3936,25 @@ class Bot:
         try:
             while not self.stopping.is_set():
                 started = time.monotonic()
-                state = self.reference_state.setdefault(name, {"ok_at": 0.0, "error": "", "error_at": 0.0, "ms": 0, "runs": 0})
+                state = self.reference_state.setdefault(name, {"ok_at": 0.0, "error": "", "error_at": 0.0, "ms": 0,
+                                                               "runs": 0, "running_since": 0.0})
+                state["running_since"] = time.time()
+                ran = True
                 try:
-                    await asyncio.wait_for(job(), timeout=REFERENCE_TIMEOUT)
-                    state.update(ok_at=time.time(), error="")
+                    # False = not due yet: a skipped tick is not a run and must not overwrite the last timing
+                    ran = await asyncio.wait_for(job(), timeout=REFERENCE_TIMEOUT) is not False
+                    if ran:
+                        state.update(ok_at=time.time(), error="")
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:  # failures are shown in /status by each feed; keep the last good data
                     text = clean_error(error) or type(error).__name__
                     state.update(error=text, error_at=time.time())
                     self.log_limited(f"reference:{name}", f"参考数据 {name} 刷新异常：{text}")
-                state.update(ms=int((time.monotonic() - started) * 1000), runs=state["runs"] + 1)
+                finally:
+                    state["running_since"] = 0.0
+                if ran:
+                    state.update(ms=int((time.monotonic() - started) * 1000), runs=state["runs"] + 1)
                 await self.wait(REFERENCE_TICK)
         finally:
             HTTP_POOL.reset(token)

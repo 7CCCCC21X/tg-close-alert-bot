@@ -82,6 +82,36 @@ async def run():
     assert not (await m._blocking(lambda: threading.current_thread().name)).startswith("reference")  # default pool elsewhere
     bot.reference_pool.shutdown(wait=False)
 
+    # --- /diag refresh health: skipped (not-due) ticks are not runs; a first run still going is not "✅" ------
+    bot, _ = make_bot()
+    ticks = {"n": 0}
+    async def throttled():
+        ticks["n"] += 1
+        if ticks["n"] == 1:
+            await asyncio.sleep(0.2)  # the one real fetch
+            return None
+        if ticks["n"] >= 4: bot.stopping.set()
+        return False               # not due: nothing fetched
+    bot.reference_pool = m.ThreadPoolExecutor(max_workers=1, thread_name_prefix="reference")
+    await asyncio.wait_for(bot.reference_loop("汇率", throttled), 2)
+    state = bot.reference_state["汇率"]
+    assert state["runs"] == 1 and state["ms"] >= 150, state  # the real fetch's timing is kept
+    started_run = asyncio.Event()
+    async def slow_first():
+        started_run.set(); await asyncio.sleep(3600)
+    bot.stopping.clear()
+    task = asyncio.create_task(bot.reference_loop("交易所收盘", slow_first))
+    await started_run.wait()
+    text = "\n".join(bot.diag_state(bot.market.now_ms()))
+    assert "⏳ 交易所收盘：首轮进行中" in text and "✅ 汇率" in text and "上次用时 0.2s｜共 1 轮" in text, text
+    task.cancel(); bot.reference_pool.shutdown(wait=False)
+    # hosts moved to the back after repeated failures are listed
+    m.SOURCE_HEALTH.hosts.clear()
+    for _ in range(2): m.SOURCE_HEALTH.record("https://push2.eastmoney.com/api", "HTTP 502: 接口请求失败")
+    text = "\n".join(bot.diag_state(bot.market.now_ms()))
+    assert "⏸️ push2.eastmoney.com：连续失败 2 次" in text and "HTTP 502" in text, text
+    m.SOURCE_HEALTH.hosts.clear()
+
     # --- without background tasks (tests, one-off runs) one_cycle refreshes inline --------------------------
     bot, tg = make_bot()
     hits = []
