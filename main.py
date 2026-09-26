@@ -38,7 +38,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.12.0"
+VERSION = "1.12.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -1425,17 +1425,34 @@ def krx_session(now_ms: int) -> str:
 
 
 def a50_session(now_ms: int) -> str:
-    """FTSE China A50 futures (SGX): day 09:00-16:30, night 17:00-04:45 Beijing time, Monday to Friday
-    (Friday's night session ends Saturday 04:45)."""
+    """FTSE China A50 futures (SGX): day 09:00-16:30, night 16:45-05:15 Beijing time.
+
+    Friday's night session ends Saturday 05:15; Sunday night has no session.
+    """
     moment = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
     local, weekday = moment.time(), moment.weekday()
-    if weekday == 6 or (weekday == 5 and local >= dt.time(4, 45)) or (weekday == 0 and local < dt.time(9, 0)):
+    if weekday == 6 or (weekday == 5 and local >= dt.time(5, 15)) or (weekday == 0 and local < dt.time(9, 0)):
         return "休市"
-    if local >= dt.time(17, 0) or local < dt.time(4, 45):
+    if local >= dt.time(16, 45) or local < dt.time(5, 15):
         return "夜盘"
     if dt.time(9, 0) <= local <= dt.time(16, 30):
         return "日盘"
     return "休市"
+
+
+def a50_last_session_end(now_ms: int) -> int:
+    """Most recent SGX A50 session end, including Friday night's Saturday morning close."""
+    local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+    day, clock, weekday = local.date(), local.time(), local.weekday()
+    if weekday < 5 and dt.time(16, 30) <= clock < dt.time(16, 45):
+        end_day, end_time = day, dt.time(16, 30)
+    elif weekday == 6 or (weekday == 0 and clock < dt.time(9, 0)):
+        end_day, end_time = day - dt.timedelta(days=1 if weekday == 6 else 2), dt.time(5, 15)
+    elif weekday == 5:
+        end_day, end_time = day, dt.time(5, 15)
+    else:  # Weekday morning gap after the night session.
+        end_day, end_time = day, dt.time(5, 15)
+    return int(dt.datetime.combine(end_day, end_time, BEIJING).timestamp() * 1000)
 
 
 def parse_cn_index(source: str, raw: bytes, now_ms: int, name: str = "上证指数") -> IndexQuote:
@@ -1538,6 +1555,8 @@ class CnIndex:
                    ("新浪CFD", "https://hq.sinajs.cn/list=hf_CHA50CFD", {"Referer": "https://finance.sina.com.cn/"}))
     A50_MINUTES = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=104.CN00Y&klt=1&fqt=0"
                    "&fields1=f1&fields2=f51,f52,f53&beg={beg}&end={end}")
+    A50_FIVE_MINUTES = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=104.CN00Y&klt=5&fqt=0"
+                        "&fields1=f1&fields2=f51,f52,f53&beg={beg}&end={end}")
 
     def __init__(self, enabled: bool = True, holidays: frozenset = frozenset()):
         self.enabled = enabled
@@ -1555,9 +1574,12 @@ class CnIndex:
     @staticmethod
     def parse_a50(source: str, raw: bytes, now_ms: int) -> IndexQuote:
         if source == "东方财富":
-            code = str(parse_eastmoney_quote(raw).get("f57") or "CN00Y")
+            data = parse_eastmoney_quote(raw)
+            code = str(data.get("f57") or "CN00Y")
             if code != "CN00Y":
                 raise ValueError(f"东方财富返回的代码不是 A50 连续合约 CN00Y（{clean_error(code)}）")
+            if not str(data.get("f86", "")).isdigit():
+                raise ValueError("东方财富 A50 报价缺少行情时间")
             q = parse_eastmoney_index(raw, now_ms, "A50期货")
             return IndexQuote("A50期货", q.last, q.prev_close, q.open, q.high, q.low, q.quoted_ms, source)
         # Sina hf_: last, ?, bid, ask, high, low, time, prev settle, open, ..., name [13], date [14]
@@ -1571,7 +1593,7 @@ class CnIndex:
             quoted_ms = int(dt.datetime.strptime(f"{fields[14]} {fields[6]}", "%Y-%m-%d %H:%M:%S")
                             .replace(tzinfo=BEIJING).timestamp() * 1000)
         except ValueError:
-            quoted_ms = now_ms
+            raise ValueError("新浪 A50 报价时间格式异常") from None
         return IndexQuote("A50期货", number(fields[0], "A50"), _opt(fields[7]), _opt(fields[8]), _opt(fields[4]),
                           _opt(fields[5]), quoted_ms, source)
 
@@ -1600,6 +1622,12 @@ class CnIndex:
         """The latest close the calendar expects is backed by a dated daily bar."""
         return self.close is not None and self.close.day >= self.expected_close(now_ms)
 
+    def close_pending(self, now_ms: int) -> bool:
+        """The cash session ended, but its dated daily bar has not confirmed the close yet."""
+        local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+        return (local.weekday() < 5 and local.date() not in self.holidays and local.time() >= dt.time(15, 0)
+                and (self.close is None or self.close.day < local.date()))
+
     async def refresh_daily(self, now_ms: int, force: bool = False) -> None:
         """Read the dated daily bars: every refresh while the expected close is unconfirmed, else every 10 min."""
         if not force and self.confirmed(now_ms) and time.monotonic() - self.daily_refreshed < self.DAILY_SECONDS:
@@ -1625,24 +1653,38 @@ class CnIndex:
         return self.quote is not None and quote_stale(self.quote, now_ms, self.STALE_MS, (dt.time(11, 30), dt.time(13, 0)))
 
     def a50_stale(self, now_ms: int) -> bool:
-        """During an A50 session the proxy must have updated within 10 minutes."""
-        return self.a50 is not None and a50_session(now_ms) != "休市" and quote_stale(self.a50, now_ms, self.STALE_MS)
+        """Reject an old live quote, including one that predates the last completed A50 session."""
+        if self.a50 is None:
+            return False
+        if a50_session(now_ms) != "休市":
+            return quote_stale(self.a50, now_ms, self.STALE_MS)
+        return self.a50.quoted_ms < a50_last_session_end(now_ms) - self.STALE_MS
 
-    async def a50_at(self, day: dt.date) -> D:
-        """A50 price at the Composite's 15:00 close on ``day``: close of the 14:59-15:00 minute bar."""
-        url = self.A50_MINUTES.format(beg=(day - dt.timedelta(days=1)).strftime("%Y%m%d"),
-                                      end=(day + dt.timedelta(days=1)).strftime("%Y%m%d"))
+    async def _a50_bar_at(self, day: dt.date, template: str, label: str) -> D:
+        url = template.format(beg=(day - dt.timedelta(days=1)).strftime("%Y%m%d"),
+                              end=(day + dt.timedelta(days=1)).strftime("%Y%m%d"))
         raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Referer": "https://quote.eastmoney.com/"})
         try:
-            klines = json.loads(raw)["data"]["klines"]
-        except (ValueError, KeyError, TypeError):
-            raise ValueError("A50 分钟线返回格式异常") from None
+            data = json.loads(raw)["data"]
+            if data.get("code") != "CN00Y":
+                raise ValueError("返回代码不是 A50 连续合约 CN00Y")
+            klines = data["klines"]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise ValueError(f"A50 {label}返回格式或代码异常") from None
         wanted = f"{day.isoformat()} 15:00"
         for line in klines:
             parts = str(line).split(",")
             if parts[0] == wanted and len(parts) >= 3:
-                return number(parts[2], "A50 15:00")
-        raise ValueError(f"A50 分钟线里没有 {wanted}")
+                return number(parts[2], f"A50 {label} 15:00")
+        raise ValueError(f"A50 {label}里没有 {wanted}")
+
+    async def a50_at(self, day: dt.date) -> D:
+        """Prefer the 15:00 one-minute bar as the same-time A50 anchor."""
+        return await self._a50_bar_at(day, self.A50_MINUTES, "1分钟K线")
+
+    async def a50_five_minute_at(self, day: dt.date) -> D:
+        """Use a dated 15:00 five-minute bar only as an explicitly approximate anchor."""
+        return await self._a50_bar_at(day, self.A50_FIVE_MINUTES, "5分钟K线")
 
     def status(self, now_ms: int, holidays: frozenset) -> str:
         q = self.quote
@@ -1665,14 +1707,18 @@ class CnIndex:
             line += f" → 昨收 {bold(fmt(q.prev_close))} {pct_text(percent(q.last, q.prev_close), style)}（{q.last - q.prev_close:+,.2f}）"
         line += f"｜{stamp(q.quoted_ms, seconds=False)} {q.source}" + stale_note(q.quoted_ms, now_ms, BEIJING)
         if self.status(now_ms, holidays) != "交易中":
-            if self.confirmed(now_ms):
+            if self.close_pending(now_ms):
+                day = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+                why = f"；日 K 获取失败：{brief_error(self.daily_error)}" if self.daily_error else ""
+                line += f"｜{bold('收盘价待确认')}（等待 {day.strftime('%m-%d')} 日 K{why}）"
+            elif self.confirmed(now_ms):
                 line += f"｜收盘 {self.close.day.strftime('%m-%d')} {bold(fmt(self.close.value))}（{self.close.source}确认）"
             else:
                 why = f"；日 K 获取失败：{brief_error(self.daily_error)}" if self.daily_error else ""
                 line += f"｜{bold('收盘价待确认')}（等待 {self.expected_close(now_ms).strftime('%m-%d')} 日 K{why}）"
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error)}" if self.error else line
 
-    def a50_line(self, now_ms: int, style: str, anchor: D | None) -> str:
+    def a50_line(self, now_ms: int, style: str, anchor: D | None, anchor_note: str = "15:00") -> str:
         if not self.enabled:
             return ""
         a = self.a50
@@ -1680,7 +1726,10 @@ class CnIndex:
             return f"📈 A50期货 ⚠️ 获取失败（{brief_error(self.a50_error)}）" if self.a50_error else "📈 A50期货 ⏳ 等待首次获取"
         line = f"📈 {bold('A50期货 ' + a50_session(a.quoted_ms))} {bold(fmt(a.last))}"
         if anchor:
-            line += f" → 上证收盘时 {bold(fmt(anchor))} {pct_text(percent(a.last, anchor), style)}"
+            label = "上证收盘时" if anchor_note == "15:00" else "上证收盘附近"
+            line += f" → {label} {bold(fmt(anchor))} {pct_text(percent(a.last, anchor), style)}"
+            if anchor_note != "15:00":
+                line += f"（{anchor_note}）"
         if a.prev_close:
             line += f"｜昨结 {fmt(a.prev_close)} {pct_text(percent(a.last, a.prev_close), style)}"
         source = a.source if "CFD" not in a.source else f"{a.source}·非交易所合约，仅参考"
@@ -2452,6 +2501,8 @@ class Bot:
         self.reference_tasks: list[asyncio.Task] = []
         self.reference_pool: ThreadPoolExecutor | None = None
         self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
+        self.a50_anchor_note = "15:00"
+        self.a50_anchor_source = "东方财富"
         self.anchor_tries: dict[str, float] = {}
         self.stopping = asyncio.Event()
         self.started = time.time()
@@ -2864,19 +2915,43 @@ class Bot:
 
         close_ms = self.sse_close_ms()
         if close_ms:
-            saved = self.anchors.get("A50") or tuple(self.store.get("anchor:A50", (0, "0")))
-            if saved[0] == close_ms:
-                self.anchors["A50"] = (close_ms, D(str(saved[1])))
-            elif self.retry_ok("A50"):
-                price = None
-                with contextlib.suppress(Exception):
-                    price = await self.cn.a50_at(dt.datetime.fromtimestamp(close_ms / 1000, BEIJING).date())
-                a50 = self.cn.a50
-                if price is None and a50 and 0 <= a50.quoted_ms - close_ms <= 5 * 60_000:
-                    price = a50.last  # the first A50 print within 5 minutes after 15:00
+            saved = self.store.get("anchor:A50", ())
+            if self.anchors.get("A50", (0,))[0] != close_ms and isinstance(saved, (list, tuple)) and len(saved) >= 2:
+                with contextlib.suppress(ValueError, TypeError, decimal.InvalidOperation):
+                    if int(saved[0]) == close_ms and D(str(saved[1])) > 0:
+                        self.anchors["A50"] = (close_ms, D(str(saved[1])))
+                        if (len(saved) >= 4 and saved[2] in
+                                {"15:00", "15:00 五分钟K近似", "15:00 后五分钟首笔近似"}
+                                and saved[3] in {"东方财富", "新浪CFD"}):
+                            self.a50_anchor_note, self.a50_anchor_source = saved[2], saved[3]
+                        else:
+                            # Old records could be either the futures feed or a CFD: recheck before using.
+                            self.a50_anchor_note, self.a50_anchor_source = "旧版锚点来源未记录", "未知"
+            anchor = self.anchors.get("A50")
+            day = dt.datetime.fromtimestamp(close_ms / 1000, BEIJING).date()
+            if (not anchor or anchor[0] != close_ms or self.a50_anchor_source == "未知") and self.retry_ok("A50"):
+                price, note, source = None, "15:00", "东方财富"
+                try:
+                    price = await self.cn.a50_at(day)
+                except Exception:
+                    try:
+                        price = await self.cn.a50_five_minute_at(day)
+                        note = "15:00 五分钟K近似"
+                    except Exception:
+                        a50 = self.cn.a50
+                        if a50 and 0 <= a50.quoted_ms - close_ms <= 5 * 60_000:
+                            price, note, source = a50.last, "15:00 后五分钟首笔近似", a50.source
                 if price is not None:
                     self.anchors["A50"] = (close_ms, price)
-                    self.store.put("anchor:A50", [close_ms, str(price)])
+                    self.a50_anchor_note, self.a50_anchor_source = note, source
+                    self.store.put("anchor:A50", [close_ms, str(price), note, source])
+            elif anchor and anchor[0] == close_ms and self.a50_anchor_note != "15:00" and self.retry_ok("A50-exact", every=600):
+                # Replace an approximate anchor when the one-minute history is available again.
+                with contextlib.suppress(Exception):
+                    price = await self.cn.a50_at(day)
+                    self.anchors["A50"] = (close_ms, price)
+                    self.a50_anchor_note, self.a50_anchor_source = "15:00", "东方财富"
+                    self.store.put("anchor:A50", [close_ms, str(price), "15:00", "东方财富"])
         if self.vols.due("SSE") and len(self.cn.bars) > 2:  # the dated bars CnIndex already read
             self.vols.refreshed["SSE"] = time.monotonic()
             self.vols.record("SSE", [close for _, close in self.cn.bars], "上证日K")
@@ -2936,9 +3011,11 @@ class Bot:
             return close_odds("上证指数", ref, q.last, sigma, remaining, target, D("0.01"), ref_note,
                               f"上证现货 {fmt(q.last)}（盘中直接用现货）", sigma_note)
         # After hours the reference is the close of a dated daily bar, never a realtime "last price".
-        if not self.cn.confirmed(now_ms):
+        if self.cn.close_pending(now_ms) or not self.cn.confirmed(now_ms):
             detail = f"，日 K 最新为 {close.day.strftime('%m-%d')}" if close else ""
-            return f"收盘价待确认（等待 {self.cn.expected_close(now_ms).strftime('%m-%d')} 上证日 K{detail}）"
+            expected = (dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date() if self.cn.close_pending(now_ms)
+                        else self.cn.expected_close(now_ms))
+            return f"收盘价待确认（等待 {expected.strftime('%m-%d')} 上证日 K{detail}）"
         close_ms, close_date = close.close_ms, close.day
         remaining, target = session_remaining("sh", now_ms, close_date, holidays)
         a50, anchor = self.cn.a50, self.anchors.get("A50")
@@ -2947,22 +3024,16 @@ class Bot:
             return "暂无 A50 报价，暂不输出概率"
         if self.cn.a50_stale(now_ms):
             return f"A50 报价已超 10 分钟未更新（最后 {stamp(a50.quoted_ms, seconds=False)}），暂不输出新概率"
-        quoted = dt.datetime.fromtimestamp(a50.quoted_ms / 1000, BEIJING)
-        session = a50_session(a50.quoted_ms)
-        # A night quote belongs to the day session before it (17:00 the same day, or before 04:45 the next day).
-        night_of = quoted.date() if quoted.time() >= dt.time(17, 0) else quoted.date() - dt.timedelta(days=1)
         if a50.quoted_ms < close_ms:
             return f"A50 报价早于 {close_date.strftime('%m-%d')} 15:00 收盘，等待新报价"
         if anchor and anchor[0] == close_ms:
-            base, base_note = anchor[1], "15:00"
-        elif session == "夜盘" and night_of == close_date and a50.prev_close:
-            # No exact 15:00 print: that day's A50 settlement (day session, ~16:30) stands in.
-            base, base_note = a50.prev_close, "昨结（锚点暂用当天日盘结算价，非 15:00 精确值）"
-        elif session != "夜盘" and quoted.date() == close_date:
-            # A50 has not traded a night session since the close: no after-hours move to map yet.
-            base, base_note = a50.last, "收盘后暂无夜盘成交"
+            if self.a50_anchor_source != a50.source:
+                if self.a50_anchor_source == "未知":
+                    return "旧版 A50 锚点未记录合约来源，且历史 K 线暂不可核实；暂停概率以免混算"
+                return f"A50 锚点是{self.a50_anchor_source}，当前报价是{a50.source}；不同合约不能混算概率"
+            base, base_note = anchor[1], self.a50_anchor_note
         else:
-            return "等待 A50 在上证 15:00 收盘时的价格"
+            return f"缺少 {close_date.strftime('%m-%d')} 15:00 的 A50 历史锚点（1 分钟及 5 分钟 K 均未取得），暂不输出概率"
         beta = self.config.a50_beta
         move = math.log(float(a50.last / base))
         effective = close.value * D(str(math.exp(beta * move)))
@@ -3200,7 +3271,9 @@ class Bot:
             holidays = self.config.holidays.get("sh", frozenset())
             lines.append(self.cn.line(now_ms, style, holidays))
             anchor = self.anchors.get("A50")
-            lines.append(self.cn.a50_line(now_ms, style, anchor[1] if anchor and anchor[0] == self.sse_close_ms() else None))
+            lines.append(self.cn.a50_line(now_ms, style, anchor[1] if anchor and anchor[0] == self.sse_close_ms()
+                                          and self.cn.a50 and self.a50_anchor_source == self.cn.a50.source else None,
+                                          self.a50_anchor_note))
             lines.append(self.odds_row(self.sse_odds(now_ms), "上证"))
         lines = [line for line in lines if line]
         lines = [line for line in lines if line]

@@ -54,10 +54,17 @@ for source, raw in [("东方财富", json.dumps({"data": {"f43": 1, "f57": "HSI0
                     ("新浪CFD", 'var hq_str_hf_HSI="1,,1,1,1,1,22:01:05,1,1,0,0,0,0,恒指,2026-09-30";'.encode("gbk"))]:
     try: m.CnIndex.parse_a50(source, raw, 0); assert False
     except ValueError as e: assert "不是 A50" in str(e), e
-# A50 sessions follow the SGX week: Friday's night runs to Saturday 04:45, then closed until Monday 09:00
-assert m.a50_session(bj(2026, 9, 26, 4, 30)) == "夜盘" and m.a50_session(bj(2026, 9, 26, 10, 0)) == "休市"
+for source, raw in [("东方财富", json.dumps({"data": {"f43": 14120, "f57": "CN00Y"}}).encode()),
+                    ("新浪CFD", 'var hq_str_hf_CHA50CFD="14118.5,,1,1,14200,14000,??,14100,14150,0,0,0,0,富时A50,2026-09-30";'.encode("gbk"))]:
+    try: m.CnIndex.parse_a50(source, raw, 0); assert False
+    except ValueError as e: assert "时间" in str(e), e
+# A50 sessions follow the SGX week: Friday's night runs to Saturday 05:15, then closed until Monday 09:00
+assert m.a50_session(bj(2026, 9, 26, 5, 6)) == "夜盘" and m.a50_session(bj(2026, 9, 26, 5, 15)) == "休市"
 assert m.a50_session(bj(2026, 9, 27, 21, 0)) == "休市" and m.a50_session(bj(2026, 9, 28, 2, 0)) == "休市"
 assert m.a50_session(bj(2026, 9, 28, 8, 59)) == "休市" and m.a50_session(bj(2026, 9, 28, 9, 30)) == "日盘"
+assert m.a50_last_session_end(bj(2026, 9, 26, 16, 0)) == bj(2026, 9, 26, 5, 15)
+assert m.a50_last_session_end(bj(2026, 9, 28, 8, 30)) == bj(2026, 9, 26, 5, 15)
+assert m.a50_last_session_end(bj(2026, 9, 28, 16, 40)) == bj(2026, 9, 28, 16, 30)
 # the calendar's latest expected close honours holidays: 09-25 is shut, so 09-24 until 09-28's close is final
 cnh = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).holidays["sh"]
 for when, want in [(bj(2026, 9, 25, 16, 0), 24), (bj(2026, 9, 27, 12, 0), 24), (bj(2026, 9, 28, 15, 10), 24), (bj(2026, 9, 28, 15, 20), 28)]:
@@ -66,10 +73,10 @@ a = m.CnIndex.parse_a50("东方财富", json.dumps({"data": {"f43": 14120, "f60"
 assert a.last == D("14120") and a.prev_close == D("14100") and a.name == "A50期货"
 acfd = m.CnIndex.parse_a50("新浪CFD", 'var hq_str_hf_CHA50CFD="14118.5,,1,1,14200,14000,22:01:05,14100,14150,0,0,0,0,富时A50,2026-09-30";'.encode("gbk"), 0)
 assert acfd.last == D("14118.5") and acfd.quoted_ms == bj(2026, 9, 30, 22, 1) + 5000
-assert m.a50_session(bj(2026, 9, 30, 22, 0)) == "夜盘" and m.a50_session(bj(2026, 10, 1, 4, 0)) == "夜盘" and m.a50_session(bj(2026, 9, 30, 10, 0)) == "日盘" and m.a50_session(bj(2026, 9, 30, 16, 45)) == "休市"
+assert m.a50_session(bj(2026, 9, 30, 22, 0)) == "夜盘" and m.a50_session(bj(2026, 10, 1, 5, 14)) == "夜盘" and m.a50_session(bj(2026, 9, 30, 10, 0)) == "日盘" and m.a50_session(bj(2026, 9, 30, 16, 45)) == "夜盘"
 
 async def run():
-    minutes = json.dumps({"data": {"klines": ["2026-09-30 14:59,14150,14155,1,1", "2026-09-30 15:00,14155,14160,1,1", "2026-09-30 15:01,14160,14158,1,1"]}}).encode()
+    minutes = json.dumps({"data": {"code": "CN00Y", "klines": ["2026-09-30 14:59,14150,14155,1,1", "2026-09-30 15:00,14155,14160,1,1", "2026-09-30 15:01,14160,14158,1,1"]}}).encode()
     calls = []
     days, d = [], dt.date(2026, 9, 30)
     while len(days) < 40:
@@ -105,7 +112,7 @@ async def run():
     store = m.Store(":memory:"); tg = FakeTelegram(); bot = m.Bot(cfg, store, FakeMarket(cfg), tg)
     await bot.one_cycle()
     close_ms = bj(2026, 9, 30, 15, 0)
-    assert bot.anchors["A50"] == (close_ms, D("14160")) and store.get("anchor:A50") == [close_ms, "14160"], bot.anchors
+    assert bot.anchors["A50"] == (close_ms, D("14160")) and store.get("anchor:A50") == [close_ms, "14160", "15:00", "东方财富"], bot.anchors
     assert bot.vols.estimates["SSE"][1] == 39 and bot.vols.estimates["SSE"][2] == "上证日K"
     o = bot.sse_odds(bot.market.now_ms())
     move = math.log(14020 / 14160)
@@ -149,7 +156,7 @@ async def run():
     # 09-28 08:30 (before the open): a realtime feed may still show a stale or "natural yesterday" price; it is ignored
     now = bj(2026, 9, 28, 8, 30)
     x.quote = m.IndexQuote("上证指数", D("3850.00"), D("3830"), None, None, None, bj(2026, 9, 27, 23, 0), "新浪")
-    x.a50 = m.IndexQuote("A50期货", D("14280"), D("14250"), None, None, None, bj(2026, 9, 26, 4, 40), "东方财富")  # Friday night's last print
+    x.a50 = m.IndexQuote("A50期货", D("14280"), D("14250"), None, None, None, bj(2026, 9, 26, 5, 6), "东方财富")  # Friday night's last print
     await x.refresh_daily(now)
     assert x.close == m.DailyClose(dt.date(2026, 9, 24), D("3888.37"), D("3870.10"), "腾讯日K", now) and x.confirmed(now)
     bot.anchors["A50"] = (c24, D("14200"))
@@ -160,6 +167,8 @@ async def run():
     # the same holds on the holiday and over the weekend
     for when in (bj(2026, 9, 25, 11, 0), bj(2026, 9, 26, 12, 0), bj(2026, 9, 27, 20, 0)):
         assert x.confirmed(when) and bot.sse_close_ms() == c24
+    assert bot.sse_odds(bj(2026, 9, 28, 15, 5)) == "收盘价待确认（等待 09-28 上证日 K，日 K 最新为 09-24）"
+    assert "收盘价待确认" in m.to_html(x.line(bj(2026, 9, 28, 15, 5), "cn", cn))
     # 09-28 15:20: the 09-28 close is due but the daily bar is not out yet -> 收盘价待确认, no probability
     now = bj(2026, 9, 28, 15, 20)
     x.quote = m.IndexQuote("上证指数", D("3901.55"), D("3888.37"), None, None, None, bj(2026, 9, 28, 15, 0), "腾讯")
@@ -203,26 +212,73 @@ async def run():
     assert bot.sse_odds(bj(2026, 9, 28, 20, 45)).proxy_note.startswith("A50 14,350 / 15:00 14,290")
     assert bot.sse_odds(bj(2026, 9, 28, 20, 51)) == "A50 报价已超 10 分钟未更新（最后 09-28 20:40），暂不输出新概率"
     assert "｜⚠️ 报价已超 10 分钟未更新" in x.a50_line(bj(2026, 9, 28, 20, 51), "cn", None)
-    # outside A50 sessions (16:30-17:00) an older print is expected, not stale
+    # outside A50 sessions (16:30-16:45) an older print is expected, not stale
     x.a50 = m.IndexQuote("A50期货", D("14320"), D("14300"), None, None, None, bj(2026, 9, 28, 16, 29), "东方财富")
-    o = bot.sse_odds(bj(2026, 9, 28, 16, 55)); assert isinstance(o, m.CloseOdds), o
+    o = bot.sse_odds(bj(2026, 9, 28, 16, 40)); assert isinstance(o, m.CloseOdds), o
     # an A50 print from before the close cannot map the after-hours move
     x.a50 = m.IndexQuote("A50期货", D("14320"), D("14300"), None, None, None, bj(2026, 9, 28, 14, 58), "东方财富")
     assert bot.sse_odds(bj(2026, 9, 28, 15, 30)) == "A50 报价已超 10 分钟未更新（最后 09-28 14:58），暂不输出新概率"
-    assert "A50 报价早于 09-28 15:00 收盘" in bot.sse_odds(bj(2026, 9, 28, 16, 40))
-    # fallback 1: no exact 15:00 anchor, night quote of the close day -> that day's settlement
+    assert "A50 报价已超 10 分钟未更新" in bot.sse_odds(bj(2026, 9, 28, 16, 40))
+    # Without a dated anchor, a quote's previous close cannot prove the 15:00 A50 price.
     bot.anchors.pop("A50")
     x.a50 = m.IndexQuote("A50期货", D("14200"), D("14300"), None, None, None, bj(2026, 9, 28, 22, 0), "东方财富")
-    o = bot.sse_odds(bj(2026, 9, 28, 22, 5))
-    assert isinstance(o, m.CloseOdds) and "昨结（锚点暂用当天日盘结算价" in o.proxy_note and o.target == dt.date(2026, 9, 29) and o.fair_up < 0.5, o
-    # fallback 2: day session after the close, no night yet -> effective = close
+    assert "缺少 09-28 15:00 的 A50 历史锚点" in bot.sse_odds(bj(2026, 9, 28, 22, 5))
     x.a50 = m.IndexQuote("A50期货", D("14250"), D("14300"), None, None, None, bj(2026, 9, 28, 16, 29), "东方财富")
-    o = bot.sse_odds(bj(2026, 9, 28, 16, 45))
-    assert isinstance(o, m.CloseOdds) and o.effective == D("3901.55") and "收盘后暂无夜盘成交" in o.proxy_note, o
+    assert "缺少 09-28 15:00 的 A50 历史锚点" in bot.sse_odds(bj(2026, 9, 28, 16, 40))
     # A50 trading on the 09-25 holiday with no 09-24 15:00 anchor -> explained, no guess
     x.close = m.DailyClose(dt.date(2026, 9, 24), D("3888.37"), D("3870.10"), "腾讯日K", 0)
     x.a50 = m.IndexQuote("A50期货", D("14250"), D("14300"), None, None, None, bj(2026, 9, 25, 11, 58), "东方财富")
-    assert bot.sse_odds(bj(2026, 9, 25, 12, 0)) == "等待 A50 在上证 15:00 收盘时的价格"
+    assert "缺少 09-24 15:00 的 A50 历史锚点" in bot.sse_odds(bj(2026, 9, 25, 12, 0))
+    assert x.a50_stale(bj(2026, 9, 26, 16, 0))  # Friday afternoon/night trading is missing
+    assert "A50 报价已超 10 分钟未更新" in bot.sse_odds(bj(2026, 9, 26, 16, 0))
+    x.a50 = m.IndexQuote("A50期货", D("14297"), D("14300"), None, None, None, bj(2026, 9, 26, 5, 6), "东方财富")
+    assert not x.a50_stale(bj(2026, 9, 26, 16, 0))
+    # After a late deployment, the one-minute history no longer covers Thursday. Recover from
+    # the dated five-minute bar, keep its approximate precision across restarts, and never mix CFDs.
+    anchor_rows = {1: [], 5: ["2026-09-24 14:55,14325,14321", "2026-09-24 15:00,14321,14319"]}
+    async def anchor_get(url, timeout=15, headers=None):
+        if "104.CN00Y" in url and "klt=" in url:
+            interval = 5 if "klt=5" in url else 1
+            return json.dumps({"data": {"code": "CN00Y", "klines": anchor_rows[interval]}}).encode()
+        raise m.RemoteError("other references unavailable")
+    m.http_get = anchor_get
+    bot.anchors.pop("A50", None); bot.anchor_tries.pop("A50", None)
+    await bot.refresh_odds_inputs(bj(2026, 9, 26, 16, 0))
+    assert bot.anchors["A50"] == (c24, D("14319"))
+    assert store.get("anchor:A50") == [c24, "14319", "15:00 五分钟K近似", "东方财富"]
+    o = bot.sse_odds(bj(2026, 9, 26, 16, 0))
+    assert isinstance(o, m.CloseOdds) and o.ref == D("3888.37") and o.target == dt.date(2026, 9, 28), o
+    assert "15:00 五分钟K近似 14,319" in o.proxy_note and "上证收盘附近" in m.to_html(x.a50_line(bj(2026, 9, 26, 16, 0), "cn", D("14319"), bot.a50_anchor_note))
+    bot3 = m.Bot(cfg, store, FakeMarket(cfg), tg); bot3.cn.close = x.close; bot3.cn.a50 = x.a50
+    await bot3.refresh_odds_inputs(bj(2026, 9, 26, 16, 0))
+    assert bot3.anchors["A50"] == (c24, D("14319")) and bot3.a50_anchor_note == "15:00 五分钟K近似"
+    # v1.12.0 saved only [time, price]. Recover it, but require the dated feed to confirm its source.
+    old_store = m.Store(":memory:"); old_store.put("anchor:A50", [c24, "14319"])
+    old_bot = m.Bot(cfg, old_store, FakeMarket(cfg), tg); old_bot.cn.close = x.close; old_bot.cn.a50 = x.a50
+    await old_bot.refresh_odds_inputs(bj(2026, 9, 26, 16, 0))
+    assert old_store.get("anchor:A50") == [c24, "14319", "15:00 五分钟K近似", "东方财富"]
+    assert isinstance(old_bot.sse_odds(bj(2026, 9, 26, 16, 0)), m.CloseOdds)
+    async def no_anchor_data(url, timeout=15, headers=None): raise m.RemoteError("no historical A50")
+    missing_store = m.Store(":memory:"); missing_store.put("anchor:A50", [c24, "14319"])
+    missing_bot = m.Bot(cfg, missing_store, FakeMarket(cfg), tg); missing_bot.cn.close = x.close; missing_bot.cn.a50 = x.a50
+    m.http_get = no_anchor_data
+    await missing_bot.refresh_odds_inputs(bj(2026, 9, 26, 16, 0))
+    assert missing_bot.anchors["A50"] == (c24, D("14319")) and missing_bot.a50_anchor_source == "未知"
+    assert "旧版 A50 锚点未记录合约来源" in missing_bot.sse_odds(bj(2026, 9, 26, 16, 0))
+    m.http_get = anchor_get
+    x.a50 = m.IndexQuote("A50期货", D("14297"), D("14300"), None, None, None, bj(2026, 9, 26, 5, 6), "新浪CFD")
+    assert "不同合约不能混算概率" in bot.sse_odds(bj(2026, 9, 26, 16, 0))
+    x.a50 = m.IndexQuote("A50期货", D("14297"), D("14300"), None, None, None, bj(2026, 9, 26, 5, 6), "东方财富")
+    anchor_rows[1] = ["2026-09-24 15:00,14320,14318"]
+    bot.anchor_tries.pop("A50-exact", None)
+    await bot.refresh_odds_inputs(bj(2026, 9, 26, 16, 0))
+    assert bot.anchors["A50"] == (c24, D("14318")) and bot.a50_anchor_note == "15:00"
+    assert store.get("anchor:A50") == [c24, "14318", "15:00", "东方财富"]
+    async def wrong_anchor_code(url, timeout=15, headers=None):
+        return json.dumps({"data": {"code": "OTHER", "klines": anchor_rows[5]}}).encode()
+    m.http_get = wrong_anchor_code
+    try: await x.a50_five_minute_at(dt.date(2026, 9, 24)); assert False
+    except ValueError as e: assert "代码异常" in str(e)
     x.close = m.DailyClose(dt.date(2026, 9, 28), D("3901.55"), D("3888.37"), "腾讯日K", 0)
     # no A50 at all -> no probability, labelled
     x.a50 = None

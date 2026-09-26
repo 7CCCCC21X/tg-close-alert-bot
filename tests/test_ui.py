@@ -83,7 +83,7 @@ async def run():
     assert f"├ 基准 75（手动·适用 {today[5:]}）→ 🔴 <b>+1.880%</b>" in a and "├ 交易所 <b>514.98 CNY</b> ≈ 72.227（" in a and "→ 🔴 +5.79%" in a, a
     assert "└ 📝 " in a and "\x01" not in a and a.endswith("⚠️ 合约行情提示，不代表股票官方收盘结算结果。"), a
     st, mode = await ask("/status")
-    assert mode == "HTML" and st.startswith("📡 <b>监控状态 v1.12.0</b>｜🟢 已订阅\n⚙️ 基准 手动参考价｜阈值 ±1%｜每 5 秒｜周期 300 秒\n📊 🔴 涨 🟢 跌 ⚪ 平"), st
+    assert mode == "HTML" and st.startswith(f"📡 <b>监控状态 v{m.VERSION}</b>｜🟢 已订阅\n⚙️ 基准 手动参考价｜阈值 ±1%｜每 5 秒｜周期 300 秒\n📊 🔴 涨 🟢 跌 ⚪ 平"), st
     assert "<b>📍 宇树 UNITREE｜UNITREEUSDT</b>\n├ 币安 <b>76.41</b>｜" in st and "💱 1 USD = 7.13 CNY（手动）" in st, st
     # error text with html-sensitive characters is escaped
     bot.snapshots["UNITREEUSDT"] = {"error": "接口 <bad> & broken"}
