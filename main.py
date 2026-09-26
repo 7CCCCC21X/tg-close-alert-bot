@@ -14,10 +14,12 @@ import datetime as dt
 import decimal
 import html
 import json
+import hmac
 import logging
 import math
 import os
 import re
+import secrets
 import signal
 import sqlite3
 import sys
@@ -33,7 +35,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.8.0"
+VERSION = "1.10.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -207,6 +209,47 @@ STOCK_MARKETS = {
 DEFAULT_TICKERS = "UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:688825,SKHYNIXUSDT=kr:000660"
 
 
+# Exchange holidays on weekdays (official 2026 notices where known); override with HOLIDAYS_CN/HK/KR.
+DEFAULT_HOLIDAYS = {
+    "CN": "2026-09-25,2026-10-01..2026-10-07",   # SSE notice: Mid-Autumn 9/25, National Day 10/1-10/7
+    "KR": "2026-09-24,2026-09-25,2026-10-05,2026-10-09",  # Chuseok, National Foundation Day (substitute), Hangul Day
+    "HK": "2026-10-01",
+}
+
+
+def parse_dates(spec: str, label: str) -> frozenset:
+    days: set[dt.date] = set()
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        start, _, end = item.partition("..")
+        try:
+            first, last = dt.date.fromisoformat(start), dt.date.fromisoformat(end or start)
+        except ValueError:
+            raise ValueError(f"{label} 日期格式应为 YYYY-MM-DD 或 YYYY-MM-DD..YYYY-MM-DD：{item}") from None
+        while first <= last:
+            days.add(first)
+            first += dt.timedelta(days=1)
+    return frozenset(days)
+
+
+def parse_holidays(env: dict[str, str]) -> dict[str, frozenset]:
+    cn = parse_dates(env.get("HOLIDAYS_CN", DEFAULT_HOLIDAYS["CN"]), "HOLIDAYS_CN")
+    return {"sh": cn, "sz": cn, "hk": parse_dates(env.get("HOLIDAYS_HK", DEFAULT_HOLIDAYS["HK"]), "HOLIDAYS_HK"),
+            "kr": parse_dates(env.get("HOLIDAYS_KR", DEFAULT_HOLIDAYS["KR"]), "HOLIDAYS_KR")}
+
+
+def parse_beta(value: str) -> float:
+    try:
+        beta = float(value)
+    except ValueError:
+        raise ValueError("A50_BETA 必须是数字，如 0.8") from None
+    if not 0 < beta <= 3:
+        raise ValueError("A50_BETA 应在 0～3 之间")
+    return beta
+
+
 def parse_prob_vol(spec: str) -> dict[str, float]:
     """PROB_VOL="UNITREEUSDT=3.5,HSI=1.2,KOSPI=2" — daily volatility in percent, overriding estimates."""
     result: dict[str, float] = {}
@@ -309,6 +352,12 @@ class Config:
     hsi_futures: bool = True  # Show the Hang Seng Index futures quote (night session after HK close).
     probability: bool = True  # Show model probabilities that the next close ends above/below the reference.
     prob_vol: dict[str, float] = field(default_factory=dict)  # Daily σ overrides (fraction), keyed by symbol/HSI/KOSPI.
+    sse_index: bool = True  # Shanghai Composite with the FTSE China A50 futures as after-hours proxy.
+    a50_beta: float = 0.8   # Composite move per unit of A50 move when mapping the proxy.
+    holidays: dict[str, frozenset] = field(default_factory=dict)  # market -> non-trading weekdays
+    web_port: int = 0        # Read-only probability web page; 0 = disabled. Railway injects PORT.
+    web_token: str = ""      # Secret path segment; generated and persisted when empty.
+    web_base: str = ""       # Public base URL, e.g. https://xxx.up.railway.app
     hl_tickers: dict[str, tuple[str, str]] = field(default_factory=dict)  # symbol -> (dex, coin) on Hyperliquid
     kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
@@ -324,6 +373,9 @@ class Config:
         # With exchange tickers configured the baseline defaults to the exchange-close instant, so the
         # contract's deviation and the stock's close are measured from the same moment.
         mode = e.get("BASELINE_MODE", "exchange_close" if tickers else "binance_daily").strip()
+        token = e.get("WEB_TOKEN", "").strip()
+        if token and not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", token):
+            raise ValueError("WEB_TOKEN 应为 16～64 位字母、数字、- 或 _")
         if mode not in BASELINE_MODES:
             raise ValueError("BASELINE_MODE 只能是 binance_daily、manual 或 exchange_close")
         url = e.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/")
@@ -355,6 +407,14 @@ class Config:
             hl_index=parse_hl_tickers(e.get("HL_INDEX", DEFAULT_HL_INDEX), ("KR200",)),
             probability=e.get("PROBABILITY", "on").strip().lower() not in {"off", "0", "false", "no"},
             prob_vol=parse_prob_vol(e.get("PROB_VOL", "")),
+            sse_index=e.get("SSE_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
+            a50_beta=parse_beta(e.get("A50_BETA", "0.8")),
+            holidays=parse_holidays(e),
+            web_port=0 if e.get("WEB", "on").strip().lower() in {"off", "0", "false", "no"}
+            else bounded_int(e, "WEB_PORT", int(e.get("PORT") or 0), 0, 65535),
+            web_token=e.get("WEB_TOKEN", "").strip(),
+            web_base=(e.get("WEB_BASE_URL", "").strip().rstrip("/")
+                      or (f"https://{e['RAILWAY_PUBLIC_DOMAIN'].strip()}" if e.get("RAILWAY_PUBLIC_DOMAIN", "").strip() else "")),
         )
 
 
@@ -1337,6 +1397,149 @@ def krx_session(now_ms: int) -> str:
     return "交易中" if dt.time(9, 0) <= local <= dt.time(15, 30) else "已收盘"
 
 
+def a50_session(now_ms: int) -> str:
+    """FTSE China A50 futures (SGX): day 09:00-16:30, night 17:00-04:45 Beijing time."""
+    local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).time()
+    if local >= dt.time(17, 0) or local < dt.time(4, 45):
+        return "夜盘"
+    if dt.time(9, 0) <= local <= dt.time(16, 30):
+        return "日盘"
+    return "休市"
+
+
+def parse_cn_index(source: str, raw: bytes, now_ms: int, name: str = "上证指数") -> IndexQuote:
+    """Tencent v_sh000001 / Sina hq_str_sh000001 / Eastmoney push2 -> IndexQuote (last, prev close, time)."""
+    if source == "东方财富":
+        return parse_eastmoney_index(raw, now_ms, name)
+    match = re.search(r'="([^"]*)"', raw.decode("gbk", errors="ignore"))
+    if not match or not match.group(1).strip():
+        raise ValueError(f"{source}{name}报价为空")
+    fields = match.group(1).split("~" if source == "腾讯" else ",")
+    try:
+        if source == "腾讯":  # [3] current, [4] prev close, [5] open, [30] yyyymmddHHMMSS
+            last, prev, opening = fields[3], fields[4], fields[5]
+            quoted = dt.datetime.strptime(re.sub(r"\D", "", fields[30])[:12], "%Y%m%d%H%M")
+        else:  # Sina: name, open, prev, current, high, low, ..., date [30], time [31]
+            last, prev, opening = fields[3], fields[2], fields[1]
+            quoted = dt.datetime.strptime(f"{fields[30]} {fields[31]}", "%Y-%m-%d %H:%M:%S")
+    except (IndexError, ValueError):
+        raise ValueError(f"{source}{name}格式异常") from None
+    return IndexQuote(name, number(last, name), _opt(prev), _opt(opening), None, None,
+                      int(quoted.replace(tzinfo=BEIJING).timestamp() * 1000), source)
+
+
+class CnIndex:
+    """Shanghai Composite (000001) plus FTSE China A50 futures (SGX) as its after-hours proxy.
+
+    Composite: Tencent → Sina → Eastmoney. A50: Eastmoney 104.CN00Y (month-continuous contract)
+    then Sina's CFD as a labelled last resort. Refreshed every 60 s, best effort.
+    """
+    REFRESH_SECONDS = 60
+    SSE_SOURCES = (("腾讯", "https://qt.gtimg.cn/q=sh000001", {"Referer": "https://gu.qq.com/"}),
+                   ("新浪", "https://hq.sinajs.cn/list=sh000001", {"Referer": "https://finance.sina.com.cn/"}),
+                   ("东方财富", IndexFutures.EM + "1.000001", {"Referer": "https://quote.eastmoney.com/"}))
+    A50_SOURCES = (("东方财富", IndexFutures.EM + "104.CN00Y", {"Referer": "https://quote.eastmoney.com/"}),
+                   ("新浪CFD", "https://hq.sinajs.cn/list=hf_CHA50CFD", {"Referer": "https://finance.sina.com.cn/"}))
+    A50_MINUTES = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=104.CN00Y&klt=1&fqt=0"
+                   "&fields1=f1&fields2=f51,f52,f53&beg={beg}&end={end}")
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.quote: IndexQuote | None = None
+        self.a50: IndexQuote | None = None
+        self.error = ""
+        self.a50_error = ""
+        self.refreshed = -1e9
+
+    @staticmethod
+    def parse_a50(source: str, raw: bytes, now_ms: int) -> IndexQuote:
+        if source == "东方财富":
+            q = parse_eastmoney_index(raw, now_ms, "A50期货")
+            return IndexQuote("A50期货", q.last, q.prev_close, q.open, q.high, q.low, q.quoted_ms, source)
+        # Sina hf_: last, ?, bid, ask, high, low, time, prev settle, open, ..., name [13], date [14]
+        match = re.search(r'="([^"]*)"', raw.decode("gbk", errors="ignore"))
+        fields = match.group(1).split(",") if match else []
+        if len(fields) < 15 or not fields[0]:
+            raise ValueError("新浪 A50 报价为空")
+        try:
+            quoted_ms = int(dt.datetime.strptime(f"{fields[14]} {fields[6]}", "%Y-%m-%d %H:%M:%S")
+                            .replace(tzinfo=BEIJING).timestamp() * 1000)
+        except ValueError:
+            quoted_ms = now_ms
+        return IndexQuote("A50期货", number(fields[0], "A50"), _opt(fields[7]), _opt(fields[8]), _opt(fields[4]),
+                          _opt(fields[5]), quoted_ms, source)
+
+    async def _first(self, sources: tuple, parse, now_ms: int, previous):
+        failures = []
+        for name, url, extra in sources:
+            try:
+                raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+                return parse(name, raw, now_ms), ""
+            except Exception as error:
+                failures.append(f"{name}: {clean_error(error)}")
+        return previous, "；".join(failures)
+
+    async def refresh(self, now_ms: int, force: bool = False) -> None:
+        if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
+            return
+        self.refreshed = time.monotonic()
+        self.quote, self.error = await self._first(self.SSE_SOURCES, parse_cn_index, now_ms, self.quote)
+        self.a50, self.a50_error = await self._first(self.A50_SOURCES, self.parse_a50, now_ms, self.a50)
+
+    async def a50_at(self, day: dt.date) -> D:
+        """A50 price at the Composite's 15:00 close on ``day``: close of the 14:59-15:00 minute bar."""
+        url = self.A50_MINUTES.format(beg=(day - dt.timedelta(days=1)).strftime("%Y%m%d"),
+                                      end=(day + dt.timedelta(days=1)).strftime("%Y%m%d"))
+        raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Referer": "https://quote.eastmoney.com/"})
+        try:
+            klines = json.loads(raw)["data"]["klines"]
+        except (ValueError, KeyError, TypeError):
+            raise ValueError("A50 分钟线返回格式异常") from None
+        wanted = f"{day.isoformat()} 15:00"
+        for line in klines:
+            parts = str(line).split(",")
+            if parts[0] == wanted and len(parts) >= 3:
+                return number(parts[2], "A50 15:00")
+        raise ValueError(f"A50 分钟线里没有 {wanted}")
+
+    def status(self, now_ms: int, holidays: frozenset) -> str:
+        q = self.quote
+        local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+        quoted = dt.datetime.fromtimestamp(q.quoted_ms / 1000, BEIJING) if q else local
+        open_now = (local.weekday() < 5 and local.date() not in holidays and quoted.date() == local.date()
+                    and dt.time(9, 30) <= local.time() < dt.time(15, 0))
+        if local.date() in holidays or local.weekday() >= 5:
+            return "休市"
+        return "交易中" if open_now else "已收盘"
+
+    def line(self, now_ms: int, style: str, holidays: frozenset) -> str:
+        if not self.enabled:
+            return ""
+        q = self.quote
+        if q is None:
+            return f"🇨🇳 上证 ⚠️ 获取失败（{brief_error(self.error)}）" if self.error else "🇨🇳 上证 ⏳ 等待首次获取"
+        line = f"🇨🇳 {bold('上证 ' + self.status(now_ms, holidays))} {bold(fmt(q.last))}"
+        if q.prev_close:
+            line += f" → 昨收 {bold(fmt(q.prev_close))} {pct_text(percent(q.last, q.prev_close), style)}（{q.last - q.prev_close:+,.2f}）"
+        line += f"｜{stamp(q.quoted_ms, seconds=False)} {q.source}" + stale_note(q.quoted_ms, now_ms, BEIJING)
+        return line + f"｜⚠️ 刷新失败：{brief_error(self.error)}" if self.error else line
+
+    def a50_line(self, now_ms: int, style: str, anchor: D | None) -> str:
+        if not self.enabled:
+            return ""
+        a = self.a50
+        if a is None:
+            return f"📈 A50期货 ⚠️ 获取失败（{brief_error(self.a50_error)}）" if self.a50_error else "📈 A50期货 ⏳ 等待首次获取"
+        line = f"📈 {bold('A50期货 ' + a50_session(a.quoted_ms))} {bold(fmt(a.last))}"
+        if anchor:
+            line += f" → 上证收盘时 {bold(fmt(anchor))} {pct_text(percent(a.last, anchor), style)}"
+        if a.prev_close:
+            line += f"｜昨结 {fmt(a.prev_close)} {pct_text(percent(a.last, a.prev_close), style)}"
+        source = a.source if "CFD" not in a.source else f"{a.source}·非交易所合约，仅参考"
+        line += f"｜{stamp(a.quoted_ms, seconds=False)} {source}" + stale_note(a.quoted_ms, now_ms, BEIJING)
+        return line + f"｜⚠️ 刷新失败：{brief_error(self.a50_error)}" if self.a50_error else line
+
+
 class KospiIndex:
     """KOSPI composite index: Naver's realtime index feed first, Eastmoney (100.KS11) as fallback."""
     REFRESH_SECONDS = 60
@@ -1424,7 +1627,7 @@ SESSIONS = {  # continuous-trading intervals, local time
     "hk": ((dt.time(9, 30), dt.time(12, 0)), (dt.time(13, 0), dt.time(16, 0))),
     "kr": ((dt.time(9, 0), dt.time(15, 30)),),
 }
-PRIOR_VOL = {"sh": 0.035, "sz": 0.035, "hk": 0.03, "kr": 0.03, "HSI": 0.013, "KOSPI": 0.02}
+PRIOR_VOL = {"sh": 0.035, "sz": 0.035, "hk": 0.03, "kr": 0.03, "HSI": 0.013, "KOSPI": 0.02, "SSE": 0.011}
 PRIOR_WEIGHT = 10  # pseudo-observations given to the prior when blending with estimated volatility
 
 
@@ -1447,10 +1650,12 @@ def price_tick(market: str, price: D, index: bool = False) -> D:
     return D(last.get(market, "0.01"))
 
 
-def session_remaining(market: str, now_ms: int, close_date: dt.date | None = None) -> tuple[float, dt.date]:
+def session_remaining(market: str, now_ms: int, close_date: dt.date | None = None,
+                      holidays: frozenset = frozenset()) -> tuple[float, dt.date]:
     """(share of a full session's variance still ahead, target close date) for the next close.
 
-    Weekends are skipped; exchange holidays are not known, so the target may be a holiday.
+    Weekends and the configured exchange holidays are skipped; each skipped weekday holiday adds
+    half a session of variance (news keeps arriving while the market is shut).
     """
     info = STOCK_MARKETS[market]
     tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
@@ -1458,15 +1663,19 @@ def session_remaining(market: str, now_ms: int, close_date: dt.date | None = Non
     total = sum((dt.datetime.combine(local.date(), b) - dt.datetime.combine(local.date(), a)).seconds
                 for a, b in SESSIONS[market]) / 60
     today = local.date()
+    trading_today = today.weekday() < 5 and today not in holidays
     finalised = local >= dt.datetime.combine(today, info.close_time, tz) + dt.timedelta(minutes=15)
-    if today.weekday() < 5 and not finalised and (close_date is None or close_date < today):
+    if trading_today and not finalised and (close_date is None or close_date < today):
         remaining = sum(max(0.0, (dt.datetime.combine(today, b, tz) - max(dt.datetime.combine(today, a, tz), local)).total_seconds())
                         for a, b in SESSIONS[market]) / 60
         return max(remaining, 1.0) / total, today
-    target = today + dt.timedelta(days=1)
-    while target.weekday() >= 5:
+    target, skipped = today + dt.timedelta(days=1), 0
+    while target.weekday() >= 5 or target in holidays:
+        skipped += target.weekday() < 5
         target += dt.timedelta(days=1)
-    return 1.0, target
+    if not trading_today and today.weekday() < 5:
+        skipped += 1  # today itself is a holiday
+    return 1.0 + 0.5 * skipped, target
 
 
 @dataclass(frozen=True)
@@ -1565,6 +1774,130 @@ class VolBook:
             return prior, f"先验 {prior * 100:.1f}%，暂无历史"
         blended = math.sqrt((n * sigma ** 2 + PRIOR_WEIGHT * prior ** 2) / (n + PRIOR_WEIGHT))
         return blended, f"{source} {n} 日 {sigma * 100:.2f}% 与先验 {prior * 100:.1f}% 加权"
+
+
+# --- read-only probability web page -------------------------------------------------------------
+WEB_PAGE = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>收盘涨跌概率</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--text:#1d2125;--muted:#6b737c;--line:#e3e6ea;--up:#d93a3a;--down:#1f9d55;--flat:#9aa3ad}
+@media (prefers-color-scheme:dark){:root{--bg:#121417;--card:#1c1f23;--text:#e8eaed;--muted:#9aa3ad;--line:#2c3137}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+header{padding:16px;max-width:1100px;margin:0 auto}h1{font-size:20px;margin:0 0 4px}
+.meta{color:var(--muted);font-size:13px}.meta span{margin-right:12px}
+main{max-width:1100px;margin:0 auto;padding:0 16px 24px;display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+.top{display:flex;justify-content:space-between;align-items:baseline;gap:8px}.name{font-weight:600}.target{color:var(--muted);font-size:13px;white-space:nowrap}
+.odds{display:flex;justify-content:space-between;margin:10px 0 6px;font-variant-numeric:tabular-nums}
+.odds b{font-size:24px}.u{color:var(--up)}.d{color:var(--down)}
+.bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--line)}
+.bar i{display:block;height:100%}
+dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:10px 0 0;font-size:13px}dt{color:var(--muted)}dd{margin:0;font-variant-numeric:tabular-nums;word-break:break-word}
+.missing{color:var(--muted)}.warn{color:#c77c00}
+footer{max-width:1100px;margin:0 auto;padding:0 16px 24px;color:var(--muted);font-size:12px}
+</style></head><body>
+<header><h1>收盘涨跌概率</h1><div class="meta" id="meta">加载中…</div></header>
+<main id="cards"></main>
+<footer id="foot">模型参考，非投资建议。</footer>
+<script>
+const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
+function pct(x){return (x*100).toFixed(1)}
+function card(it,style){
+  const c=$("div","card"),top=$("div","top");
+  top.append($("div","name",it.name),$("div","target",it.target?("目标 "+it.target+" 收盘"):""));c.append(top);
+  if(it.missing){c.append($("p","missing","概率暂缺："+it.missing));return c}
+  const upCls=style==="us"?"d":"u",dnCls=style==="us"?"u":"d";
+  const o=$("div","odds"),a=$("div"),b=$("div");
+  a.append($("span","","涨 "));const ua=$("b",upCls,pct(it.fair_up)+"¢");a.append(ua);
+  b.append($("span","","跌 "));const db=$("b",dnCls,pct(it.fair_down)+"¢");b.append(db);o.append(a,b);c.append(o);
+  const bar=$("div","bar"),iu=$("i"),iff=$("i"),idn=$("i");
+  iu.style.width=(it.up*100)+"%";iu.style.background="var(--"+(style==="us"?"down":"up")+")";
+  iff.style.width=(it.flat*100)+"%";iff.style.background="var(--flat)";
+  idn.style.width=(it.down*100)+"%";idn.style.background="var(--"+(style==="us"?"up":"down")+")";
+  bar.append(iu,iff,idn);c.append(bar);
+  const dl=$("dl");const row=(k,v)=>{dl.append($("dt","",k),$("dd","",v))};
+  row("参考收盘",it.ref+(it.unit?" "+it.unit:"")+"（"+it.ref_note+"）");
+  row("有效价",it.effective+(it.unit?" "+it.unit:"")+"（"+(it.move>=0?"+":"")+it.move.toFixed(3)+"%）");
+  row("代理",it.proxy_note);
+  row("σ","日 "+(it.sigma_daily*100).toFixed(2)+"% × √"+it.remaining.toFixed(3)+" = "+(it.sigma*100).toFixed(2)+"%（"+it.sigma_note+"）");
+  row("严格涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%，z "+it.z.toFixed(3));
+  c.append(dl);return c}
+async function load(){
+  try{
+    const r=await fetch(location.pathname.replace(/\/$/,"")+"/data.json",{cache:"no-store"});
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    const d=await r.json();const box=document.getElementById("cards");box.replaceChildren(...d.items.map(it=>card(it,d.color_style)));
+    const m=document.getElementById("meta");m.replaceChildren($("span","","更新 "+d.generated_at),$("span","","基准 "+d.mode),$("span","","v"+d.version));
+    document.getElementById("foot").textContent=d.note;
+  }catch(e){const m=document.getElementById("meta");m.replaceChildren($("span","warn","刷新失败："+e.message+"，稍后自动重试"))}
+}
+load();setInterval(load,10000);
+</script></body></html>"""
+
+
+class WebServer:
+    """Tiny read-only HTTP server (stdlib asyncio) for the probability page.
+
+    Routes: /health, /p/<token> (HTML), /p/<token>/data.json (JSON). Everything else is 404, the
+    token is compared in constant time, and responses are no-store with a restrictive CSP.
+    """
+    MAX_HEADER_BYTES = 8192
+
+    def __init__(self, bot: "Bot", port: int, token: str):
+        self.bot, self.port, self.token = bot, port, token
+        self.server: asyncio.base_events.Server | None = None
+
+    async def start(self) -> int:
+        self.server = await asyncio.start_server(self.handle, "0.0.0.0", self.port)
+        self.port = self.server.sockets[0].getsockname()[1]
+        return self.port
+
+    async def stop(self) -> None:
+        if self.server:
+            self.server.close()
+            with contextlib.suppress(Exception):
+                await self.server.wait_closed()
+
+    def route(self, method: str, path: str) -> tuple[int, str, bytes]:
+        if method not in {"GET", "HEAD"}:
+            return 405, "text/plain; charset=utf-8", b"method not allowed"
+        if path in {"/", "/health"}:
+            return 200, "text/plain; charset=utf-8", b"ok"
+        parts = path.strip("/").split("/")
+        if len(parts) in {2, 3} and parts[0] == "p" and hmac.compare_digest(parts[1], self.token):
+            if len(parts) == 2:
+                return 200, "text/html; charset=utf-8", WEB_PAGE.encode("utf-8")
+            if parts[2] == "data.json":
+                body = json.dumps(self.bot.odds_payload(), ensure_ascii=False).encode("utf-8")
+                return 200, "application/json; charset=utf-8", body
+        return 404, "text/plain; charset=utf-8", b"not found"
+
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
+            if len(head) > self.MAX_HEADER_BYTES:
+                raise ValueError("header too large")
+            method, target, _ = head.split(b"\r\n", 1)[0].decode("latin-1").split(" ", 2)
+            status, ctype, body = self.route(method.upper(), urllib.parse.urlsplit(target).path)
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ValueError):
+            status, ctype, body, method = 400, "text/plain; charset=utf-8", b"bad request", "GET"
+        except Exception as error:  # Never let a page request touch the bot's loops.
+            LOG.warning("web request failed: %s", clean_error(error))
+            status, ctype, body, method = 500, "text/plain; charset=utf-8", b"error", "GET"
+        reason = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed", 500: "Internal Server Error"}[status]
+        headers = (f"HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n"
+                   "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
+                   "X-Robots-Tag: noindex\r\nContent-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; "
+                   "script-src 'unsafe-inline'; img-src 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n")
+        with contextlib.suppress(Exception):
+            writer.write(headers.encode("latin-1") + (b"" if method.upper() == "HEAD" else body))
+            await writer.drain()
+        with contextlib.suppress(Exception):
+            writer.close()
+            await writer.wait_closed()
 
 
 @dataclass(frozen=True)
@@ -1735,6 +2068,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("pause", "暂停当前订阅"),
     Command("resume", "恢复当前订阅"),
     Command("prob", "查看各标的下个收盘涨跌概率及计算过程"),
+    Command("web", "获取概率网页链接（自动刷新）"),
     Command("test", "发送测试消息，不代表行情正常"),
     Command("id", "查看你的用户 ID、聊天 ID、话题 ID"),
     Command("help", "显示说明"),
@@ -1909,6 +2243,12 @@ class Bot:
         self.hsi = IndexFutures(config.hsi_futures)
         self.hl = Hyperliquid({**config.hl_tickers, **config.hl_index})
         self.kospi = KospiIndex(config.kospi_index)
+        self.cn = CnIndex(config.sse_index)
+        self.web_token = config.web_token or self.store.get("web_token") or ""
+        if config.web_port and not self.web_token:
+            self.web_token = secrets.token_urlsafe(18)
+            self.store.put("web_token", self.web_token)
+        self.web: WebServer | None = None
         self.vols = VolBook(config.prob_vol)
         self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
         self.anchor_tries: dict[str, float] = {}
@@ -1923,7 +2263,7 @@ class Bot:
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
-            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob,
+            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web,
         }
 
     def settings(self) -> dict:
@@ -2286,6 +2626,30 @@ class Bot:
                     and self.anchors.get("HSI", (0,))[0] != close_ms):
                 self.anchors["HSI"] = (close_ms, q.last)
 
+        sse = self.cn.quote
+        if sse is not None:
+            close_ms = self.sse_close_ms(sse)
+            saved = self.anchors.get("A50") or tuple(self.store.get("anchor:A50", (0, "0")))
+            if saved[0] == close_ms:
+                self.anchors["A50"] = (close_ms, D(str(saved[1])))
+            elif self.retry_ok("A50"):
+                price = None
+                with contextlib.suppress(Exception):
+                    price = await self.cn.a50_at(dt.datetime.fromtimestamp(close_ms / 1000, BEIJING).date())
+                a50 = self.cn.a50
+                if price is None and a50 and 0 <= a50.quoted_ms - close_ms <= 5 * 60_000:
+                    price = a50.last  # the first A50 print within 5 minutes after 15:00
+                if price is not None:
+                    self.anchors["A50"] = (close_ms, price)
+                    self.store.put("anchor:A50", [close_ms, str(price)])
+        if self.vols.due("SSE"):
+            self.vols.refreshed["SSE"] = time.monotonic()
+            with contextlib.suppress(Exception):
+                raw = await http_get("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh000001,day,,,40,",
+                                     headers={"User-Agent": BROWSER_UA, "Referer": "https://gu.qq.com/"})
+                days = json.loads(raw)["data"]["sh000001"]
+                rows = days.get("day") or days.get("qfqday") or []
+                self.vols.record("SSE", [number(r[2], "收盘") for r in rows if len(r) > 2], "上证日K")
         for key, url, market in (("KOSPI", "https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=40&symbol=KOSPI", "kr"),
                                  ("HSI", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=40"
                                          "&fields1=f1&fields2=f51,f52,f53&secid=100.HSI", "hk")):
@@ -2302,6 +2666,45 @@ class Bot:
             return False
         self.anchor_tries[key] = now
         return True
+
+    def sse_close_ms(self, q: IndexQuote) -> int:
+        """15:00 on the Composite's latest completed session (the quote's day once it has closed)."""
+        local = dt.datetime.fromtimestamp(q.quoted_ms / 1000, BEIJING)
+        day = local.date()
+        if local.time() < dt.time(15, 0):  # quote from an unfinished session → the session before it
+            day -= dt.timedelta(days=1)
+        holidays = self.config.holidays.get("sh", frozenset())
+        while day.weekday() >= 5 or day in holidays:
+            day -= dt.timedelta(days=1)
+        return int(dt.datetime.combine(day, dt.time(15, 0), BEIJING).timestamp() * 1000)
+
+    def sse_odds(self, now_ms: int) -> CloseOdds | str | None:
+        q = self.cn.quote
+        if not self.config.probability or not self.config.sse_index:
+            return None
+        if q is None:
+            return "缺少上证指数"
+        holidays = self.config.holidays.get("sh", frozenset())
+        sigma, sigma_note = self.vols.get("SSE", "SSE")
+        if self.cn.status(now_ms, holidays) == "交易中" and q.prev_close:
+            today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+            remaining, target = session_remaining("sh", now_ms, today - dt.timedelta(days=1), holidays)
+            return close_odds("上证指数", q.prev_close, q.last, sigma, remaining, target, D("0.01"), "昨收",
+                              f"上证现货 {fmt(q.last)}（盘中直接用现货）", sigma_note)
+        close_ms = self.sse_close_ms(q)
+        close_date = dt.datetime.fromtimestamp(close_ms / 1000, BEIJING).date()
+        remaining, target = session_remaining("sh", now_ms, close_date, holidays)
+        a50, anchor = self.cn.a50, self.anchors.get("A50")
+        if a50 is None:
+            return "缺少 A50 期货报价"
+        if not anchor or anchor[0] != close_ms:
+            return "等待 A50 在上证 15:00 收盘时的价格"
+        beta = self.config.a50_beta
+        move = math.log(float(a50.last / anchor[1]))
+        effective = q.last * D(str(math.exp(beta * move)))
+        return close_odds("上证指数", q.last, effective, sigma, remaining, target, D("0.01"),
+                          f"{close_date.strftime('%m-%d')} 收盘",
+                          f"A50 {fmt(a50.last)} / 15:00 {fmt(anchor[1])} → {percent(a50.last, anchor[1]):+.3f}% × β {beta:g}", sigma_note)
 
     @staticmethod
     def kospi_close_ms(q: IndexQuote) -> int:
@@ -2329,7 +2732,7 @@ class Bot:
             return "等待币安在收盘时刻的价格"
         info = STOCK_MARKETS[ticker.market]
         close_date = dt.datetime.fromtimestamp(ref.close_ms / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset))).date()
-        remaining, target = session_remaining(ticker.market, now_ms, close_date)
+        remaining, target = session_remaining(ticker.market, now_ms, close_date, self.config.holidays.get(ticker.market, frozenset()))
         sigma, sigma_note = self.vols.get(symbol, ticker.market)
         move = percent(price, anchor[1])
         return close_odds(NAMES.get(symbol, symbol), ref.value, ref.value * price / anchor[1], sigma, remaining, target,
@@ -2347,7 +2750,7 @@ class Bot:
         cash_open = local.weekday() < 5 and dt.time(9, 30) <= local.time() < dt.time(16, 10)
         sigma, sigma_note = self.vols.get("HSI", "HSI")
         if cash_open and q.spot_prev:
-            remaining, target = session_remaining("hk", now_ms, local.date() - dt.timedelta(days=1))
+            remaining, target = session_remaining("hk", now_ms, local.date() - dt.timedelta(days=1), self.config.holidays.get("hk", frozenset()))
             return close_odds("恒生指数", q.spot_prev, q.spot, sigma, remaining, target, D("0.01"), "昨收",
                               f"恒指现货 {fmt(q.spot)}（盘中直接用现货）", sigma_note)
         close_date = self.hk_cash_close_date(now_ms)
@@ -2360,7 +2763,7 @@ class Bot:
             anchor = self.anchors["HSI"][1]
         if anchor is None:
             return "缺少期货在现货收市时的价格"
-        remaining, target = session_remaining("hk", now_ms, close_date)
+        remaining, target = session_remaining("hk", now_ms, close_date, self.config.holidays.get("hk", frozenset()))
         return close_odds("恒生指数", q.spot, q.spot * q.last / anchor, sigma, remaining, target, D("0.01"),
                           f"{close_date.strftime('%m-%d')} 收盘", f"恒指期货 {fmt(q.last)} / {anchor_note} {fmt(anchor)} → {percent(q.last, anchor):+.3f}%",
                           sigma_note)
@@ -2376,11 +2779,11 @@ class Bot:
         quoted_day = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date()
         local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
         if quoted_day == local.date() and krx_session(now_ms) == "交易中" and k.prev_close:
-            remaining, target = session_remaining("kr", now_ms, quoted_day - dt.timedelta(days=1))
+            remaining, target = session_remaining("kr", now_ms, quoted_day - dt.timedelta(days=1), self.config.holidays.get("kr", frozenset()))
             return close_odds("KOSPI", k.prev_close, k.last, sigma, remaining, target, D("0.01"), "昨收",
                               f"KOSPI 现货 {fmt(k.last)}（盘中直接用现货）", sigma_note)
         hl, anchor = self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
-        remaining, target = session_remaining("kr", now_ms, quoted_day)
+        remaining, target = session_remaining("kr", now_ms, quoted_day, self.config.holidays.get("kr", frozenset()))
         if hl is None:
             return "缺少 HL KR200 代理"
         if anchor and anchor[0] == self.kospi_close_ms(k):
@@ -2403,6 +2806,51 @@ class Bot:
             return f"{prefix}概率暂缺：{odds}"
         return odds.row().replace("🎲 ", prefix, 1)
 
+    def odds_items(self, now_ms: int) -> list[tuple[str, CloseOdds | str]]:
+        items = [("恒生指数", self.hsi_odds(now_ms)), ("KOSPI", self.kospi_odds(now_ms)), ("上证指数", self.sse_odds(now_ms))]
+        for symbol in self.config.symbols:
+            snapshot = self.snapshots.get(symbol) or {}
+            quote = snapshot.get("quote")
+            items.append((f"{NAMES.get(symbol, symbol)}｜{symbol}", self.contract_odds(symbol, quote.price, now_ms) if quote else "等待行情"))
+        return [(title, odds) for title, odds in items if odds is not None]
+
+    def odds_payload(self) -> dict:
+        """JSON for the web page: one entry per item, numbers raw, text already plain."""
+        now_ms = self.market.now_ms()
+        items = []
+        for title, odds in (self.odds_items(now_ms) if self.config.probability else []):
+            if isinstance(odds, str):
+                items.append({"name": title, "missing": odds})
+                continue
+            items.append({
+                "name": title, "target": odds.target.strftime("%m-%d"), "unit": odds.unit,
+                "ref": fmt(odds.ref), "ref_note": odds.ref_note, "effective": fmt(odds.effective.quantize(D("0.0001"))),
+                "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note,
+                "sigma_daily": odds.sigma_daily, "sigma": odds.sigma, "remaining": odds.remaining, "sigma_note": odds.sigma_note,
+                "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
+                "fair_up": odds.fair_up, "fair_down": odds.fair_down,
+            })
+        return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION,
+                "mode": BASELINE_SHORT.get(self.settings()["mode"], self.settings()["mode"]),
+                "color_style": self.config.color_style, "items": items,
+                "note": ("模型参考，非投资建议。有效价 = 参考收盘 × 代理现价 ÷ 代理在参考收盘时刻的价格；"
+                         "P(涨) = 1 − Φ(ln((参考+半跳)/有效)/σ剩余)，平盘两边各计一半。目标日跳过周末和已配置的交易所假期。"
+                         if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")}
+
+    def web_url(self) -> str:
+        path = f"/p/{self.web_token}"
+        return f"{self.config.web_base}{path}" if self.config.web_base else path
+
+    def cmd_web(self, req: Request) -> str:
+        if not self.config.web_port or not self.web_token:
+            return ("网页未开启：需要一个监听端口。Railway 会自动提供 PORT；其他环境请设置 WEB_PORT。"
+                    "设置 WEB=off 可显式关闭。")
+        if not self.config.web_base:
+            return (f"网页已在端口 {self.config.web_port} 运行，但还没有公网域名。\n"
+                    "Railway：服务 Settings → Networking → Generate Domain，重新部署后再发 /web；"
+                    f"或设置 WEB_BASE_URL。\n路径：{self.web_url()}")
+        return f"📊 概率网页（每 10 秒自动刷新，链接含私密令牌，请勿转发）：\n{self.web_url()}"
+
     def cmd_prob(self, req: Request) -> "Reply":
         if not self.config.probability:
             return Reply("概率功能已关闭（PROBABILITY=off）。")
@@ -2410,17 +2858,12 @@ class Bot:
         lines = [f"🎲 {bold('收盘涨跌概率（模型参考，非投资建议）')}",
                  "有效价 = 参考收盘 × 代理现价 / 代理在参考收盘时刻的价格",
                  "P(涨) = 1 − Φ(ln((参考+半跳)/有效) / σ剩余)，平盘两边各计一半"]
-        items = [("恒生指数", self.hsi_odds(now_ms)), ("KOSPI", self.kospi_odds(now_ms))]
-        for symbol in self.config.symbols:
-            snapshot = self.snapshots.get(symbol) or {}
-            quote = snapshot.get("quote")
-            items.append((f"{NAMES.get(symbol, symbol)}｜{symbol}", self.contract_odds(symbol, quote.price, now_ms) if quote else "等待行情"))
-        for title, odds in items:
+        for title, odds in self.odds_items(now_ms):
             if odds is None:
                 continue
             lines.append("\n" + bold(f"📍 {title}"))
             lines.extend(tree(odds.detail() if isinstance(odds, CloseOdds) else [f"概率暂缺：{odds}"]))
-        lines.append("\n⚠️ 目标日按工作日推算、未计交易所假期；σ 为历史估计；代理与结算标的之间有基差。")
+        lines.append("\n⚠️ 目标日跳过周末和已配置的交易所假期（HOLIDAYS_*），每个假日按半天方差计入；σ 为历史估计；代理与结算标的之间有基差。")
         return Reply("\n".join(lines), html=True)
 
     def kospi_line200(self, now_ms: int) -> str:
@@ -2434,11 +2877,15 @@ class Bot:
             lines.append(self.hsi.line(now_ms, self.config.color_style))
         if self.config.kospi_index and ticker and ticker.market == "kr" and self.kospi.quote:
             lines.append(self.kospi.line(now_ms, self.config.color_style))
+        if self.config.sse_index and ticker and ticker.market in {"sh", "sz"} and self.cn.quote:
+            lines.append(self.cn.line(now_ms, self.config.color_style, self.config.holidays.get("sh", frozenset())))
         if self.config.kospi_index and ticker and ticker.market == "kr" and self.kospi.quote200:
             lines.append(self.kospi_line200(now_ms))
         if price is not None and symbol in self.hl.quotes:
             lines.append(self.hl_line(symbol, price))
-        return lines
+        if price is not None:  # Model odds for the next close, so each alert carries its own read.
+            lines.append(self.odds_row(self.contract_odds(symbol, price, now_ms)))
+        return [line for line in lines if line]
 
     def references_for(self, symbol: str, now_ms: int) -> dict[str, Baseline]:
         found = {kind: self.reference_for(kind, symbol, now_ms) for kind in REFERENCE_KINDS}
@@ -2471,6 +2918,14 @@ class Bot:
             lines.append(self.kospi.line(now_ms, style))
             lines.append(self.kospi_line200(now_ms))
             lines.append(self.odds_row(self.kospi_odds(now_ms), "KOSPI"))
+        if self.config.sse_index:
+            holidays = self.config.holidays.get("sh", frozenset())
+            lines.append(self.cn.line(now_ms, style, holidays))
+            anchor = self.anchors.get("A50")
+            lines.append(self.cn.a50_line(now_ms, style, anchor[1] if anchor and self.cn.quote
+                                           and anchor[0] == self.sse_close_ms(self.cn.quote) else None))
+            lines.append(self.odds_row(self.sse_odds(now_ms), "上证"))
+        lines = [line for line in lines if line]
         lines = [line for line in lines if line]
         for symbol in self.config.symbols:
             snapshot = self.snapshots.get(symbol)
@@ -2521,7 +2976,7 @@ class Bot:
 
         # Best effort; failures are reported in /status and never block price alerts.
         await asyncio.gather(self.stocks.refresh(now_ms), self.fx.refresh(), self.hsi.refresh(now_ms), self.hl.refresh(),
-                             self.kospi.refresh(now_ms))
+                             self.kospi.refresh(now_ms), self.cn.refresh(now_ms))
 
         async def collect(symbol: str) -> tuple[str, dict]:
             try:
@@ -2670,12 +3125,23 @@ class Bot:
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, self.stopping.set)
         tasks = [asyncio.create_task(self.monitor_loop()), asyncio.create_task(self.commands_loop())]
+        if self.config.web_port:
+            try:
+                self.web = WebServer(self, self.config.web_port, self.web_token)
+                port = await self.web.start()
+                LOG.info("Probability page listening on port %s (%s)", port,
+                         "public URL via /web" if self.config.web_base else "no public domain yet")
+            except OSError as error:
+                LOG.warning("概率网页启动失败（不影响提醒）：%s", clean_error(error))
+                self.web = None
         try:
             await self.stopping.wait()
         finally:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self.web:
+                await self.web.stop()
             LOG.info("Stopped safely")
 
 
