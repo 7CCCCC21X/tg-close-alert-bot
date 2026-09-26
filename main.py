@@ -35,7 +35,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -1796,7 +1796,7 @@ main{max-width:1100px;margin:0 auto;padding:0 16px 24px;display:grid;gap:12px;gr
 .bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--line)}
 .bar i{display:block;height:100%}
 dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:10px 0 0;font-size:13px}dt{color:var(--muted)}dd{margin:0;font-variant-numeric:tabular-nums;word-break:break-word}
-.missing{color:var(--muted)}.warn{color:#c77c00}
+.missing{color:var(--muted)}.warn{color:#c77c00}.cd{margin-top:8px;font-size:14px;font-variant-numeric:tabular-nums}.cd b{font-size:16px}.cd.done{color:var(--muted)}
 footer{max-width:1100px;margin:0 auto;padding:0 16px 24px;color:var(--muted);font-size:12px}
 </style></head><body>
 <header><h1>收盘涨跌概率</h1><div class="meta" id="meta">加载中…</div></header>
@@ -1807,7 +1807,7 @@ const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==un
 function pct(x){return (x*100).toFixed(1)}
 function card(it,style){
   const c=$("div","card"),top=$("div","top");
-  top.append($("div","name",it.name),$("div","target",it.target?("目标 "+it.target+" 收盘"):""));c.append(top);
+  top.append($("div","name",it.name),$("div","target",it.close_label?("目标 "+it.close_label):""));c.append(top);
   if(it.missing){c.append($("p","missing","概率暂缺："+it.missing));return c}
   const upCls=style==="us"?"d":"u",dnCls=style==="us"?"u":"d";
   const o=$("div","odds"),a=$("div"),b=$("div");
@@ -1818,6 +1818,7 @@ function card(it,style){
   iff.style.width=(it.flat*100)+"%";iff.style.background="var(--flat)";
   idn.style.width=(it.down*100)+"%";idn.style.background="var(--"+(style==="us"?"up":"down")+")";
   bar.append(iu,iff,idn);c.append(bar);
+  if(it.close_ms){const cd=$("div","cd");cd.dataset.close=it.close_ms;c.append(cd)}
   const dl=$("dl");const row=(k,v)=>{dl.append($("dt","",k),$("dd","",v))};
   row("参考收盘",it.ref+(it.unit?" "+it.unit:"")+"（"+it.ref_note+"）");
   row("有效价",it.effective+(it.unit?" "+it.unit:"")+"（"+(it.move>=0?"+":"")+it.move.toFixed(3)+"%）");
@@ -1825,16 +1826,27 @@ function card(it,style){
   row("σ","日 "+(it.sigma_daily*100).toFixed(2)+"% × √"+it.remaining.toFixed(3)+" = "+(it.sigma*100).toFixed(2)+"%（"+it.sigma_note+"）");
   row("严格涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%，z "+it.z.toFixed(3));
   c.append(dl);return c}
+let skew=0;
+function two(n){return String(n).padStart(2,"0")}
+function tick(){
+  const now=Date.now()+skew;
+  document.querySelectorAll(".cd").forEach(el=>{
+    const left=Math.floor((Number(el.dataset.close)-now)/1000);
+    el.replaceChildren();
+    if(left<=0){el.className="cd done";el.textContent="已到收盘时间，等待收盘价确认";return}
+    el.className="cd";const d=Math.floor(left/86400),h=Math.floor(left%86400/3600),m=Math.floor(left%3600/60),s=left%60;
+    el.append($("span","","⏳ 距收盘 "),$("b","",(d?d+"天 ":"")+two(h)+":"+two(m)+":"+two(s)));
+  })}
 async function load(){
   try{
     const r=await fetch(location.pathname.replace(/\/$/,"")+"/data.json",{cache:"no-store"});
     if(!r.ok)throw new Error("HTTP "+r.status);
-    const d=await r.json();const box=document.getElementById("cards");box.replaceChildren(...d.items.map(it=>card(it,d.color_style)));
+    const d=await r.json();if(d.server_ms)skew=d.server_ms-Date.now();const box=document.getElementById("cards");box.replaceChildren(...d.items.map(it=>card(it,d.color_style)));
     const m=document.getElementById("meta");m.replaceChildren($("span","","更新 "+d.generated_at),$("span","","基准 "+d.mode),$("span","","v"+d.version));
-    document.getElementById("foot").textContent=d.note;
+    document.getElementById("foot").textContent=d.note;tick();
   }catch(e){const m=document.getElementById("meta");m.replaceChildren($("span","warn","刷新失败："+e.message+"，稍后自动重试"))}
 }
-load();setInterval(load,10000);
+load();setInterval(load,10000);setInterval(tick,1000);
 </script></body></html>"""
 
 
@@ -2822,20 +2834,32 @@ class Bot:
             if isinstance(odds, str):
                 items.append({"name": title, "missing": odds})
                 continue
+            close_ms, close_label = self.target_close(title, odds.target)
             items.append({
                 "name": title, "target": odds.target.strftime("%m-%d"), "unit": odds.unit,
+                "close_ms": close_ms, "close_label": close_label,
                 "ref": fmt(odds.ref), "ref_note": odds.ref_note, "effective": fmt(odds.effective.quantize(D("0.0001"))),
                 "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note,
                 "sigma_daily": odds.sigma_daily, "sigma": odds.sigma, "remaining": odds.remaining, "sigma_note": odds.sigma_note,
                 "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down,
             })
-        return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION,
+        return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION, "server_ms": now_ms,
                 "mode": BASELINE_SHORT.get(self.settings()["mode"], self.settings()["mode"]),
                 "color_style": self.config.color_style, "items": items,
                 "note": ("模型参考，非投资建议。有效价 = 参考收盘 × 代理现价 ÷ 代理在参考收盘时刻的价格；"
                          "P(涨) = 1 − Φ(ln((参考+半跳)/有效)/σ剩余)，平盘两边各计一半。目标日跳过周末和已配置的交易所假期。"
                          if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")}
+
+    def target_close(self, title: str, target: dt.date) -> tuple[int, str]:
+        """Epoch ms and label of the target session's official close for an odds item."""
+        market = {"恒生指数": "hk", "KOSPI": "kr", "上证指数": "sh"}.get(title)
+        if market is None:
+            ticker = self.config.tickers.get(title.split("｜")[-1])
+            market = ticker.market if ticker else "sh"
+        info = STOCK_MARKETS[market]
+        close = dt.datetime.combine(target, info.close_time, dt.timezone(dt.timedelta(hours=info.utc_offset)))
+        return int(close.timestamp() * 1000), f"{close.strftime('%m-%d %H:%M')} {info.name}收盘（{info.tz_name}）"
 
     def web_url(self) -> str:
         path = f"/p/{self.web_token}"
