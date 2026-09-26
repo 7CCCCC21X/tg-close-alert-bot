@@ -33,7 +33,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -2438,7 +2438,9 @@ class Bot:
             lines.append(self.kospi_line200(now_ms))
         if price is not None and symbol in self.hl.quotes:
             lines.append(self.hl_line(symbol, price))
-        return lines
+        if price is not None:  # Model odds for the next close, so each alert carries its own read.
+            lines.append(self.odds_row(self.contract_odds(symbol, price, now_ms)))
+        return [line for line in lines if line]
 
     def references_for(self, symbol: str, now_ms: int) -> dict[str, Baseline]:
         found = {kind: self.reference_for(kind, symbol, now_ms) for kind in REFERENCE_KINDS}
