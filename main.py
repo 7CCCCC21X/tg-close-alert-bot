@@ -35,7 +35,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.10.1"
+VERSION = "1.11.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -1783,68 +1783,86 @@ WEB_PAGE = """<!doctype html>
 <meta name="robots" content="noindex">
 <title>收盘涨跌概率</title>
 <style>
-:root{--bg:#f6f7f9;--card:#fff;--text:#1d2125;--muted:#6b737c;--line:#e3e6ea;--up:#d93a3a;--down:#1f9d55;--flat:#9aa3ad}
-@media (prefers-color-scheme:dark){:root{--bg:#121417;--card:#1c1f23;--text:#e8eaed;--muted:#9aa3ad;--line:#2c3137}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
-header{padding:16px;max-width:1100px;margin:0 auto}h1{font-size:20px;margin:0 0 4px}
-.meta{color:var(--muted);font-size:13px}.meta span{margin-right:12px}
-main{max-width:1100px;margin:0 auto;padding:0 16px 24px;display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
-.top{display:flex;justify-content:space-between;align-items:baseline;gap:8px}.name{font-weight:600}.target{color:var(--muted);font-size:13px;white-space:nowrap}
-.odds{display:flex;justify-content:space-between;margin:10px 0 6px;font-variant-numeric:tabular-nums}
-.odds b{font-size:24px}.u{color:var(--up)}.d{color:var(--down)}
-.bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--line)}
-.bar i{display:block;height:100%}
-dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:10px 0 0;font-size:13px}dt{color:var(--muted)}dd{margin:0;font-variant-numeric:tabular-nums;word-break:break-word}
-.missing{color:var(--muted)}.warn{color:#c77c00}.cd{margin-top:8px;font-size:14px;font-variant-numeric:tabular-nums}.cd b{font-size:16px}.cd.done{color:var(--muted)}
-footer{max-width:1100px;margin:0 auto;padding:0 16px 24px;color:var(--muted);font-size:12px}
-</style></head><body>
+:root{--bg:#f4f5f7;--card:#fff;--text:#1b1f23;--muted:#6b737c;--faint:#9aa3ad;--line:#e5e8ec;--up:#d63b3b;--down:#1e9a54;--flat:#b8c0c8;--chip:#f0f2f5}
+@media (prefers-color-scheme:dark){:root{--bg:#101215;--card:#1a1d21;--text:#e8eaed;--muted:#9aa3ad;--faint:#6b737c;--line:#2a2f35;--chip:#23272c}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:16px}
+header{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:6px 16px;margin-bottom:6px}
+h1{font-size:20px;margin:0}.meta{color:var(--muted);font-size:13px;display:flex;flex-wrap:wrap;gap:4px 12px}
+.legend{color:var(--muted);font-size:12px;margin:0 0 14px}.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 3px 0 8px;vertical-align:-1px}
+h2{font-size:13px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin:18px 2px 8px}
+.grid{display:grid;gap:12px;align-items:start;grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 14px 10px}
+.head{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+.name{font-weight:650;font-size:16px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sym{color:var(--faint);font-size:12px;font-weight:400;margin-left:6px}
+.cd{font-size:13px;font-variant-numeric:tabular-nums;white-space:nowrap;background:var(--chip);border-radius:999px;padding:2px 9px}
+.cd.done{color:var(--muted)}
+.odds{display:flex;justify-content:space-between;align-items:baseline;margin:12px 0 6px;font-variant-numeric:tabular-nums}
+.odds .lbl{color:var(--muted);font-size:13px;margin-right:4px}.odds b{font-size:28px;font-weight:700;letter-spacing:-.01em}
+.u{color:var(--up)}.d{color:var(--down)}
+.bar{display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--line)}.bar i{display:block;height:100%}
+.target{color:var(--muted);font-size:12px;margin-top:8px}
+.px{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;margin-top:6px;font-size:14px;font-variant-numeric:tabular-nums}
+.px .k{color:var(--muted);font-size:12px}.chip{font-size:12px;border-radius:6px;padding:1px 6px;background:var(--chip);font-weight:600}
+details{margin-top:8px;border-top:1px solid var(--line);padding-top:6px}summary{cursor:pointer;color:var(--muted);font-size:12px;list-style:none}
+summary::-webkit-details-marker{display:none}summary:before{content:"▸ ";}details[open] summary:before{content:"▾ "}
+dl{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;margin:6px 0 2px;font-size:12.5px}dt{color:var(--muted)}dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
+.card.missing{padding-bottom:14px}.card.missing p{margin:8px 0 0;color:var(--muted);font-size:13px}
+.warn{color:#c77c00}footer{color:var(--faint);font-size:12px;margin-top:20px;line-height:1.6}
+</style></head><body><div class="wrap">
 <header><h1>收盘涨跌概率</h1><div class="meta" id="meta">加载中…</div></header>
-<main id="cards"></main>
+<div class="legend" id="legend"></div>
+<h2 id="h-index">指数</h2><div class="grid" id="g-index"></div>
+<h2 id="h-contract">合约标的</h2><div class="grid" id="g-contract"></div>
 <footer id="foot">模型参考，非投资建议。</footer>
+</div>
 <script>
 const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
-function pct(x){return (x*100).toFixed(1)}
-function card(it,style){
-  const c=$("div","card"),top=$("div","top");
-  top.append($("div","name",it.name),$("div","target",it.close_label?("目标 "+it.close_label):""));c.append(top);
-  if(it.missing){c.append($("p","missing","概率暂缺："+it.missing));return c}
-  const upCls=style==="us"?"d":"u",dnCls=style==="us"?"u":"d";
+const open=new Set();let skew=0,fetchedAt=0,style="cn";
+const two=n=>String(n).padStart(2,"0"),pct=x=>(x*100).toFixed(1);
+function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
+function card(it){
+  const c=$("div","card"+(it.missing?" missing":"")),head=$("div","head"),nm=$("div","name",it.name);
+  if(it.symbol)nm.append($("span","sym",it.symbol));head.append(nm);
+  if(it.close_ms){const cd=$("span","cd");cd.dataset.close=it.close_ms;head.append(cd)}
+  c.append(head);
+  if(it.missing){c.append($("p","","概率暂缺："+it.missing));return c}
   const o=$("div","odds"),a=$("div"),b=$("div");
-  a.append($("span","","涨 "));const ua=$("b",upCls,pct(it.fair_up)+"¢");a.append(ua);
-  b.append($("span","","跌 "));const db=$("b",dnCls,pct(it.fair_down)+"¢");b.append(db);o.append(a,b);c.append(o);
-  const bar=$("div","bar"),iu=$("i"),iff=$("i"),idn=$("i");
-  iu.style.width=(it.up*100)+"%";iu.style.background="var(--"+(style==="us"?"down":"up")+")";
-  iff.style.width=(it.flat*100)+"%";iff.style.background="var(--flat)";
-  idn.style.width=(it.down*100)+"%";idn.style.background="var(--"+(style==="us"?"up":"down")+")";
-  bar.append(iu,iff,idn);c.append(bar);
-  if(it.close_ms){const cd=$("div","cd");cd.dataset.close=it.close_ms;c.append(cd)}
-  const dl=$("dl");const row=(k,v)=>{dl.append($("dt","",k),$("dd","",v))};
-  row("参考收盘",it.ref+(it.unit?" "+it.unit:"")+"（"+it.ref_note+"）");
-  row("有效价",it.effective+(it.unit?" "+it.unit:"")+"（"+(it.move>=0?"+":"")+it.move.toFixed(3)+"%）");
-  row("代理",it.proxy_note);
-  row("σ","日 "+(it.sigma_daily*100).toFixed(2)+"% × √"+it.remaining.toFixed(3)+" = "+(it.sigma*100).toFixed(2)+"%（"+it.sigma_note+"）");
-  row("严格涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%，z "+it.z.toFixed(3));
-  c.append(dl);return c}
-let skew=0;
-function two(n){return String(n).padStart(2,"0")}
+  a.append($("span","lbl","涨"),$("b",style==="us"?"d":"u",pct(it.fair_up)+"¢"));
+  b.append($("span","lbl","跌"),$("b",style==="us"?"u":"d",pct(it.fair_down)+"¢"));o.append(a,b);c.append(o);
+  const bar=$("div","bar");[[it.up,upColor()],[it.flat,"var(--flat)"],[it.down,downColor()]].forEach(([w,col])=>{const i=$("i");i.style.width=(w*100)+"%";i.style.background=col;bar.append(i)});c.append(bar);
+  c.append($("div","target","目标 "+it.close_label));
+  const px=$("div","px"),unit=it.unit?" "+it.unit:"";
+  px.append($("span","k","参考"),$("span","",it.ref+unit),$("span","k","→ 有效"),$("span","",it.effective+unit));
+  const chip=$("span","chip",(it.move>=0?"+":"")+it.move.toFixed(2)+"%");chip.style.color=it.move>0?upColor():it.move<0?downColor():"var(--muted)";px.append(chip);c.append(px);
+  const det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
+  det.append($("summary","","计算明细"));const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
+  row("参考",it.ref+unit+"（"+it.ref_note+"）");row("代理",it.proxy_note);
+  row("σ","日 "+(it.sigma_daily*100).toFixed(2)+"% × √"+it.remaining.toFixed(3)+" = "+(it.sigma*100).toFixed(2)+"%");
+  row("σ 来源",it.sigma_note);row("涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%");row("z",it.z.toFixed(3));
+  det.append(dl);c.append(det);return c}
 function tick(){
   const now=Date.now()+skew;
-  document.querySelectorAll(".cd").forEach(el=>{
-    const left=Math.floor((Number(el.dataset.close)-now)/1000);
-    el.replaceChildren();
-    if(left<=0){el.className="cd done";el.textContent="已到收盘时间，等待收盘价确认";return}
-    el.className="cd";const d=Math.floor(left/86400),h=Math.floor(left%86400/3600),m=Math.floor(left%3600/60),s=left%60;
-    el.append($("span","","⏳ 距收盘 "),$("b","",(d?d+"天 ":"")+two(h)+":"+two(m)+":"+two(s)));
-  })}
+  document.querySelectorAll(".cd").forEach(el=>{const left=Math.floor((Number(el.dataset.close)-now)/1000);
+    if(left<=0){el.className="cd done";el.textContent="已到收盘";return}
+    const d=Math.floor(left/86400),h=Math.floor(left%86400/3600),m=Math.floor(left%3600/60),s=left%60;
+    el.className="cd";el.textContent="⏳ "+(d?d+"天 ":"")+two(h)+":"+two(m)+":"+two(s)});
+  const ago=document.getElementById("ago");if(ago&&fetchedAt)ago.textContent=Math.max(0,Math.round((Date.now()-fetchedAt)/1000))+" 秒前刷新"}
 async function load(){
   try{
-    const r=await fetch(location.pathname.replace(/\/$/,"")+"/data.json",{cache:"no-store"});
+    const r=await fetch(location.pathname.replace(/\\/$/,"")+"/data.json",{cache:"no-store"});
     if(!r.ok)throw new Error("HTTP "+r.status);
-    const d=await r.json();if(d.server_ms)skew=d.server_ms-Date.now();const box=document.getElementById("cards");box.replaceChildren(...d.items.map(it=>card(it,d.color_style)));
-    const m=document.getElementById("meta");m.replaceChildren($("span","","更新 "+d.generated_at),$("span","","基准 "+d.mode),$("span","","v"+d.version));
+    const d=await r.json();if(d.server_ms)skew=d.server_ms-Date.now();fetchedAt=Date.now();style=d.color_style||"cn";
+    for(const g of["index","contract"]){const items=d.items.filter(i=>(i.group||"contract")===g);
+      document.getElementById("g-"+g).replaceChildren(...items.map(card));document.getElementById("h-"+g).hidden=!items.length}
+    document.getElementById("meta").replaceChildren($("span","","数据 "+d.generated_at),$("span","","",),$("span","","基准 "+d.mode),$("span","","v"+d.version));
+    document.getElementById("meta").children[1].id="ago";
+    const lg=document.getElementById("legend");lg.replaceChildren("¢ = 公平价（平盘两边各半）");
+    [["涨",upColor()],["平","var(--flat)"],["跌",downColor()]].forEach(([t,col])=>{const i=$("i");i.style.background=col;lg.append(i,t)});
     document.getElementById("foot").textContent=d.note;tick();
-  }catch(e){const m=document.getElementById("meta");m.replaceChildren($("span","warn","刷新失败："+e.message+"，稍后自动重试"))}
+  }catch(e){document.getElementById("meta").replaceChildren($("span","warn","刷新失败："+e.message+"，稍后自动重试"))}
 }
 load();setInterval(load,10000);setInterval(tick,1000);
 </script></body></html>"""
@@ -2662,14 +2680,28 @@ class Bot:
                 days = json.loads(raw)["data"]["sh000001"]
                 rows = days.get("day") or days.get("qfqday") or []
                 self.vols.record("SSE", [number(r[2], "收盘") for r in rows if len(r) > 2], "上证日K")
-        for key, url, market in (("KOSPI", "https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=40&symbol=KOSPI", "kr"),
-                                 ("HSI", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=40"
-                                         "&fields1=f1&fields2=f51,f52,f53&secid=100.HSI", "hk")):
-            if self.vols.due(key):
-                self.vols.refreshed[key] = time.monotonic()  # one attempt per window even if it fails
-                with contextlib.suppress(Exception):
+        # Index volatility: KOSPI from Naver; HSI from Tencent, else Eastmoney. One attempt per window.
+        sources = {"KOSPI": (("https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=40&symbol=KOSPI", "naver"),),
+                   "HSI": (("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=hkHSI,day,,,40,", "tencent"),
+                           ("https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=40"
+                            "&fields1=f1&fields2=f51,f52,f53&secid=100.HSI", "eastmoney"))}
+        for key, urls in sources.items():
+            if not self.vols.due(key):
+                continue
+            self.vols.refreshed[key] = time.monotonic()
+            for url, kind in urls:
+                try:
                     raw = await http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*"})
-                    self.vols.record(key, [c for _, c in parse_daily_bars(market, raw)], "指数日K")
+                    if kind == "tencent":
+                        days = json.loads(raw)["data"]["hkHSI"]
+                        closes = [number(r[2], "收盘") for r in (days.get("day") or days.get("qfqday") or []) if len(r) > 2]
+                    else:
+                        closes = [c for _, c in parse_daily_bars("kr" if kind == "naver" else "hk", raw)]
+                    if len(closes) > 2:
+                        self.vols.record(key, closes, "指数日K")
+                        break
+                except Exception:
+                    continue
 
     def retry_ok(self, key: str, every: float = 60) -> bool:
         """Throttle failing anchor lookups to one attempt per minute per key."""
@@ -2707,16 +2739,29 @@ class Bot:
         close_date = dt.datetime.fromtimestamp(close_ms / 1000, BEIJING).date()
         remaining, target = session_remaining("sh", now_ms, close_date, holidays)
         a50, anchor = self.cn.a50, self.anchors.get("A50")
+        ref_note = f"{close_date.strftime('%m-%d')} 收盘"
         if a50 is None:
-            return "缺少 A50 期货报价"
-        if not anchor or anchor[0] != close_ms:
+            return close_odds("上证指数", q.last, q.last, sigma, remaining, target, D("0.01"), ref_note,
+                              "暂无 A50 报价，按收盘价计算（约 50/50）", sigma_note)
+        quoted = dt.datetime.fromtimestamp(a50.quoted_ms / 1000, BEIJING)
+        session = a50_session(a50.quoted_ms)
+        # A night quote belongs to the day session before it (17:00 the same day, or before 04:45 the next day).
+        night_of = quoted.date() if quoted.time() >= dt.time(17, 0) else quoted.date() - dt.timedelta(days=1)
+        if anchor and anchor[0] == close_ms:
+            base, base_note = anchor[1], "15:00"
+        elif session == "夜盘" and night_of == close_date and a50.prev_close:
+            # No exact 15:00 print: that day's A50 settlement (day session, ~16:30) stands in.
+            base, base_note = a50.prev_close, "昨结（锚点暂用当天日盘结算价，非 15:00 精确值）"
+        elif session != "夜盘" and quoted.date() == close_date and a50.quoted_ms >= close_ms:
+            # A50 has not traded a night session since the close: no after-hours move to map yet.
+            base, base_note = a50.last, "收盘后暂无夜盘成交"
+        else:
             return "等待 A50 在上证 15:00 收盘时的价格"
         beta = self.config.a50_beta
-        move = math.log(float(a50.last / anchor[1]))
+        move = math.log(float(a50.last / base))
         effective = q.last * D(str(math.exp(beta * move)))
-        return close_odds("上证指数", q.last, effective, sigma, remaining, target, D("0.01"),
-                          f"{close_date.strftime('%m-%d')} 收盘",
-                          f"A50 {fmt(a50.last)} / 15:00 {fmt(anchor[1])} → {percent(a50.last, anchor[1]):+.3f}% × β {beta:g}", sigma_note)
+        return close_odds("上证指数", q.last, effective, sigma, remaining, target, D("0.01"), ref_note,
+                          f"A50 {fmt(a50.last)} / {base_note} {fmt(base)} → {percent(a50.last, base):+.3f}% × β {beta:g}", sigma_note)
 
     @staticmethod
     def kospi_close_ms(q: IndexQuote) -> int:
@@ -2831,12 +2876,14 @@ class Bot:
         now_ms = self.market.now_ms()
         items = []
         for title, odds in (self.odds_items(now_ms) if self.config.probability else []):
+            name, _, symbol = title.partition("｜")
+            base = {"name": name, "symbol": symbol, "group": "contract" if symbol else "index"}
             if isinstance(odds, str):
-                items.append({"name": title, "missing": odds})
+                items.append({**base, "missing": odds})
                 continue
             close_ms, close_label = self.target_close(title, odds.target)
             items.append({
-                "name": title, "target": odds.target.strftime("%m-%d"), "unit": odds.unit,
+                **base, "target": odds.target.strftime("%m-%d"), "unit": odds.unit,
                 "close_ms": close_ms, "close_label": close_label,
                 "ref": fmt(odds.ref), "ref_note": odds.ref_note, "effective": fmt(odds.effective.quantize(D("0.0001"))),
                 "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note,
