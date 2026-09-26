@@ -1,4 +1,4 @@
-import asyncio, sys, time, math, json, datetime as dt
+import dataclasses, asyncio, sys, time, math, json, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
@@ -91,6 +91,9 @@ async def run():
     assert bot.anchors["SKHYNIXUSDT"] == (close_ms, D("1350")), bot.anchors
     assert bot.anchors["KOSPI"] == (close_ms, D("1126.60")) and "candleSnapshot" in hl_calls, bot.anchors
     assert "SKHYNIXUSDT" in bot.vols.estimates and bot.vols.estimates["SKHYNIXUSDT"][1] == 30
+    assert store.get("anchor:KOSPI") == [close_ms, "1126.60", "15:30 一分钟K"]  # persisted for restarts
+    now = bot.market.now_ms()
+    bot.hl.quotes["KR200"] = dataclasses.replace(bot.hl.quotes["KR200"], fetched_ms=now - 30_000)  # pin to the fake clock
     ko = bot.kospi_odds(bot.market.now_ms())
     assert isinstance(ko, m.CloseOdds) and ko.target == dt.date(2026, 9, 28) and f"{ko.fair_up * 100:.1f}" == "28.2", ko
     co = bot.contract_odds("SKHYNIXUSDT", D("1340"), bot.market.now_ms())
@@ -108,6 +111,42 @@ async def run():
     assert "HL KR200 1,107.15 / 收盘时刻 1,126.6 → -1.726%（KOSPI200 代理，存在基差）" in pr and "公平价 涨 <b>28.2¢</b> / 跌 <b>71.8¢</b>" in pr, pr
     assert "<b>📍 SK 海力士｜SKHYNIXUSDT</b>" in pr and "参考收盘 <b>1,857,000 KRW</b>（09-23 15:30 韩国时间·Naver）" in pr and "币安日K 30 日" in pr, pr
     assert "📍 恒生指数" not in pr  # HSI disabled
+    # --- KR200 anchor: restart, 5-minute fallback, recorded mark, never the KOSPI200 cash level ---------
+    k, hl = bot.kospi.quote, bot.hl.quotes["KR200"]
+    async def no_candles(url, payload=None, timeout=15): raise m.RemoteError("HTTP 500: 接口请求失败")
+    m.http_json = no_candles
+    bot2 = m.Bot(cfg, store, FakeMarket(cfg), FakeTelegram()); bot2.kospi.quote = k; bot2.hl.quotes["KR200"] = hl
+    await bot2.kospi_anchor(k, hl)  # restart mid-holiday: the saved anchor is used, HL is not asked
+    assert bot2.anchors["KOSPI"] == (close_ms, D("1126.60")) and bot2.kospi_anchor_note == "15:30 一分钟K"
+    five = []
+    async def only_5m(url, payload=None, timeout=15):
+        five.append(payload["req"]["interval"])
+        if payload["req"]["interval"] == "1m": return []  # older than HL's 5,000 one-minute candles
+        t = payload["req"]["endTime"]; return [{"t": t - 300000, "c": "1126.40"}]
+    m.http_json = only_5m
+    bot3 = m.Bot(cfg, m.Store(":memory:"), FakeMarket(cfg), FakeTelegram()); bot3.kospi.quote = k; bot3.hl.quotes["KR200"] = hl
+    await bot3.kospi_anchor(k, hl)
+    assert five == ["1m", "5m"] and bot3.anchors["KOSPI"] == (close_ms, D("1126.40")) and bot3.kospi_anchor_note == "15:30 五分钟K"
+    o3 = bot3.kospi_odds(now); assert isinstance(o3, m.CloseOdds) and "/ 15:30 五分钟K 1,126.4" in o3.proxy_note, o3.proxy_note
+    m.http_json = no_candles
+    bot4 = m.Bot(cfg, m.Store(":memory:"), FakeMarket(cfg), FakeTelegram()); bot4.kospi.quote = k; bot4.hl.quotes["KR200"] = hl
+    bot4.kospi.quote200 = k  # a KOSPI200 cash level is available but must not stand in for the perp anchor
+    await bot4.kospi_anchor(k, hl)
+    msg = bot4.kospi_odds(now)
+    assert isinstance(msg, str) and "缺少 HL KR200 在 09-23 15:30 的同源锚点" in msg and "HTTP 500" in msg, msg
+    bot5 = m.Bot(cfg, m.Store(":memory:"), FakeMarket(cfg), FakeTelegram()); bot5.kospi.quote = k
+    at_close = dataclasses.replace(hl, mark=D("1126.9"), fetched_ms=close_ms + 20_000)
+    await bot5.kospi_anchor(k, at_close)  # the live mark seen right after the close is recorded ...
+    bot5.anchors.clear(); bot5.retry_ok = lambda key, every=60: True
+    await bot5.kospi_anchor(k, hl)          # ... and used when the candles are gone
+    assert bot5.anchors["KOSPI"] == (close_ms, D("1126.9")) and bot5.kospi_anchor_note == "15:30 后两分钟内标记价近似"
+    # a stale HL mark (refresh failing) gives no new probability
+    bot.hl.quotes["KR200"] = dataclasses.replace(hl, fetched_ms=now - 11 * 60_000)
+    assert "HL KR200 报价已超 10 分钟未更新" in bot.kospi_odds(now)
+    bot.hl.quotes["KR200"] = hl
+    diag = "\n".join(bot.diag_state(now))
+    assert "KR200 锚点：1,126.6 @" in diag and "（15:30 一分钟K·HL）" in diag and "KOSPI 波动率：3.02%（PROB_VOL 手动设定）" in diag, diag
+    assert "KOSPI 概率：涨 28.2¢" in diag, diag
     # missing anchor / stale reference are explained instead of guessed
     bot.anchors.pop("SKHYNIXUSDT")
     assert bot.contract_odds("SKHYNIXUSDT", D("1340"), bot.market.now_ms()) == "等待币安在收盘时刻的价格"

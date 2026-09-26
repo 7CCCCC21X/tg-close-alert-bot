@@ -1409,16 +1409,21 @@ class Hyperliquid:
         self.tickers = dict(tickers)
         self.quotes: dict[str, HlQuote] = {}
         self.notes: dict[str, str] = {}   # symbol -> why there is no quote (not listed / fetch failed)
-        self.at_cache: dict[tuple[str, int], D] = {}
+        self.at_cache: dict[tuple[str, int, str], D] = {}
         self.refreshed = -1e9
 
-    async def price_at(self, coin: str, at_ms: int) -> D:
-        """Close of the 1-minute candle ending at ``at_ms`` (the market's price at that instant)."""
-        key = (coin, at_ms)
+    async def price_at(self, coin: str, at_ms: int, interval: str = "1m") -> D:
+        """Close of the candle ending at ``at_ms`` (the market's price at that instant).
+
+        Hyperliquid only serves the latest 5,000 candles per interval (about 3.5 days of 1-minute bars),
+        so after a long holiday the 5-minute candle ending at the same instant is the fallback.
+        """
+        key = (coin, at_ms, interval)
         if key in self.at_cache:
             return self.at_cache[key]
+        minutes = {"1m": 1, "5m": 5, "15m": 15}[interval]
         rows = await http_json(self.URL, {"type": "candleSnapshot", "req": {
-            "coin": coin, "interval": "1m", "startTime": at_ms - 5 * 60_000, "endTime": at_ms}})
+            "coin": coin, "interval": interval, "startTime": at_ms - 5 * minutes * 60_000, "endTime": at_ms}})
         candles = [r for r in rows if isinstance(r, dict) and int(r.get("t", 0)) < at_ms] if isinstance(rows, list) else []
         if not candles:
             raise ValueError(f"Hyperliquid 没有 {coin} 在 {stamp(at_ms, seconds=False)} 的 K 线")
@@ -2758,6 +2763,7 @@ class Bot:
         self.reference_pool: ThreadPoolExecutor | None = None
         self.reference_state: dict[str, dict] = {}  # per background feed: last success, last error, duration
         self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
+        self.kospi_anchor_note, self.kospi_anchor_error = "", ""
         self.a50_anchor_note = "15:00"
         self.a50_anchor_error = ""  # why the last anchor lookup failed (shown in /diag and the odds row)
         self.a50_anchor_source = "东方财富"
@@ -3159,10 +3165,7 @@ class Bot:
                     self.vols.record(symbol, closes, "币安日K")
         kospi, hl = self.kospi.quote, self.hl.quotes.get("KR200")
         if kospi and hl:
-            close_ms = self.kospi_close_ms(kospi)
-            if self.anchors.get("KOSPI", (0,))[0] != close_ms and self.retry_ok("KOSPI"):
-                with contextlib.suppress(Exception):
-                    self.anchors["KOSPI"] = (close_ms, await self.hl.price_at(hl.coin, close_ms))
+            await self.kospi_anchor(kospi, hl)
         q = self.hsi.quote
         if q and q.spot is not None:
             close_date = self.hk_cash_close_date(now_ms, self.hsi.holidays)
@@ -3258,6 +3261,42 @@ class Bot:
                         break
                 except Exception:
                     continue
+
+    async def kospi_anchor(self, kospi: IndexQuote, hl: HlQuote) -> None:
+        """HL KR200 at the KOSPI 15:30 close, from the same perp as the live proxy, persisted across restarts.
+
+        Order: saved record → 1-minute candle → 5-minute candle (same instant, survives longer on HL)
+        → the live mark recorded within two minutes after the close.
+        """
+        close_ms = self.kospi_close_ms(kospi)
+        if 0 <= hl.fetched_ms - close_ms <= 2 * 60_000 and not self.store.get(f"kr200_print:{close_ms}"):
+            self.store.put(f"kr200_print:{close_ms}", [hl.fetched_ms, str(hl.mark)])  # too late to catch afterwards
+        if self.anchors.get("KOSPI", (0,))[0] == close_ms:
+            return
+        saved = self.store.get("anchor:KOSPI", ())
+        with contextlib.suppress(ValueError, TypeError, IndexError, decimal.InvalidOperation):
+            if int(saved[0]) == close_ms and D(str(saved[1])) > 0:
+                self.anchors["KOSPI"] = (close_ms, D(str(saved[1])))
+                self.kospi_anchor_note = str(saved[2]) if len(saved) > 2 else "15:30"
+                return
+        if not self.retry_ok("KOSPI"):
+            return
+        price, note, failures = None, "", []
+        for interval, label in (("1m", "15:30 一分钟K"), ("5m", "15:30 五分钟K")):
+            try:
+                price, note = await self.hl.price_at(hl.coin, close_ms, interval), label
+                break
+            except Exception as error:
+                failures.append(clean_error(error))
+        printed = self.store.get(f"kr200_print:{close_ms}")
+        if price is None and printed:
+            with contextlib.suppress(ValueError, TypeError, IndexError, decimal.InvalidOperation):
+                price, note = D(str(printed[1])), "15:30 后两分钟内标记价近似"
+        self.kospi_anchor_error = "；".join(failures) if price is None else ""
+        if price is not None:
+            self.anchors["KOSPI"] = (close_ms, price)
+            self.kospi_anchor_note = note
+            self.store.put("anchor:KOSPI", [close_ms, str(price), note])
 
     def retry_ok(self, key: str, every: float = 60) -> bool:
         """Throttle failing anchor lookups to one attempt per minute per key."""
@@ -3392,6 +3431,8 @@ class Bot:
                           f"{close_date.strftime('%m-%d')} 收盘", f"恒指期货 {fmt(q.last)} / {anchor_note} {fmt(anchor)} → {percent(q.last, anchor):+.3f}%",
                           sigma_note)
 
+    HL_STALE_MS = 10 * 60_000  # an HL mark older than this (refresh failing) is not used for new probabilities
+
     def kospi_odds(self, now_ms: int) -> CloseOdds | str | None:
         k = self.kospi.quote
         if not self.config.probability or not self.config.kospi_index:
@@ -3410,12 +3451,13 @@ class Bot:
         remaining, target = session_remaining("kr", now_ms, quoted_day, self.config.holidays.get("kr", frozenset()))
         if hl is None:
             return "缺少 HL KR200 代理"
-        if anchor and anchor[0] == self.kospi_close_ms(k):
-            base, base_note = anchor[1], "收盘时刻"
-        elif self.kospi.quote200:
-            base, base_note = self.kospi.quote200.last, "KOSPI200 收盘（HL 收盘时刻价格暂缺）"
-        else:
-            return "等待 HL KR200 在收盘时刻的价格"
+        if now_ms - hl.fetched_ms > self.HL_STALE_MS:
+            return f"HL KR200 报价已超 10 分钟未更新（最后 {stamp(hl.fetched_ms, seconds=False)}），暂不输出新概率"
+        if not (anchor and anchor[0] == self.kospi_close_ms(k)):
+            # Never divide the perp by the KOSPI200 cash level: their basis would be read as a move.
+            why = f"：{brief_error(self.kospi_anchor_error, 90)}" if self.kospi_anchor_error else ""
+            return f"缺少 HL KR200 在 {quoted_day.strftime('%m-%d')} 15:30 的同源锚点{why}；暂不输出概率"
+        base, base_note = anchor[1], "收盘时刻" if self.kospi_anchor_note == "15:30 一分钟K" else self.kospi_anchor_note
         return close_odds("KOSPI", k.last, k.last * hl.mark / base, sigma, remaining, target, D("0.01"),
                           f"{quoted_day.strftime('%m-%d')} 收盘",
                           f"HL KR200 {fmt(hl.mark)} / {base_note} {fmt(base)} → {percent(hl.mark, base):+.3f}%（KOSPI200 代理，存在基差）",
@@ -3878,9 +3920,23 @@ class Bot:
                          + (f"｜最近查找失败：{brief_error(self.a50_anchor_error, 120)}" if self.a50_anchor_error else ""))
             odds = self.sse_odds(now_ms)
             if isinstance(odds, CloseOdds):
-                lines.append(f"  上证概率：涨 {odds.fair_up * 100:.1f}¢（有效 {fmt(odds.effective.quantize(D('0.01')))}）")
+                lines.append(f"  上证概率：涨 {odds.fair_up * 100:.1f}¢（有效 {fmt(odds.effective.quantize(D('0.01')))}·σ {odds.sigma * 100:.2f}%·{odds.sigma_note}）")
             elif odds is not None:
                 lines.append(f"  上证概率：暂缺——{odds}")
+        if self.config.kospi_index:
+            k, hl, anchor = self.kospi.quote, self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
+            lines.append(f"  KOSPI 基准：{f'{fmt(k.last)}｜{stamp(k.quoted_ms, seconds=False)}｜{k.source}' if k else '无'}"
+                         + (f"｜错误：{brief_error(self.kospi.error, 80)}" if self.kospi.error else ""))
+            lines.append(f"  KR200 代理：{f'{fmt(hl.mark)}（HL {hl.coin} 标记价）｜{int((now_ms - hl.fetched_ms) / 1000)} 秒前' if hl else '无'}")
+            lines.append(f"  KR200 锚点：{f'{fmt(anchor[1])} @ {stamp(anchor[0], seconds=False)}（{self.kospi_anchor_note}·HL）' if anchor else '无'}"
+                         + (f"｜最近查找失败：{brief_error(self.kospi_anchor_error, 120)}" if self.kospi_anchor_error else ""))
+            sigma, note = self.vols.get("KOSPI", "KOSPI")
+            lines.append(f"  KOSPI 波动率：{sigma * 100:.2f}%（{note}）")
+            odds = self.kospi_odds(now_ms)
+            if isinstance(odds, CloseOdds):
+                lines.append(f"  KOSPI 概率：涨 {odds.fair_up * 100:.1f}¢（有效 {fmt(odds.effective.quantize(D('0.01')))}）")
+            elif odds is not None:
+                lines.append(f"  KOSPI 概率：暂缺——{odds}")
         if self.config.hsi_futures and (self.hsi.quote or self.hsi.error):
             q = self.hsi.quote
             lines.append(f"  恒指期货：{f'{q.session_name(self.hsi.holidays)} {fmt(q.last)}｜{stamp(q.quoted_ms, seconds=False)}｜{q.source}' if q else '无'}"
