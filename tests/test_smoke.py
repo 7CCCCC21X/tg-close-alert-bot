@@ -22,7 +22,7 @@ async def run():
     methods = [c[0] for c in tg.calls]
     assert methods == ["setMyCommands", "setChatMenuButton"], methods
     cmds = tg.calls[0][1]["commands"]
-    assert len(cmds) == 15
+    assert len(cmds) == 16 and "diag" in [c["command"] for c in cmds]
     for c in cmds:
         assert re.fullmatch(r"[a-z0-9_]{1,32}", c["command"]), c
         assert 1 <= len(c["description"]) <= 256, c
@@ -54,7 +54,7 @@ async def run():
     assert store.get("manual:UNITREEUSDT:2026-09-18") == {"value": "75", "valid_date": "2026-09-18"}
     assert "日K" in await ask("/mode daily") and bot.settings()["mode"] == "binance_daily"
     assert "不是手动模式" in await ask("/setclose CXMT 8")
-    assert (await ask("/status")).startswith("📡 <b>监控状态 v1.12.1</b>｜🟢 已订阅"); assert await ask("/price") == await ask("/status")
+    assert (await ask("/status")).startswith(f"📡 <b>监控状态 v{m.VERSION}</b>｜🟢 已订阅"); assert await ask("/price") == await ask("/status")
     assert "测试" in await ask("/test"); assert "未知命令" in await ask("/nope")
     assert "已取消" in await ask("/unsubscribe") and "-100:7" not in bot.subscriptions()
     assert await ask("hello") is None
