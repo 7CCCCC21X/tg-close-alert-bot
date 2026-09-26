@@ -14,6 +14,7 @@ import copy
 import datetime as dt
 import decimal
 import html
+import inspect
 import json
 import hmac
 import logging
@@ -503,7 +504,10 @@ def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
         text = f"HTTP {error.code}: {hints.get(error.code, description or '接口请求失败')}"
         raise RemoteError(clean_error(text), retry) from None
     except (urllib.error.URLError, TimeoutError, OSError) as error:
-        raise RemoteError(f"网络错误 ({type(error).__name__})") from None
+        # Keep the underlying reason (DNS failure, refused, proxy 403, certificate...): /diag relies on it.
+        reason = getattr(error, "reason", None) if isinstance(error, urllib.error.URLError) else None
+        detail = f": {clean_error(str(reason))[:80]}" if reason else ""
+        raise RemoteError(f"网络错误 ({type(error).__name__}{detail})") from None
 
 
 def _http_json(url: str, payload: dict | None = None, timeout: int = 15) -> Any:
@@ -2230,6 +2234,69 @@ class WebServer:
             await writer.wait_closed()
 
 
+# --- diagnostics (/diag, --diag) --------------------------------------------------------------------
+
+DIAG_TIMEOUT = 12      # seconds per probe
+DIAG_PARALLEL = 4      # probes in flight at once (gentle on free feeds that drop bursts)
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    group: str
+    name: str
+    ok: bool
+    ms: int
+    detail: str
+
+
+def raw_snippet(raw: Any, limit: int = 140) -> str:
+    """The start of a response, whitespace collapsed, for 'what did the feed actually send'."""
+    if isinstance(raw, (bytes, bytearray)):
+        text = raw.decode("utf-8", errors="ignore")
+        if text.count("\ufffd") or not text.strip():
+            text = raw.decode("gbk", errors="ignore")
+    else:
+        text = json.dumps(raw, ensure_ascii=False, default=str) if not isinstance(raw, str) else raw
+    text = re.sub(r"<(script|style)\b.*?</\1>", " ", text, flags=re.S | re.I)
+    if text.lstrip().startswith("<"):  # an HTML error/block page: keep the words, drop the markup
+        text = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    text = re.sub(r"\s+", " ", text).strip()
+    return clean_error(text[:limit] + ("…" if len(text) > limit else "")) or "（空响应）"
+
+
+async def run_probe(group: str, name: str, fetch: Any, check: Any) -> ProbeResult:
+    """Fetch once and check the answer; a failure says whether the request or the content was wrong."""
+    started = time.monotonic()
+    try:
+        raw = await asyncio.wait_for(fetch(), DIAG_TIMEOUT)
+    except asyncio.TimeoutError:
+        return ProbeResult(group, name, False, int((time.monotonic() - started) * 1000), f"请求超时（>{DIAG_TIMEOUT} 秒）")
+    except Exception as error:
+        return ProbeResult(group, name, False, int((time.monotonic() - started) * 1000),
+                           f"请求失败：{clean_error(error) or type(error).__name__}")
+    ms = int((time.monotonic() - started) * 1000)
+    try:
+        return ProbeResult(group, name, True, ms, check(raw))
+    except Exception as error:
+        return ProbeResult(group, name, False, ms,
+                           f"内容异常：{clean_error(error) or type(error).__name__}｜返回：{raw_snippet(raw)}")
+
+
+def eastmoney_fields(raw: bytes, keys: tuple[str, ...]) -> str:
+    """'f57=CN00Y f86=09-26 05:14' from a push2 answer, so a rejected code or missing time is visible."""
+    try:
+        data = json.loads(raw).get("data") or {}
+    except (ValueError, AttributeError):
+        return ""
+    parts = []
+    for key in keys:
+        value = data.get(key)
+        if key == "f86" and str(value).isdigit():
+            value = stamp(int(value) * 1000, seconds=False)
+        parts.append(f"{key}={value if value not in (None, '') else '空'}")
+    return " ".join(parts)
+
+
 @dataclass(frozen=True)
 class Plan:
     reason: str
@@ -2399,6 +2466,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("resume", "恢复当前订阅"),
     Command("prob", "查看各标的下个收盘涨跌概率及计算过程"),
     Command("web", "获取概率网页链接（自动刷新）"),
+    Command("diag", "逐个检测数据源（币安/交易所/上证/A50/恒指/KOSPI/HL/汇率），找出哪里出问题"),
     Command("test", "发送测试消息，不代表行情正常"),
     Command("id", "查看你的用户 ID、聊天 ID、话题 ID"),
     Command("help", "显示说明"),
@@ -2583,6 +2651,7 @@ class Bot:
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
         self.reference_pool: ThreadPoolExecutor | None = None
+        self.reference_state: dict[str, dict] = {}  # per background feed: last success, last error, duration
         self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
         self.a50_anchor_note = "15:00"
         self.a50_anchor_source = "东方财富"
@@ -2598,7 +2667,7 @@ class Bot:
             "/subscribe": self.cmd_subscribe, "/resume": self.cmd_resume, "/pause": self.cmd_pause,
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
-            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web,
+            "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag,
         }
 
     def settings(self) -> dict:
@@ -2760,6 +2829,8 @@ class Bot:
         try:
             handler = self.handlers.get(req.command)
             reply = handler(req) if handler else "未知命令。发送 /help 查看用法。"
+            if inspect.isawaitable(reply):
+                reply = await reply
             if isinstance(reply, tuple):  # (text, inline keyboard) card
                 reply, markup = reply
             elif isinstance(reply, Reply):
@@ -3495,6 +3566,215 @@ class Bot:
                     if self.settings() == settings and self.subscriptions().get(sub_id, {}).get("active"):
                         self.store.put(state_key, plan.next_state)
 
+    # --- diagnostics ---------------------------------------------------------------------------------
+
+    def diag_probes(self, now_ms: int) -> list[tuple[str, str, Any, Any]]:
+        """(group, source, fetch, check) for every feed the bot uses, each source separately."""
+        probes: list[tuple[str, str, Any, Any]] = []
+
+        def get(url: str, extra: dict[str, str]) -> Any:
+            return lambda: http_get(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **extra})
+
+        def when(ms: int) -> str:
+            return stamp(ms, seconds=False) + stale_note(ms, now_ms, BEIJING)
+
+        # Binance: clock and the monitored contracts
+        def check_time(data: Any) -> str:
+            offset = int(data["serverTime"]) - int(time.time() * 1000)
+            return f"服务器时间正常，本机偏差 {offset / 1000:+.1f} 秒"
+
+        def check_prices(rows: Any) -> str:
+            missing = [sym for sym in self.config.symbols if sym not in rows]
+            if missing:
+                raise ValueError("接口没有这些合约：" + "、".join(missing))
+            return "、".join(f"{short_name(sym)} {fmt_price(number(rows[sym]['price'], sym))}" for sym in self.config.symbols)
+
+        probes += [("币安", "服务器时间", lambda: self.market.get("/fapi/v1/time"), check_time),
+                   ("币安", "合约最新价", self.market.prices, check_prices)]
+
+        # Underlying stock closes: every source for every ticker
+        for symbol, ticker in self.config.tickers.items():
+            info = STOCK_MARKETS[ticker.market]
+            for name, url, extra in StockMarket.sources(ticker):
+                def check_stock(raw: bytes, name=name, ticker=ticker, info=info) -> str:
+                    if name in {"东方财富", "Naver"}:
+                        day, close, _ = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
+                    else:
+                        day, close, _ = parse_quote_close(name, ticker.market, raw, info, now_ms)
+                    return f"{day.strftime('%m-%d') if day else '上一交易日（无日期）'} 收盘 {fmt(close)} {info.currency}"
+                probes.append((f"交易所收盘·{short_name(symbol)}", f"{name} {ticker.market}:{ticker.code}", get(url, extra), check_stock))
+
+        if self.config.sse_index:
+            for name, url, extra in CnIndex.SSE_SOURCES:
+                def check_sse(raw: bytes, name=name) -> str:
+                    q = parse_cn_index(name, raw, now_ms)
+                    return f"{fmt(q.last)}（昨收 {fmt(q.prev_close) if q.prev_close else '—'}）｜{when(q.quoted_ms)}"
+                probes.append(("上证实时", name, get(url, extra), check_sse))
+            for name, url, extra in CnIndex.DAILY_SOURCES:
+                def check_daily(raw: bytes, name=name) -> str:
+                    bars = parse_cn_daily(name, raw)
+                    day, close, _ = last_completed_bar(bars, STOCK_MARKETS["sh"], now_ms)
+                    expected = self.cn.expected_close(now_ms)
+                    flag = "" if day >= expected else f"｜⚠️ 应有 {expected.strftime('%m-%d')}，尚未出现"
+                    return f"最新完结 {day.strftime('%m-%d')} 收盘 {fmt(close)}（共 {len(bars)} 根）{flag}"
+                probes.append(("上证日K", name, get(url, extra), check_daily))
+            for name, url, extra in CnIndex.A50_SOURCES:
+                def check_a50(raw: bytes, name=name) -> str:
+                    fields = eastmoney_fields(raw, ("f57", "f58", "f86")) if name == "东方财富" else ""
+                    try:
+                        q = CnIndex.parse_a50(name, raw, now_ms)
+                    except Exception as error:
+                        raise ValueError(f"{clean_error(error)}{'｜' + fields if fields else ''}") from None
+                    stale = "｜⚠️ 超 10 分钟未更新" if a50_session(now_ms) != "休市" and now_ms - q.quoted_ms > CnIndex.STALE_MS else ""
+                    return (f"{fmt(q.last)}｜{when(q.quoted_ms)}（{a50_session(q.quoted_ms)}）{stale}"
+                            + (f"｜{fields}" if fields else "") + ("｜非交易所合约" if "CFD" in name else ""))
+                probes.append(("A50实时", name, get(url, extra), check_a50))
+            close_day = self.cn.close.day if self.cn.close else self.cn.expected_close(now_ms)
+            for label, template in (("1分钟K", CnIndex.A50_MINUTES), ("5分钟K", CnIndex.A50_FIVE_MINUTES)):
+                url = template.format(beg=(close_day - dt.timedelta(days=1)).strftime("%Y%m%d"),
+                                      end=(close_day + dt.timedelta(days=1)).strftime("%Y%m%d"))
+                def check_hist(raw: bytes, label=label) -> str:
+                    data = json.loads(raw).get("data") or {}
+                    rows = [str(r).split(",") for r in data.get("klines") or []]
+                    wanted = f"{close_day.isoformat()} 15:00"
+                    hit = next((r for r in rows if r[0] == wanted and len(r) >= 3), None)
+                    span = f"{rows[0][0][5:]}～{rows[-1][0][5:]}" if rows else "无数据"
+                    if not a50_code_ok(data.get("code")):
+                        raise ValueError(f"代码 {data.get('code')} 不是 A50")
+                    if hit is None:
+                        raise ValueError(f"没有 {wanted} 这一根（返回 {len(rows)} 根：{span}）")
+                    return f"{wanted[5:]} 收 {fmt(number(hit[2], 'A50'))}（返回 {len(rows)} 根：{span}）"
+                probes.append(("A50锚点", f"东方财富{label} {close_day.strftime('%m-%d')} 15:00",
+                               get(url, {"Referer": "https://quote.eastmoney.com/"}), check_hist))
+
+        if self.config.hsi_futures:
+            holidays = self.hsi.holidays
+            for name, url, extra in IndexFutures.FUTURES_SOURCES:
+                def check_fut(raw: bytes, name=name) -> str:
+                    q = IndexFutures.parse_futures(name, raw, now_ms, holidays)
+                    basis = f"｜{'高' if q.basis > 0 else '低' if q.basis < 0 else '平'}水 {abs(q.basis):,.0f}" if q.spot is not None else ""
+                    return f"{q.session_name(holidays)} {fmt(q.last)}（前收 {fmt(q.prev_settle) if q.prev_settle else '—'}）{basis}｜{when(q.quoted_ms)}"
+                probes.append(("恒指期货", name, get(url, extra), check_fut))
+            for name, url, extra in IndexFutures.SPOT_SOURCES:
+                def check_spot(raw: bytes, name=name) -> str:
+                    last, prev = IndexFutures.parse_spot(name, raw)
+                    return f"{fmt(last)}（昨收 {fmt(prev) if prev else '—'}）"
+                probes.append(("恒指现货", name, get(url, extra), check_spot))
+
+        if self.config.kospi_index:
+            for group, sources in (("KOSPI", KospiIndex.SOURCES), ("KOSPI200", KospiIndex.SOURCES_200)):
+                for name, url, extra in sources:
+                    def check_kospi(raw: bytes, name=name) -> str:
+                        q = KospiIndex.parse(name, raw, now_ms)
+                        return f"{fmt(q.last)}（昨收 {fmt(q.prev_close) if q.prev_close else '—'}）｜{stamp(q.quoted_ms, seconds=False)}"
+                    probes.append((group, name, get(url, extra), check_kospi))
+
+        for dex in sorted({dex for dex, _ in self.hl.tickers.values()}):
+            coins = sorted(coin for d, coin in self.hl.tickers.values() if d == dex)
+            payload: dict[str, Any] = {"type": "metaAndAssetCtxs", **({"dex": dex} if dex else {})}
+            def check_hl(data: Any, coins=coins) -> str:
+                found = Hyperliquid.parse_dex(data)
+                missing = [c for c in coins if c not in found]
+                if missing:
+                    raise ValueError(f"找不到 {'、'.join(missing)}（该 dex 共 {len(found)} 个市场）")
+                return "、".join(f"{c} {fmt(found[c].mark)}" for c in coins)
+            probes.append(("Hyperliquid", f"dex {dex or '主市场'}", lambda payload=payload: http_json(Hyperliquid.URL, payload), check_hl))
+
+        for name, url in FxRates.SOURCES:
+            def check_fx(data: Any) -> str:
+                rates = data.get("rates") if isinstance(data, dict) else None
+                if not isinstance(rates, dict):
+                    raise ValueError("没有 rates 字段")
+                return "、".join(f"{c} {fmt(number(rates[c], c))}" for c in ("CNY", "HKD", "KRW") if c in rates) or "没有所需货币"
+            probes.append(("汇率", name.split("（")[0], lambda url=url: http_json(url), check_fx))
+        return probes
+
+    async def diagnose(self) -> list[ProbeResult]:
+        now_ms = self.market.now_ms()
+        gate = asyncio.Semaphore(DIAG_PARALLEL)
+
+        async def one(group: str, name: str, fetch: Any, check: Any) -> ProbeResult:
+            async with gate:
+                return await run_probe(group, name, fetch, check)
+
+        token = HTTP_POOL.set(self.reference_pool)  # keep probe requests off the Binance/Telegram pool
+        try:
+            return list(await asyncio.gather(*(one(*p) for p in self.diag_probes(now_ms))))
+        finally:
+            HTTP_POOL.reset(token)
+
+    def diag_state(self, now_ms: int) -> list[str]:
+        """What the running bot currently holds: background refresh health and derived values."""
+        lines = []
+        if self.reference_state:
+            lines.append("🔄 后台刷新")
+            for name, _ in self.reference_jobs():
+                state = self.reference_state.get(name)
+                if not state:
+                    lines.append(f"  ⏳ {name}：尚未运行")
+                    continue
+                ok_ago = f"{int(time.time() - state['ok_at'])} 秒前成功" if state["ok_at"] else "从未成功"
+                mark = "❌" if state["error"] and state["error_at"] >= state["ok_at"] else "✅"
+                err = f"｜最近错误：{brief_error(state['error'], 80)}" if state["error"] else ""
+                lines.append(f"  {mark} {name}：{ok_ago}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{err}")
+        else:
+            lines.append("🔄 后台刷新：未启动（命令行诊断或测试环境）")
+        lines.append("📌 当前使用中的数据")
+        if self.config.sse_index:
+            close = self.cn.close
+            lines.append(f"  上证收盘：{f'{close.day:%m-%d} {fmt(close.value)}（{close.source}）' if close else '未确认'}"
+                         f"{'' if self.cn.confirmed(now_ms) else f'｜⚠️ 应确认到 {self.cn.expected_close(now_ms):%m-%d}'}"
+                         + (f"｜日K错误：{brief_error(self.cn.daily_error, 80)}" if self.cn.daily_error else ""))
+            a50 = self.cn.a50
+            lines.append(f"  A50 报价：{f'{fmt(a50.last)}｜{stamp(a50.quoted_ms, seconds=False)}｜{a50.source}' if a50 else '无'}"
+                         + (f"｜前序源失败：{brief_error(self.cn.a50_skipped, 100)}" if self.cn.a50_skipped else "")
+                         + (f"｜全部失败：{brief_error(self.cn.a50_error, 100)}" if self.cn.a50_error else ""))
+            anchor = self.anchors.get("A50")
+            lines.append(f"  A50 锚点：{f'{fmt(anchor[1])} @ {stamp(anchor[0], seconds=False)}（{self.a50_anchor_note}·{self.a50_anchor_source}）' if anchor else '无'}")
+            odds = self.sse_odds(now_ms)
+            if isinstance(odds, CloseOdds):
+                lines.append(f"  上证概率：涨 {odds.fair_up * 100:.1f}¢（有效 {fmt(odds.effective.quantize(D('0.01')))}）")
+            elif odds is not None:
+                lines.append(f"  上证概率：暂缺——{odds}")
+        if self.config.hsi_futures and (self.hsi.quote or self.hsi.error):
+            q = self.hsi.quote
+            lines.append(f"  恒指期货：{f'{q.session_name(self.hsi.holidays)} {fmt(q.last)}｜{stamp(q.quoted_ms, seconds=False)}｜{q.source}' if q else '无'}"
+                         + (f"｜错误：{brief_error(self.hsi.error, 80)}" if self.hsi.error else ""))
+        for symbol in self.config.symbols:
+            snap = self.snapshots.get(symbol) or {}
+            err = self.stocks.errors.get(symbol)
+            if "error" in snap or err:
+                lines.append(f"  {short_name(symbol)}：" + "｜".join(x for x in (snap.get("error"), f"交易所收盘：{err}" if err else "") if x))
+        return lines
+
+    @staticmethod
+    def diag_text(results: list[ProbeResult], state: list[str], title: str) -> str:
+        failed = [r for r in results if not r.ok]
+        groups: dict[str, list[ProbeResult]] = {}
+        for r in results:
+            groups.setdefault(r.group, []).append(r)
+        broken = [g for g, rs in groups.items() if not any(r.ok for r in rs)]
+        lines = [title, f"共 {len(results)} 项｜✅ {len(results) - len(failed)}｜❌ {len(failed)}"]
+        if results and len(failed) == len(results):
+            reasons = sorted({r.detail for r in failed}, key=lambda d: -sum(r.detail == d for r in failed))
+            lines.append("🚨 所有数据源都失败：多半是部署环境本身连不上外网（DNS/出网/代理），不是某个接口的问题。"
+                         f"最常见的错误：{brief_error(reasons[0], 100)}")
+        elif broken:
+            lines.append("🚨 整组全部失败（该数据当前拿不到）：" + "、".join(broken))
+        partial = [r for r in failed if r.group not in broken]
+        if partial and len(failed) < len(results):
+            lines.append("⚠️ 其余失败的源（同组有别的源顶上）：" + "、".join(f"{r.group}·{r.name}" for r in partial))
+        for group, rs in groups.items():
+            lines.append(f"\n【{group}】")
+            lines.extend(f"{'✅' if r.ok else '❌'} {r.name}（{r.ms} ms）：{r.detail}" for r in rs)
+        return "\n".join(lines + [""] + state)
+
+    async def cmd_diag(self, req: Request) -> str:
+        await self.tell(req.chat, req.thread, "🩺 正在逐个检测数据源，约 10–30 秒…")
+        results = await self.diagnose()
+        return self.diag_text(results, self.diag_state(self.market.now_ms()),
+                              f"🩺 数据源检测 v{VERSION}｜{stamp(self.market.now_ms())}（北京时间）")
+
     def reference_jobs(self) -> list[tuple[str, Any]]:
         """(name, coroutine factory) per reference feed; each has its own refresh cadence inside."""
         now = self.market.now_ms
@@ -3510,12 +3790,18 @@ class Bot:
         token = HTTP_POOL.set(self.reference_pool)  # this task's blocking requests stay off the default pool
         try:
             while not self.stopping.is_set():
+                started = time.monotonic()
+                state = self.reference_state.setdefault(name, {"ok_at": 0.0, "error": "", "error_at": 0.0, "ms": 0, "runs": 0})
                 try:
                     await asyncio.wait_for(job(), timeout=REFERENCE_TIMEOUT)
+                    state.update(ok_at=time.time(), error="")
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:  # failures are shown in /status by each feed; keep the last good data
-                    self.log_limited(f"reference:{name}", f"参考数据 {name} 刷新异常：{clean_error(error) or type(error).__name__}")
+                    text = clean_error(error) or type(error).__name__
+                    state.update(error=text, error_at=time.time())
+                    self.log_limited(f"reference:{name}", f"参考数据 {name} 刷新异常：{text}")
+                state.update(ms=int((time.monotonic() - started) * 1000), runs=state["runs"] + 1)
                 await self.wait(REFERENCE_TICK)
         finally:
             HTTP_POOL.reset(token)
@@ -3629,6 +3915,27 @@ class Bot:
             LOG.info("Stopped safely")
 
 
+async def run_diagnostics(config: Config) -> int:
+    """`python main.py --diag`: probe every source once, refresh the reference data the way the bot does,
+    and print the same report as /diag. No Telegram token is needed; nothing is sent or stored."""
+    store = Store(":memory:")
+    bot = Bot(config, store, Binance(config), None)  # type: ignore[arg-type]
+    try:
+        with contextlib.suppress(Exception):
+            await bot.market.sync_clock()
+        now_ms = bot.market.now_ms()
+        await asyncio.gather(*(job() for name, job in bot.reference_jobs() if name != "概率输入"), return_exceptions=True)
+        if config.probability:
+            with contextlib.suppress(Exception):
+                await bot.refresh_odds_inputs(now_ms)
+        results = await bot.diagnose()
+        print(bot.diag_text(results, bot.diag_state(bot.market.now_ms()),
+                            f"🩺 数据源检测 v{VERSION}｜{stamp(bot.market.now_ms())}（北京时间）"))
+        return 0 if all(r.ok for r in results) else 1
+    finally:
+        store.close()
+
+
 async def check_market(config: Config) -> int:
     """Live read-only diagnostics; no Telegram token or administrator is necessary."""
     market = Binance(config)
@@ -3679,6 +3986,7 @@ async def check_market(config: Config) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="只诊断币安最新价和昨日日 K；不发送 TG")
+    parser.add_argument("--diag", action="store_true", help="逐个检测全部数据源并打印报告（同 /diag）；不发送 TG")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     store = None
@@ -3686,6 +3994,8 @@ def main() -> int:
         config = Config.from_env()
         if args.check:
             return asyncio.run(check_market(config))
+        if args.diag:
+            return asyncio.run(run_diagnostics(config))
         if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", config.token):
             raise ValueError("请在 Railway Variables 配置 TELEGRAM_BOT_TOKEN，不要写进代码或提交到 GitHub")
         store = Store(config.db_path)
