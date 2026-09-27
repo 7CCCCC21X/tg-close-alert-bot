@@ -160,6 +160,10 @@ async def run():
     await x.refresh_daily(now)
     assert x.close == m.DailyClose(dt.date(2026, 9, 24), D("3888.37"), D("3870.10"), "腾讯日K", now) and x.confirmed(now)
     bot.anchors["A50"] = (c24, D("14200"))
+    # A50 has been shut since Saturday 05:15: no new move to map, so no odds until it reopens at 09:00
+    assert bot.sse_odds(now) == "A50 休市，09-28 09:00 开盘后恢复概率"
+    now = bj(2026, 9, 28, 9, 5)
+    x.a50 = m.IndexQuote("A50期货", D("14280"), D("14250"), None, None, None, bj(2026, 9, 28, 9, 4), "东方财富")
     o = bot.sse_odds(now)
     assert isinstance(o, m.CloseOdds) and o.ref == D("3888.37") and o.ref_note == "09-24 收盘·腾讯日K" and o.target == dt.date(2026, 9, 28), o
     assert abs(float(o.effective) - 3888.37 * math.exp(0.8 * math.log(14280 / 14200))) < 1e-6, o
@@ -230,7 +234,7 @@ async def run():
     x.a50 = m.IndexQuote("A50期货", D("14250"), D("14300"), None, None, None, bj(2026, 9, 25, 11, 58), "东方财富")
     assert "缺少 09-24 15:00 的 A50 锚点（东方财富 1 分钟及 5 分钟 K均未取得" in bot.sse_odds(bj(2026, 9, 25, 12, 0))
     assert x.a50_stale(bj(2026, 9, 26, 16, 0))  # Friday afternoon/night trading is missing
-    assert "A50 报价已超 10 分钟未更新" in bot.sse_odds(bj(2026, 9, 26, 16, 0))
+    assert bot.sse_odds(bj(2026, 9, 26, 16, 0)) == "A50 休市，09-28 09:00 开盘后恢复概率"  # Saturday: paused, not stale
     x.a50 = m.IndexQuote("A50期货", D("14297"), D("14300"), None, None, None, bj(2026, 9, 26, 5, 6), "东方财富")
     assert not x.a50_stale(bj(2026, 9, 26, 16, 0))
     # After a late deployment, the one-minute history no longer covers Thursday. Recover from
@@ -246,12 +250,16 @@ async def run():
     await bot.refresh_odds_inputs(bj(2026, 9, 26, 16, 0))
     assert bot.anchors["A50"] == (c24, D("14319"))
     assert store.get("anchor:A50") == [c24, "14319", "15:00 五分钟K近似", "东方财富"]
-    o = bot.sse_odds(bj(2026, 9, 26, 16, 0))
+    assert bot.sse_odds(bj(2026, 9, 26, 16, 0)) == "A50 休市，09-28 09:00 开盘后恢复概率"
+    friday_night, x.a50 = x.a50, m.IndexQuote("A50期货", D("14297"), D("14300"), None, None, None, bj(2026, 9, 28, 9, 4), "东方财富")
+    o = bot.sse_odds(bj(2026, 9, 28, 9, 5)); x.a50 = friday_night  # Monday's open: odds again, from the same anchor
     assert isinstance(o, m.CloseOdds) and o.ref == D("3888.37") and o.target == dt.date(2026, 9, 28), o
     assert "15:00 五分钟K近似 14,319" in o.proxy_note and "上证收盘附近" in m.to_html(x.a50_line(bj(2026, 9, 26, 16, 0), "cn", D("14319"), bot.a50_anchor_note))
     bot3 = m.Bot(cfg, store, FakeMarket(cfg), tg); bot3.cn.close = x.close; bot3.cn.a50 = x.a50
     await bot3.refresh_odds_inputs(bj(2026, 9, 26, 16, 0))
     assert bot3.anchors["A50"] == (c24, D("14319")) and bot3.a50_anchor_note == "15:00 五分钟K近似"
+    # The anchor bookkeeping below runs on Saturday; check its odds as if A50 were trading (the closure is tested above).
+    a50_next_open, m.a50_next_open = m.a50_next_open, lambda now_ms: None
     # v1.12.0 saved only [time, price]. Recover it, but require the dated feed to confirm its source.
     old_store = m.Store(":memory:"); old_store.put("anchor:A50", [c24, "14319"])
     old_bot = m.Bot(cfg, old_store, FakeMarket(cfg), tg); old_bot.cn.close = x.close; old_bot.cn.a50 = x.a50
@@ -282,6 +290,7 @@ async def run():
     m.http_get = wrong_anchor_code
     try: await x.a50_five_minute_at(dt.date(2026, 9, 24)); assert False
     except ValueError as e: assert "代码异常" in str(e)
+    m.a50_next_open = a50_next_open
     x.close = m.DailyClose(dt.date(2026, 9, 28), D("3901.55"), D("3888.37"), "腾讯日K", 0)
     # no A50 at all -> no probability, labelled
     x.a50 = None
