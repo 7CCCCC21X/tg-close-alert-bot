@@ -63,6 +63,9 @@ def make_bot(store=None):
 
 
 async def run():
+    # NOW is Saturday, when A50 is shut and the odds pause (checked at the end); the scenarios below test
+    # the feed and anchor logic, so they read the odds as if A50 were trading.
+    a50_next_open, m.a50_next_open = m.a50_next_open, lambda now_ms: None
     # 1) Eastmoney quote blocked, its K line answers: same futures -> odds are produced, and the reason is visible
     m.http_get = feed(quote_ok=False)
     bot = make_bot()
@@ -189,6 +192,18 @@ async def run():
     bot.cn.a50 = m.IndexQuote("A50期货", D("1"), None, None, None, None, bj(9, 25, 15, 1), "新浪CFD")
     await bot.refresh_odds_inputs(bj(9, 25, 15, 2))
     assert bot.store.get("a50_print:2026-09-25:新浪CFD") is None
+
+    # 8) while A50 is shut there is nothing new to map: the odds pause until it reopens
+    m.a50_next_open = a50_next_open
+    assert [m.a50_next_open(t) for t in (bj(9, 26, 5, 14), bj(9, 28, 9, 0), bj(9, 28, 16, 40), bj(9, 29, 3, 0))] == [None] * 4
+    assert [m.a50_next_open(t) for t in (bj(9, 26, 5, 15), bj(9, 27, 23, 0), bj(9, 28, 8, 59), bj(9, 29, 6, 0))] == \
+        [bj(9, 28, 9, 0)] * 3 + [bj(9, 29, 9, 0)]
+    bot = make_bot(); bot.anchors["A50"] = (bj(9, 24, 15, 0), D("14180")); bot.a50_anchor_source = "东方财富"
+    bot.cn.a50 = m.IndexQuote("A50期货", D("14196.5"), None, None, None, None, bj(9, 26, 5, 14), "东方财富")
+    for when in (NOW, bj(9, 28, 0, 22), bj(9, 28, 8, 30)):  # Saturday evening, Sunday night, Monday before 09:00
+        assert bot.sse_odds(when) == "A50 休市，09-28 09:00 开盘后恢复概率", bot.sse_odds(when)
+    bot.cn.a50 = m.IndexQuote("A50期货", D("14196.5"), None, None, None, None, bj(9, 28, 9, 1), "东方财富")
+    assert isinstance(bot.sse_odds(bj(9, 28, 9, 2)), m.CloseOdds)  # Monday's day session: odds again
     print("A50_OK")
 
 

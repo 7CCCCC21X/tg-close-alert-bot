@@ -1589,6 +1589,20 @@ def a50_session(now_ms: int) -> str:
     return "休市"
 
 
+def a50_next_open(now_ms: int) -> int | None:
+    """When A50 trading resumes after a closure that outlasts the 16:30-16:45 break; None while it trades
+    or during that break (the day session's last print still stands for those 15 minutes)."""
+    if a50_session(now_ms) != "休市":
+        return None
+    local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+    day, clock, weekday = local.date(), local.time(), local.weekday()
+    if weekday < 5 and dt.time(16, 30) < clock < dt.time(16, 45):
+        return None
+    if weekday >= 5:  # Saturday after 05:15 or Sunday: Monday's day session
+        day += dt.timedelta(days=7 - weekday)
+    return int(dt.datetime.combine(day, dt.time(9, 0), BEIJING).timestamp() * 1000)
+
+
 def a50_last_session_end(now_ms: int) -> int:
     """Most recent SGX A50 session end, including Friday night's Saturday morning close."""
     local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
@@ -3489,6 +3503,10 @@ class Bot:
         remaining, target = session_remaining("sh", now_ms, close_date, holidays)
         a50, anchor = self.cn.a50, self.anchors.get("A50")
         ref_note = f"{close_date.strftime('%m-%d')} 收盘"
+        reopen = a50_next_open(now_ms)
+        if reopen:
+            # No A50 trading, so nothing new to map: pause rather than keep showing the last session's odds.
+            return f"A50 休市，{stamp(reopen, seconds=False)} 开盘后恢复概率"
         if a50 is None:
             return "暂无 A50 报价，暂不输出概率"
         if self.cn.a50_stale(now_ms):
