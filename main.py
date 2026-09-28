@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.13.1"
+VERSION = "1.13.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -2756,7 +2756,7 @@ WEB_PAGE = """<!doctype html>
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
 .wrap{max-width:1180px;margin:0 auto;padding:16px}
 header{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:6px 16px;margin-bottom:6px}
-h1{font-size:20px;margin:0}.meta{color:var(--muted);font-size:13px;display:flex;flex-wrap:wrap;gap:4px 12px}
+h1{font-size:20px;margin:0}.hr{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px}.tog{display:inline-flex;align-items:center;gap:5px;font-size:13px;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:3px 10px 3px 7px;cursor:pointer;user-select:none}.tog input{margin:0;accent-color:var(--best)}body.nobook .pb{display:none}.meta{color:var(--muted);font-size:13px;display:flex;flex-wrap:wrap;gap:4px 12px}
 .legend{color:var(--muted);font-size:12px;margin:0 0 14px;display:flex;flex-wrap:wrap;align-items:center;gap:4px 14px}.legend .sw{white-space:nowrap}.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 3px 0 6px;vertical-align:-1px}.legend .sw i:first-child{margin-left:0}
 h2{font-size:13px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin:18px 2px 8px}
 .grid{display:grid;gap:12px;align-items:stretch;grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}
@@ -2788,7 +2788,7 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 .tip{margin-top:8px;font-size:13px;display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 8px}.tip.none{color:var(--muted);font-size:12.5px}.tip b{color:var(--best)}.tip .k{color:var(--muted);font-size:12px}.small{font-size:12px;margin-top:4px}
 .warn{color:var(--warn)}footer{color:var(--faint);font-size:12px;margin-top:20px;line-height:1.6}
 </style></head><body><div class="wrap">
-<header><h1>收盘涨跌概率</h1><div class="meta" id="meta">加载中…</div></header>
+<header><h1>收盘涨跌概率</h1><div class="hr"><div class="meta" id="meta">加载中…</div><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label></div></header>
 <div class="legend" id="legend"></div>
 <h2 id="h-index">指数</h2><div class="grid" id="g-index"></div>
 <h2 id="h-contract">合约标的</h2><div class="grid" id="g-contract"></div>
@@ -2858,6 +2858,9 @@ async function load(){
     document.getElementById("foot").textContent=d.note;tick();
   }catch(e){document.getElementById("meta").replaceChildren($("span","warn","刷新失败："+e.message+"，稍后自动重试"))}
 }
+const sb=document.getElementById("showbook");try{sb.checked=localStorage.getItem("showbook")!=="0"}catch(e){}
+const applyBook=()=>document.body.classList.toggle("nobook",!sb.checked);applyBook();
+sb.addEventListener("change",()=>{applyBook();try{localStorage.setItem("showbook",sb.checked?"1":"0")}catch(e){}});
 load();setInterval(load,10000);setInterval(tick,1000);
 </script></body></html>"""
 
