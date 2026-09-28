@@ -106,6 +106,46 @@ async def run():
     await bot.predict.refresh(targets)
     assert not any(want["UNITREEUSDT"] in u for u, _ in calls[n:]) and any(u.endswith("/markets/0xd/orderbook") for u, _ in calls[n:])
     assert not any("/markets/902/orderbook" in u for u, _ in calls[n:]), "the key that answered is tried first"
+    # target price (目标价): GraphQL marketData.startPrice on the category's own type
+    feed = m.PredictFeed(cfg)
+    ks = "kospi-composite-index-up-or-down-on-september-29-2026"
+    asked = []
+    async def gql(url, payload=None):
+        asked.append(payload["query"])
+        if "__typename" in payload["query"]:
+            return {"data": {"category": {"id": "77", "__typename": "StockUpDownCategory"}}}
+        if "... on StockUpDownCategory" in payload["query"]:
+            return {"data": {"category": {"marketData": [{"marketId": "990", "startPrice": 6910.89}]}}}
+        if "markets(" in payload["query"]:
+            return {"data": {"markets": {"edges": [{"node": {"id": "990", "conditionId": "0xe", "title": "KOSPI up?"}}]}}}
+        raise AssertionError(payload)
+    feed.fetch = gql
+    market = await feed.resolve(ks)
+    assert market["id"] == "990" and feed.types[ks] == "StockUpDownCategory"
+    assert await feed.strike(ks, "990") == D("6910.89") and await feed.strike(ks, "990") == D("6910.89")
+    assert sum("startPrice" in q for q in asked) == 1, "cached for a while"
+    async def no_field(url, payload=None):
+        raise m.RemoteError('Predict GraphQL 错误：[{"message": "Cannot query field \\"marketData\\" on type \\"X\\""}]')
+    other = "x-up-or-down-on-september-29-2026"
+    feed.types[other] = "X"; feed.fetch = no_field
+    assert await feed.strike(other, "1") is None and "X" in feed.no_strike
+    # the odds are measured against it; a proxy-mapped estimate moves with it, a live print does not
+    kcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT"})
+    kbot = m.Bot(kcfg, m.Store(":memory:"), FakeMarket(), tg)
+    kbot.predict.strikes[ks] = (D("6910.89"), time.monotonic())
+    after = m.close_odds("KOSPI", D("6889.74"), D("6899.514"), 0.012, 1.0, dt.date(2026, 9, 29), D("0.01"), "09-28 收盘",
+                         "HL KR200 1,000 / 收盘时刻 999 → +0.14%（KOSPI200 代理）", "σ", mode="盘后")
+    s = kbot.settle_on_strike("KOSPI", after)
+    assert s.ref == D("6910.89") and abs(s.effective - D("6899.514") * D("6910.89") / D("6889.74")) < D("1e-9"), s
+    assert abs(s.fair_up - after.fair_up) < 1e-6 and "Predict 目标价" in s.ref_note and "6,889.74" in s.ref_note, s
+    live = m.close_odds("KOSPI", D("6889.74"), D("6899.514"), 0.012, 0.5, dt.date(2026, 9, 29), D("0.01"), "09-28 收盘",
+                        "KOSPI 现货 6,899.514（盘中直接用现货）", "σ")
+    s = kbot.settle_on_strike("KOSPI", live)
+    assert s.ref == D("6910.89") and s.effective == D("6899.514") and s.fair_up < live.fair_up, s
+    assert kbot.settle_on_strike("KOSPI", m.dataclasses.replace(after, target=dt.date(2026, 9, 30))) == m.dataclasses.replace(after, target=dt.date(2026, 9, 30))
+    kbot.predict.strikes[ks] = (D("1.0"), time.monotonic())  # nonsense (other unit): shown, not used
+    s = kbot.settle_on_strike("KOSPI", after)
+    assert s.ref == after.ref and "未采用" in s.ref_note, s
     # /book: SSE shows the edges and the best side; missing items say why
     tg.sent.clear()
     await bot.process_message({"text": "/book", "chat": {"id": 1}, "from": {"id": 42}, "date": time.time()})
