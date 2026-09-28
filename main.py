@@ -2316,6 +2316,7 @@ class CloseOdds:
     unit: str = ""
     beta: float = 1.0      # proxy coefficient used for the effective price
     mode: str = "盘中"     # "盘中" = live index vs previous close; "盘后" = mapped from an after-hours proxy
+    warn: str = ""         # the inputs are aging: shown, but no trade suggestion is made from these odds
 
     @property
     def direct(self) -> bool:
@@ -2356,7 +2357,7 @@ class CloseOdds:
             f"有效价 {bold(fmt(self.effective.quantize(D('0.0001'))) + unit)}（{percent(self.effective, self.ref):+.3f}%）",
             f"σ 日 {self.sigma_daily * 100:.2f}%（{self.sigma_note}）× √{self.remaining:.3f} = {self.sigma * 100:.2f}%｜z {self.z:+.3f}",
             f"涨 {self.up * 100:.2f}%·平 {self.flat * 100:.2f}%·跌 {self.down * 100:.2f}% → 公平价 涨 {bold(f'{self.fair_up * 100:.1f}¢')} / 跌 {bold(f'{self.fair_down * 100:.1f}¢')}",
-        ]
+        ] + ([f"⚠️ {self.warn}"] if self.warn else [])
 
 
 def close_odds(name: str, ref: D, effective: D, sigma_daily: float, remaining: float, target: dt.date, tick: D,
@@ -2705,6 +2706,8 @@ def book_lines(book: PredictBook | None, error: str, odds: "CloseOdds | str | No
     best = best_edge(edges)
     if book.stale(now_ms):
         lines.append("盘口过期，不给建议")
+    elif odds.warn:
+        lines.append(f"⚠️ {odds.warn}，暂不给建议")
     elif best:
         how = "挂单排队，成交不保证" if best.maker else f"立即成交，卖1/买1 只有 {best.size:g} 份"
         lines.append(f"👉 {bold(best.label)} @ {cents(best.price)} 优势最大 {cents(best.edge, True)}（{how}）")
@@ -2891,7 +2894,7 @@ summary .v{color:var(--text)}.chip{font-size:12px;border-radius:6px;padding:0 5p
 dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:6px 0 2px;font-size:12px}dt{color:var(--muted)}dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 .card.missing p{margin:0;color:var(--muted);font-size:12.5px}
 .pb{margin-top:auto;border-top:1px solid var(--line);padding-top:6px;font-size:12.5px;font-variant-numeric:tabular-nums}
-a.pb{display:block;color:inherit;text-decoration:none;border-radius:8px;margin:0 -6px;padding:6px 6px 4px;cursor:pointer}
+a.pb{display:block;color:inherit;text-decoration:none;border-radius:8px;margin:auto -6px 0;padding:6px 6px 4px;cursor:pointer}
 a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge{background:var(--card)}
 .quote{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 10px;color:var(--muted)}.quote span{white-space:nowrap}.quote b{color:var(--text);font-weight:600}.quote .pt{font-weight:600;color:var(--best)}
 .edges{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:5px}
@@ -2957,7 +2960,8 @@ function card(it){
   row("目标",it.close_label);row("参考",it.ref+unit+"（"+it.ref_note+"）");row("有效",it.effective+unit);row("代理",it.proxy_note);
   row("σ","日 "+(it.sigma_daily*100).toFixed(2)+"% × √"+it.remaining.toFixed(3)+" = "+(it.sigma*100).toFixed(2)+"%");
   row("σ 来源",it.sigma_note);row("涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%");row("z",it.z.toFixed(3));
-  det.append(dl);c.append(det);if(it.predict)c.append(book(it.predict));return c}
+  det.append(dl);c.append(det);if(it.warn){const w=$("div","warn small","⚠️ "+it.warn);c.append(w)}
+  if(it.predict)c.append(book(it.predict));return c}
 function tick(){
   const now=Date.now()+skew;
   document.querySelectorAll(".cd").forEach(el=>{const left=Math.floor((Number(el.dataset.close)-now)/1000);
@@ -4112,8 +4116,14 @@ class Bot:
             return f"A50 休市，{stamp(reopen, seconds=False)} 开盘后恢复概率"
         if a50 is None:
             return "暂无 A50 报价，暂不输出概率"
+        warn = ""
         if self.cn.a50_stale(now_ms):
-            return f"A50 报价已超 10 分钟未更新（最后 {stamp(a50.quoted_ms, seconds=False)}），暂不输出新概率"
+            # A short gap (a feed outage, the 16:30-16:45 break running long) prices from the last print, flagged;
+            # after an hour without a print the odds would be guesswork: pause them.
+            if a50_session(now_ms) == "休市" or now_ms - a50.quoted_ms > self.A50_SOFT_STALE_MS:
+                return f"A50 报价已超 10 分钟未更新（最后 {stamp(a50.quoted_ms, seconds=False)}），暂不输出新概率"
+            warn = (f"A50 {(now_ms - a50.quoted_ms) // 60_000} 分钟未更新，按 "
+                    f"{dt.datetime.fromtimestamp(a50.quoted_ms / 1000, BEIJING):%H:%M} 报价估算")
         if a50.quoted_ms < close_ms:
             return f"A50 报价早于 {close_date.strftime('%m-%d')} 15:00 收盘，等待新报价"
         if anchor and anchor[0] == close_ms:
@@ -4132,10 +4142,11 @@ class Bot:
         beta = self.config.a50_beta
         move = math.log(float(a50.last / base))
         effective = close.value * D(str(math.exp(beta * move)))
-        return close_odds("上证指数", close.value, effective, sigma, remaining, target, D("0.01"),
+        odds = close_odds("上证指数", close.value, effective, sigma, remaining, target, D("0.01"),
                           f"{ref_note}·{close.source}",
                           f"A50 {fmt(a50.last)} / {base_note} {fmt(base)} → {percent(a50.last, base):+.3f}% × β {beta:g}", sigma_note,
                           beta=beta, mode="盘后")
+        return dataclasses.replace(odds, warn=warn) if warn else odds
 
     @staticmethod
     def kospi_close_ms(q: IndexQuote) -> int:
@@ -4252,6 +4263,7 @@ class Bot:
                           f"{close_date.strftime('%m-%d')} 收盘", f"恒指期货 {fmt(q.last)} / {anchor_note} {fmt(anchor)} → {percent(q.last, anchor):+.3f}%",
                           sigma_note, mode="盘后")
 
+    A50_SOFT_STALE_MS = 60 * 60_000  # A50 silent longer than this: no odds at all (shorter: odds with a warning)
     HL_STALE_MS = 10 * 60_000  # an HL mark older than this (refresh failing) is not used for new probabilities
 
     def kospi_odds(self, now_ms: int) -> CloseOdds | str | None:
@@ -4328,9 +4340,10 @@ class Bot:
         tick = price_tick(ticker.market, strike) if ticker and "｜" in title else D("0.01")
         # A proxy-mapped estimate is "our close × proxy move": move it onto the settlement close too.
         effective = odds.effective if odds.direct else odds.effective * strike / odds.ref
-        return close_odds(odds.name, strike, effective, odds.sigma_daily, odds.remaining, odds.target, tick,
-                          f"Predict 目标价（本地参考 {fmt(odds.ref)}·{odds.ref_note}）", odds.proxy_note, odds.sigma_note,
-                          odds.unit, odds.beta, odds.mode)
+        return dataclasses.replace(
+            close_odds(odds.name, strike, effective, odds.sigma_daily, odds.remaining, odds.target, tick,
+                       f"Predict 目标价（本地参考 {fmt(odds.ref)}·{odds.ref_note}）", odds.proxy_note, odds.sigma_note,
+                       odds.unit, odds.beta, odds.mode), warn=odds.warn)
 
     def odds_payload(self) -> dict:
         """JSON for the web page: one entry per item, numbers raw, text already plain."""
@@ -4353,7 +4366,7 @@ class Bot:
                 "target": odds.target.strftime("%m-%d"), "unit": odds.unit or self.card_currency(symbol),
                 "close_ms": close_ms, "close_label": close_label,
                 "ref": fmt(odds.ref), "ref_note": odds.ref_note, "effective": fmt(odds.effective.quantize(D("0.0001"))),
-                "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note,
+                "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note, "warn": odds.warn,
                 "sigma_daily": odds.sigma_daily, "sigma": odds.sigma, "remaining": odds.remaining, "sigma_note": odds.sigma_note,
                 "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down,
@@ -4416,7 +4429,7 @@ class Bot:
                    age=max(0, (now_ms - book.fetched_ms) // 1000), stale=book.stale(now_ms))
         if isinstance(odds, CloseOdds):
             edges = book_edges(odds.fair_up, book)
-            best = None if book.stale(now_ms) else best_edge(edges)
+            best = None if book.stale(now_ms) or odds.warn else best_edge(edges)
             out["edges"] = [{"label": e.label, "maker": e.maker, "price": e.price, "edge": e.edge, "size": e.size,
                              "best": e is best} for e in edges]
         return out

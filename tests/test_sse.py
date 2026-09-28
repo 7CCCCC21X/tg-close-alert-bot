@@ -227,14 +227,20 @@ async def run():
     bot.cn = x; bot.anchors["A50"] = (bj(2026, 9, 28, 15, 0), D("14290"))
     x.a50 = m.IndexQuote("A50期货", D("14350"), D("14300"), None, None, None, bj(2026, 9, 28, 20, 40), "东方财富")
     assert bot.sse_odds(bj(2026, 9, 28, 20, 45)).proxy_note.startswith("A50 14,350 / 15:00 14,290")
-    assert bot.sse_odds(bj(2026, 9, 28, 20, 51)) == "A50 报价已超 10 分钟未更新（最后 09-28 20:40），暂不输出新概率"
+    # a short silence still prices from the last print, flagged, with no trade suggestion; an hour of it pauses the odds
+    o = bot.sse_odds(bj(2026, 9, 28, 20, 51))
+    assert isinstance(o, m.CloseOdds) and o.warn == "A50 11 分钟未更新，按 20:40 报价估算", o
+    assert "⚠️ A50 11 分钟未更新" in "\n".join(o.detail())
+    sb = m.PredictBook("SSE", "s", "1", "t", ((D("0.10"), D("5")),), ((D("0.12"), D("5")),), bj(2026, 9, 28, 20, 51))
+    assert "⚠️ A50 11 分钟未更新" in "\n".join(m.book_lines(sb, "", o, bj(2026, 9, 28, 20, 51))) and "👉" not in "\n".join(m.book_lines(sb, "", o, bj(2026, 9, 28, 20, 51)))
+    assert bot.sse_odds(bj(2026, 9, 28, 21, 41)) == "A50 报价已超 10 分钟未更新（最后 09-28 20:40），暂不输出新概率"
     assert "｜⚠️ 报价已超 10 分钟未更新" in x.a50_line(bj(2026, 9, 28, 20, 51), "cn", None)
     # outside A50 sessions (16:30-16:45) an older print is expected, not stale
     x.a50 = m.IndexQuote("A50期货", D("14320"), D("14300"), None, None, None, bj(2026, 9, 28, 16, 29), "东方财富")
     o = bot.sse_odds(bj(2026, 9, 28, 16, 40)); assert isinstance(o, m.CloseOdds), o
     # an A50 print from before the close cannot map the after-hours move
     x.a50 = m.IndexQuote("A50期货", D("14320"), D("14300"), None, None, None, bj(2026, 9, 28, 14, 58), "东方财富")
-    assert bot.sse_odds(bj(2026, 9, 28, 15, 30)) == "A50 报价已超 10 分钟未更新（最后 09-28 14:58），暂不输出新概率"
+    assert bot.sse_odds(bj(2026, 9, 28, 15, 30)) == "A50 报价早于 09-28 15:00 收盘，等待新报价", bot.sse_odds(bj(2026, 9, 28, 15, 30))
     assert "A50 报价已超 10 分钟未更新" in bot.sse_odds(bj(2026, 9, 28, 16, 40))
     # Without a dated anchor, a quote's previous close cannot prove the 15:00 A50 price.
     bot.anchors.pop("A50")
