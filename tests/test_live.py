@@ -28,7 +28,9 @@ assert (q.last, q.prev_close, q.quoted_ms, q.source) == (D("1870000"), D("185700
 for bad in [b'v_sh688836="";', tencent("sh688836", "0.00", "76.50", "20260928092000")]:
     try: m.parse_stock_live("腾讯", "sh", bad, 0); assert False, bad
     except ValueError: pass
-assert [n for n, _, _ in m.StockMarket.live_sources(m.StockTicker("hk", "00625"))] == ["腾讯", "新浪"]
+hk_src = m.StockMarket.live_sources(m.StockTicker("hk", "00625"))
+assert [n for n, _, _ in hk_src] == ["腾讯", "新浪"] and hk_src[0][1].endswith("q=r_hk00625") and hk_src[1][1].endswith("list=rt_hk00625")
+assert m.StockMarket.live_sources(m.StockTicker("sh", "688825"))[0][1].endswith("q=sh688825")
 assert "domestic/stock/000660" in m.StockMarket.live_sources(m.StockTicker("kr", "000660"))[0][1]
 
 # --- session window: first continuous minute until the close is final --------------------------------
@@ -103,6 +105,27 @@ async def run():
     # No Binance anchor either: say what is missing
     bot.anchors.clear()
     assert bot.contract_odds("UNITREEUSDT", D("10.80"), now) == "等待币安在收盘时刻的价格"
+
+    # HK: a lagging Tencent quote (e.g. the 15-minute delayed feed) is not accepted; Sina's fresh print is used
+    hcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "HK0625USDT"})
+    hbot = m.Bot(hcfg, m.Store(":memory:"), FakeMarket(hcfg), None)
+    hbot.stocks.closes["HK0625USDT"] = m.StockMarket.baseline(m.StockTicker("hk", "00625", True), m.STOCK_MARKETS["hk"], "腾讯",
+                                                              dt.date(2026, 9, 25), D("35.10"))
+    hbot.anchors["HK0625USDT"] = (bj(9, 25, 16, 10), D("35.63"))
+    lagging = ('v_r_hk00625="100~希音~00625~35.20~35.10~35.00~' + "~".join(["0"] * 24) + '~2026/09/28 09:33:00~x";').encode("gbk")
+    fresh = ('var hq_str_rt_hk00625="SHEIN,希音,35.00,35.10,35.60,34.90,35.40,' + ",".join(["0"] * 10) + ',2026/09/28,09:48:50";').encode("gbk")
+    async def hk_get(url, timeout=15, headers=None):
+        return lagging if "gtimg" in url else fresh
+    m.http_get = hk_get
+    t = bj(9, 28, 9, 49)
+    await hbot.stocks.refresh_live(t, force=True)
+    o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
+    assert o.effective == D("35.40") and "新浪" in o.proxy_note and o.ref == D("35.10") and o.unit == "", o
+    async def all_lag(url, timeout=15, headers=None): return lagging
+    m.http_get = all_lag
+    await hbot.stocks.refresh_live(t, force=True)
+    o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
+    assert "现货行情已超 10 分钟未更新" in o.proxy_note and "报价停在 09-28 09:33" in hbot.stocks.live_errors["HK0625USDT"], hbot.stocks.live_errors
     print("LIVE_OK")
 
 
