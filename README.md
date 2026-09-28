@@ -79,7 +79,7 @@ tg-close-alert-bot/
 └── tests/
     ├── run_all.py
     ├── offline.py
-    └── test_*.py（25 组离线测试）
+    └── test_*.py（26 组离线测试）
 ```
 
 `Dockerfile` 会在构建时运行 `tests/` 里的全部离线测试（不联网、不需要 Token），任何一组失败都会让构建失败，不会上线有问题的版本。不需要在电脑上安装 Python，也不需要额外搭建数据库服务。
@@ -190,6 +190,7 @@ EXCHANGE_TICKERS=UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:6888
 | `/pause` | 暂停当前订阅 |
 | `/resume` | 恢复当前订阅 |
 | `/prob` | 查看各标的下个收盘涨跌概率及计算过程 |
+| `/book` | 拉取 Predict.fun 对应涨跌市场的订单簿，和模型公平价对比，看挂涨还是挂跌优势大 |
 | `/web` | 获取概率网页链接（自动刷新，需在 Railway 生成域名） |
 | `/diag` | 逐个检测所有数据源，找出哪里出问题（仅管理员，约 10–30 秒） |
 | `/calib` | 用保存的预测快照和实际收盘给概率模型打分：Brier、对数损失、校准表、代理系数拟合与逐日向前检验（只评估，不自动改参数；也可 `python main.py --calib`） |
@@ -334,6 +335,65 @@ HL_TICKERS=UNITREEUSDT=xyz:UNITREE,HK0625USDT=xyz:SHEIN,CXMTUSDT=xyz:CXMT,SKHYNI
 - 网页只读，不能修改任何设置，也不展示订阅或 Telegram 信息；响应带 `no-store`、`noindex`、`no-referrer` 和限制性的 CSP。
 - 其他部署环境用 `WEB_PORT` 指定端口、`WEB_BASE_URL` 指定公网地址；`WEB=off` 关闭。
 - `/health` 返回 `ok`，可以作为健康检查路径。
+
+### Predict 订单簿对比（/book）
+
+机器人每 15 秒读取 Predict.fun 上对应的每日涨跌市场订单簿（只读，不下单），和模型公平价比较，告诉你挂哪边优势大。`/book` 列出全部标的，`/prob` 和概率网页的每张卡片也附带盘口。
+
+市场链接按目标收盘日自动拼出，日期变了不用改任何配置：
+
+```text
+https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-september-28-2026
+                                 └── 前缀 ──────┘            └ 月-日-年（目标收盘日）┘
+```
+
+目标日和概率模型一致（盘中是今天收盘，收盘后是下一个交易日），所以盘口和概率对的是同一个市场。默认前缀：
+
+| 标的 | 前缀 |
+| --- | --- |
+| 恒生指数 `HSI` | `hang-seng-index` |
+| KOSPI `KOSPI` | `kospi-composite-index` |
+| 上证指数 `SSE` | `sse-composite-index` |
+| 宇树 `UNITREEUSDT` | `unitree` |
+| 希音 `HK0625USDT` | `shein` |
+| 长鑫 `CXMTUSDT` | `cxmt` |
+| SK 海力士 `SKHYNIXUSDT` | `sk-hynix-inc` |
+
+订单簿报价的是“涨”：买 1 份跌 @ p 等于卖 1 份涨 @ 1−p。对每个方向算 **优势 = 模型公平价 − 成交价**（每份，¢）：
+
+| 方向 | 价格 | 优势 |
+| --- | --- | --- |
+| 挂涨（在买1排队） | 买1 | 公平涨 − 买1 |
+| 挂跌（在卖1对面排队） | 1 − 卖1 | 公平跌 − (1 − 卖1) = 卖1 − 公平涨 |
+| 吃涨（立即成交） | 卖1 | 公平涨 − 卖1 |
+| 吃跌（立即成交） | 1 − 买1 | 公平跌 − (1 − 买1) = 买1 − 公平涨 |
+
+例：截图里恒指买1 81¢、卖1 85¢，模型公平涨 78¢ → 挂跌 15¢ 优势 +7¢（最大），吃跌 19¢ +3¢，挂涨 −3¢，吃涨 −7¢。
+
+```text
+📍 恒生指数
+├ 📕 Predict 涨 买1 81.0¢×400｜卖1 85.0¢×12｜中间 83.0¢
+├ 模型 涨 78.0¢｜跌 22.0¢
+├ 挂涨 81.0¢ 优势 -3.0¢｜挂跌 15.0¢ 优势 +7.0¢
+├ 吃涨 85.0¢ 优势 -7.0¢｜吃跌 19.0¢ 优势 +3.0¢
+├ 👉 挂跌 @ 15.0¢ 优势最大 +7.0¢（挂单排队，成交不保证）
+└ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-september-28-2026
+```
+
+说明：
+
+- 挂单优势包含了价差，但要排队、不保证成交；吃单立即成交，但只有买1/卖1 那一档的数量。四个方向都没有正优势时显示“暂不挂”。
+- 未计手续费、积分和 LP 奖励；模型本身有误差（见 `/calib`），优势只是参考。
+- 超过 90 秒没刷新成功的盘口只显示、不给建议；目标日切换时旧盘口立即丢弃。
+- Predict 上还没上架的市场显示“Predict 上还没有这个市场（slug）”，10 分钟后再查；网络失败会显示原因并保留上次盘口。
+- 订单簿走 `https://api.predict.fun/v1/markets/<id>/orderbook`。如果 `/book` 显示 HTTP 401/403，到 Predict.fun 申请 API key 填进 `PREDICT_API_KEY`（建议单独一个 key，别和交易程序共用限流桶）。
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `PREDICT` | `on` | `off` 关闭盘口获取和 `/book` |
+| `PREDICT_API_KEY` | 空 | 可选，作为 `x-api-key` 发给 api.predict.fun |
+| `PREDICT_POLL_SECONDS` | `15` | 盘口刷新间隔（5～3600 秒） |
+| `PREDICT_SLUGS` | 上表 | `键=前缀`，逗号分隔；键为 `HSI`/`KOSPI`/`SSE` 或合约代码。只写的键才获取，例如只看恒指：`PREDICT_SLUGS=HSI=hang-seng-index` |
 
 ### 上证指数与 A50 夜盘
 
