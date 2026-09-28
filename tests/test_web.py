@@ -78,7 +78,15 @@ async def run():
     assert payload["items"][0]["group"] == "index" and payload["items"][1]["symbol"] == "UNITREEUSDT" and payload["items"][1]["group"] == "contract"
     sse = payload["items"][0]
     assert sse["target"] == "10-08" and 0 < sse["fair_up"] < 0.5 and abs(sse["up"] + sse["flat"] + sse["down"] - 1) < 1e-9 and sse["ref"] == "3,850.12"
-    assert payload["items"][1] == {"name": "宇树 UNITREE", "symbol": "UNITREEUSDT", "group": "contract", "missing": "等待行情"} and payload["color_style"] == "cn"
+    uni = payload["items"][1]
+    assert {k: uni[k] for k in ("name", "symbol", "group", "missing")} == {"name": "宇树 UNITREE", "symbol": "UNITREEUSDT", "group": "contract", "missing": "等待行情"} and payload["color_style"] == "cn"
+    # every card says which trading day it prices, relative to Beijing today
+    assert sse["day"] == "2026-10-08" and sse["day_label"] == "10-08 周四" and sse["ref_day"] == "09-30", sse
+    assert uni["day_label"].endswith(("周一", "周二", "周三", "周四", "周五")) and uni["day_ahead"] >= 0 and payload["today"], (uni, payload["today"])
+    now = int(dt.datetime(2026, 9, 28, 15, 5, tzinfo=m.BEIJING).timestamp() * 1000)
+    assert m.day_fields(dt.date(2026, 9, 28), now)["day_tag"] == "今天" and m.day_fields(dt.date(2026, 9, 29), now)["day_tag"] == "明天"
+    assert m.day_fields(dt.date(2026, 9, 30), now)["day_tag"] == "后天" and m.day_fields(dt.date(2026, 10, 2), now)["day_tag"] == "本周五"
+    assert m.day_fields(dt.date(2026, 10, 8), now)["day_tag"] == "下周四" and m.day_fields(dt.date(2026, 10, 8), now)["day_ahead"] == 10
     assert sse["close_ms"] == int(dt.datetime(2026, 10, 8, 15, 0, tzinfo=m.BEIJING).timestamp() * 1000) and sse["close_label"] == "10-08 15:00 上交所收盘（北京时间）"
     assert payload["server_ms"] == bot.market.now_ms()
     kst = dt.timezone(dt.timedelta(hours=9))

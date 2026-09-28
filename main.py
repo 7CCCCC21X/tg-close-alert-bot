@@ -2658,6 +2658,19 @@ def best_edge(edges: list[BookEdge]) -> BookEdge | None:
     return max(good, key=lambda e: (round(e.edge, 4), e.maker)) if good else None
 
 
+WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def day_fields(target: dt.date, now_ms: int) -> dict:
+    """Web card date badge: '09-29 周二' plus 今天 / 明天 / 后天 / 下周一 relative to Beijing today."""
+    today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+    ahead = (target - today).days
+    week = WEEKDAYS[target.weekday()]
+    tag = {0: "今天", 1: "明天", 2: "后天"}.get(ahead) or (
+        ("下" if target.isocalendar()[1] != today.isocalendar()[1] else "本") + week if 0 < ahead < 14 else "")
+    return {"day": target.isoformat(), "day_label": f"{target:%m-%d} {week}", "day_tag": tag, "day_ahead": ahead}
+
+
 def cents(value: float, sign: bool = False) -> str:
     return f"{value * 100:+.1f}¢" if sign else f"{value * 100:.1f}¢"
 
@@ -2884,7 +2897,7 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 .edge .el{color:var(--muted);white-space:nowrap}.edge b{font-weight:600;color:var(--faint);white-space:nowrap}.edge.pos b{color:var(--text)}.edge:not(.pos) .el{color:var(--faint)}
 .edge.best{border-color:var(--best);background:var(--best-bg)}.edge.best .el{color:var(--text)}.edge.best b{color:var(--best)}
 .tip{margin-top:8px;font-size:13px;display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 8px}.tip.none{color:var(--muted);font-size:12.5px}.tip b{color:var(--best)}.tip .k{color:var(--muted);font-size:12px}.small{font-size:12px;margin-top:4px}
-.warn{color:var(--warn)}footer{color:var(--faint);font-size:12px;margin-top:20px;line-height:1.6}
+.day{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;margin-top:6px;font-size:13px;color:var(--muted)}.day b{font-size:15px;font-weight:650;color:var(--text);font-variant-numeric:tabular-nums}.tag{border-radius:6px;padding:1px 7px;font-size:12px;font-weight:600;background:var(--chip);color:var(--muted)}.tag.next{background:var(--best-bg);color:var(--best)}.tag.new{background:var(--best);color:#fff}.card.rolled{border-color:var(--best);box-shadow:0 0 0 1px var(--best)}.px .rd{color:var(--faint);font-size:12px}.warn{color:var(--warn)}footer{color:var(--faint);font-size:12px;margin-top:20px;line-height:1.6}
 </style></head><body><div class="wrap">
 <header><h1>收盘涨跌概率</h1><div class="hr"><div class="meta" id="meta">加载中…</div><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label></div></header>
 <div class="legend" id="legend"></div>
@@ -2894,7 +2907,7 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 </div>
 <script>
 const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
-const open=new Set();let skew=0,fetchedAt=0,style="cn";
+const open=new Set(),seen={},rolled={};let skew=0,fetchedAt=0,style="cn";
 const two=n=>String(n).padStart(2,"0"),pct=x=>(x*100).toFixed(1),cent=x=>(x*100).toFixed(1)+"¢";
 const qty=n=>Number(n).toLocaleString("en-US",{maximumFractionDigits:n>=100?0:n>=10?1:2});
 function book(p){
@@ -2920,6 +2933,11 @@ function card(it){
   if(it.symbol)nm.append($("span","sym",it.symbol));head.append(nm);
   if(it.close_ms){const cd=$("span","cd");cd.dataset.close=it.close_ms;head.append(cd)}
   c.append(head);
+  if(it.day){const dy=$("div","day");dy.append("📅 交易日",$("b","",it.day_label));
+    if(it.day_tag)dy.append($("span","tag"+(it.day_ahead>0?" next":""),it.day_tag));
+    const k=it.name+"|"+(it.symbol||"");if(seen[k]&&seen[k]<it.day)rolled[k]=Date.now();seen[k]=it.day;
+    if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");dy.append($("span","tag new","已切换到新交易日"))}
+    c.append(dy)}
   if(it.missing){c.append($("p","","概率暂缺："+it.missing));if(it.predict)c.append(book(it.predict));return c}
   const o=$("div","odds"),a=$("div"),b=$("div");
   a.append($("span","lbl","涨"),$("b",style==="us"?"d":"u",pct(it.fair_up)+"¢"));
@@ -2927,7 +2945,7 @@ function card(it){
   const bar=$("div","bar");[[it.up,upColor()],[it.flat,"var(--flat)"],[it.down,downColor()]].forEach(([w,col])=>{const i=$("i");i.style.width=(w*100)+"%";i.style.background=col;bar.append(i)});c.append(bar);
   c.append($("div","target","目标 "+it.close_label));
   const px=$("div","px"),unit=it.unit?" "+it.unit:"";
-  px.append($("span","k","参考"),$("span","",it.ref+unit),$("span","k","→ 有效"),$("span","",it.effective+unit));
+  px.append($("span","k","参考"));if(it.ref_day)px.append($("span","rd",it.ref_day+" 收盘"));px.append($("span","",it.ref+unit),$("span","k","→ 有效"),$("span","",it.effective+unit));
   const chip=$("span","chip",(it.move>=0?"+":"")+it.move.toFixed(2)+"%");chip.style.color=it.move>0?upColor():it.move<0?downColor():"var(--muted)";px.append(chip);c.append(px);
   const det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   det.append($("summary","","计算明细"));const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
@@ -2949,8 +2967,8 @@ async function load(){
     const d=await r.json();if(d.server_ms)skew=d.server_ms-Date.now();fetchedAt=Date.now();style=d.color_style||"cn";
     for(const g of["index","contract"]){const items=d.items.filter(i=>(i.group||"contract")===g);
       document.getElementById("g-"+g).replaceChildren(...items.map(card));document.getElementById("h-"+g).hidden=!items.length}
-    document.getElementById("meta").replaceChildren($("span","","数据 "+d.generated_at),$("span","","",),$("span","","基准 "+d.mode),$("span","","v"+d.version));
-    document.getElementById("meta").children[1].id="ago";
+    document.getElementById("meta").replaceChildren(...(d.today?[$("span","","今天 "+d.today)]:[]),$("span","","数据 "+d.generated_at),$("span","","",),$("span","","基准 "+d.mode),$("span","","v"+d.version));
+    document.getElementById("meta").children[d.today?2:1].id="ago";
     const lg=document.getElementById("legend");const sw=$("span","sw");[["涨",upColor()],["平","var(--flat)"],["跌",downColor()]].forEach(([t,col])=>{const i=$("i");i.style.background=col;sw.append(i,t)});
     lg.replaceChildren(sw,$("span","","¢ = 公平价（平盘两边各半）"),$("span","","盘口优势 = 公平价 − 成交价：挂涨@买1 · 挂跌@1−卖1 · 吃涨@卖1 · 吃跌@1−买1"));
     document.getElementById("foot").textContent=d.note;tick();
@@ -3873,7 +3891,7 @@ class Bot:
             if (0 <= a50.quoted_ms - at_close <= 5 * 60_000 and quoted.weekday() < 5
                     and quoted.date() not in self.config.holidays.get("sh", frozenset()) and not self.store.get(key)):
                 self.store.put(key, [a50.quoted_ms, str(a50.last)])
-        close_ms = self.sse_close_ms()
+        close_ms = self.sse_close_ms(now_ms)
         if close_ms:
             saved = self.store.get("anchor:A50", ())
             if self.anchors.get("A50", (0,))[0] != close_ms and isinstance(saved, (list, tuple)) and len(saved) >= 2:
@@ -4031,9 +4049,22 @@ class Bot:
         self.anchor_tries[key] = now
         return True
 
-    def sse_close_ms(self) -> int:
-        """15:00 on the Composite's latest close confirmed by a dated daily bar; 0 = none yet."""
-        return self.cn.close.close_ms if self.cn.close else 0
+    def sse_close(self, now_ms: int) -> DailyClose | None:
+        """The Composite's latest close: the dated daily bar, or, while today's bar is still pending
+        after 15:00, the realtime quote printed at/after the close (replaced once the bar arrives)."""
+        q = self.cn.quote
+        if q is None or not self.cn.close_pending(now_ms):
+            return self.cn.close
+        today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+        at_close = int(dt.datetime.combine(today, dt.time(15, 0), BEIJING).timestamp() * 1000)
+        if q.quoted_ms < at_close or dt.datetime.fromtimestamp(q.quoted_ms / 1000, BEIJING).date() != today:
+            return self.cn.close  # no print from the close yet
+        return DailyClose(today, q.last, q.prev_close, f"{q.source}实时收盘（日K待确认）", q.quoted_ms)
+
+    def sse_close_ms(self, now_ms: int | None = None) -> int:
+        """15:00 on the Composite's latest close (see sse_close); 0 = none yet."""
+        close = self.sse_close(self.market.now_ms() if now_ms is None else now_ms)
+        return close.close_ms if close else 0
 
     def sse_odds(self, now_ms: int) -> CloseOdds | str | None:
         q = self.cn.quote
@@ -4056,8 +4087,10 @@ class Bot:
             sigma, sigma_note = self.vols.get("SSE", "SSE", intraday=True)
             return close_odds("上证指数", ref, q.last, sigma, remaining, target, D("0.01"), ref_note,
                               f"上证现货 {fmt(q.last)}（盘中直接用现货）", sigma_note)
-        # After hours the reference is the close of a dated daily bar, never a realtime "last price".
-        if self.cn.close_pending(now_ms) or not self.cn.confirmed(now_ms):
+        # After hours the reference is the close of a dated daily bar; only today's own closing print
+        # stands in for it while that bar is pending, never an older realtime "last price".
+        close = self.sse_close(now_ms)
+        if close is self.cn.close and (self.cn.close_pending(now_ms) or not self.cn.confirmed(now_ms)):
             detail = f"，日 K 最新为 {close.day.strftime('%m-%d')}" if close else ""
             expected = (dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date() if self.cn.close_pending(now_ms)
                         else self.cn.expected_close(now_ms))
@@ -4303,11 +4336,14 @@ class Bot:
             if book:
                 base["predict"] = book
             if isinstance(odds, str):
-                items.append({**base, "missing": odds})
+                target = self.predict_day(title, now_ms)
+                items.append({**base, "missing": odds, **(day_fields(target, now_ms) if target else {})})
                 continue
             close_ms, close_label = self.target_close(title, odds.target)
+            ref_day = re.search(r"\b\d\d-\d\d\b", odds.ref_note)
             items.append({
-                **base, "target": odds.target.strftime("%m-%d"), "unit": odds.unit,
+                **base, **day_fields(odds.target, now_ms), "ref_day": ref_day.group(0) if ref_day else "",
+                "target": odds.target.strftime("%m-%d"), "unit": odds.unit,
                 "close_ms": close_ms, "close_label": close_label,
                 "ref": fmt(odds.ref), "ref_note": odds.ref_note, "effective": fmt(odds.effective.quantize(D("0.0001"))),
                 "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note,
@@ -4315,12 +4351,23 @@ class Bot:
                 "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down,
             })
+        today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION, "server_ms": now_ms,
+                "today": f"{today:%m-%d} {WEEKDAYS[today.weekday()]}",
                 "mode": BASELINE_SHORT.get(self.settings()["mode"], self.settings()["mode"]),
                 "color_style": self.config.color_style, "items": items,
                 "note": ("模型参考，非投资建议。有效价 = 参考收盘 × 代理现价 ÷ 代理在参考收盘时刻的价格；"
                          "P(涨) = 1 − Φ(ln((参考+半跳)/有效)/σ剩余)，平盘两边各计一半。目标日跳过周末和已配置的交易所假期。"
                          if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")}
+
+    def predict_day(self, title: str, now_ms: int) -> dt.date | None:
+        """The session a card without odds is waiting for (its next close by the calendar)."""
+        market = {"恒生指数": "hk", "KOSPI": "kr", "上证指数": "sh"}.get(title)
+        ticker = self.config.tickers.get(title.split("｜")[-1])
+        market = market or (ticker.market if ticker else None)
+        if market is None:
+            return None
+        return session_remaining(market, now_ms, None, self.config.holidays.get(market, frozenset()))[1]
 
     def predict_key(self, title: str) -> str:
         return PREDICT_KEYS.get(title) or title.split("｜")[-1]
@@ -4493,7 +4540,7 @@ class Bot:
             holidays = self.config.holidays.get("sh", frozenset())
             lines.append(self.cn.line(now_ms, style, holidays))
             anchor = self.anchors.get("A50")
-            lines.append(self.cn.a50_line(now_ms, style, anchor[1] if anchor and anchor[0] == self.sse_close_ms()
+            lines.append(self.cn.a50_line(now_ms, style, anchor[1] if anchor and anchor[0] == self.sse_close_ms(now_ms)
                                           and self.cn.a50 and a50_family(self.a50_anchor_source) == a50_family(self.cn.a50.source)
                                           else None,
                                           self.a50_anchor_note))
