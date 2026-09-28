@@ -316,6 +316,13 @@ def parse_predict_slugs(spec: str) -> dict[str, str]:
     return out
 
 
+def parse_ref_code(value: str) -> str:
+    code = value.strip()
+    if code and not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", code):
+        raise ValueError("PREDICT_REF_CODE 应为 1～32 位字母、数字、- 或 _（留空表示不加邀请码）")
+    return code
+
+
 def parse_hl_tickers(spec: str, symbols: tuple[str, ...]) -> dict[str, tuple[str, str]]:
     """HL_TICKERS="SYMBOL=dex:COIN,..." (dex omitted = the main Hyperliquid perp dex); "off" disables."""
     tickers: dict[str, tuple[str, str]] = {}
@@ -393,6 +400,7 @@ class Config:
     predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
     predict_api_key: str = ""  # Optional x-api-key for api.predict.fun (REST orderbook).
     predict_poll: int = 15   # seconds between orderbook refreshes
+    predict_ref: str = "B00EA"  # referral code appended to Predict market links (?ref=); empty = none
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -441,6 +449,7 @@ class Config:
             predict_slugs=parse_predict_slugs(e.get("PREDICT_SLUGS", DEFAULT_PREDICT_SLUGS)),
             predict_api_key=e.get("PREDICT_API_KEY", "").strip(),
             predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 15, 5, 3600),
+            predict_ref=parse_ref_code(e.get("PREDICT_REF_CODE", "B00EA")),
             probability=e.get("PROBABILITY", "on").strip().lower() not in {"off", "0", "false", "no"},
             prob_vol=parse_prob_vol(e.get("PROB_VOL", "")),
             sse_index=e.get("SSE_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -2487,6 +2496,11 @@ def predict_slug(stem: str, day: dt.date) -> str:
     return f"{stem}-up-or-down-on-{MONTHS[day.month - 1]}-{day.day}-{day.year}"
 
 
+def predict_url(slug: str, ref: str = "") -> str:
+    """Market page link, with the referral code when one is configured."""
+    return PREDICT_SITE + slug + (f"?ref={urllib.parse.quote(ref)}" if ref else "")
+
+
 def predict_levels(rows: Any, bids: bool) -> tuple[tuple[D, D], ...]:
     """[[price, size], ...] or [{price, size}, ...] -> sorted (price, size) with empty levels dropped."""
     out = []
@@ -2541,10 +2555,6 @@ class PredictBook:
     def ask(self) -> tuple[D, D] | None:
         return self.asks[0] if self.asks else None
 
-    @property
-    def url(self) -> str:
-        return PREDICT_SITE + self.slug
-
     def stale(self, now_ms: int) -> bool:
         return now_ms - self.fetched_ms > PREDICT_STALE_MS
 
@@ -2587,7 +2597,7 @@ def cents(value: float, sign: bool = False) -> str:
 
 
 def book_lines(book: PredictBook | None, error: str, odds: "CloseOdds | str | None", now_ms: int,
-               link: bool = True) -> list[str]:
+               url: str = "") -> list[str]:
     """Lines for Telegram (bold sentinels, send as HTML): quote, four edges, the best one, the market link."""
     if book is None:
         return [f"📕 Predict 盘口暂缺：{error or '等待首次获取'}"]
@@ -2621,8 +2631,8 @@ def book_lines(book: PredictBook | None, error: str, odds: "CloseOdds | str | No
         lines.append(f"👉 {bold(best.label)} @ {cents(best.price)} 优势最大 {cents(best.edge, True)}（{how}）")
     else:
         lines.append("👉 四个方向对模型都没有正优势，暂不挂")
-    if link:
-        lines.append(book.url)
+    if url:
+        lines.append(url)
     return lines
 
 
@@ -2768,7 +2778,9 @@ summary::-webkit-details-marker{display:none}summary:before{content:"▸ ";}deta
 dl{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;margin:6px 0 2px;font-size:12.5px}dt{color:var(--muted)}dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 .card.missing{padding-bottom:14px}.card.missing p{margin:8px 0 0;color:var(--muted);font-size:13px}
 .pb{margin-top:10px;border-top:1px solid var(--line);padding-top:8px;font-size:13px;font-variant-numeric:tabular-nums}
-.pbh{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px}.pbh a{color:inherit;font-weight:600}.pbh .k{color:var(--muted)}
+a.pb{display:block;color:inherit;text-decoration:none;border-radius:10px;padding-bottom:6px;margin-left:-6px;margin-right:-6px;padding-left:6px;padding-right:6px;cursor:pointer}
+a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge{background:var(--card)}
+.pbh{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px}.pbh .pt{font-weight:600;color:var(--best)}.pbh .k{color:var(--muted)}
 .edges{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:6px}
 .edge{display:flex;justify-content:space-between;gap:6px;background:var(--chip);border:1px solid transparent;border-radius:8px;padding:4px 8px}
 .edge .el{color:var(--muted)}.edge b{font-weight:600;color:var(--muted)}.edge.pos b{color:var(--text)}
@@ -2786,7 +2798,7 @@ const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==un
 const open=new Set();let skew=0,fetchedAt=0,style="cn";
 const two=n=>String(n).padStart(2,"0"),pct=x=>(x*100).toFixed(1),cent=x=>(x*100).toFixed(1)+"¢";
 function book(p){
-  const w=$("div","pb"),h=$("div","pbh"),a=$("a","","Predict 盘口");a.href=p.url;a.target="_blank";a.rel="noopener noreferrer";h.append(a);
+  const w=$("a","pb"),h=$("div","pbh");w.href=p.url;w.target="_blank";w.rel="noopener noreferrer";w.title="打开 Predict 市场";h.append($("span","pt","Predict 盘口 ↗"));
   const has=p.bids||p.asks;
   if(has){const b=p.bids[0],k=p.asks[0];
     h.append($("span","k","买1 "+(b?cent(b[0])+"×"+b[1]:"无")+" · 卖1 "+(k?cent(k[0])+"×"+k[1]:"无")));
@@ -4170,7 +4182,7 @@ class Bot:
         if not self.config.predict or not slug:
             return None
         book, error = self.predict.books.get(key), self.predict.errors.get(key, "")
-        out: dict[str, Any] = {"url": PREDICT_SITE + slug, "error": error}
+        out: dict[str, Any] = {"url": predict_url(slug, self.config.predict_ref), "error": error}
         if book is None:
             return out
         out.update(bids=[[float(p), float(q)] for p, q in book.bids], asks=[[float(p), float(q)] for p, q in book.asks],
@@ -4200,9 +4212,10 @@ class Bot:
             item = odds.get(title)
             book, error = self.predict.books.get(key), self.predict.errors.get(key, "")
             lines.append("\n" + bold(f"📍 {title}"))
-            rows = book_lines(book, error, item, now_ms)
+            url = predict_url(slug, self.config.predict_ref)
+            rows = book_lines(book, error, item, now_ms, url)
             if book is None:
-                rows.append(PREDICT_SITE + slug)
+                rows.append(url)
             if isinstance(item, str):
                 rows.insert(0, f"概率暂缺：{item}")
             lines.extend(tree(rows))
@@ -4249,7 +4262,7 @@ class Bot:
             rows = odds.detail() if isinstance(odds, CloseOdds) else [f"概率暂缺：{odds}"]
             key = self.predict_key(title)
             if key in self.predict.slugs:
-                rows += book_lines(self.predict.books.get(key), self.predict.errors.get(key, ""), odds, now_ms, link=False)
+                rows += book_lines(self.predict.books.get(key), self.predict.errors.get(key, ""), odds, now_ms)
             lines.extend(tree(rows))
         lines.append("\n⚠️ 目标日跳过周末和已配置的交易所假期（HOLIDAYS_*），每个假日按半天方差计入；σ 为历史估计；代理与结算标的之间有基差。")
         return Reply("\n".join(lines), html=True)

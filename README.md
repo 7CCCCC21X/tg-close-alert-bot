@@ -338,7 +338,7 @@ HL_TICKERS=UNITREEUSDT=xyz:UNITREE,HK0625USDT=xyz:SHEIN,CXMTUSDT=xyz:CXMT,SKHYNI
 
 ### Predict 订单簿对比（/book）
 
-机器人每 15 秒读取 Predict.fun 上对应的每日涨跌市场订单簿（只读，不下单），和模型公平价比较，告诉你挂哪边优势大。`/book` 列出全部标的，`/prob` 和概率网页的每张卡片也附带盘口。
+机器人每 15 秒读取 Predict.fun 上对应的每日涨跌市场订单簿（只读，不下单），和模型公平价比较，告诉你挂哪边优势大。`/book` 列出全部标的并附市场链接，`/prob` 和概率网页的每张卡片也附带盘口。网页上整块盘口（报价、四个优势格子、建议）都可以点，点了在新标签页打开对应的 Predict 市场；链接带邀请码 `?ref=B00EA`。
 
 市场链接按目标收盘日自动拼出，日期变了不用改任何配置：
 
@@ -377,7 +377,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-september-28-2026
 ├ 挂涨 81.0¢ 优势 -3.0¢｜挂跌 15.0¢ 优势 +7.0¢
 ├ 吃涨 85.0¢ 优势 -7.0¢｜吃跌 19.0¢ 优势 +3.0¢
 ├ 👉 挂跌 @ 15.0¢ 优势最大 +7.0¢（挂单排队，成交不保证）
-└ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-september-28-2026
+└ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-september-28-2026?ref=B00EA
 ```
 
 说明：
@@ -393,6 +393,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-september-28-2026
 | `PREDICT` | `on` | `off` 关闭盘口获取和 `/book` |
 | `PREDICT_API_KEY` | 空 | 可选，作为 `x-api-key` 发给 api.predict.fun |
 | `PREDICT_POLL_SECONDS` | `15` | 盘口刷新间隔（5～3600 秒） |
+| `PREDICT_REF_CODE` | `B00EA` | 市场链接后面加的邀请码（`?ref=`）；留空不加 |
 | `PREDICT_SLUGS` | 上表 | `键=前缀`，逗号分隔；键为 `HSI`/`KOSPI`/`SSE` 或合约代码。只写的键才获取，例如只看恒指：`PREDICT_SLUGS=HSI=hang-seng-index` |
 
 ### 上证指数与 A50 夜盘

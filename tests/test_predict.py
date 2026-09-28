@@ -6,7 +6,13 @@ D = m.D
 
 # config + slugs
 c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"})
-assert c.predict and c.predict_poll == 15 and c.predict_api_key == ""
+assert c.predict and c.predict_poll == 15 and c.predict_api_key == "" and c.predict_ref == "B00EA"
+assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_REF_CODE": ""}).predict_ref == ""
+assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_REF_CODE": " AB12 "}).predict_ref == "AB12"
+try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_REF_CODE": "a&b=c"}); assert False
+except ValueError: pass
+assert m.predict_url("cxmt-up-or-down-on-september-28-2026", "B00EA") == "https://predict.fun/zh-cn/market/cxmt-up-or-down-on-september-28-2026?ref=B00EA"
+assert m.predict_url("cxmt-up-or-down-on-september-28-2026") == "https://predict.fun/zh-cn/market/cxmt-up-or-down-on-september-28-2026"
 assert c.predict_slugs["HSI"] == "hang-seng-index" and c.predict_slugs["SKHYNIXUSDT"] == "sk-hynix-inc" and len(c.predict_slugs) == 7
 assert not m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT": "off"}).predict
 assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_SLUGS": "hsi=Hang-Seng-Index"}).predict_slugs == {"HSI": "hang-seng-index"}
@@ -91,7 +97,7 @@ async def run():
     assert await bot.predict.refresh(targets) is True
     assert await bot.predict.refresh(targets) is False  # not due yet
     books, errors = bot.predict.books, bot.predict.errors
-    assert books["SSE"].bid == (D("0.81"), D("400")) and books["SSE"].url == m.PREDICT_SITE + want["SSE"]
+    assert books["SSE"].bid == (D("0.81"), D("400"))
     assert books["CXMTUSDT"].ask == (D("0.4"), D("50")) and bot.predict.book_keys["902"] == "0xd"  # id 404 → conditionId
     assert "还没有这个市场" in errors["UNITREEUSDT"] and "还没有这个市场" in errors["KOSPI"]
     assert "网络错误" in errors["HSI"] and want["HSI"] not in bot.predict.markets  # unknown ≠ not listed: retried next tick
@@ -106,7 +112,7 @@ async def run():
     text = tg.sent[-1]
     assert "Predict 盘口 vs 模型公平价" in text and "📍 上证指数" in text and "买1 81.0¢×400" in text and "卖1 85.0¢×12" in text, text
     assert "挂涨 81.0¢" in text and "挂跌 15.0¢" in text and "吃涨 85.0¢" in text and "吃跌 19.0¢" in text and "👉" in text, text
-    assert "还没有这个市场" in text and m.PREDICT_SITE + want["UNITREEUSDT"] in text and "网络错误" in text
+    assert "还没有这个市场" in text and m.PREDICT_SITE + want["UNITREEUSDT"] + "?ref=B00EA" in text and m.PREDICT_SITE + want["SSE"] + "?ref=B00EA" in text and "网络错误" in text
     assert "中间 83.0¢" in text and "<b>" in text
     sse = bot.sse_odds(now_ms)
     best = m.best_edge(m.book_edges(sse.fair_up, books["SSE"]))
@@ -119,7 +125,7 @@ async def run():
     payload = bot.odds_payload()
     item = next(i for i in payload["items"] if i["name"] == "上证指数")
     p = item["predict"]
-    assert p["url"] == m.PREDICT_SITE + want["SSE"] and p["bids"][0] == [0.81, 400.0] and not p["stale"] and p["error"] == ""
+    assert p["url"] == m.PREDICT_SITE + want["SSE"] + "?ref=B00EA" and p["bids"][0] == [0.81, 400.0] and not p["stale"] and p["error"] == ""
     assert [e["label"] for e in p["edges"]] == ["挂涨", "挂跌", "吃涨", "吃跌"] and sum(e["best"] for e in p["edges"]) == 1
     uni = next(i for i in payload["items"] if i["name"] == "宇树 UNITREE")
     assert uni["missing"] == "等待行情" and "还没有这个市场" in uni["predict"]["error"] and "edges" not in uni["predict"]
@@ -160,7 +166,16 @@ async def run():
         text = await page.inner_text("#g-index")
         assert "Predict 盘口" in text and "买1 81.0¢×400" in text and "挂跌 15.0¢" in text and "优势最大" in text, text
         assert await page.locator(".edge.best").count() == 1
-        assert await page.get_attribute(".pb a", "href") == m.PREDICT_SITE + want["SSE"]
+        # the whole block is one link: quote line, edge chips and tip all sit inside it
+        href = m.PREDICT_SITE + want["SSE"] + "?ref=B00EA"
+        assert await page.get_attribute("#g-index a.pb", "href") == href and await page.get_attribute("#g-index a.pb", "target") == "_blank"
+        assert await page.locator("#g-index a.pb .edges .edge.best").count() == 1 and await page.locator("#g-index a.pb .tip").count() == 1
+        await page.context.route("https://predict.fun/**", lambda route: route.fulfill(body="predict", content_type="text/html"))
+        async with page.context.expect_page() as popup:
+            await page.click("#g-index a.pb .edge.best")  # a click on an edge chip opens the market too
+        tab = await popup.value; await tab.wait_for_load_state()
+        assert tab.url == href, tab.url
+        await tab.close()
         assert "还没有这个市场" in await page.inner_text("#g-contract")
         wide = await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         assert wide, "no horizontal scroll at phone width"
