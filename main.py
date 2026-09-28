@@ -2318,6 +2318,11 @@ class CloseOdds:
     mode: str = "盘中"     # "盘中" = live index vs previous close; "盘后" = mapped from an after-hours proxy
 
     @property
+    def direct(self) -> bool:
+        """The effective price is the underlying's own live print, not a proxy-mapped estimate."""
+        return "直接用现货" in self.proxy_note
+
+    @property
     def move(self) -> float:
         """The proxy's own log move since the anchor (before β)."""
         return math.log(float(self.effective / self.ref)) / self.beta
@@ -2545,7 +2550,8 @@ PREDICT_SITE = "https://predict.fun/zh-cn/market/"
 PREDICT_ITEMS = (("HSI", "恒生指数", "hk"), ("KOSPI", "KOSPI", "kr"), ("SSE", "上证指数", "sh"))
 PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
 PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and never recommended
-PREDICT_MISS_SECONDS = 60       # an unknown slug is looked up again after this long (new markets show up within a minute)
+PREDICT_STRIKE_SECONDS = 300   # a known target price is re-read this often (the site may correct it)
+PREDICT_MISS_SECONDS = 60      # an unknown slug is looked up again after this long (new markets show up within a minute)
 PREDICT_DEPTH = 5
 MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
           "november", "december")
@@ -2706,6 +2712,9 @@ class PredictFeed:
         self.books: dict[str, PredictBook] = {}                  # item key -> latest book
         self.errors: dict[str, str] = {}
         self.slugs: dict[str, str] = {}                          # item key -> slug currently followed
+        self.types: dict[str, str] = {}                          # slug -> GraphQL category type
+        self.strikes: dict[str, tuple[D | None, float]] = {}     # slug -> (target price shown on the site, when)
+        self.no_strike: set[str] = set()                         # category types without marketData.startPrice
         self.refreshed = -1e9
 
     def headers(self) -> dict[str, str]:
@@ -2732,8 +2741,10 @@ class PredictFeed:
         found: list[dict] = []
         errors = []  # only failures that leave the answer unknown; "no such category" is an answer
         try:
-            data = await self.graphql("query($id: ID!) { category(id: $id) { id } }", {"id": slug})
+            data = await self.graphql("query($id: ID!) { category(id: $id) { id __typename } }", {"id": slug})
             category = (data or {}).get("category") or {}
+            if re.fullmatch(r"[A-Za-z_]\w*", str(category.get("__typename") or "")):
+                self.types[slug] = category["__typename"]
             if category.get("id") is not None:
                 data = await self.graphql(
                     "query($f: MarketFilterInput!) { markets(filter: $f, pagination: { first: 20 }) "
@@ -2774,6 +2785,32 @@ class PredictFeed:
             return predict_levels(book.get("bids"), True), predict_levels(book.get("asks"), False), key
         raise RemoteError(last or "订单簿获取失败")
 
+    async def strike(self, slug: str, market_id: str) -> D | None:
+        """The market's target price (目标价 / price to beat: the close it settles against), from GraphQL
+        category.marketData.startPrice. Best effort: None when the category type has no such field."""
+        cached = self.strikes.get(slug)
+        if cached and time.monotonic() - cached[1] < (PREDICT_STRIKE_SECONDS if cached[0] is not None else PREDICT_MISS_SECONDS):
+            return cached[0]
+        kind = self.types.get(slug, "")
+        value = cached[0] if cached else None
+        if kind and kind not in self.no_strike:
+            try:
+                data = await self.graphql(f"query($id: ID!) {{ category(id: $id) {{ ... on {kind} "
+                                          "{ marketData { marketId startPrice } } } }", {"id": slug})
+                rows = ((data or {}).get("category") or {}).get("marketData") or []
+                rows = [r for r in rows if isinstance(r, dict) and r.get("startPrice") not in (None, "", 0)]
+                row = next((r for r in rows if str(r.get("marketId")) == market_id), rows[0] if len(rows) == 1 else None)
+                if row:
+                    value = D(str(row["startPrice"]))
+                    value = value if value > 0 else None
+            except RemoteError as error:
+                if "Cannot query field" in str(error) or "Unknown type" in str(error):
+                    self.no_strike.add(kind)  # schema answer: never ask this type again
+            except (TimeoutError, OSError, ValueError, TypeError, decimal.InvalidOperation):
+                pass
+        self.strikes[slug] = (value, time.monotonic())
+        return value
+
     async def refresh_one(self, key: str, slug: str) -> None:
         try:
             market = await self.resolve(slug)
@@ -2781,6 +2818,7 @@ class PredictFeed:
                 self.books.pop(key, None)
                 self.errors[key] = f"Predict 上还没有这个市场（{slug}）"
                 return
+            await self.strike(slug, market["id"])
             bids, asks, _ = await self.orderbook(market)
             self.books[key] = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000))
             self.errors.pop(key, None)
@@ -4231,7 +4269,28 @@ class Bot:
             snapshot = self.snapshots.get(symbol) or {}
             quote = snapshot.get("quote")
             items.append((f"{NAMES.get(symbol, symbol)}｜{symbol}", self.contract_odds(symbol, quote.price, now_ms) if quote else "等待行情"))
-        return [(title, odds) for title, odds in items if odds is not None]
+        return [(title, self.settle_on_strike(title, odds)) for title, odds in items if odds is not None]
+
+    def settle_on_strike(self, title: str, odds: CloseOdds | str) -> CloseOdds | str:
+        """Measure the odds against the Predict market's own target price (the close it settles against,
+        e.g. Yahoo ^KS11 / KRX official) when it is known and our reference close differs from it."""
+        if not isinstance(odds, CloseOdds) or not self.config.predict:
+            return odds
+        key = self.predict_key(title)
+        stem = self.config.predict_slugs.get(key)
+        slug = predict_slug(stem, odds.target) if stem else ""
+        strike = (self.predict.strikes.get(slug) or (None,))[0] if slug else None
+        if strike is None or strike == odds.ref:
+            return odds
+        if abs(percent(strike, odds.ref)) >= 5:  # another unit or another underlying: do not mix them
+            return dataclasses.replace(odds, ref_note=odds.ref_note + f"｜Predict 目标价 {fmt(strike)} 与参考相差过大，未采用")
+        ticker = self.config.tickers.get(title.split("｜")[-1])
+        tick = price_tick(ticker.market, strike) if ticker and "｜" in title else D("0.01")
+        # A proxy-mapped estimate is "our close × proxy move": move it onto the settlement close too.
+        effective = odds.effective if odds.direct else odds.effective * strike / odds.ref
+        return close_odds(odds.name, strike, effective, odds.sigma_daily, odds.remaining, odds.target, tick,
+                          f"Predict 目标价（本地参考 {fmt(odds.ref)}·{odds.ref_note}）", odds.proxy_note, odds.sigma_note,
+                          odds.unit, odds.beta, odds.mode)
 
     def odds_payload(self) -> dict:
         """JSON for the web page: one entry per item, numbers raw, text already plain."""
