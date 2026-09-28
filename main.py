@@ -3873,7 +3873,7 @@ class Bot:
             if (0 <= a50.quoted_ms - at_close <= 5 * 60_000 and quoted.weekday() < 5
                     and quoted.date() not in self.config.holidays.get("sh", frozenset()) and not self.store.get(key)):
                 self.store.put(key, [a50.quoted_ms, str(a50.last)])
-        close_ms = self.sse_close_ms()
+        close_ms = self.sse_close_ms(now_ms)
         if close_ms:
             saved = self.store.get("anchor:A50", ())
             if self.anchors.get("A50", (0,))[0] != close_ms and isinstance(saved, (list, tuple)) and len(saved) >= 2:
@@ -4031,9 +4031,22 @@ class Bot:
         self.anchor_tries[key] = now
         return True
 
-    def sse_close_ms(self) -> int:
-        """15:00 on the Composite's latest close confirmed by a dated daily bar; 0 = none yet."""
-        return self.cn.close.close_ms if self.cn.close else 0
+    def sse_close(self, now_ms: int) -> DailyClose | None:
+        """The Composite's latest close: the dated daily bar, or, while today's bar is still pending
+        after 15:00, the realtime quote printed at/after the close (replaced once the bar arrives)."""
+        q = self.cn.quote
+        if q is None or not self.cn.close_pending(now_ms):
+            return self.cn.close
+        today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+        at_close = int(dt.datetime.combine(today, dt.time(15, 0), BEIJING).timestamp() * 1000)
+        if q.quoted_ms < at_close or dt.datetime.fromtimestamp(q.quoted_ms / 1000, BEIJING).date() != today:
+            return self.cn.close  # no print from the close yet
+        return DailyClose(today, q.last, q.prev_close, f"{q.source}实时收盘（日K待确认）", q.quoted_ms)
+
+    def sse_close_ms(self, now_ms: int | None = None) -> int:
+        """15:00 on the Composite's latest close (see sse_close); 0 = none yet."""
+        close = self.sse_close(self.market.now_ms() if now_ms is None else now_ms)
+        return close.close_ms if close else 0
 
     def sse_odds(self, now_ms: int) -> CloseOdds | str | None:
         q = self.cn.quote
@@ -4056,8 +4069,10 @@ class Bot:
             sigma, sigma_note = self.vols.get("SSE", "SSE", intraday=True)
             return close_odds("上证指数", ref, q.last, sigma, remaining, target, D("0.01"), ref_note,
                               f"上证现货 {fmt(q.last)}（盘中直接用现货）", sigma_note)
-        # After hours the reference is the close of a dated daily bar, never a realtime "last price".
-        if self.cn.close_pending(now_ms) or not self.cn.confirmed(now_ms):
+        # After hours the reference is the close of a dated daily bar; only today's own closing print
+        # stands in for it while that bar is pending, never an older realtime "last price".
+        close = self.sse_close(now_ms)
+        if close is self.cn.close and (self.cn.close_pending(now_ms) or not self.cn.confirmed(now_ms)):
             detail = f"，日 K 最新为 {close.day.strftime('%m-%d')}" if close else ""
             expected = (dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date() if self.cn.close_pending(now_ms)
                         else self.cn.expected_close(now_ms))
@@ -4493,7 +4508,7 @@ class Bot:
             holidays = self.config.holidays.get("sh", frozenset())
             lines.append(self.cn.line(now_ms, style, holidays))
             anchor = self.anchors.get("A50")
-            lines.append(self.cn.a50_line(now_ms, style, anchor[1] if anchor and anchor[0] == self.sse_close_ms()
+            lines.append(self.cn.a50_line(now_ms, style, anchor[1] if anchor and anchor[0] == self.sse_close_ms(now_ms)
                                           and self.cn.a50 and a50_family(self.a50_anchor_source) == a50_family(self.cn.a50.source)
                                           else None,
                                           self.a50_anchor_note))

@@ -181,7 +181,18 @@ async def run():
     x.a50 = m.IndexQuote("A50期货", D("14300"), D("14250"), None, None, None, bj(2026, 9, 28, 15, 19), "东方财富")
     await x.refresh_daily(now)
     assert not x.confirmed(now) and x.close.day == dt.date(2026, 9, 24)
+    # ... but today's own 15:00 print stands in for it, so the card moves on to the next close at once
+    assert bot.sse_close_ms(now) == bj(2026, 9, 28, 15, 0)
+    assert "缺少 09-28 15:00 的 A50 锚点" in bot.sse_odds(now), bot.sse_odds(now)
+    bot.anchors["A50"] = (bj(2026, 9, 28, 15, 0), D("14290"))
+    o = bot.sse_odds(now)
+    assert isinstance(o, m.CloseOdds) and o.ref == D("3901.55") and o.target == dt.date(2026, 9, 29), o
+    assert o.ref_note == "09-28 收盘·腾讯实时收盘（日K待确认）", o.ref_note
+    # a pre-close print is never used as the close
+    x.quote = m.IndexQuote("上证指数", D("3899.00"), D("3888.37"), None, None, None, bj(2026, 9, 28, 14, 59), "腾讯")
     assert bot.sse_odds(now) == "收盘价待确认（等待 09-28 上证日 K，日 K 最新为 09-24）", bot.sse_odds(now)
+    x.quote = m.IndexQuote("上证指数", D("3901.55"), D("3888.37"), None, None, None, bj(2026, 9, 28, 15, 0), "腾讯")
+    bot.anchors["A50"] = (c24, D("14200"))
     assert "｜<b>收盘价待确认</b>（等待 09-28 日 K）" in m.to_html(x.line(now, "cn", cn))
     # the bar arrives -> confirmed; an older answer later never steps the close back
     feed["rows"] = bars24 + [["2026-09-28", "0", "3901.55", "0", "0", "0"]]
