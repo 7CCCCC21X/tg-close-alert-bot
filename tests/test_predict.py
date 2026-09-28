@@ -177,6 +177,11 @@ async def run():
         assert tab.url == href, tab.url
         await tab.close()
         assert "还没有这个市场" in await page.inner_text("#g-contract")
+        # the header toggle hides every Predict block, and the choice survives a reload
+        await page.click("#showbook"); assert not await page.is_visible("#g-index a.pb")
+        await page.reload(); await page.wait_for_selector(".card .odds")
+        assert not await page.is_checked("#showbook") and not await page.is_visible("#g-index a.pb")
+        await page.click("#showbook"); assert await page.is_visible("#g-index a.pb")
         wide = await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         assert wide, "no horizontal scroll at phone width"
         if os.environ.get("WEB_SCREENSHOT"):
