@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.12.5"
+VERSION = "1.12.6"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -1028,7 +1028,8 @@ class StockMarket:
             return [("Naver", f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}",
                      {"Referer": "https://finance.naver.com/"})]
         sina = ("rt_hk" if ticker.market == "hk" else ticker.market) + ticker.code
-        return [("腾讯", f"https://qt.gtimg.cn/q={ticker.market}{code}", {"Referer": "https://gu.qq.com/"}),
+        tencent = ("r_hk" if ticker.market == "hk" else ticker.market) + code  # plain hkXXXXX is 15 minutes delayed
+        return [("腾讯", f"https://qt.gtimg.cn/q={tencent}", {"Referer": "https://gu.qq.com/"}),
                 ("新浪", f"https://hq.sinajs.cn/list={sina}", {"Referer": "https://finance.sina.com.cn/"})]
 
     LIVE_SECONDS = 20
@@ -1044,14 +1045,22 @@ class StockMarket:
         for index, (symbol, ticker) in enumerate(due.items()):
             if index:
                 await asyncio.sleep(0.3)
-            failures = []
+            failures, best = [], None
             for name, url, extra in SOURCE_HEALTH.order(self.live_sources(ticker)):
                 try:
-                    self.live[symbol] = parse_stock_live(name, ticker.market, await fetch_source(url, extra), now_ms)
-                    self.live_errors.pop(symbol, None)
-                    break
+                    q = parse_stock_live(name, ticker.market, await fetch_source(url, extra), now_ms)
                 except Exception as error:
                     failures.append(f"{name}: {clean_error(error)}")
+                    continue
+                if best is None or q.quoted_ms > best.quoted_ms:
+                    best = q
+                self.live[symbol] = best
+                if not self.live_quote(symbol, now_ms)[1]:
+                    break  # fresh: done
+                # A lagging feed (delayed quotes): try the next source, keep the newest print
+                failures.append(f"{name}: 报价停在 {stamp(q.quoted_ms, seconds=False)}")
+            if best is not None and not self.live_quote(symbol, now_ms)[1]:
+                self.live_errors.pop(symbol, None)
             else:
                 self.live_errors[symbol] = "；".join(failures)
 
