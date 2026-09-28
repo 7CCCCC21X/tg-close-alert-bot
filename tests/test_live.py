@@ -91,6 +91,17 @@ async def run():
     bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "79.00", "76.50", "20260928150002"), 0)
     o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 15, 14))
     assert o.effective == D("79.00") and o.fair_up > 0.99, o
+    # Once the closing print is noted, the card moves on to the next close measured from it, without
+    # waiting for the daily bar (which only confirms it after 15:15)
+    bot.note_live_close("UNITREEUSDT", cfg.tickers["UNITREEUSDT"], bj(9, 28, 15, 14))
+    assert bot.odds_base("UNITREEUSDT", bj(9, 28, 15, 14))[:2] == (bj(9, 28, 15, 0), D("79.00"))
+    assert bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 15, 14)) == "等待币安在收盘时刻的价格"
+    bot.anchors["UNITREEUSDT"] = (bj(9, 28, 15, 0), D("10.80"))
+    o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 15, 14))
+    assert o.target == dt.date(2026, 9, 29) and o.ref == D("79.00") and o.effective == D("79.00") and "日K待确认" in o.ref_note, o
+    o = bot.contract_odds("UNITREEUSDT", D("10.90"), bj(9, 28, 15, 40))  # live window over, bar still pending
+    assert o.target == dt.date(2026, 9, 29) and o.ref == D("79.00") and o.effective > D("79.00"), o
+    bot.anchors["UNITREEUSDT"] = (bj(9, 24, 15, 0), D("10.60"))
     # Yesterday's quote at the open is not today's price
     bot.stocks.live["UNITREEUSDT"] = m.parse_stock_live("腾讯", "sh", tencent("sh688836", "76.50", "75.00", "20260924150002"), 0)
     o = bot.contract_odds("UNITREEUSDT", D("10.80"), bj(9, 28, 9, 31))

@@ -2545,7 +2545,7 @@ PREDICT_SITE = "https://predict.fun/zh-cn/market/"
 PREDICT_ITEMS = (("HSI", "恒生指数", "hk"), ("KOSPI", "KOSPI", "kr"), ("SSE", "上证指数", "sh"))
 PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
 PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and never recommended
-PREDICT_MISS_SECONDS = 600      # an unknown slug is looked up again after this long
+PREDICT_MISS_SECONDS = 60       # an unknown slug is looked up again after this long (new markets show up within a minute)
 PREDICT_DEPTH = 5
 MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
           "november", "december")
@@ -3800,11 +3800,12 @@ class Bot:
     async def refresh_odds_inputs(self, now_ms: int) -> None:
         """Proxy prices at each reference close and volatility estimates (cached; best effort)."""
         for symbol, ticker in self.config.tickers.items():
-            ref = self.reference_for("exchange", symbol, now_ms)
-            if ref and ref.close_ms and self.anchors.get(symbol, (0,))[0] != ref.close_ms and self.retry_ok(symbol):
+            self.note_live_close(symbol, ticker, now_ms)
+            close_ms = self.odds_base(symbol, now_ms)[0]
+            if close_ms and self.anchors.get(symbol, (0,))[0] != close_ms and self.retry_ok(symbol):
                 with contextlib.suppress(Exception):
-                    price, _ = await self.market.price_at(symbol, ref.close_ms)
-                    self.anchors[symbol] = (ref.close_ms, price)
+                    price, _ = await self.market.price_at(symbol, close_ms)
+                    self.anchors[symbol] = (close_ms, price)
             if self.vols.due(symbol):
                 self.vols.refreshed[symbol] = time.monotonic()  # one attempt per window even if it fails
                 with contextlib.suppress(Exception):
@@ -4072,25 +4073,57 @@ class Bot:
             day -= dt.timedelta(days=1)
         return day
 
+    def note_live_close(self, symbol: str, ticker: StockTicker, now_ms: int) -> None:
+        """Remember the stock's own print once today's close has passed, before the daily bar confirms it,
+        so the probability can move on to the next close right away (persisted across restarts)."""
+        info = STOCK_MARKETS[ticker.market]
+        tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+        today = dt.datetime.fromtimestamp(now_ms / 1000, tz).date()
+        close_ms = int(dt.datetime.combine(today, info.close_time, tz).timestamp() * 1000)
+        if now_ms < close_ms + 60_000:
+            return
+        live, _ = self.stocks.live_quote(symbol, now_ms)  # None once the close is final (+15 min): keep the last one
+        if live is None or live.quoted_ms < close_ms - 5 * 60_000:
+            return  # no print from the closing auction yet
+        record = [close_ms, str(live.last), live.source]
+        if self.store.get(f"live_close:{symbol}") != record:
+            self.store.put(f"live_close:{symbol}", record)
+
+    def odds_base(self, symbol: str, now_ms: int) -> tuple[int, D | None, str]:
+        """(close ms, close value, note) the next-close probability is measured from: the confirmed
+        exchange close, or today's live closing print while the daily bar has not confirmed it yet."""
+        ref = self.reference_for("exchange", symbol, now_ms)
+        best = (ref.close_ms, ref.value, f"{close_when(ref)}·{short_source(ref.source)}") if ref and ref.close_ms else (0, None, "")
+        saved = self.store.get(f"live_close:{symbol}")
+        with contextlib.suppress(ValueError, TypeError, IndexError, decimal.InvalidOperation):
+            close_ms, value = int(saved[0]), D(str(saved[1]))
+            # A manual close in another unit (≥20% apart) cannot be compared with the stock's own print.
+            if close_ms > best[0] and value > 0 and close_ms <= now_ms and (best[1] is None or abs(percent(best[1], value)) < 20):
+                best = (close_ms, value, f"{stamp(close_ms, seconds=False)}·{saved[2]}现货收盘（日K待确认）")
+        return best
+
     def contract_odds(self, symbol: str, price: D, now_ms: int) -> CloseOdds | str | None:
         ticker = self.config.tickers.get(symbol)
         if not self.config.probability or not ticker:
             return None
         ref = self.reference_for("exchange", symbol, now_ms)
-        if ref is None or not ref.close_ms:
+        base_ms, base_value, base_label = self.odds_base(symbol, now_ms)
+        if not base_ms:
             return "缺少带收盘时刻的交易所收盘价"
         anchor = self.anchors.get(symbol)
         info = STOCK_MARKETS[ticker.market]
         holidays = self.config.holidays.get(ticker.market, frozenset())
-        close_date = dt.datetime.fromtimestamp(ref.close_ms / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset))).date()
+        tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+        close_date = dt.datetime.fromtimestamp(base_ms / 1000, tz).date()
         sigma, sigma_note = self.vols.get(symbol, ticker.market)
-        unit = "" if ticker.same_unit else (ref.currency or info.currency)
+        unit = "" if ticker.same_unit else ((ref.currency if ref else "") or info.currency)
         live, live_why = self.stocks.live_quote(symbol, now_ms)
-        if live is not None:
+        closed_today = close_date == dt.datetime.fromtimestamp(now_ms / 1000, tz).date() and base_ms <= now_ms
+        if live is not None and not closed_today:
             # The stock itself is trading: use its own price, not the Binance proxy.
-            same_unit = not live.prev_close or abs(percent(ref.value, live.prev_close)) < 20  # a manual close in another unit
+            same_unit = not live.prev_close or abs(percent(base_value, live.prev_close)) < 20  # a manual close in another unit
             if close_date == expected_close_date(ticker.market, now_ms, holidays) and same_unit:
-                base, base_note = ref.value, f"{close_when(ref)}·{short_source(ref.source)}"
+                base, base_note = base_value, base_label
             elif live.prev_close:
                 base, base_note = live.prev_close, "昨收（实时行情）"
             else:
@@ -4099,12 +4132,12 @@ class Bot:
             return close_odds(NAMES.get(symbol, symbol), base, live.last, sigma, remaining, target,
                               price_tick(ticker.market, base), base_note,
                               f"{info.name}现货 {fmt_price(live.last)}（{live.source}·盘中直接用现货）", sigma_note, unit)
-        if anchor is None or anchor[0] != ref.close_ms:
+        if anchor is None or anchor[0] != base_ms:
             return "等待币安在收盘时刻的价格"
         remaining, target = session_remaining(ticker.market, now_ms, close_date, holidays)
         move = percent(price, anchor[1])
-        return close_odds(NAMES.get(symbol, symbol), ref.value, ref.value * price / anchor[1], sigma, remaining, target,
-                          price_tick(ticker.market, ref.value), f"{close_when(ref)}·{short_source(ref.source)}",
+        return close_odds(NAMES.get(symbol, symbol), base_value, base_value * price / anchor[1], sigma, remaining, target,
+                          price_tick(ticker.market, base_value), base_label,
                           f"币安 {fmt_price(price)} / 收盘时刻 {fmt_price(anchor[1])} → {move:+.3f}%"
                           + (f"｜{live_why}，暂用币安" if live_why else ""), sigma_note, unit)
 
