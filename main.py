@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.13.2"
+VERSION = "1.13.3"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -893,11 +893,17 @@ class Binance:
 
 def parse_daily_bars(market: str, raw: bytes) -> list[tuple[dt.date, D]]:
     """(date, close) per daily bar, oldest first, from the market's data source."""
-    bars: list[tuple[dt.date, D]] = []
+    return [(day, close) for day, _, close in parse_daily_ohlc(market, raw)]
+
+
+def parse_daily_ohlc(market: str, raw: bytes) -> list[tuple[dt.date, D | None, D]]:
+    """(date, open or None, close) per daily bar, oldest first, from the market's data source."""
+    bars: list[tuple[dt.date, D | None, D]] = []
     if market == "kr":
         # Naver: <item data="20260917|open|high|low|close|volume" /> (EUC-KR page, digits are ASCII)
-        for date, close in re.findall(rb'data="(\d{8})\|[^|"]*\|[^|"]*\|[^|"]*\|([0-9.]+)\|', raw):
-            bars.append((dt.datetime.strptime(date.decode(), "%Y%m%d").date(), number(close.decode(), "收盘价")))
+        for date, opening, close in re.findall(rb'data="(\d{8})\|([^|"]*)\|[^|"]*\|[^|"]*\|([0-9.]+)\|', raw):
+            bars.append((dt.datetime.strptime(date.decode(), "%Y%m%d").date(), _open_price(opening.decode()),
+                         number(close.decode(), "收盘价")))
     else:
         # Eastmoney: {"data": {"klines": ["2026-09-17,open,close,high,low,...", ...]}}
         try:
@@ -907,10 +913,28 @@ def parse_daily_bars(market: str, raw: bytes) -> list[tuple[dt.date, D]]:
         for line in klines:
             parts = str(line).split(",")
             if len(parts) >= 3:
-                bars.append((dt.date.fromisoformat(parts[0]), number(parts[2], "收盘价")))
+                bars.append((dt.date.fromisoformat(parts[0]), _open_price(parts[1]), number(parts[2], "收盘价")))
     if not bars:
         raise ValueError("日 K 接口没有返回任何交易日")
     return bars
+
+
+def _open_price(text: str) -> D | None:
+    """A daily bar's open, or None when missing / not a positive number (it only feeds volatility)."""
+    try:
+        value = D(str(text).strip())
+    except decimal.InvalidOperation:
+        return None
+    return value if value.is_finite() and value > 0 else None
+
+
+def finished_bars(bars: list[tuple], market: str, now_ms: int) -> list[tuple]:
+    """Daily bars (date first) whose session has ended: today's bar counts only 15 minutes after the close."""
+    info = STOCK_MARKETS[market]
+    tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+    local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
+    done = local >= dt.datetime.combine(local.date(), info.close_time, tz) + dt.timedelta(minutes=15)
+    return [bar for bar in bars if bar[0] < local.date() or (bar[0] == local.date() and done)]
 
 
 def last_completed_bar(bars: list[tuple[dt.date, D]], info: StockMarketInfo,
@@ -1838,17 +1862,22 @@ def parse_cn_index(source: str, raw: bytes, now_ms: int, name: str = "上证指�
 
 def parse_cn_daily(source: str, raw: bytes) -> list[tuple[dt.date, D]]:
     """Dated Shanghai Composite daily bars (date, close), oldest first; the code is checked."""
+    return [(day, close) for day, _, close in parse_cn_daily_ohlc(source, raw)]
+
+
+def parse_cn_daily_ohlc(source: str, raw: bytes) -> list[tuple[dt.date, D | None, D]]:
+    """As parse_cn_daily, with each bar's open (None when missing)."""
     try:
         data = json.loads(raw)["data"]
         if source == "腾讯日K":  # {"data": {"sh000001": {"day": [["2026-09-24", open, close, high, low, vol], ...]}}}
             if "sh000001" not in data:
                 raise ValueError("腾讯日 K 没有返回 sh000001")
-            rows = [(r[0], r[2]) for r in data["sh000001"].get("day") or [] if len(r) > 2]
+            rows = [(r[0], r[1], r[2]) for r in data["sh000001"].get("day") or [] if len(r) > 2]
         else:  # Eastmoney: {"data": {"code": "000001", "market": 1, "klines": ["2026-09-24,open,close", ...]}}
             if str(data.get("code")) != "000001" or int(data.get("market", -1)) != 1:
                 raise ValueError(f"东方财富日 K 代码不是上证指数（{data.get('market')}.{data.get('code')}）")
-            rows = [tuple(str(line).split(",")[:3:2]) for line in data.get("klines") or []]
-        bars = sorted((dt.date.fromisoformat(day), number(close, "上证收盘")) for day, close in rows)
+            rows = [tuple(str(line).split(",")[:3]) for line in data.get("klines") or []]
+        bars = sorted((dt.date.fromisoformat(day), _open_price(opening), number(close, "上证收盘")) for day, opening, close in rows)
     except (ValueError, KeyError, TypeError, AttributeError) as error:
         raise ValueError(f"{source}格式异常：{clean_error(error)}") from None
     if not bars:
@@ -1921,6 +1950,7 @@ class CnIndex:
         self.a50: IndexQuote | None = None
         self.close: DailyClose | None = None
         self.bars: list[tuple[dt.date, D]] = []
+        self.opens: dict[dt.date, D] = {}  # daily-bar opens (volatility split only)
         self.error = ""
         self.a50_error = ""
         self.a50_skipped = ""  # why earlier A50 sources failed when a later one answered
@@ -2002,15 +2032,15 @@ class CnIndex:
         for name, url, extra in SOURCE_HEALTH.order(self.DAILY_SOURCES):
             try:
                 raw = await fetch_source(url, extra)
-                bars = [(day, close) for day, close in parse_cn_daily(name, raw)
-                        if day <= dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()]
+                ohlc = [bar for bar in parse_cn_daily_ohlc(name, raw) if bar[0] <= dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()]
+                bars = [(day, close) for day, _, close in ohlc]
                 day, close, prev = last_completed_bar(bars, STOCK_MARKETS["sh"], now_ms)
             except Exception as error:
                 failures.append(f"{name}: {clean_error(error)}")
                 continue
             if self.close is None or day >= self.close.day:  # never step back to an older session
                 self.close = DailyClose(day, close, prev, name, now_ms)
-            self.bars, self.daily_error = bars, ""
+            self.bars, self.opens, self.daily_error = bars, {day: o for day, o, _ in ohlc if o}, ""
             return
         self.daily_error = "；".join(failures)
 
@@ -2448,6 +2478,29 @@ def realised_vol(closes: list[D]) -> tuple[float, int]:
     return math.sqrt(sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)), len(returns)
 
 
+INTRADAY_SHARE_BOUNDS = (0.3, 1.0)  # in-session share of the daily variance is clamped to this range
+INTRADAY_SHARE_MIN_DAYS = 10
+
+
+def intraday_share(opens: list[D | None], closes: list[D]) -> tuple[float, int] | None:
+    """Share of close-to-close variance that happens open→close: Σ ln(C/O)² / (Σ ln(O/C₋₁)² + Σ ln(C/O)²).
+
+    During a session the opening gap has already happened, so only this share of the daily variance is
+    still ahead (scaled by the session time left). None when too few days carry an open.
+    """
+    gap = body = 0.0
+    n = 0
+    for prev, opening, close in zip(closes, opens[1:], closes[1:]):
+        if opening and prev and close and opening > 0 and prev > 0 and close > 0:
+            gap += math.log(float(opening / prev)) ** 2
+            body += math.log(float(close / opening)) ** 2
+            n += 1
+    if n < INTRADAY_SHARE_MIN_DAYS or gap + body <= 0:
+        return None
+    low, high = INTRADAY_SHARE_BOUNDS
+    return min(high, max(low, body / (gap + body))), n
+
+
 class VolBook:
     """Daily volatility per asset: manual override, else recent realised volatility blended with a prior."""
     REFRESH_SECONDS = 6 * 3600
@@ -2455,25 +2508,39 @@ class VolBook:
     def __init__(self, overrides: dict[str, float]):
         self.overrides = dict(overrides)
         self.estimates: dict[str, tuple[float, int, str]] = {}   # key -> (sigma, n, source)
+        self.shares: dict[str, tuple[float, int]] = {}           # key -> (in-session share of daily variance, n)
         self.refreshed: dict[str, float] = {}
 
     def due(self, key: str) -> bool:
         return key not in self.overrides and time.monotonic() - self.refreshed.get(key, -1e9) >= self.REFRESH_SECONDS
 
-    def record(self, key: str, closes: list[D], source: str) -> None:
+    def record(self, key: str, closes: list[D], source: str, opens: list[D | None] | None = None) -> None:
+        """closes oldest first, finished sessions only; opens (same days) split the variance into gap and session."""
         sigma, n = realised_vol(closes)
         self.estimates[key] = (sigma, n, source)
         self.refreshed[key] = time.monotonic()
+        share = intraday_share(opens, closes) if opens else None
+        if share is None:
+            self.shares.pop(key, None)
+        else:
+            self.shares[key] = share
 
-    def get(self, key: str, prior_key: str) -> tuple[float, str]:
+    def get(self, key: str, prior_key: str, intraday: bool = False) -> tuple[float, str]:
+        """Daily close-to-close σ. intraday=True: only the in-session part (today's opening gap has happened)."""
         if key in self.overrides:
-            return self.overrides[key], "PROB_VOL 手动设定"
-        prior = PRIOR_VOL[prior_key]
-        sigma, n, source = self.estimates.get(key, (0.0, 0, ""))
-        if n < 2:
-            return prior, f"先验 {prior * 100:.1f}%，暂无历史"
-        blended = math.sqrt((n * sigma ** 2 + PRIOR_WEIGHT * prior ** 2) / (n + PRIOR_WEIGHT))
-        return blended, f"{source} {n} 日 {sigma * 100:.2f}% 与先验 {prior * 100:.1f}% 加权"
+            sigma, note = self.overrides[key], "PROB_VOL 手动设定"
+        else:
+            prior = PRIOR_VOL[prior_key]
+            est, n, source = self.estimates.get(key, (0.0, 0, ""))
+            if n < 2:
+                sigma, note = prior, f"先验 {prior * 100:.1f}%，暂无历史"
+            else:
+                sigma = math.sqrt((n * est ** 2 + PRIOR_WEIGHT * prior ** 2) / (n + PRIOR_WEIGHT))
+                note = f"{source} {n} 日 {est * 100:.2f}% 与先验 {prior * 100:.1f}% 加权"
+        share = self.shares.get(key)
+        if intraday and share is not None:
+            return sigma * math.sqrt(share[0]), f"{note}；盘中取 {share[0] * 100:.0f}% 方差（{share[1]} 日开盘跳空已扣除）"
+        return sigma, note
 
 
 # --- Predict.fun orderbook vs model ---------------------------------------------------------------
@@ -3826,7 +3893,8 @@ class Bot:
                     self.store.put("anchor:A50", [close_ms, str(price), "15:00", "东方财富"])
         if self.vols.due("SSE") and len(self.cn.bars) > 2:  # the dated bars CnIndex already read
             self.vols.refreshed["SSE"] = time.monotonic()
-            self.vols.record("SSE", [close for _, close in self.cn.bars], "上证日K")
+            done = finished_bars(self.cn.bars, "sh", now_ms)
+            self.vols.record("SSE", [close for _, close in done], "上证日K", [self.cn.opens.get(day) for day, _ in done])
         # Index volatility: KOSPI from Naver; HSI from Tencent, else Eastmoney. One attempt per window.
         sources = {"KOSPI": (("https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=40&symbol=KOSPI", "naver"),),
                    "HSI": (("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=hkHSI,day,,,40,", "tencent"),
@@ -3839,13 +3907,16 @@ class Bot:
             for url, kind in urls:
                 try:
                     raw = await fetch_source(url)
+                    market = "kr" if key == "KOSPI" else "hk"
                     if kind == "tencent":
                         days = json.loads(raw)["data"]["hkHSI"]
-                        closes = [number(r[2], "收盘") for r in (days.get("day") or days.get("qfqday") or []) if len(r) > 2]
+                        bars = [(dt.date.fromisoformat(r[0]), _open_price(r[1]), number(r[2], "收盘"))
+                                for r in (days.get("day") or days.get("qfqday") or []) if len(r) > 2]
                     else:
-                        closes = [c for _, c in parse_daily_bars("kr" if kind == "naver" else "hk", raw)]
-                    if len(closes) > 2:
-                        self.vols.record(key, closes, "指数日K")
+                        bars = parse_daily_ohlc(market, raw)
+                    bars = finished_bars(sorted(bars, key=lambda bar: bar[0]), market, now_ms)  # today's bar is still moving
+                    if len(bars) > 2:
+                        self.vols.record(key, [c for _, _, c in bars], "指数日K", [o for _, o, _ in bars])
                         break
                 except Exception:
                     continue
@@ -3950,6 +4021,7 @@ class Bot:
                 return "缺少上证昨收"
             today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
             remaining, target = session_remaining("sh", now_ms, today - dt.timedelta(days=1), holidays)
+            sigma, sigma_note = self.vols.get("SSE", "SSE", intraday=True)
             return close_odds("上证指数", ref, q.last, sigma, remaining, target, D("0.01"), ref_note,
                               f"上证现货 {fmt(q.last)}（盘中直接用现货）", sigma_note)
         # After hours the reference is the close of a dated daily bar, never a realtime "last price".
@@ -4055,7 +4127,9 @@ class Bot:
         sigma, sigma_note = self.vols.get("HSI", "HSI")
         if cash_open and q.spot_prev:
             remaining, target = session_remaining("hk", now_ms, local.date() - dt.timedelta(days=1), self.config.holidays.get("hk", frozenset()))
-            return close_odds("恒生指数", q.spot_prev, q.spot, sigma, remaining, target, D("0.01"), "昨收",
+            sigma, sigma_note = self.vols.get("HSI", "HSI", intraday=True)
+            prev_day = expected_close_date("hk", now_ms, self.config.holidays.get("hk", frozenset()))
+            return close_odds("恒生指数", q.spot_prev, q.spot, sigma, remaining, target, D("0.01"), f"{prev_day.strftime('%m-%d')} 收盘",
                               f"恒指现货 {fmt(q.spot)}（盘中直接用现货）", sigma_note)
         close_date = self.hk_cash_close_date(now_ms, holidays)
         anchor, anchor_note = None, "收市时"
@@ -4087,8 +4161,11 @@ class Bot:
         quoted_day = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date()
         local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
         if quoted_day == local.date() and krx_session(now_ms) == "交易中" and k.prev_close:
-            remaining, target = session_remaining("kr", now_ms, quoted_day - dt.timedelta(days=1), self.config.holidays.get("kr", frozenset()))
-            return close_odds("KOSPI", k.prev_close, k.last, sigma, remaining, target, D("0.01"), "昨收",
+            holidays = self.config.holidays.get("kr", frozenset())
+            remaining, target = session_remaining("kr", now_ms, quoted_day - dt.timedelta(days=1), holidays)
+            sigma, sigma_note = self.vols.get("KOSPI", "KOSPI", intraday=True)
+            prev_day = expected_close_date("kr", now_ms, holidays)
+            return close_odds("KOSPI", k.prev_close, k.last, sigma, remaining, target, D("0.01"), f"{prev_day.strftime('%m-%d')} 收盘",
                               f"KOSPI 现货 {fmt(k.last)}（盘中直接用现货）", sigma_note)
         hl, anchor = self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
         holidays = self.config.holidays.get("kr", frozenset())
@@ -4658,7 +4735,9 @@ class Bot:
             lines.append(f"  KR200 锚点：{f'{fmt(anchor[1])} @ {stamp(anchor[0], seconds=False)}（{self.kospi_anchor_note}·HL）' if anchor else '无'}"
                          + (f"｜最近查找失败：{brief_error(self.kospi_anchor_error, 120)}" if self.kospi_anchor_error else ""))
             sigma, note = self.vols.get("KOSPI", "KOSPI")
-            lines.append(f"  KOSPI 波动率：{sigma * 100:.2f}%（{note}）")
+            share = self.vols.shares.get("KOSPI")
+            lines.append(f"  KOSPI 波动率：{sigma * 100:.2f}%（{note}）"
+                         + (f"｜盘中 {sigma * math.sqrt(share[0]) * 100:.2f}%（开盘→收盘占 {share[0] * 100:.0f}%）" if share else "｜暂无开盘价，盘中不扣跳空"))
             odds = self.kospi_odds(now_ms)
             if isinstance(odds, CloseOdds):
                 lines.append(f"  KOSPI 概率：涨 {odds.fair_up * 100:.1f}¢（有效 {fmt(odds.effective.quantize(D('0.01')))}）")
