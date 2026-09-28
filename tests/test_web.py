@@ -28,7 +28,10 @@ async def browser_check(async_playwright, chrome, port, token):
         await page.goto(f"http://127.0.0.1:{port}/p/{token}")
         await page.wait_for_selector(".card .odds")
         text = await page.inner_text(".wrap")
-        assert "上证指数" in text and "目标 10-08 15:00 上交所收盘（北京时间）" in text and "涨35.0¢" in text and "概率暂缺：等待行情" in text, text
+        assert "上证指数" in text and "10-08 下周四" in text and "涨35.0¢" in text and "概率暂缺：等待行情" in text, text
+        # the full close time sits on the countdown's tooltip (and in the details), not as another line
+        assert await page.get_attribute(".cd", "title") == "目标 10-08 15:00 上交所收盘（北京时间）"
+        assert "09-30 收" in text and "目标" not in await page.inner_text("#g-index .card"), text
         cd = await page.inner_text(".cd")
         # server clock is 09-30 22:05 and the close is 10-08 15:00 → 7 days 16:55 left (ticking down)
         assert cd.startswith("⏳ 7天 16:5"), cd
@@ -36,7 +39,7 @@ async def browser_check(async_playwright, chrome, port, token):
         assert await page.inner_text(".cd") != cd, "countdown must tick"
         assert "数据 09-30 22:05:00" in await page.inner_text("#meta") and "秒前刷新" in await page.inner_text("#meta")
         assert await page.inner_text("#h-index") == "指数" and await page.is_visible("#h-contract")
-        assert "UNITREEUSDT" in await page.inner_text("#g-contract") and "上证指数" in await page.inner_text("#g-index")
+        assert await page.get_attribute("#g-contract .name", "title") == "UNITREEUSDT" and "上证指数" in await page.inner_text("#g-index")
         await page.click("#g-index details summary"); assert await page.is_visible("#g-index dl")
         await page.wait_for_timeout(10500)  # survives one data refresh
         assert await page.is_visible("#g-index dl"), "open details must stay open across refresh"

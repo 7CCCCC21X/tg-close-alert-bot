@@ -204,12 +204,14 @@ async def run():
         await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
         await page.wait_for_selector(".pb .edges")
         text = await page.inner_text("#g-index")
-        assert "Predict 盘口" in text and "买1 81.0¢×400" in text and "挂跌 15.0¢" in text and "优势最大" in text, text
+        assert "Predict ↗" in text and "买1 81.0¢×400" in text and "挂跌 15.0¢" in text and "+24.9¢" in text, text
+        # a best edge of 10¢ or more puts a red frame round the card
+        assert await page.locator("#g-index .card.hot .edge.best.hot").count() == 1
         assert await page.locator(".edge.best").count() == 1
         # the whole block is one link: quote line, edge chips and tip all sit inside it
         href = m.PREDICT_SITE + want["SSE"] + "?ref=B00EA"
         assert await page.get_attribute("#g-index a.pb", "href") == href and await page.get_attribute("#g-index a.pb", "target") == "_blank"
-        assert await page.locator("#g-index a.pb .edges .edge.best").count() == 1 and await page.locator("#g-index a.pb .tip").count() == 1
+        assert await page.locator("#g-index a.pb .edges .edge.best").count() == 1 and await page.locator("#g-index a.pb .edges .edge").count() == 4
         await page.context.route("https://predict.fun/**", lambda route: route.fulfill(body="predict", content_type="text/html"))
         async with page.context.expect_page() as popup:
             await page.click("#g-index a.pb .edge.best")  # a click on an edge chip opens the market too
