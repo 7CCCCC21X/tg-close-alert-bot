@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.13.3"
+VERSION = "1.13.5"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -187,13 +187,13 @@ class StockMarketInfo:
     tz_name: str = "北京时间"
 
     def close_label(self, close_ms: int) -> str:
-        """'｜收盘 09-18 15:00（北京时间）', or with the venue's local time first when it differs."""
+        """'｜收盘 09-18 15:00（北京时间）', plus the venue's local time when it differs."""
         if not close_ms:
             return ""
         if self.utc_offset == 8:
             return close_label(close_ms)
         local = dt.datetime.fromtimestamp(close_ms / 1000, dt.timezone(dt.timedelta(hours=self.utc_offset)))
-        return f"｜收盘 {local.strftime('%m-%d %H:%M')}（{self.tz_name}）＝北京 {stamp(close_ms, seconds=False)}"
+        return f"｜收盘 {stamp(close_ms, seconds=False)}（北京时间，{self.tz_name[:-2]} {local.strftime('%H:%M')}）"
 
 
 # Official closing-price times, verified 2026-09:
@@ -766,10 +766,7 @@ def manual_baseline(record: dict | None, now_ms: int, kind: str = "manual") -> B
 
 
 def close_when(ref: "Baseline") -> str:
-    """'09-23 15:30 韩国时间' for non-Beijing venues, else '09-23 15:00'."""
-    local = re.search(r"收盘 (\S+ \S+)（([^）]+)）", ref.close_note or "")
-    if local and local.group(2) != "北京时间":
-        return f"{local.group(1)} {local.group(2)}"
+    """Beijing close time such as '09-23 14:30'."""
     return stamp(ref.close_ms, seconds=False) if ref.close_ms else "上一交易日"
 
 
@@ -781,9 +778,6 @@ def reference_row(kind: str, price: D, ref: Baseline | None, fx: "FxRates | None
     if ref is None:
         return f"{label} 未设置（{command}）"
     when = f"{stamp(ref.close_ms, seconds=False)} 收" if ref.close_ms else "上一交易日"
-    local = re.search(r"收盘 (\S+ \S+)（([^）]+)）", ref.close_note or "")
-    if local and local.group(2) != "北京时间":  # Non-Beijing venue: show its local close time.
-        when = f"{local.group(1)} {local.group(2)} 收"
     meta = "·".join(x for x in (when, short_source(ref.source)) if x)
     day = f"｜当日 {pct_text(percent(ref.value, ref.prev_value), style)}" if ref.prev_value else ""
     if ref.currency in SAME_UNIT:
@@ -1061,7 +1055,8 @@ class StockMarket:
                     self.closes[symbol] = Baseline(number(saved["value"], "收盘价"), saved["key"], saved["label"],
                                                    int(saved["valid_until_ms"]), int(saved["close_ms"]),
                                                    saved.get("currency", ""), saved.get("source", ""),
-                                                   saved.get("close_note", ""),
+                                                   # Re-derive: older versions stored venue-local text.
+                                                   STOCK_MARKETS[config.tickers[symbol].market].close_label(int(saved["close_ms"])),
                                                    D(saved["prev_value"]) if saved.get("prev_value") else None)
 
     @staticmethod
@@ -2200,8 +2195,7 @@ class KospiIndex:
         if q.change is not None and q.prev_close:
             line += f" → 昨收 {bold(fmt(q.prev_close))} {pct_text(q.change / q.prev_close * 100, style)}（{q.change:+,.2f}）"
         kst = dt.timezone(dt.timedelta(hours=9))
-        local = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst)
-        line += f"｜{local.strftime('%m-%d %H:%M')} 韩国时间 {q.source}" + stale_note(q.quoted_ms, now_ms, kst)
+        line += f"｜{stamp(q.quoted_ms, seconds=False)} {q.source}" + stale_note(q.quoted_ms, now_ms, kst)
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error)}" if self.error else line
 
     def line200(self, now_ms: int, style: str, hl: "HlQuote | None", hl_note: str = "") -> str:
@@ -2221,8 +2215,7 @@ class KospiIndex:
         elif hl_note:
             line += f"｜🌊 HL {brief_error(hl_note, 40)}"
         kst = dt.timezone(dt.timedelta(hours=9))
-        local = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst)
-        line += f"｜{local.strftime('%m-%d %H:%M')} 韩国时间 {q.source}" + stale_note(q.quoted_ms, now_ms, kst)
+        line += f"｜{stamp(q.quoted_ms, seconds=False)} {q.source}" + stale_note(q.quoted_ms, now_ms, kst)
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error200)}" if self.error200 else line
 
 
@@ -4315,7 +4308,9 @@ class Bot:
             market = ticker.market if ticker else "sh"
         info = STOCK_MARKETS[market]
         close = dt.datetime.combine(target, info.close_time, dt.timezone(dt.timedelta(hours=info.utc_offset)))
-        return int(close.timestamp() * 1000), f"{close.strftime('%m-%d %H:%M')} {info.name}收盘（{info.tz_name}）"
+        local = f"，{info.tz_name[:-2]} {close.strftime('%H:%M')}" if info.utc_offset != 8 else ""
+        return (int(close.timestamp() * 1000),
+                f"{close.astimezone(BEIJING).strftime('%m-%d %H:%M')} {info.name}收盘（北京时间{local}）")
 
     def web_url(self) -> str:
         path = f"/p/{self.web_token}"

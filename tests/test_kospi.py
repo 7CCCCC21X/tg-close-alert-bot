@@ -24,9 +24,9 @@ e = m.parse_eastmoney_index(em, 0, "韩国KOSPI"); assert e.last == D("3371.89")
 # line
 k = m.KospiIndex(); k.quote = up
 line = k.line(ms(16, 0), "cn")
-assert line == "🇰🇷 " + m.bold("KOSPI 已收盘") + " " + m.bold("3,371.89") + " → 昨收 " + m.bold("3,359.55") + " 🔴 +0.37%（+12.34）｜09-23 15:30 韩国时间 Naver", line
-assert k.line(ms(9, 0, 24), "cn").endswith("｜09-23 15:30 韩国时间 Naver｜⚠️ 非今日数据")
-k.quote = e; assert "KOSPI 已收盘" in k.line(ms(16, 0), "cn") and "韩国时间 东方财富" in k.line(ms(16, 0), "cn")
+assert line == "🇰🇷 " + m.bold("KOSPI 已收盘") + " " + m.bold("3,371.89") + " → 昨收 " + m.bold("3,359.55") + " 🔴 +0.37%（+12.34）｜09-23 14:30 Naver", line
+assert k.line(ms(9, 0, 24), "cn").endswith("｜09-23 14:30 Naver｜⚠️ 非今日数据")
+k.quote = e; assert "KOSPI 已收盘" in k.line(ms(16, 0), "cn") and "14:30 东方财富" in k.line(ms(16, 0), "cn")
 k.quote = None; k.error = "Naver: HTTP 403"; assert k.line(0, "cn") == "🇰🇷 KOSPI ⚠️ 获取失败（Naver: HTTP 403）"
 assert m.KospiIndex(False).line(0, "cn") == ""
 

@@ -82,7 +82,7 @@ async def run():
     assert sse["close_ms"] == int(dt.datetime(2026, 10, 8, 15, 0, tzinfo=m.BEIJING).timestamp() * 1000) and sse["close_label"] == "10-08 15:00 上交所收盘（北京时间）"
     assert payload["server_ms"] == bot.market.now_ms()
     kst = dt.timezone(dt.timedelta(hours=9))
-    assert bot.target_close("KOSPI", dt.date(2026, 9, 28)) == (int(dt.datetime(2026, 9, 28, 15, 30, tzinfo=kst).timestamp() * 1000), "09-28 15:30 韩交所收盘（韩国时间）")
+    assert bot.target_close("KOSPI", dt.date(2026, 9, 28)) == (int(dt.datetime(2026, 9, 28, 15, 30, tzinfo=kst).timestamp() * 1000), "09-28 14:30 韩交所收盘（北京时间，韩国 15:30）")
     assert bot.target_close("宇树 UNITREE｜UNITREEUSDT", dt.date(2026, 9, 28))[1] == "09-28 15:00 上交所收盘（北京时间）"
     assert bot.target_close("恒生指数", dt.date(2026, 9, 28))[1] == "09-28 16:10 港交所收盘（北京时间）"
     json.dumps(payload)  # serialisable
