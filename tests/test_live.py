@@ -132,6 +132,7 @@ async def run():
     await hbot.stocks.refresh_live(t, force=True)
     o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
     assert o.effective == D("35.40") and "新浪" in o.proxy_note and o.ref == D("35.10") and o.unit == "", o
+    assert hbot.card_currency("HK0625USDT") == "HKD" and hbot.card_currency("") == ""  # the web card still names it
     async def all_lag(url, timeout=15, headers=None): return lagging
     m.http_get = all_lag
     await hbot.stocks.refresh_live(t, force=True)
