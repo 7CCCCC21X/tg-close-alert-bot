@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.12.6"
+VERSION = "1.12.7"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -3557,6 +3557,8 @@ class Bot:
             self.store.put(f"kr200_print:{close_ms}", [hl.fetched_ms, str(kr200_price(hl)[0])])  # too late to catch afterwards
         if self.anchors.get("KOSPI", (0,))[0] == close_ms:
             return
+        if hl.fetched_ms < close_ms:
+            return  # today's session is still running: its 15:30 has not happened yet, nothing to look up
         saved = self.store.get("anchor:KOSPI", ())
         with contextlib.suppress(ValueError, TypeError, IndexError, decimal.InvalidOperation):
             if int(saved[0]) == close_ms and D(str(saved[1])) > 0:
