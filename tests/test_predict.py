@@ -204,7 +204,7 @@ async def run():
         await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
         await page.wait_for_selector(".pb .edges")
         text = await page.inner_text("#g-index")
-        assert "Predict ↗" in text and "买1 81.0¢×400" in text and "挂跌 15.0¢" in text and "+24.9¢" in text, text
+        assert "Predict ↗" in text and "买1 81.0¢×400" in text and "挂跌 15.0" in text and "+24.9¢" in text, text
         # a best edge of 10¢ or more puts a red frame round the card
         assert await page.locator("#g-index .card.hot .edge.best.hot").count() == 1
         assert await page.locator(".edge.best").count() == 1

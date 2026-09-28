@@ -2890,13 +2890,14 @@ summary::-webkit-details-marker{display:none}summary:before{content:"▸";color:
 summary .v{color:var(--text)}.chip{font-size:12px;border-radius:6px;padding:0 5px;background:var(--chip);font-weight:600}
 dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:6px 0 2px;font-size:12px}dt{color:var(--muted)}dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 .card.missing p{margin:0;color:var(--muted);font-size:12.5px}
-.pb{border-top:1px solid var(--line);padding-top:6px;font-size:12.5px;font-variant-numeric:tabular-nums}
+.pb{margin-top:auto;border-top:1px solid var(--line);padding-top:6px;font-size:12.5px;font-variant-numeric:tabular-nums}
 a.pb{display:block;color:inherit;text-decoration:none;border-radius:8px;margin:0 -6px;padding:6px 6px 4px;cursor:pointer}
 a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge{background:var(--card)}
 .quote{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 10px;color:var(--muted)}.quote span{white-space:nowrap}.quote b{color:var(--text);font-weight:600}.quote .pt{font-weight:600;color:var(--best)}
 .edges{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:5px}
-.edge{display:flex;flex-direction:column;align-items:center;background:var(--chip);border:1px solid transparent;border-radius:7px;padding:2px 2px 3px;min-width:0;line-height:1.3}
-.edge .el{color:var(--faint);font-size:11.5px;white-space:nowrap}.edge b{font-weight:650;font-size:13px;color:var(--faint);white-space:nowrap}.edge.pos b{color:var(--text)}.edge.pos .el{color:var(--muted)}
+.edge{display:flex;flex-direction:column;align-items:center;background:var(--chip);border:1px solid transparent;border-radius:7px;padding:3px 2px;min-width:0;line-height:1.25;overflow:hidden}
+.edge .el{color:var(--faint);font-size:11px;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}.edge .el i{font-style:normal;font-variant-numeric:tabular-nums}
+.edge b{font-weight:650;font-size:14px;color:var(--faint);white-space:nowrap;font-variant-numeric:tabular-nums}.edge.pos b{color:var(--text)}.edge.pos .el{color:var(--muted)}
 .edge.best{border-color:var(--best);background:var(--best-bg)}.edge.best .el{color:var(--text)}.edge.best b{color:var(--best)}
 .edge.hot{border-color:var(--hot);background:var(--hot-bg)}.edge.hot b{color:var(--hot)}
 .small{font-size:12px;margin-top:3px}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
@@ -2927,7 +2928,8 @@ function book(p){
   if(p.edges&&p.edges.length){const g=$("div","edges");
     p.edges.forEach(e=>{const x=$("div","edge"+(e.best?" best":"")+(e.best&&e.edge>=HOT?" hot":"")+(e.edge>0?" pos":""));
       x.title=e.maker?"挂单排队，成交不保证":"立即成交，量 "+qty(e.size);
-      x.append($("span","el",e.label+" "+cent(e.price)),$("b","",(e.edge>=0?"+":"")+cent(e.edge)));g.append(x)});
+      const el=$("span","el",e.label+" ");el.append($("i","",(e.price*100).toFixed(1)));x.title=e.label+" @ "+cent(e.price)+"："+x.title;
+      x.append(el,$("b","",(e.edge>=0?"+":"")+cent(e.edge)));g.append(x)});
     w.append(g);if(p.stale)w.append($("div","warn small","盘口过期，不给建议"))}
   return w}
 function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
