@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.12.4"
+VERSION = "1.12.5"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -924,6 +924,58 @@ def parse_quote_close(source: str, market: str, raw: bytes, info: StockMarketInf
     return None, number(previous, "昨收价"), None
 
 
+def stock_live_window(market: str, now_ms: int, holidays: frozenset = frozenset()) -> tuple[int, int] | None:
+    """(open, final) epoch ms of today's session while the stock trades, else None.
+
+    Runs from the first continuous-trading minute until the close is final (close time + 15 minutes),
+    so the pre-open auction's indicative prices are never read as trades.
+    """
+    info = STOCK_MARKETS[market]
+    tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+    local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
+    today = local.date()
+    if today.weekday() >= 5 or today in holidays:
+        return None
+    start = dt.datetime.combine(today, SESSIONS[market][0][0], tz)
+    final = dt.datetime.combine(today, info.close_time, tz) + dt.timedelta(minutes=15)
+    if not start <= local < final:
+        return None
+    return int(start.timestamp() * 1000), int(final.timestamp() * 1000)
+
+
+def parse_stock_live(source: str, market: str, raw: bytes, now_ms: int) -> IndexQuote:
+    """Realtime stock quote -> IndexQuote(last, previous close, quote time). Naver for KRX, Tencent/Sina otherwise."""
+    if source == "Naver":
+        q = parse_naver_index(raw, now_ms)
+        return dataclasses.replace(q, source="Naver")
+    text = raw.decode("gbk", errors="ignore")
+    match = re.search(r'="([^"]*)"', text)
+    if not match or not match.group(1).strip():
+        raise ValueError(f"{source}行情为空（代码可能不存在）")
+    fields = match.group(1).split("~" if source == "腾讯" else ",")
+    try:
+        if source == "腾讯":
+            name, current, previous, opened = fields[1], fields[3], fields[4], fields[5]
+            digits = re.sub(r"\D", "", fields[30])[:14]
+            quoted = dt.datetime.strptime(digits[:12], "%Y%m%d%H%M")
+            if len(digits) == 14:
+                quoted = quoted.replace(second=int(digits[12:]))
+        elif market == "hk":
+            name, current, previous, opened = fields[1], fields[6], fields[3], fields[2]
+            quoted = dt.datetime.strptime(f"{fields[17]} {fields[18]}", "%Y/%m/%d %H:%M:%S")
+        else:
+            name, current, previous, opened = fields[0], fields[3], fields[2], fields[1]
+            quoted = dt.datetime.strptime(f"{fields[30]} {fields[31]}", "%Y-%m-%d %H:%M:%S")
+    except (IndexError, ValueError):
+        raise ValueError(f"{source}行情格式异常") from None
+    last = number(current, "现价")
+    if last <= 0:
+        raise ValueError(f"{source}现价为 0（尚未成交或停牌）")
+    tz = dt.timezone(dt.timedelta(hours=STOCK_MARKETS[market].utc_offset))
+    return IndexQuote(name, last, _opt(previous), _opt(opened), None, None,
+                      int(quoted.replace(tzinfo=tz).timestamp() * 1000), source)
+
+
 class StockMarket:
     """Fetches each contract's underlying stock close from public quote feeds.
 
@@ -939,6 +991,9 @@ class StockMarket:
         self.closes: dict[str, Baseline] = {}
         self.errors: dict[str, str] = {}
         self.refreshed = -1e9
+        self.live: dict[str, IndexQuote] = {}   # realtime stock quote while its session runs
+        self.live_errors: dict[str, str] = {}
+        self.live_refreshed = -1e9
         for symbol in config.tickers:
             saved = store.get(f"stock_close:{symbol}") if store else None
             if saved:
@@ -965,6 +1020,63 @@ class StockMarket:
             ("腾讯", f"https://qt.gtimg.cn/q={ticker.market}{code}", {"Referer": "https://gu.qq.com/"}),
             ("新浪", f"https://hq.sinajs.cn/list={sina}", {"Referer": "https://finance.sina.com.cn/"}),
         ]
+
+    @staticmethod
+    def live_sources(ticker: StockTicker) -> list[tuple[str, str, dict[str, str]]]:
+        code = urllib.parse.quote(ticker.code)
+        if ticker.market == "kr":
+            return [("Naver", f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}",
+                     {"Referer": "https://finance.naver.com/"})]
+        sina = ("rt_hk" if ticker.market == "hk" else ticker.market) + ticker.code
+        return [("腾讯", f"https://qt.gtimg.cn/q={ticker.market}{code}", {"Referer": "https://gu.qq.com/"}),
+                ("新浪", f"https://hq.sinajs.cn/list={sina}", {"Referer": "https://finance.sina.com.cn/"})]
+
+    LIVE_SECONDS = 20
+    LIVE_STALE_MS = 10 * 60_000
+
+    async def refresh_live(self, now_ms: int, force: bool = False) -> bool | None:
+        """Realtime quotes, only for the stocks whose session is running now."""
+        due = {symbol: ticker for symbol, ticker in self.config.tickers.items()
+               if stock_live_window(ticker.market, now_ms, self.config.holidays.get(ticker.market, frozenset()))}
+        if not due or (not force and time.monotonic() - self.live_refreshed < self.LIVE_SECONDS):
+            return False  # nothing trading / not due: nothing fetched
+        self.live_refreshed = time.monotonic()
+        for index, (symbol, ticker) in enumerate(due.items()):
+            if index:
+                await asyncio.sleep(0.3)
+            failures = []
+            for name, url, extra in SOURCE_HEALTH.order(self.live_sources(ticker)):
+                try:
+                    self.live[symbol] = parse_stock_live(name, ticker.market, await fetch_source(url, extra), now_ms)
+                    self.live_errors.pop(symbol, None)
+                    break
+                except Exception as error:
+                    failures.append(f"{name}: {clean_error(error)}")
+            else:
+                self.live_errors[symbol] = "；".join(failures)
+
+    def live_quote(self, symbol: str, now_ms: int) -> tuple[IndexQuote | None, str]:
+        """(today's fresh realtime quote, why not) while the stock trades; (None, "") outside its session."""
+        ticker = self.config.tickers.get(symbol)
+        window = ticker and stock_live_window(ticker.market, now_ms, self.config.holidays.get(ticker.market, frozenset()))
+        if not window:
+            return None, ""
+        q = self.live.get(symbol)
+        error = self.live_errors.get(symbol, "")
+        if q is None:
+            return None, f"现货行情未取得（{brief_error(error, 60)}）" if error else "等待现货行情"
+        if q.quoted_ms < window[0] - 30 * 60_000:  # still yesterday's print (pre-open auction may stamp minutes early)
+            return None, "现货今日尚未开盘成交"
+        sessions = SESSIONS[ticker.market]
+        lunch = (sessions[0][1], sessions[1][0]) if len(sessions) > 1 else None  # HK/A-share lunch, Beijing time
+        info = STOCK_MARKETS[ticker.market]
+        tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+        day = dt.datetime.fromtimestamp(now_ms / 1000, tz).date()
+        end = max(sessions[-1][1], info.close_time)  # no new prints after the close; don't call its last one stale
+        clock = min(now_ms, int(dt.datetime.combine(day, end, tz).timestamp() * 1000) + 60_000)
+        if quote_stale(q, clock, self.LIVE_STALE_MS, lunch):
+            return None, f"现货行情已超 10 分钟未更新（最后 {stamp(q.quoted_ms, seconds=False)}）"
+        return q, ""
 
     async def fetch(self, symbol: str, ticker: StockTicker, now_ms: int) -> Baseline:
         info = STOCK_MARKETS[ticker.market]
@@ -3556,17 +3668,33 @@ class Bot:
         if ref is None or not ref.close_ms:
             return "缺少带收盘时刻的交易所收盘价"
         anchor = self.anchors.get(symbol)
-        if not anchor or anchor[0] != ref.close_ms:
-            return "等待币安在收盘时刻的价格"
         info = STOCK_MARKETS[ticker.market]
+        holidays = self.config.holidays.get(ticker.market, frozenset())
         close_date = dt.datetime.fromtimestamp(ref.close_ms / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset))).date()
-        remaining, target = session_remaining(ticker.market, now_ms, close_date, self.config.holidays.get(ticker.market, frozenset()))
         sigma, sigma_note = self.vols.get(symbol, ticker.market)
+        unit = "" if ticker.same_unit else (ref.currency or info.currency)
+        live, live_why = self.stocks.live_quote(symbol, now_ms)
+        if live is not None:
+            # The stock itself is trading: use its own price, not the Binance proxy.
+            same_unit = not live.prev_close or abs(percent(ref.value, live.prev_close)) < 20  # a manual close in another unit
+            if close_date == expected_close_date(ticker.market, now_ms, holidays) and same_unit:
+                base, base_note = ref.value, f"{close_when(ref)}·{short_source(ref.source)}"
+            elif live.prev_close:
+                base, base_note = live.prev_close, "昨收（实时行情）"
+            else:
+                return "缺少昨收"
+            remaining, target = session_remaining(ticker.market, now_ms, None, holidays)
+            return close_odds(NAMES.get(symbol, symbol), base, live.last, sigma, remaining, target,
+                              price_tick(ticker.market, base), base_note,
+                              f"{info.name}现货 {fmt_price(live.last)}（{live.source}·盘中直接用现货）", sigma_note, unit)
+        if anchor is None or anchor[0] != ref.close_ms:
+            return "等待币安在收盘时刻的价格"
+        remaining, target = session_remaining(ticker.market, now_ms, close_date, holidays)
         move = percent(price, anchor[1])
         return close_odds(NAMES.get(symbol, symbol), ref.value, ref.value * price / anchor[1], sigma, remaining, target,
                           price_tick(ticker.market, ref.value), f"{close_when(ref)}·{short_source(ref.source)}",
-                          f"币安 {fmt_price(price)} / 收盘时刻 {fmt_price(anchor[1])} → {move:+.3f}%", sigma_note,
-                          "" if ticker.same_unit else (ref.currency or info.currency))
+                          f"币安 {fmt_price(price)} / 收盘时刻 {fmt_price(anchor[1])} → {move:+.3f}%"
+                          + (f"｜{live_why}，暂用币安" if live_why else ""), sigma_note, unit)
 
     def hsi_odds(self, now_ms: int) -> CloseOdds | str | None:
         q = self.hsi.quote
@@ -4119,8 +4247,11 @@ class Bot:
         for symbol in self.config.symbols:
             snap = self.snapshots.get(symbol) or {}
             err = self.stocks.errors.get(symbol)
-            if "error" in snap or err:
-                lines.append(f"  {short_name(symbol)}：" + "｜".join(x for x in (snap.get("error"), f"交易所收盘：{err}" if err else "") if x))
+            live, why = self.stocks.live_quote(symbol, now_ms)
+            live_text = (f"股票实时：{fmt_price(live.last)}｜{stamp(live.quoted_ms, seconds=False)}｜{live.source}" if live
+                         else f"股票实时：{why}" if why else "")
+            if "error" in snap or err or live_text:
+                lines.append(f"  {short_name(symbol)}：" + "｜".join(x for x in (snap.get("error"), f"交易所收盘：{err}" if err else "", live_text) if x))
         return lines
 
     @staticmethod
@@ -4154,7 +4285,8 @@ class Bot:
     def reference_jobs(self) -> list[tuple[str, Any]]:
         """(name, coroutine factory) per reference feed; each has its own refresh cadence inside."""
         now = self.market.now_ms
-        jobs = [("交易所收盘", lambda: self.stocks.refresh(now())), ("汇率", self.fx.refresh),
+        jobs = [("交易所收盘", lambda: self.stocks.refresh(now())), ("股票实时", lambda: self.stocks.refresh_live(now())),
+                ("汇率", self.fx.refresh),
                 ("恒指期货", lambda: self.hsi.refresh(now())), ("Hyperliquid", self.hl.refresh),
                 ("KOSPI", lambda: self.kospi.refresh(now())), ("上证/A50", lambda: self.cn.refresh(now()))]
         if self.config.probability:
