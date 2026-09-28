@@ -2874,31 +2874,33 @@ h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px 8px;display:flex;flex-direction:column;gap:6px;min-width:0}
 .card.hot{border:2px solid var(--hot);box-shadow:0 0 0 3px var(--hot-bg);padding:9px 11px 7px}
 .card.rolled{border-color:var(--best);box-shadow:0 0 0 1px var(--best)}
-.head{display:flex;align-items:center;gap:6px}
-.name{font-weight:650;font-size:15px;min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tag{border-radius:6px;padding:1px 6px;font-size:12px;font-weight:600;background:var(--chip);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+.head{display:flex;align-items:center;gap:5px}
+.name{font-weight:650;font-size:14.5px;min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tag{border-radius:6px;padding:1px 5px;font-size:12px;font-weight:600;background:var(--chip);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
 .tag.next{background:var(--best-bg);color:var(--best)}.tag.new{background:var(--best);color:#fff}.tag.hotk{background:var(--hot);color:#fff}
-.cd{font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;background:var(--chip);border-radius:999px;padding:1px 8px}
+.cd{font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;background:var(--chip);border-radius:999px;padding:1px 7px}
 .cd.done{color:var(--muted)}.cd.soon{color:var(--warn);font-weight:600}
 .odds{display:flex;align-items:center;gap:8px;font-variant-numeric:tabular-nums}
 .odds b{font-size:22px;font-weight:700;letter-spacing:-.01em;white-space:nowrap}.odds .lbl{color:var(--muted);font-size:12px;font-weight:400;margin:0 3px}
 .u{color:var(--up)}.d{color:var(--down)}
 .bar{flex:1;display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--line)}.bar i{display:block;height:100%}
-details{font-size:12.5px}summary{cursor:pointer;list-style:none;display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 6px;color:var(--muted);font-variant-numeric:tabular-nums}
+details{font-size:12.5px}summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:4px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:0}
+summary>*{flex:none}summary .v{color:var(--text)}summary .un{color:var(--faint);font-size:11px}summary .rd{color:var(--faint);font-size:12px}summary .chip{margin-left:auto}
 summary::-webkit-details-marker{display:none}summary:before{content:"▸";color:var(--faint)}details[open] summary:before{content:"▾"}
 summary .v{color:var(--text)}.chip{font-size:12px;border-radius:6px;padding:0 5px;background:var(--chip);font-weight:600}
 dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:6px 0 2px;font-size:12px}dt{color:var(--muted)}dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 .card.missing p{margin:0;color:var(--muted);font-size:12.5px}
-.pb{border-top:1px solid var(--line);padding-top:6px;font-size:12.5px;font-variant-numeric:tabular-nums}
+.pb{margin-top:auto;border-top:1px solid var(--line);padding-top:6px;font-size:12.5px;font-variant-numeric:tabular-nums}
 a.pb{display:block;color:inherit;text-decoration:none;border-radius:8px;margin:0 -6px;padding:6px 6px 4px;cursor:pointer}
 a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge{background:var(--card)}
 .quote{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 10px;color:var(--muted)}.quote span{white-space:nowrap}.quote b{color:var(--text);font-weight:600}.quote .pt{font-weight:600;color:var(--best)}
 .edges{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:5px}
-.edge{display:flex;flex-direction:column;align-items:center;background:var(--chip);border:1px solid transparent;border-radius:7px;padding:2px 2px 3px;min-width:0;line-height:1.3}
-.edge .el{color:var(--faint);font-size:11.5px;white-space:nowrap}.edge b{font-weight:650;font-size:13px;color:var(--faint);white-space:nowrap}.edge.pos b{color:var(--text)}.edge.pos .el{color:var(--muted)}
+.edge{display:flex;flex-direction:column;align-items:center;background:var(--chip);border:1px solid transparent;border-radius:7px;padding:3px 2px;min-width:0;line-height:1.25;overflow:hidden}
+.edge .el{color:var(--faint);font-size:11px;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}.edge .el i{font-style:normal;font-variant-numeric:tabular-nums}
+.edge b{font-weight:650;font-size:14px;color:var(--faint);white-space:nowrap;font-variant-numeric:tabular-nums}.edge.pos b{color:var(--text)}.edge.pos .el{color:var(--muted)}
 .edge.best{border-color:var(--best);background:var(--best-bg)}.edge.best .el{color:var(--text)}.edge.best b{color:var(--best)}
 .edge.hot{border-color:var(--hot);background:var(--hot-bg)}.edge.hot b{color:var(--hot)}
-.small{font-size:12px;margin-top:3px}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6}
+.small{font-size:12px;margin-top:3px}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
 </style></head><body><div class="wrap">
 <header><h1>收盘涨跌概率</h1><div class="hr"><div class="meta" id="meta">加载中…</div><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label></div></header>
 <div class="legend" id="legend"></div>
@@ -2910,6 +2912,8 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
 const open=new Set(),seen={},rolled={};let skew=0,fetchedAt=0,style="cn";
 const two=n=>String(n).padStart(2,"0"),pct=x=>(x*100).toFixed(1),cent=x=>(x*100).toFixed(1)+"¢";
+const like=(v,ref)=>{const d=(String(ref).split(".")[1]||"").length,n=Number(String(v).replace(/,/g,""));
+  if(!isFinite(n))return v;const k=d>=2?d:(Math.abs(n)>=1000?0:2);return n.toLocaleString("en-US",{minimumFractionDigits:k,maximumFractionDigits:k})};
 const qty=n=>Number(n).toLocaleString("en-US",{maximumFractionDigits:n>=100?0:n>=10?1:2});
 const HOT=0.1;  // an edge this large (10¢) gets the red frame
 function book(p){
@@ -2924,7 +2928,8 @@ function book(p){
   if(p.edges&&p.edges.length){const g=$("div","edges");
     p.edges.forEach(e=>{const x=$("div","edge"+(e.best?" best":"")+(e.best&&e.edge>=HOT?" hot":"")+(e.edge>0?" pos":""));
       x.title=e.maker?"挂单排队，成交不保证":"立即成交，量 "+qty(e.size);
-      x.append($("span","el",e.label+" "+cent(e.price)),$("b","",(e.edge>=0?"+":"")+cent(e.edge)));g.append(x)});
+      const el=$("span","el",e.label+" ");el.append($("i","",(e.price*100).toFixed(1)));x.title=e.label+" @ "+cent(e.price)+"："+x.title;
+      x.append(el,$("b","",(e.edge>=0?"+":"")+cent(e.edge)));g.append(x)});
     w.append(g);if(p.stale)w.append($("div","warn small","盘口过期，不给建议"))}
   return w}
 function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
@@ -2945,8 +2950,8 @@ function card(it){
   o.append(a,bar,b);c.append(o);
   const unit=it.unit?" "+it.unit:"";
   const det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
-  const sm=$("summary");sm.title="点开看计算明细";
-  sm.append($("span","",(it.ref_day?it.ref_day+" 收":"参考")),$("span","v",it.ref),"→",$("span","v",it.effective+unit));
+  const sm=$("summary");sm.title=(it.ref_day?it.ref_day+" 收盘 → 有效价":"参考 → 有效价")+"；点开看计算明细";
+  sm.append($("span","rd",it.ref_day||"参考"),$("span","v",it.ref),$("span","","→"),$("span","v",like(it.effective,it.ref)));if(it.unit)sm.append($("span","un",it.unit));
   const chip=$("span","chip",(it.move>=0?"+":"")+it.move.toFixed(2)+"%");chip.style.color=it.move>0?upColor():it.move<0?downColor():"var(--muted)";sm.append(chip);det.append(sm);
   const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("目标",it.close_label);row("参考",it.ref+unit+"（"+it.ref_note+"）");row("有效",it.effective+unit);row("代理",it.proxy_note);
@@ -4345,7 +4350,7 @@ class Bot:
             ref_day = re.search(r"\b\d\d-\d\d\b", odds.ref_note)
             items.append({
                 **base, **day_fields(odds.target, now_ms), "ref_day": ref_day.group(0) if ref_day else "",
-                "target": odds.target.strftime("%m-%d"), "unit": odds.unit,
+                "target": odds.target.strftime("%m-%d"), "unit": odds.unit or self.card_currency(symbol),
                 "close_ms": close_ms, "close_label": close_label,
                 "ref": fmt(odds.ref), "ref_note": odds.ref_note, "effective": fmt(odds.effective.quantize(D("0.0001"))),
                 "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note,
@@ -4361,6 +4366,11 @@ class Bot:
                 "note": ("模型参考，非投资建议。有效价 = 参考收盘 × 代理现价 ÷ 代理在参考收盘时刻的价格；"
                          "P(涨) = 1 − Φ(ln((参考+半跳)/有效)/σ剩余)，平盘两边各计一半。目标日跳过周末和已配置的交易所假期。"
                          if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")}
+
+    def card_currency(self, symbol: str) -> str:
+        """Every contract card names its price currency, also when the contract is quoted in it (HKD)."""
+        ticker = self.config.tickers.get(symbol) if symbol else None
+        return STOCK_MARKETS[ticker.market].currency if ticker else ""
 
     def predict_day(self, title: str, now_ms: int) -> dt.date | None:
         """The session a card without odds is waiting for (its next close by the calendar)."""

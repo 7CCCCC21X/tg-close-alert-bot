@@ -31,7 +31,7 @@ async def browser_check(async_playwright, chrome, port, token):
         assert "上证指数" in text and "10-08 下周四" in text and "涨35.0¢" in text and "概率暂缺：等待行情" in text, text
         # the full close time sits on the countdown's tooltip (and in the details), not as another line
         assert await page.get_attribute(".cd", "title") == "目标 10-08 15:00 上交所收盘（北京时间）"
-        assert "09-30 收" in text and "目标" not in await page.inner_text("#g-index .card"), text
+        assert "09-30" in text and "目标" not in await page.inner_text("#g-index .card"), text
         cd = await page.inner_text(".cd")
         # server clock is 09-30 22:05 and the close is 10-08 15:00 → 7 days 16:55 left (ticking down)
         assert cd.startswith("⏳ 7天 16:5"), cd
