@@ -126,6 +126,16 @@ async def run():
     await hbot.stocks.refresh_live(t, force=True)
     o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
     assert "现货行情已超 10 分钟未更新" in o.proxy_note and "报价停在 09-28 09:33" in hbot.stocks.live_errors["HK0625USDT"], hbot.stocks.live_errors
+
+    # KOSPI trading: today's 15:30 anchor is in the future, so HL is not asked for it (no bogus error)
+    asked = []
+    async def hl_json(url, payload=None, timeout=15): asked.append(payload); return []
+    m.http_json = hl_json
+    k = m.IndexQuote("KOSPI", D("6933.77"), D("7080.92"), None, None, None, kr(9, 28, 10, 53), "Naver")
+    kbot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(cfg), None)
+    class H: coin, fetched_ms, mark = "xyz:KR200", kr(9, 28, 10, 53), D("1099.2")
+    await kbot.kospi_anchor(k, H)
+    assert not asked and kbot.kospi_anchor_error == "" and "KOSPI" not in kbot.anchors
     print("LIVE_OK")
 
 
