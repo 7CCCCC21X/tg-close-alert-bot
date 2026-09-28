@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.13.3"
+VERSION = "1.13.4"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4315,7 +4315,9 @@ class Bot:
             market = ticker.market if ticker else "sh"
         info = STOCK_MARKETS[market]
         close = dt.datetime.combine(target, info.close_time, dt.timezone(dt.timedelta(hours=info.utc_offset)))
-        return int(close.timestamp() * 1000), f"{close.strftime('%m-%d %H:%M')} {info.name}收盘（{info.tz_name}）"
+        local = f"，{info.tz_name[:-2]} {close.strftime('%H:%M')}" if info.utc_offset != 8 else ""
+        return (int(close.timestamp() * 1000),
+                f"{close.astimezone(BEIJING).strftime('%m-%d %H:%M')} {info.name}收盘（北京时间{local}）")
 
     def web_url(self) -> str:
         path = f"/p/{self.web_token}"
