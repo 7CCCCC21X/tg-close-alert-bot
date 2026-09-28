@@ -2884,7 +2884,8 @@ h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin
 .odds b{font-size:22px;font-weight:700;letter-spacing:-.01em;white-space:nowrap}.odds .lbl{color:var(--muted);font-size:12px;font-weight:400;margin:0 3px}
 .u{color:var(--up)}.d{color:var(--down)}
 .bar{flex:1;display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--line)}.bar i{display:block;height:100%}
-details{font-size:12.5px}summary{cursor:pointer;list-style:none;display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 6px;color:var(--muted);font-variant-numeric:tabular-nums}
+details{font-size:12.5px}summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:5px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:0}
+summary>*{flex:none}summary .v{color:var(--text)}summary .un{flex:0 1 auto;min-width:0;overflow:hidden;color:var(--faint);font-size:11.5px}summary .rd{color:var(--faint);font-size:12px}summary .chip{margin-left:auto}
 summary::-webkit-details-marker{display:none}summary:before{content:"▸";color:var(--faint)}details[open] summary:before{content:"▾"}
 summary .v{color:var(--text)}.chip{font-size:12px;border-radius:6px;padding:0 5px;background:var(--chip);font-weight:600}
 dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:6px 0 2px;font-size:12px}dt{color:var(--muted)}dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
@@ -2898,7 +2899,7 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 .edge .el{color:var(--faint);font-size:11.5px;white-space:nowrap}.edge b{font-weight:650;font-size:13px;color:var(--faint);white-space:nowrap}.edge.pos b{color:var(--text)}.edge.pos .el{color:var(--muted)}
 .edge.best{border-color:var(--best);background:var(--best-bg)}.edge.best .el{color:var(--text)}.edge.best b{color:var(--best)}
 .edge.hot{border-color:var(--hot);background:var(--hot-bg)}.edge.hot b{color:var(--hot)}
-.small{font-size:12px;margin-top:3px}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6}
+.small{font-size:12px;margin-top:3px}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
 </style></head><body><div class="wrap">
 <header><h1>收盘涨跌概率</h1><div class="hr"><div class="meta" id="meta">加载中…</div><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label></div></header>
 <div class="legend" id="legend"></div>
@@ -2910,6 +2911,8 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
 const open=new Set(),seen={},rolled={};let skew=0,fetchedAt=0,style="cn";
 const two=n=>String(n).padStart(2,"0"),pct=x=>(x*100).toFixed(1),cent=x=>(x*100).toFixed(1)+"¢";
+const like=(v,ref)=>{const d=(String(ref).split(".")[1]||"").length,n=Number(String(v).replace(/,/g,""));
+  if(!isFinite(n))return v;const k=d>=2?d:(Math.abs(n)>=1000?0:2);return n.toLocaleString("en-US",{minimumFractionDigits:k,maximumFractionDigits:k})};
 const qty=n=>Number(n).toLocaleString("en-US",{maximumFractionDigits:n>=100?0:n>=10?1:2});
 const HOT=0.1;  // an edge this large (10¢) gets the red frame
 function book(p){
@@ -2946,7 +2949,7 @@ function card(it){
   const unit=it.unit?" "+it.unit:"";
   const det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   const sm=$("summary");sm.title="点开看计算明细";
-  sm.append($("span","",(it.ref_day?it.ref_day+" 收":"参考")),$("span","v",it.ref),"→",$("span","v",it.effective+unit));
+  sm.append($("span","rd",(it.ref_day?it.ref_day+" 收":"参考")),$("span","v",it.ref),$("span","","→"),$("span","v",like(it.effective,it.ref)));if(it.unit)sm.append($("span","un",it.unit));
   const chip=$("span","chip",(it.move>=0?"+":"")+it.move.toFixed(2)+"%");chip.style.color=it.move>0?upColor():it.move<0?downColor():"var(--muted)";sm.append(chip);det.append(sm);
   const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("目标",it.close_label);row("参考",it.ref+unit+"（"+it.ref_note+"）");row("有效",it.effective+unit);row("代理",it.proxy_note);
