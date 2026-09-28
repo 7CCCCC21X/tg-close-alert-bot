@@ -44,6 +44,8 @@ tday = json.dumps({"data": {"sh000001": {"day": [["2026-09-23", "3860", "3870.10
 assert m.parse_cn_daily("腾讯日K", tday) == [(dt.date(2026, 9, 23), D("3870.10")), (dt.date(2026, 9, 24), D("3888.37"))]
 eday = json.dumps({"data": {"code": "000001", "market": 1, "klines": ["2026-09-24,3871,3888.37", "2026-09-23,3860,3870.10"]}}).encode()
 assert m.parse_cn_daily("东方财富日K", eday)[-1] == (dt.date(2026, 9, 24), D("3888.37"))
+assert m.parse_cn_daily_ohlc("腾讯日K", tday)[0] == (dt.date(2026, 9, 23), D("3860"), D("3870.10"))
+assert m.parse_cn_daily_ohlc("东方财富日K", eday)[-1] == (dt.date(2026, 9, 24), D("3871"), D("3888.37"))
 for source, raw in [("腾讯日K", json.dumps({"data": {"sz399001": {"day": []}}}).encode()),
                     ("东方财富日K", json.dumps({"data": {"code": "000001", "market": 0, "klines": ["2026-09-24,1,2"]}}).encode()),
                     ("腾讯日K", json.dumps({"data": {"sh000001": {"day": []}}}).encode()), ("腾讯日K", b"<html>")]:

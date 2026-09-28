@@ -41,6 +41,21 @@ assert book.get("HSI", "HSI") == (0.012, "PROB_VOL 手动设定") and book.get("
 book.record("X", [D(100 * (1.02 if i % 2 else 1)) for i in range(21)], "币安日K")
 sig, note = book.get("X", "sh"); assert 0.025 < sig < 0.035 and "币安日K 20 日" in note, (sig, note)
 assert not book.due("HSI") and not book.due("X") and book.due("Y")
+# intraday: only the open→close share of the daily variance is still ahead once the session has opened
+closes = [D(100)] + [D(100 * (1.02 if i % 2 else 1)) for i in range(1, 21)]
+opens = [None] + [(a * b).sqrt() for a, b in zip(closes, closes[1:])]  # opens halfway: gap = body each day
+share, n = m.intraday_share(opens, closes); assert n == 20 and abs(share - 0.5) < 1e-9, share
+assert m.intraday_share([None] * 21, closes) is None and m.intraday_share(opens[:5], closes[:5]) is None  # too few opens
+assert m.intraday_share([None] + closes[1:], closes)[0] == m.INTRADAY_SHARE_BOUNDS[0]  # all gap, no session move: clamped
+book.record("X", closes, "指数日K", opens)
+full, _ = book.get("X", "sh"); part, note = book.get("X", "sh", intraday=True)
+assert abs(part - full * math.sqrt(share)) < 1e-12 and f"盘中取 {share * 100:.0f}% 方差（20 日开盘跳空已扣除）" in note, note
+book.record("X", closes, "指数日K"); assert book.get("X", "sh", intraday=True) == book.get("X", "sh")  # no opens: unchanged
+book.shares["HSI"] = (0.64, 30); assert abs(book.get("HSI", "HSI", intraday=True)[0] - 0.012 * 0.8) < 1e-12  # manual σ too
+# today's daily bar is not a finished day until 15 minutes after the close
+bars = [(dt.date(2026, 9, 23), D(1)), (dt.date(2026, 9, 28), D(2))]
+assert m.finished_bars(bars, "kr", kr(2026, 9, 28, 12, 30)) == bars[:1] and m.finished_bars(bars, "kr", kr(2026, 9, 28, 15, 44)) == bars[:1]
+assert m.finished_bars(bars, "kr", kr(2026, 9, 28, 15, 45)) == bars and m.finished_bars(bars, "sh", bj(2026, 9, 28, 15, 15)) == bars
 assert m.parse_prob_vol("unitreeusdt=3.5, HSI=1.2") == {"UNITREEUSDT": 0.035, "HSI": 0.012}
 for bad in ["X=abc", "X=0", "X=150"]:
     try: m.parse_prob_vol(bad); assert False, bad
@@ -176,5 +191,10 @@ async def hsi():
     bot.hsi.quote = m.FuturesQuote("x", D("24600"), D("24691"), None, None, None, bj(2026, 9, 28, 10, 0), "etnet", D("24600"), "etnet", D("24510.09"))
     o = bot.hsi_odds(bj(2026, 9, 28, 10, 0))
     assert o.ref == D("24510.09") and o.effective == D("24600") and o.target == dt.date(2026, 9, 28) and abs(o.remaining - 300 / 330) < 1e-9 and o.fair_up > 0.5, o
+    assert o.ref_note == "09-25 收盘" and o.sigma_daily == 0.00979369, o  # dated reference; no open data: full σ
+    bot.vols.shares["HSI"] = (0.64, 39)
+    o = bot.hsi_odds(bj(2026, 9, 28, 10, 0)); assert abs(o.sigma_daily - 0.00979369 * 0.8) < 1e-12 and "盘中取 64% 方差" in o.sigma_note, o
+    bot.hsi.quote = m.FuturesQuote("恒指期货(09/2026)夜市", D("24501"), D("24504"), None, None, None, bj(2026, 9, 25, 20, 59), "etnet", D("24510.09"), "etnet", D("24760"))
+    assert bot.hsi_odds(now).sigma_daily == 0.00979369  # after hours the next opening gap is still ahead: full σ
     print("HSI_PROB_OK")
 asyncio.run(run()); asyncio.run(hsi())

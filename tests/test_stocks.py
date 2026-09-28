@@ -30,6 +30,8 @@ nv = ('<?xml version="1.0" encoding="EUC-KR" ?><protocol><chartdata symbol="0006
       '<item data="20260916|1700000|1760000|1690000|1730000|3000000" /><item data="20260917|1740000|1760000|1720000|1745000|2500000" />'
       '<item data="20260918|1750000|1830000|1740000|1825000|2000000" /></chartdata></protocol>').encode("euc-kr")
 bars_kr = m.parse_daily_bars("kr", nv); assert bars_kr[1] == (dt.date(2026, 9, 17), D("1745000")) and len(bars_kr) == 3
+assert m.parse_daily_ohlc("kr", nv)[1] == (dt.date(2026, 9, 17), D("1740000"), D("1745000"))
+assert m.parse_daily_ohlc("sh", em)[-1] == (dt.date(2026, 9, 18), D("151.00"), D("149.80"))
 for bad in [b'{"data":null}', b"garbage", b"<protocol></protocol>"]:
     try: m.parse_daily_bars("kr" if bad.startswith(b"<") else "sh", bad); assert False
     except ValueError: pass
