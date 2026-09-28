@@ -385,7 +385,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-september-28-2026
 - 挂单优势包含了价差，但要排队、不保证成交；吃单立即成交，但只有买1/卖1 那一档的数量。四个方向都没有正优势时显示“暂不挂”。
 - 未计手续费、积分和 LP 奖励；模型本身有误差（见 `/calib`），优势只是参考。
 - 超过 90 秒没刷新成功的盘口只显示、不给建议；目标日切换时旧盘口立即丢弃。
-- Predict 上还没上架的市场显示“Predict 上还没有这个市场（slug）”，10 分钟后再查；网络失败会显示原因并保留上次盘口。
+- Predict 上还没上架的市场显示“Predict 上还没有这个市场（slug）”，1 分钟后再查（新上架的市场最多延迟约 1 分钟出现）；网络失败会显示原因并保留上次盘口。
 - 订单簿走 `https://api.predict.fun/v1/markets/<id>/orderbook`。如果 `/book` 显示 HTTP 401/403，到 Predict.fun 申请 API key 填进 `PREDICT_API_KEY`（建议单独一个 key，别和交易程序共用限流桶）。
 
 | 变量 | 默认 | 说明 |
