@@ -96,7 +96,7 @@ async def run():
     for s in cfg.symbols: bot.snapshots[s] = {"quote": m.Quote(D("100"), nowm), "baseline": base}
     st = await ask("/status")
     assert "交易所 <b>149.8 CNY</b>" in st and "无 CNY 汇率" in st and "收·东方财富）" in st, st
-    assert "<b>1,825,000 KRW</b>" in st and "韩国时间 收·Naver）" in st, st
+    assert "<b>1,825,000 KRW</b>" in st and "14:30 收·Naver）" in st, st
     assert "交易所 ⚠️ 获取失败（东方财富: HTTP 404" in st and "/setexchange" in st, st
     await ask("/setexchange UNITREE 150.5 CNY 09-17 15:00")
     st = await ask("/status"); assert "<b>150.5 CNY</b>" in st and "东方财富）" not in st.split("UNITREEUSDT")[1].split("SHEIN")[0], st

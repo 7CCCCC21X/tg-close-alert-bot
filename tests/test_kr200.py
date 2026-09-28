@@ -21,9 +21,9 @@ async def run():
     hl = m.HlQuote("xyz:KR200", D("1121.7"), D("1122.6"), None, D("1104.6"), D("-0.000175"), 0)
     line = k.line200(ms(17, 0), "cn", hl)
     assert line == ("🇰🇷 " + m.bold("KOSPI200 已收盘") + " " + m.bold("1,105.3") + " → 昨收 " + m.bold("1,095.5") + " 🔴 +0.89%"
-                    "｜🌊 HL KR200 " + m.bold("1,121.7") + " → 相对 KOSPI200 🔴 +1.48%（24h 🔴 +1.55%）｜09-23 16:15 韩国时间 Naver"), line
+                    "｜🌊 HL KR200 " + m.bold("1,121.7") + " → 相对 KOSPI200 🔴 +1.48%（24h 🔴 +1.55%）｜09-23 15:15 Naver"), line
     assert "🌊 HL 未找到市场 xyz:KR200" in k.line200(ms(17, 0), "cn", None, "未找到市场 xyz:KR200（该 dex 共 3 个市场），可用 HL_TICKERS 指定")
-    assert k.line200(ms(17, 0), "cn", None).endswith("韩国时间 Naver") and "HL" not in k.line200(ms(17, 0), "cn", None)
+    assert k.line200(ms(17, 0), "cn", None).endswith("15:15 Naver") and "HL" not in k.line200(ms(17, 0), "cn", None)
     # KPI200 failing keeps the composite working and reports separately
     async def half(url, timeout=15, headers=None):
         if url.endswith("/index/KPI200"): raise m.RemoteError("HTTP 503: 接口请求失败")

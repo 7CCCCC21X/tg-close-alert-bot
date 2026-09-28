@@ -23,7 +23,7 @@ assert "→ 🔴 +1.75%｜当日 🟢 -4.57%" in row, row
 kr = m.STOCK_MARKETS["kr"]
 bk = m.StockMarket.baseline(m.StockTicker("kr", "000660"), kr, "Naver", dt.date(2026, 9, 18), D("1841000"), D("1745000"))
 row = m.reference_row("exchange", D("1332.79"), bk, m.FxRates({"KRW": D("1382.55")}), "cn")
-assert "｜当日 🔴 +5.50%" in row and "韩国时间 收·Naver）" in row, row
+assert "｜当日 🔴 +5.50%" in row and "14:30 收·Naver）" in row, row
 assert "当日" not in m.reference_row("exchange", D("1"), m.StockMarket.baseline(m.StockTicker("sh", "1"), sh, "x", None, D("2")), m.FxRates(), "cn")
 # persistence keeps prev_value
 cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "HK0625USDT"})

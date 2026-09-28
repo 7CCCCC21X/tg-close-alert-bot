@@ -12,13 +12,13 @@ assert b_sh.close_text == "｜收盘 09-18 15:00（北京时间）", b_sh.close_
 b_hk = m.StockMarket.baseline(m.StockTicker("hk", "00625", True), hk, "东方财富", day, D("37.76"))
 assert b_hk.close_text == "｜收盘 09-18 16:10（北京时间）" and b_hk.currency == "", b_hk.close_text
 b_kr = m.StockMarket.baseline(m.StockTicker("kr", "000660"), kr, "Naver", day, D("1842000"))
-assert b_kr.close_text == "｜收盘 09-18 15:30（韩国时间）＝北京 09-18 14:30", b_kr.close_text
+assert b_kr.close_text == "｜收盘 09-18 14:30（北京时间，韩国 15:30）", b_kr.close_text
 assert dt.datetime.fromtimestamp(b_kr.close_ms / 1000, tz9).strftime("%H:%M") == "15:30"
 unknown = m.StockMarket.baseline(m.StockTicker("kr", "000660"), kr, "Naver", None, D("1"))
 assert unknown.close_text == "" and unknown.close_ms == 0
 # reference line carries the venue-local text; manual records keep the Beijing-only format
 line = m.reference_row("exchange", D("1332"), b_kr, m.FxRates({"KRW": D("1382.55")}), "cn")
-assert "（09-18 15:30 韩国时间 收·Naver）" in line, line
+assert "（09-18 14:30 收·Naver）" in line, line
 manual = m.Baseline(D("1"), "k", "l", 0, int(dt.datetime(2026, 9, 17, 16, 0, tzinfo=tz8).timestamp() * 1000), "HKD")
 assert "（09-17 16:00 收）→ ⚪ 无 HKD 汇率" in m.reference_row("exchange", D("1"), manual, m.FxRates(), "cn")
 # Binance daily label spells out the UTC day boundary
@@ -37,3 +37,14 @@ cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT"})
 store = m.Store(":memory:"); sm = m.StockMarket(cfg, store); sm.remember("SKHYNIXUSDT", b_kr)
 assert m.StockMarket(cfg, store).closes["SKHYNIXUSDT"].close_text == b_kr.close_text
 print("CLOSELABEL_OK")
+# a close saved by an older version with Korea-time text is re-labelled in Beijing time on restart
+class _Store:
+    def __init__(self, d): self.d = d
+    def get(self, k): return self.d.get(k)
+    def put(self, k, v): self.d[k] = v
+cfg_kr = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT"})
+old = {"value": "1842000", "key": "k", "label": "l", "valid_until_ms": 0, "close_ms": b_kr.close_ms, "currency": "KRW",
+       "source": "Naver", "close_note": "｜收盘 09-18 15:30（韩国时间）＝北京 09-18 14:30"}
+restored = m.StockMarket(cfg_kr, _Store({"stock_close:SKHYNIXUSDT": old})).closes["SKHYNIXUSDT"]
+assert restored.close_text == "｜收盘 09-18 14:30（北京时间，韩国 15:30）", restored.close_text
+print("CLOSELABEL_RESTORE_OK")
