@@ -54,7 +54,8 @@ async def run():
     bot.hsi.refresh, bot.kospi.refresh, bot.cn.refresh = hang, broken, fine
     bot.start_reference_tasks()
     assert [t.get_name() for t in bot.reference_tasks] == ["reference:交易所收盘", "reference:股票实时", "reference:汇率", "reference:恒指期货",
-                                                            "reference:Hyperliquid", "reference:KOSPI", "reference:上证/A50", "reference:概率输入"]
+                                                            "reference:Hyperliquid", "reference:KOSPI", "reference:上证/A50", "reference:概率输入",
+                                                            "reference:Predict 盘口"]
     started = time.monotonic()
     await bot.one_cycle()
     assert time.monotonic() - started < 1.0, "the alert loop must not wait for reference feeds"
@@ -163,7 +164,7 @@ async def run():
         await asyncio.sleep(0.1)
         if [t for t in tg.sent if "上涨超过" in t]: break
     assert [t for t in tg.sent if "上涨超过" in t], tg.sent
-    assert len(bot.reference_tasks) == 8 and all(not t.done() for t in bot.reference_tasks)
+    assert len(bot.reference_tasks) == 9 and all(not t.done() for t in bot.reference_tasks)
     bot.stopping.set()
     await asyncio.wait_for(runner, 3)
     assert all(t.done() for t in bot.reference_tasks) and bot.reference_pool._shutdown

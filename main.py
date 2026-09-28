@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.12.7"
+VERSION = "1.13.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -297,6 +297,32 @@ DEFAULT_HL_INDEX = "KR200=xyz:KR200"
 HL_TICKER_RE = re.compile(r"(?:([A-Za-z0-9_]{1,16}):)?([A-Za-z0-9_.-]{1,24})")
 
 
+DEFAULT_PREDICT_SLUGS = ("HSI=hang-seng-index,KOSPI=kospi-composite-index,SSE=sse-composite-index,"
+                         "UNITREEUSDT=unitree,HK0625USDT=shein,CXMTUSDT=cxmt,SKHYNIXUSDT=sk-hynix-inc")
+PREDICT_SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
+def parse_predict_slugs(spec: str) -> dict[str, str]:
+    """"HSI=hang-seng-index,CXMTUSDT=cxmt" -> {key: slug stem}; the date part is added per target day."""
+    out: dict[str, str] = {}
+    for part in spec.split(","):
+        if not part.strip():
+            continue
+        key, sep, stem = part.partition("=")
+        key, stem = key.strip().upper(), stem.strip().lower()
+        if not sep or not re.fullmatch(r"[A-Z0-9_]{2,40}", key) or not PREDICT_SLUG_RE.fullmatch(stem):
+            raise ValueError(f"PREDICT_SLUGS 格式错误：{part.strip()}（应为 HSI=hang-seng-index 这样的 键=slug前缀）")
+        out[key] = stem
+    return out
+
+
+def parse_ref_code(value: str) -> str:
+    code = value.strip()
+    if code and not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", code):
+        raise ValueError("PREDICT_REF_CODE 应为 1～32 位字母、数字、- 或 _（留空表示不加邀请码）")
+    return code
+
+
 def parse_hl_tickers(spec: str, symbols: tuple[str, ...]) -> dict[str, tuple[str, str]]:
     """HL_TICKERS="SYMBOL=dex:COIN,..." (dex omitted = the main Hyperliquid perp dex); "off" disables."""
     tickers: dict[str, tuple[str, str]] = {}
@@ -370,6 +396,11 @@ class Config:
     hl_tickers: dict[str, tuple[str, str]] = field(default_factory=dict)  # symbol -> (dex, coin) on Hyperliquid
     kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
+    predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
+    predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
+    predict_api_key: str = ""  # Optional x-api-key for api.predict.fun (REST orderbook).
+    predict_poll: int = 15   # seconds between orderbook refreshes
+    predict_ref: str = "B00EA"  # referral code appended to Predict market links (?ref=); empty = none
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -414,6 +445,11 @@ class Config:
             hl_tickers=parse_hl_tickers(e.get("HL_TICKERS", DEFAULT_HL_TICKERS), symbols),
             kospi_index=e.get("KOSPI_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
             hl_index=parse_hl_tickers(e.get("HL_INDEX", DEFAULT_HL_INDEX), ("KR200",)),
+            predict=e.get("PREDICT", "on").strip().lower() not in {"off", "0", "false", "no"},
+            predict_slugs=parse_predict_slugs(e.get("PREDICT_SLUGS", DEFAULT_PREDICT_SLUGS)),
+            predict_api_key=e.get("PREDICT_API_KEY", "").strip(),
+            predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 15, 5, 3600),
+            predict_ref=parse_ref_code(e.get("PREDICT_REF_CODE", "B00EA")),
             probability=e.get("PROBABILITY", "on").strip().lower() not in {"off", "0", "false", "no"},
             prob_vol=parse_prob_vol(e.get("PROB_VOL", "")),
             sse_index=e.get("SSE_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -2440,6 +2476,273 @@ class VolBook:
         return blended, f"{source} {n} 日 {sigma * 100:.2f}% 与先验 {prior * 100:.1f}% 加权"
 
 
+# --- Predict.fun orderbook vs model ---------------------------------------------------------------
+# Each daily "X up or down on <date>" market has one orderbook, quoted for 涨 (Up) on a 0–1 scale.
+# Buying 跌 at p is the same as selling 涨 at 1 − p, so for 跌 the prices are 1 − 卖1 (maker) / 1 − 买1 (taker).
+PREDICT_GRAPHQL = "https://graphql.predict.fun/graphql"
+PREDICT_REST = "https://api.predict.fun/v1"
+PREDICT_SITE = "https://predict.fun/zh-cn/market/"
+PREDICT_ITEMS = (("HSI", "恒生指数", "hk"), ("KOSPI", "KOSPI", "kr"), ("SSE", "上证指数", "sh"))
+PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
+PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and never recommended
+PREDICT_MISS_SECONDS = 600      # an unknown slug is looked up again after this long
+PREDICT_DEPTH = 5
+MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
+          "november", "december")
+
+
+def predict_slug(stem: str, day: dt.date) -> str:
+    """hang-seng-index + 2026-09-28 -> hang-seng-index-up-or-down-on-september-28-2026 (the site's URL slug)."""
+    return f"{stem}-up-or-down-on-{MONTHS[day.month - 1]}-{day.day}-{day.year}"
+
+
+def predict_url(slug: str, ref: str = "") -> str:
+    """Market page link, with the referral code when one is configured."""
+    return PREDICT_SITE + slug + (f"?ref={urllib.parse.quote(ref)}" if ref else "")
+
+
+def predict_levels(rows: Any, bids: bool) -> tuple[tuple[D, D], ...]:
+    """[[price, size], ...] or [{price, size}, ...] -> sorted (price, size) with empty levels dropped."""
+    out = []
+    for row in rows if isinstance(rows, list) else []:
+        try:
+            price, size = (row[0], row[1]) if isinstance(row, (list, tuple)) else (row.get("price"), row.get("size", row.get("quantity")))
+            price, size = D(str(price)), D(str(size))
+        except (IndexError, TypeError, AttributeError, decimal.InvalidOperation):
+            continue
+        if price.is_finite() and size.is_finite() and 0 < price < 1 and size > 0:
+            out.append((price, size))
+    out.sort(key=lambda level: level[0], reverse=bids)
+    return tuple(out[:PREDICT_DEPTH])
+
+
+def predict_markets(data: Any) -> list[dict]:
+    """Market records ({id, conditionId, title}) anywhere in a GraphQL / REST answer."""
+    found: list[dict] = []
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(node, dict):
+            if node.get("id") is not None and ("conditionId" in node or "question" in node) and "title" in node:
+                found.append({"id": str(node["id"]), "conditionId": str(node.get("conditionId") or ""),
+                              "title": str(node.get("title") or node.get("question") or "")})
+                return
+            for value in node.values():
+                walk(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, depth + 1)
+    walk(data)
+    return list({m["id"]: m for m in found}.values())
+
+
+@dataclass(frozen=True)
+class PredictBook:
+    key: str
+    slug: str
+    market_id: str
+    title: str
+    bids: tuple[tuple[D, D], ...]
+    asks: tuple[tuple[D, D], ...]
+    fetched_ms: int
+
+    @property
+    def bid(self) -> tuple[D, D] | None:
+        return self.bids[0] if self.bids else None
+
+    @property
+    def ask(self) -> tuple[D, D] | None:
+        return self.asks[0] if self.asks else None
+
+    def stale(self, now_ms: int) -> bool:
+        return now_ms - self.fetched_ms > PREDICT_STALE_MS
+
+
+@dataclass(frozen=True)
+class BookEdge:
+    """One way to trade the book: side 涨/跌, maker (挂) or taker (吃), the 涨/跌-denominated price and model edge."""
+    side: str
+    maker: bool
+    price: float
+    edge: float        # model fair price − price paid, per share (1.0 = $1)
+    size: float        # shares resting at the level this refers to
+
+    @property
+    def label(self) -> str:
+        return f"{'挂' if self.maker else '吃'}{self.side}"
+
+
+def book_edges(fair_up: float, book: PredictBook) -> list[BookEdge]:
+    """挂涨 = rest a bid at 买1, 挂跌 = rest a 跌 bid at 1 − 卖1, 吃涨 = buy at 卖1, 吃跌 = buy 跌 at 1 − 买1."""
+    fair_down = 1 - fair_up
+    edges = []
+    if book.bid:
+        bid, size = float(book.bid[0]), float(book.bid[1])
+        edges += [BookEdge("涨", True, bid, fair_up - bid, size), BookEdge("跌", False, 1 - bid, fair_down - (1 - bid), size)]
+    if book.ask:
+        ask, size = float(book.ask[0]), float(book.ask[1])
+        edges += [BookEdge("跌", True, 1 - ask, fair_down - (1 - ask), size), BookEdge("涨", False, ask, fair_up - ask, size)]
+    return sorted(edges, key=lambda e: (not e.maker, e.side != "涨"))
+
+
+def best_edge(edges: list[BookEdge]) -> BookEdge | None:
+    """The side with the largest positive model edge (maker wins ties: it also collects the spread)."""
+    good = [e for e in edges if e.edge > 0.0005]
+    return max(good, key=lambda e: (round(e.edge, 4), e.maker)) if good else None
+
+
+def cents(value: float, sign: bool = False) -> str:
+    return f"{value * 100:+.1f}¢" if sign else f"{value * 100:.1f}¢"
+
+
+def book_lines(book: PredictBook | None, error: str, odds: "CloseOdds | str | None", now_ms: int,
+               url: str = "") -> list[str]:
+    """Lines for Telegram (bold sentinels, send as HTML): quote, four edges, the best one, the market link."""
+    if book is None:
+        return [f"📕 Predict 盘口暂缺：{error or '等待首次获取'}"]
+    bid = f"{cents(float(book.bid[0]))}×{fmt(book.bid[1])}" if book.bid else "无"
+    ask = f"{cents(float(book.ask[0]))}×{fmt(book.ask[1])}" if book.ask else "无"
+    age = (now_ms - book.fetched_ms) // 1000
+    head = f"📕 Predict 涨 买1 {bid}｜卖1 {ask}"
+    if book.bid and book.ask:
+        head += f"｜中间 {cents(float(book.bid[0] + book.ask[0]) / 2)}"
+    lines = [head + (f"｜⚠️ {age} 秒前" if book.stale(now_ms) else "")]
+    if error:
+        lines.append(f"⚠️ 最近刷新失败：{brief_error(error, 60)}（显示上次盘口）")
+    if not isinstance(odds, CloseOdds):
+        lines.append("模型概率暂缺，无法比较优势")
+        return lines
+    edges = book_edges(odds.fair_up, book)
+    if not edges:
+        lines.append("盘口为空，无法比较")
+        return lines
+    lines.append(f"模型 涨 {cents(odds.fair_up)}｜跌 {cents(odds.fair_down)}")
+    for maker in (True, False):
+        row = [f"{e.label} {cents(e.price)} 优势 {bold(cents(e.edge, True)) if e.edge > 0 else cents(e.edge, True)}"
+               for e in edges if e.maker == maker]
+        if row:
+            lines.append("｜".join(row))
+    best = best_edge(edges)
+    if book.stale(now_ms):
+        lines.append("盘口过期，不给建议")
+    elif best:
+        how = "挂单排队，成交不保证" if best.maker else f"立即成交，卖1/买1 只有 {best.size:g} 份"
+        lines.append(f"👉 {bold(best.label)} @ {cents(best.price)} 优势最大 {cents(best.edge, True)}（{how}）")
+    else:
+        lines.append("👉 四个方向对模型都没有正优势，暂不挂")
+    if url:
+        lines.append(url)
+    return lines
+
+
+class PredictFeed:
+    """Resolves each day's Predict.fun slug to its market and polls the orderbook (GraphQL + REST, read-only)."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.markets: dict[str, tuple[dict | None, float]] = {}  # slug -> (market or None = not listed, when)
+        self.book_keys: dict[str, str] = {}                      # market id -> id/conditionId that answered
+        self.books: dict[str, PredictBook] = {}                  # item key -> latest book
+        self.errors: dict[str, str] = {}
+        self.slugs: dict[str, str] = {}                          # item key -> slug currently followed
+        self.refreshed = -1e9
+
+    def headers(self) -> dict[str, str]:
+        return {"x-api-key": self.config.predict_api_key} if self.config.predict_api_key else {}
+
+    async def fetch(self, url: str, payload: dict | None = None) -> Any:
+        raw = await _blocking(_http_get, url, payload, SOURCE_TIMEOUT, self.headers() if url.startswith(PREDICT_REST) else {})
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise RemoteError("Predict 接口未返回有效 JSON") from None
+
+    async def graphql(self, query: str, variables: dict) -> Any:
+        data = await self.fetch(PREDICT_GRAPHQL, {"query": query, "variables": variables})
+        if isinstance(data, dict) and data.get("errors"):
+            raise RemoteError("Predict GraphQL 错误：" + clean_error(json.dumps(data["errors"], ensure_ascii=False))[:120])
+        return data.get("data") if isinstance(data, dict) else None
+
+    async def resolve(self, slug: str) -> dict | None:
+        """slug -> market via GraphQL category(id: slug) → markets(categoryId); REST /categories/<slug> as fallback."""
+        cached = self.markets.get(slug)
+        if cached and (cached[0] is not None or time.monotonic() - cached[1] < PREDICT_MISS_SECONDS):
+            return cached[0]
+        found: list[dict] = []
+        errors = []  # only failures that leave the answer unknown; "no such category" is an answer
+        try:
+            data = await self.graphql("query($id: ID!) { category(id: $id) { id } }", {"id": slug})
+            category = (data or {}).get("category") or {}
+            if category.get("id") is not None:
+                data = await self.graphql(
+                    "query($f: MarketFilterInput!) { markets(filter: $f, pagination: { first: 20 }) "
+                    "{ edges { node { id conditionId title question } } } }", {"f": {"categoryId": str(category["id"])}})
+                found = predict_markets(data)
+        except (RemoteError, TimeoutError, OSError) as error:
+            errors.append(clean_error(error))
+        if not found:
+            try:
+                found = predict_markets(await self.fetch(f"{PREDICT_REST}/categories/{urllib.parse.quote(slug)}"))
+            except (RemoteError, TimeoutError, OSError) as error:
+                if "HTTP 404" not in str(error) and errors:
+                    errors.append(clean_error(error))
+                else:
+                    errors.clear()  # GraphQL answered "no such category", or REST did (404)
+        if not found and errors:
+            raise RemoteError("；".join(errors))  # network trouble: not cached as "not listed"
+        market = found[0] if found else None
+        self.markets[slug] = (market, time.monotonic())
+        return market
+
+    async def orderbook(self, market: dict) -> tuple[tuple, tuple, str]:
+        keys = [k for k in dict.fromkeys([self.book_keys.get(market["id"]), market["id"], market.get("conditionId")]) if k]
+        last = ""
+        for key in keys:
+            try:
+                data = await self.fetch(f"{PREDICT_REST}/markets/{urllib.parse.quote(key)}/orderbook")
+            except RemoteError as error:
+                last = clean_error(error)
+                if "429" in last or "401" in last or "403" in last:
+                    break  # same answer for every key; do not burn more requests
+                continue
+            book = data.get("data", data) if isinstance(data, dict) else {}
+            if not isinstance(book, dict) or ("bids" not in book and "asks" not in book):
+                last = "订单簿格式异常"
+                continue
+            self.book_keys[market["id"]] = key
+            return predict_levels(book.get("bids"), True), predict_levels(book.get("asks"), False), key
+        raise RemoteError(last or "订单簿获取失败")
+
+    async def refresh_one(self, key: str, slug: str) -> None:
+        try:
+            market = await self.resolve(slug)
+            if market is None:
+                self.books.pop(key, None)
+                self.errors[key] = f"Predict 上还没有这个市场（{slug}）"
+                return
+            bids, asks, _ = await self.orderbook(market)
+            self.books[key] = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000))
+            self.errors.pop(key, None)
+        except (RemoteError, TimeoutError, OSError) as error:
+            self.errors[key] = clean_error(error) or type(error).__name__
+
+    async def refresh(self, targets: dict[str, str], force: bool = False) -> bool:
+        """targets: item key -> slug. False = not due yet."""
+        if not force and time.monotonic() - self.refreshed < self.config.predict_poll:
+            return False
+        self.refreshed = time.monotonic()
+        for key in list(self.books):
+            if targets.get(key) != self.books[key].slug:
+                self.books.pop(key)  # the target day moved on: never show yesterday's book for today's market
+        for key in list(self.errors):
+            if key not in targets:
+                self.errors.pop(key)
+        self.slugs = dict(targets)
+        await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in targets.items()))
+        return True
+
+
 # --- read-only probability web page -------------------------------------------------------------
 WEB_PAGE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -2447,7 +2750,7 @@ WEB_PAGE = """<!doctype html>
 <meta name="robots" content="noindex">
 <title>收盘涨跌概率</title>
 <style>
-:root{--bg:#f4f5f7;--card:#fff;--text:#1b1f23;--muted:#6b737c;--faint:#9aa3ad;--line:#e5e8ec;--up:#d63b3b;--down:#1e9a54;--flat:#b8c0c8;--chip:#f0f2f5}
+:root{--best:#2d6cdf;--bg:#f4f5f7;--card:#fff;--text:#1b1f23;--muted:#6b737c;--faint:#9aa3ad;--line:#e5e8ec;--up:#d63b3b;--down:#1e9a54;--flat:#b8c0c8;--chip:#f0f2f5}
 @media (prefers-color-scheme:dark){:root{--bg:#101215;--card:#1a1d21;--text:#e8eaed;--muted:#9aa3ad;--faint:#6b737c;--line:#2a2f35;--chip:#23272c}}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
@@ -2474,6 +2777,14 @@ details{margin-top:8px;border-top:1px solid var(--line);padding-top:6px}summary{
 summary::-webkit-details-marker{display:none}summary:before{content:"▸ ";}details[open] summary:before{content:"▾ "}
 dl{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;margin:6px 0 2px;font-size:12.5px}dt{color:var(--muted)}dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 .card.missing{padding-bottom:14px}.card.missing p{margin:8px 0 0;color:var(--muted);font-size:13px}
+.pb{margin-top:10px;border-top:1px solid var(--line);padding-top:8px;font-size:13px;font-variant-numeric:tabular-nums}
+a.pb{display:block;color:inherit;text-decoration:none;border-radius:10px;padding-bottom:6px;margin-left:-6px;margin-right:-6px;padding-left:6px;padding-right:6px;cursor:pointer}
+a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge{background:var(--card)}
+.pbh{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px}.pbh .pt{font-weight:600;color:var(--best)}.pbh .k{color:var(--muted)}
+.edges{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:6px}
+.edge{display:flex;justify-content:space-between;gap:6px;background:var(--chip);border:1px solid transparent;border-radius:8px;padding:4px 8px}
+.edge .el{color:var(--muted)}.edge b{font-weight:600;color:var(--muted)}.edge.pos b{color:var(--text)}
+.edge.best{border-color:var(--best)}.edge.best b{color:var(--best)}.tip{margin-top:6px;font-size:12.5px}.small{font-size:12px;margin-top:4px}
 .warn{color:#c77c00}footer{color:var(--faint);font-size:12px;margin-top:20px;line-height:1.6}
 </style></head><body><div class="wrap">
 <header><h1>收盘涨跌概率</h1><div class="meta" id="meta">加载中…</div></header>
@@ -2485,14 +2796,30 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;margin:6px 0 2px;fon
 <script>
 const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
 const open=new Set();let skew=0,fetchedAt=0,style="cn";
-const two=n=>String(n).padStart(2,"0"),pct=x=>(x*100).toFixed(1);
+const two=n=>String(n).padStart(2,"0"),pct=x=>(x*100).toFixed(1),cent=x=>(x*100).toFixed(1)+"¢";
+function book(p){
+  const w=$("a","pb"),h=$("div","pbh");w.href=p.url;w.target="_blank";w.rel="noopener noreferrer";w.title="打开 Predict 市场";h.append($("span","pt","Predict 盘口 ↗"));
+  const has=p.bids||p.asks;
+  if(has){const b=p.bids[0],k=p.asks[0];
+    h.append($("span","k","买1 "+(b?cent(b[0])+"×"+b[1]:"无")+" · 卖1 "+(k?cent(k[0])+"×"+k[1]:"无")));
+    if(p.stale)h.append($("span","warn",p.age+" 秒前"))}
+  else if(!p.error)h.append($("span","k","等待获取"));
+  w.append(h);
+  if(p.error)w.append($("div","warn small",(has?"刷新失败，显示上次盘口：":"")+p.error));
+  if(p.edges&&p.edges.length){const g=$("div","edges");
+    p.edges.forEach(e=>{const x=$("div","edge"+(e.best?" best":"")+(e.edge>0?" pos":""));
+      x.append($("span","el",e.label+" "+cent(e.price)),$("b","",(e.edge>=0?"+":"")+cent(e.edge)));g.append(x)});
+    w.append(g);const best=p.edges.find(e=>e.best);
+    w.append($("div","tip",best?"👉 "+best.label+" @ "+cent(best.price)+" 优势最大（"+(best.maker?"挂单排队":"立即成交")+"）"
+      :(p.stale?"盘口过期，不给建议":"四个方向对模型都没有正优势")))}
+  return w}
 function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
 function card(it){
   const c=$("div","card"+(it.missing?" missing":"")),head=$("div","head"),nm=$("div","name",it.name);
   if(it.symbol)nm.append($("span","sym",it.symbol));head.append(nm);
   if(it.close_ms){const cd=$("span","cd");cd.dataset.close=it.close_ms;head.append(cd)}
   c.append(head);
-  if(it.missing){c.append($("p","","概率暂缺："+it.missing));return c}
+  if(it.missing){c.append($("p","","概率暂缺："+it.missing));if(it.predict)c.append(book(it.predict));return c}
   const o=$("div","odds"),a=$("div"),b=$("div");
   a.append($("span","lbl","涨"),$("b",style==="us"?"d":"u",pct(it.fair_up)+"¢"));
   b.append($("span","lbl","跌"),$("b",style==="us"?"u":"d",pct(it.fair_down)+"¢"));o.append(a,b);c.append(o);
@@ -2506,7 +2833,7 @@ function card(it){
   row("参考",it.ref+unit+"（"+it.ref_note+"）");row("代理",it.proxy_note);
   row("σ","日 "+(it.sigma_daily*100).toFixed(2)+"% × √"+it.remaining.toFixed(3)+" = "+(it.sigma*100).toFixed(2)+"%");
   row("σ 来源",it.sigma_note);row("涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%");row("z",it.z.toFixed(3));
-  det.append(dl);c.append(det);return c}
+  det.append(dl);if(it.predict)c.append(book(it.predict));c.append(det);return c}
 function tick(){
   const now=Date.now()+skew;
   document.querySelectorAll(".cd").forEach(el=>{const left=Math.floor((Number(el.dataset.close)-now)/1000);
@@ -2523,7 +2850,7 @@ async function load(){
       document.getElementById("g-"+g).replaceChildren(...items.map(card));document.getElementById("h-"+g).hidden=!items.length}
     document.getElementById("meta").replaceChildren($("span","","数据 "+d.generated_at),$("span","","",),$("span","","基准 "+d.mode),$("span","","v"+d.version));
     document.getElementById("meta").children[1].id="ago";
-    const lg=document.getElementById("legend");lg.replaceChildren("¢ = 公平价（平盘两边各半）");
+    const lg=document.getElementById("legend");lg.replaceChildren("¢ = 公平价（平盘两边各半）；盘口优势 = 公平价 − 成交价，挂涨@买1、挂跌@1−卖1、吃涨@卖1、吃跌@1−买1");
     [["涨",upColor()],["平","var(--flat)"],["跌",downColor()]].forEach(([t,col])=>{const i=$("i");i.style.background=col;lg.append(i,t)});
     document.getElementById("foot").textContent=d.note;tick();
   }catch(e){document.getElementById("meta").replaceChildren($("span","warn","刷新失败："+e.message+"，稍后自动重试"))}
@@ -2825,6 +3152,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("pause", "暂停当前订阅"),
     Command("resume", "恢复当前订阅"),
     Command("prob", "查看各标的下个收盘涨跌概率及计算过程"),
+    Command("book", "对比 Predict 订单簿和模型公平价，看挂涨还是挂跌优势大"),
     Command("web", "获取概率网页链接（自动刷新）"),
     Command("calib", "用已保存的预测快照和实际收盘给概率模型打分（Brier/校准/逐日向前拟合）"),
     Command("diag", "逐个检测数据源（币安/交易所/上证/A50/恒指/KOSPI/HL/汇率），找出哪里出问题"),
@@ -3009,6 +3337,7 @@ class Bot:
             self.store.put("web_token", self.web_token)
         self.web: WebServer | None = None
         self.vols = VolBook(config.prob_vol)
+        self.predict = PredictFeed(config)
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
         self.reference_pool: ThreadPoolExecutor | None = None
@@ -3032,6 +3361,7 @@ class Bot:
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
             "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/calib": self.cmd_calib,
+            "/book": self.cmd_book,
         }
 
     def settings(self) -> dict:
@@ -3801,6 +4131,9 @@ class Bot:
         for title, odds in (self.odds_items(now_ms) if self.config.probability else []):
             name, _, symbol = title.partition("｜")
             base = {"name": name, "symbol": symbol, "group": "contract" if symbol else "index"}
+            book = self.predict_payload(title, odds, now_ms)
+            if book:
+                base["predict"] = book
             if isinstance(odds, str):
                 items.append({**base, "missing": odds})
                 continue
@@ -3820,6 +4153,76 @@ class Bot:
                 "note": ("模型参考，非投资建议。有效价 = 参考收盘 × 代理现价 ÷ 代理在参考收盘时刻的价格；"
                          "P(涨) = 1 − Φ(ln((参考+半跳)/有效)/σ剩余)，平盘两边各计一半。目标日跳过周末和已配置的交易所假期。"
                          if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")}
+
+    def predict_key(self, title: str) -> str:
+        return PREDICT_KEYS.get(title) or title.split("｜")[-1]
+
+    def predict_targets(self, now_ms: int) -> dict[str, str]:
+        """Item key -> Predict slug for the close the model is pricing (the next close when the model has none)."""
+        if not self.config.predict:
+            return {}
+        odds = dict(self.odds_items(now_ms)) if self.config.probability else {}
+        entries = [*PREDICT_ITEMS, *((symbol, f"{NAMES.get(symbol, symbol)}｜{symbol}", self.config.tickers[symbol].market)
+                                     for symbol in self.config.symbols if symbol in self.config.tickers)]
+        targets = {}
+        for key, title, market in entries:
+            stem = self.config.predict_slugs.get(key)
+            if not stem:
+                continue
+            item = odds.get(title)
+            day = (item.target if isinstance(item, CloseOdds)
+                   else session_remaining(market, now_ms, None, self.config.holidays.get(market, frozenset()))[1])
+            targets[key] = predict_slug(stem, day)
+        return targets
+
+    def predict_payload(self, title: str, odds: CloseOdds | str | None, now_ms: int) -> dict | None:
+        """The web page's orderbook block for one item, or None when that item has no Predict market configured."""
+        key = self.predict_key(title)
+        slug = self.predict.slugs.get(key)
+        if not self.config.predict or not slug:
+            return None
+        book, error = self.predict.books.get(key), self.predict.errors.get(key, "")
+        out: dict[str, Any] = {"url": predict_url(slug, self.config.predict_ref), "error": error}
+        if book is None:
+            return out
+        out.update(bids=[[float(p), float(q)] for p, q in book.bids], asks=[[float(p), float(q)] for p, q in book.asks],
+                   age=max(0, (now_ms - book.fetched_ms) // 1000), stale=book.stale(now_ms))
+        if isinstance(odds, CloseOdds):
+            edges = book_edges(odds.fair_up, book)
+            best = None if book.stale(now_ms) else best_edge(edges)
+            out["edges"] = [{"label": e.label, "maker": e.maker, "price": e.price, "edge": e.edge, "size": e.size,
+                             "best": e is best} for e in edges]
+        return out
+
+    def cmd_book(self, req: Request) -> "Reply":
+        if not self.config.predict:
+            return Reply("Predict 盘口功能已关闭（PREDICT=off）。")
+        now_ms = self.market.now_ms()
+        odds = dict(self.odds_items(now_ms)) if self.config.probability else {}
+        lines = [f"📕 {bold('Predict 盘口 vs 模型公平价')}",
+                 "挂涨=在买1排队买涨；挂跌=在 1−卖1 排队买跌；吃=立即成交。优势=模型公平价−成交价（每份，¢）"]
+        titles = [title for _, title, _ in PREDICT_ITEMS] + [f"{NAMES.get(s, s)}｜{s}" for s in self.config.symbols]
+        shown = 0
+        for title in titles:
+            key = self.predict_key(title)
+            slug = self.predict.slugs.get(key)
+            if not slug:
+                continue
+            shown += 1
+            item = odds.get(title)
+            book, error = self.predict.books.get(key), self.predict.errors.get(key, "")
+            lines.append("\n" + bold(f"📍 {title}"))
+            url = predict_url(slug, self.config.predict_ref)
+            rows = book_lines(book, error, item, now_ms, url)
+            if book is None:
+                rows.append(url)
+            if isinstance(item, str):
+                rows.insert(0, f"概率暂缺：{item}")
+            lines.extend(tree(rows))
+        if not shown:
+            lines.append("\n⏳ 还没有盘口数据，启动后约 15 秒首次获取；请稍后再试。")
+        lines.append("\n⚠️ 模型只是参考；未计手续费和积分/LP 奖励，挂单不保证成交。")
+        return Reply("\n".join(lines), html=True)
 
     def target_close(self, title: str, target: dt.date) -> tuple[int, str]:
         """Epoch ms and label of the target session's official close for an odds item."""
@@ -3856,7 +4259,11 @@ class Bot:
             if odds is None:
                 continue
             lines.append("\n" + bold(f"📍 {title}"))
-            lines.extend(tree(odds.detail() if isinstance(odds, CloseOdds) else [f"概率暂缺：{odds}"]))
+            rows = odds.detail() if isinstance(odds, CloseOdds) else [f"概率暂缺：{odds}"]
+            key = self.predict_key(title)
+            if key in self.predict.slugs:
+                rows += book_lines(self.predict.books.get(key), self.predict.errors.get(key, ""), odds, now_ms)
+            lines.extend(tree(rows))
         lines.append("\n⚠️ 目标日跳过周末和已配置的交易所假期（HOLIDAYS_*），每个假日按半天方差计入；σ 为历史估计；代理与结算标的之间有基差。")
         return Reply("\n".join(lines), html=True)
 
@@ -4302,6 +4709,8 @@ class Bot:
                 ("KOSPI", lambda: self.kospi.refresh(now())), ("上证/A50", lambda: self.cn.refresh(now()))]
         if self.config.probability:
             jobs.append(("概率输入", lambda: self.refresh_odds_inputs(now())))
+        if self.config.predict:
+            jobs.append(("Predict 盘口", lambda: self.predict.refresh(self.predict_targets(now()))))
         return jobs
 
     async def reference_loop(self, name: str, job: Any) -> None:
