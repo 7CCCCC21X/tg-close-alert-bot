@@ -2861,43 +2861,44 @@ WEB_PAGE = """<!doctype html>
 <meta name="robots" content="noindex">
 <title>收盘涨跌概率</title>
 <style>
-:root{--best:#2d6cdf;--best-bg:#eef3fd;--warn:#c77c00;--bg:#f4f5f7;--card:#fff;--text:#1b1f23;--muted:#6b737c;--faint:#9aa3ad;--line:#e5e8ec;--up:#d63b3b;--down:#1e9a54;--flat:#b8c0c8;--chip:#f0f2f5}
-@media (prefers-color-scheme:dark){:root{--bg:#101215;--card:#1a1d21;--text:#e8eaed;--muted:#9aa3ad;--faint:#6b737c;--line:#2a2f35;--chip:#23272c;--best:#6f9ef0;--best-bg:#1c2a42;--warn:#e0a040}}
+:root{--best:#2d6cdf;--best-bg:#eef3fd;--warn:#c77c00;--bg:#f4f5f7;--card:#fff;--text:#1b1f23;--muted:#6b737c;--faint:#9aa3ad;--line:#e5e8ec;--up:#d63b3b;--down:#1e9a54;--flat:#b8c0c8;--chip:#f0f2f5;--hot:#e02424;--hot-bg:#fdecec}
+@media (prefers-color-scheme:dark){:root{--bg:#101215;--card:#1a1d21;--text:#e8eaed;--muted:#9aa3ad;--faint:#6b737c;--line:#2a2f35;--chip:#23272c;--best:#6f9ef0;--best-bg:#1c2a42;--warn:#e0a040;--hot:#ff5a5a;--hot-bg:#3a1c1e}}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
-.wrap{max-width:1180px;margin:0 auto;padding:16px}
-header{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:6px 16px;margin-bottom:6px}
-h1{font-size:20px;margin:0}.hr{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px}.tog{display:inline-flex;align-items:center;gap:5px;font-size:13px;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:3px 10px 3px 7px;cursor:pointer;user-select:none}.tog input{margin:0;accent-color:var(--best)}body.nobook .pb{display:none}.meta{color:var(--muted);font-size:13px;display:flex;flex-wrap:wrap;gap:4px 12px}
-.legend{color:var(--muted);font-size:12px;margin:0 0 14px;display:flex;flex-wrap:wrap;align-items:center;gap:4px 14px}.legend .sw{white-space:nowrap}.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 3px 0 6px;vertical-align:-1px}.legend .sw i:first-child{margin-left:0}
-h2{font-size:13px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin:18px 2px 8px}
-.grid{display:grid;gap:12px;align-items:stretch;grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 14px 10px;display:flex;flex-direction:column;min-width:0}
-.head{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
-.name{font-weight:650;font-size:16px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sym{color:var(--faint);font-size:12px;font-weight:400;margin-left:6px}
-.cd{font-size:13px;font-variant-numeric:tabular-nums;white-space:nowrap;background:var(--chip);border-radius:999px;padding:2px 9px}
+.wrap{max-width:1560px;margin:0 auto;padding:12px 16px}
+header{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 16px;margin-bottom:4px}
+h1{font-size:18px;margin:0}.hr{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px}.tog{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:2px 9px 2px 6px;cursor:pointer;user-select:none}.tog input{margin:0;accent-color:var(--best)}body.nobook .pb{display:none}.meta{color:var(--muted);font-size:12px;display:flex;flex-wrap:wrap;gap:2px 10px}
+.legend{color:var(--muted);font-size:12px;margin:0 0 6px;display:flex;flex-wrap:wrap;align-items:center;gap:2px 12px}.legend .sw{white-space:nowrap}.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 3px 0 6px;vertical-align:-1px}.legend .sw i:first-child{margin-left:0}.legend .hot i{background:var(--hot)}
+h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin:10px 2px 6px}
+.grid{display:grid;gap:10px;align-items:stretch;grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px 8px;display:flex;flex-direction:column;gap:6px;min-width:0}
+.card.hot{border:2px solid var(--hot);box-shadow:0 0 0 3px var(--hot-bg);padding:9px 11px 7px}
+.card.rolled{border-color:var(--best);box-shadow:0 0 0 1px var(--best)}
+.head{display:flex;align-items:center;gap:6px}
+.name{font-weight:650;font-size:15px;min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tag{border-radius:6px;padding:1px 6px;font-size:12px;font-weight:600;background:var(--chip);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+.tag.next{background:var(--best-bg);color:var(--best)}.tag.new{background:var(--best);color:#fff}.tag.hotk{background:var(--hot);color:#fff}
+.cd{font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;background:var(--chip);border-radius:999px;padding:1px 8px}
 .cd.done{color:var(--muted)}.cd.soon{color:var(--warn);font-weight:600}
-.odds{display:flex;justify-content:space-between;align-items:baseline;margin:12px 0 6px;font-variant-numeric:tabular-nums}
-.odds .lbl{color:var(--muted);font-size:13px;margin-right:4px}.odds b{font-size:28px;font-weight:700;letter-spacing:-.01em}
+.odds{display:flex;align-items:center;gap:8px;font-variant-numeric:tabular-nums}
+.odds b{font-size:22px;font-weight:700;letter-spacing:-.01em;white-space:nowrap}.odds .lbl{color:var(--muted);font-size:12px;font-weight:400;margin:0 3px}
 .u{color:var(--up)}.d{color:var(--down)}
-.bar{display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--line)}.bar i{display:block;height:100%}
-.target{color:var(--muted);font-size:12px;margin-top:8px}
-.px{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;margin-top:6px;font-size:14px;font-variant-numeric:tabular-nums}
-.px .k{color:var(--muted);font-size:12px}.chip{font-size:12px;border-radius:6px;padding:1px 6px;background:var(--chip);font-weight:600}
-details{margin-top:auto;border-top:1px solid var(--line);padding-top:6px}summary{cursor:pointer;color:var(--muted);font-size:12px;list-style:none}
-summary::-webkit-details-marker{display:none}summary:before{content:"▸ ";}details[open] summary:before{content:"▾ "}
-dl{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;margin:6px 0 2px;font-size:12.5px}dt{color:var(--muted)}dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
-.card.missing{padding-bottom:14px}.card.missing p{margin:8px 0 0;color:var(--muted);font-size:13px}
-.pb{margin:10px 0 8px;border-top:1px solid var(--line);padding-top:8px;font-size:13px;font-variant-numeric:tabular-nums}
-a.pb{display:block;color:inherit;text-decoration:none;border-radius:10px;padding-bottom:6px;margin-left:-6px;margin-right:-6px;padding-left:6px;padding-right:6px;cursor:pointer}
+.bar{flex:1;display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--line)}.bar i{display:block;height:100%}
+details{font-size:12.5px}summary{cursor:pointer;list-style:none;display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 6px;color:var(--muted);font-variant-numeric:tabular-nums}
+summary::-webkit-details-marker{display:none}summary:before{content:"▸";color:var(--faint)}details[open] summary:before{content:"▾"}
+summary .v{color:var(--text)}.chip{font-size:12px;border-radius:6px;padding:0 5px;background:var(--chip);font-weight:600}
+dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:6px 0 2px;font-size:12px}dt{color:var(--muted)}dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
+.card.missing p{margin:0;color:var(--muted);font-size:12.5px}
+.pb{border-top:1px solid var(--line);padding-top:6px;font-size:12.5px;font-variant-numeric:tabular-nums}
+a.pb{display:block;color:inherit;text-decoration:none;border-radius:8px;margin:0 -6px;padding:6px 6px 4px;cursor:pointer}
 a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge{background:var(--card)}
-.pbh{display:flex;align-items:baseline;justify-content:space-between;gap:8px}.pbh .pt{font-weight:600;color:var(--best)}.pbh .go{color:var(--faint);font-size:12px;white-space:nowrap}.quote{display:flex;flex-wrap:wrap;gap:2px 12px;margin-top:4px;color:var(--muted);font-size:12.5px}.quote span{white-space:nowrap}.quote b{color:var(--text);font-weight:600}
-.edges{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:6px}
-.edge{display:flex;justify-content:space-between;align-items:baseline;gap:6px;background:var(--chip);border:1px solid transparent;border-radius:8px;padding:5px 8px;min-width:0}
-.edge .el{color:var(--muted);white-space:nowrap}.edge b{font-weight:600;color:var(--faint);white-space:nowrap}.edge.pos b{color:var(--text)}.edge:not(.pos) .el{color:var(--faint)}
+.quote{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 10px;color:var(--muted)}.quote span{white-space:nowrap}.quote b{color:var(--text);font-weight:600}.quote .pt{font-weight:600;color:var(--best)}
+.edges{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:5px}
+.edge{display:flex;flex-direction:column;align-items:center;background:var(--chip);border:1px solid transparent;border-radius:7px;padding:2px 2px 3px;min-width:0;line-height:1.3}
+.edge .el{color:var(--faint);font-size:11.5px;white-space:nowrap}.edge b{font-weight:650;font-size:13px;color:var(--faint);white-space:nowrap}.edge.pos b{color:var(--text)}.edge.pos .el{color:var(--muted)}
 .edge.best{border-color:var(--best);background:var(--best-bg)}.edge.best .el{color:var(--text)}.edge.best b{color:var(--best)}
-.tip{margin-top:8px;font-size:13px;display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 8px}.tip.none{color:var(--muted);font-size:12.5px}.tip b{color:var(--best)}.tip .k{color:var(--muted);font-size:12px}.small{font-size:12px;margin-top:4px}
-.day{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;margin-top:6px;font-size:13px;color:var(--muted)}.day b{font-size:15px;font-weight:650;color:var(--text);font-variant-numeric:tabular-nums}.tag{border-radius:6px;padding:1px 7px;font-size:12px;font-weight:600;background:var(--chip);color:var(--muted)}.tag.next{background:var(--best-bg);color:var(--best)}.tag.new{background:var(--best);color:#fff}.card.rolled{border-color:var(--best);box-shadow:0 0 0 1px var(--best)}.px .rd{color:var(--faint);font-size:12px}.warn{color:var(--warn)}footer{color:var(--faint);font-size:12px;margin-top:20px;line-height:1.6}
+.edge.hot{border-color:var(--hot);background:var(--hot-bg)}.edge.hot b{color:var(--hot)}
+.small{font-size:12px;margin-top:3px}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6}
 </style></head><body><div class="wrap">
 <header><h1>收盘涨跌概率</h1><div class="hr"><div class="meta" id="meta">加载中…</div><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label></div></header>
 <div class="legend" id="legend"></div>
@@ -2910,49 +2911,48 @@ const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==un
 const open=new Set(),seen={},rolled={};let skew=0,fetchedAt=0,style="cn";
 const two=n=>String(n).padStart(2,"0"),pct=x=>(x*100).toFixed(1),cent=x=>(x*100).toFixed(1)+"¢";
 const qty=n=>Number(n).toLocaleString("en-US",{maximumFractionDigits:n>=100?0:n>=10?1:2});
+const HOT=0.1;  // an edge this large (10¢) gets the red frame
 function book(p){
-  const w=$("a","pb"),h=$("div","pbh");w.href=p.url;w.target="_blank";w.rel="noopener noreferrer";w.title="打开 Predict 市场";
-  h.append($("span","pt","Predict 盘口"),$("span","go","打开 ↗"));w.append(h);
+  const w=$("a","pb");w.href=p.url;w.target="_blank";w.rel="noopener noreferrer";w.title="打开 Predict 市场";
+  const q=$("div","quote");q.append($("span","pt","Predict ↗"));w.append(q);
   const has=p.bids||p.asks;
-  if(has){const b=p.bids[0],k=p.asks[0],q=$("div","quote"),lv=(t,l)=>{const x=$("span","",t+" ");x.append($("b","",l?cent(l[0]):"无"));if(l)x.append("×"+qty(l[1]));return x};
-    q.append(lv("买1",b),lv("卖1",k));if(b&&k)q.append($("span","","价差 "+cent(k[0]-b[0])));
-    if(p.stale)q.append($("span","warn",p.age+" 秒前"));w.append(q)}
-  else if(!p.error)w.append($("div","quote","等待获取"));
+  if(has){const b=p.bids[0],k=p.asks[0],lv=(t,l)=>{const x=$("span","",t+" ");x.append($("b","",l?cent(l[0]):"无"));if(l)x.append("×"+qty(l[1]));return x};
+    q.append(lv("买1",b),lv("卖1",k));if(b&&k)q.title="价差 "+cent(k[0]-b[0]);
+    if(p.stale)q.append($("span","warn",p.age+" 秒前"))}
+  else if(!p.error)q.append($("span","","等待获取"));
   if(p.error)w.append($("div","warn small",(has?"刷新失败，显示上次盘口：":"")+p.error));
   if(p.edges&&p.edges.length){const g=$("div","edges");
-    p.edges.forEach(e=>{const x=$("div","edge"+(e.best?" best":"")+(e.edge>0?" pos":""));
+    p.edges.forEach(e=>{const x=$("div","edge"+(e.best?" best":"")+(e.best&&e.edge>=HOT?" hot":"")+(e.edge>0?" pos":""));
+      x.title=e.maker?"挂单排队，成交不保证":"立即成交，量 "+qty(e.size);
       x.append($("span","el",e.label+" "+cent(e.price)),$("b","",(e.edge>=0?"+":"")+cent(e.edge)));g.append(x)});
-    w.append(g);const best=p.edges.find(e=>e.best),t=$("div","tip"+(best?"":" none"));
-    if(best){const b=$("b","",best.label+" @ "+cent(best.price));t.append("👉 ",b,"优势最大 +"+cent(best.edge),$("span","k",best.maker?"挂单排队，成交不保证":"立即成交，量 "+qty(best.size)))}
-    else t.textContent=p.stale?"盘口过期，不给建议":"四个方向对模型都没有正优势";
-    w.append(t)}
+    w.append(g);if(p.stale)w.append($("div","warn small","盘口过期，不给建议"))}
   return w}
 function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
 function card(it){
   const c=$("div","card"+(it.missing?" missing":"")),head=$("div","head"),nm=$("div","name",it.name);
-  if(it.symbol)nm.append($("span","sym",it.symbol));head.append(nm);
-  if(it.close_ms){const cd=$("span","cd");cd.dataset.close=it.close_ms;head.append(cd)}
-  c.append(head);
-  if(it.day){const dy=$("div","day");dy.append("📅 交易日",$("b","",it.day_label));
-    if(it.day_tag)dy.append($("span","tag"+(it.day_ahead>0?" next":""),it.day_tag));
+  nm.title=it.symbol||it.name;head.append(nm);
+  if(it.day){const t=$("span","tag"+(it.day_ahead>0?" next":""),(it.day_tag?it.day_label.split(" ")[0]+" "+it.day_tag:it.day_label));t.title="交易日 "+it.day_label;head.append(t);
     const k=it.name+"|"+(it.symbol||"");if(seen[k]&&seen[k]<it.day)rolled[k]=Date.now();seen[k]=it.day;
-    if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");dy.append($("span","tag new","已切换到新交易日"))}
-    c.append(dy)}
+    if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");t.className="tag new";t.textContent+=" 新"}}
+  if(it.close_ms){const cd=$("span","cd");cd.dataset.close=it.close_ms;cd.title="目标 "+it.close_label;head.append(cd)}
+  c.append(head);
+  const best=it.predict&&it.predict.edges&&it.predict.edges.find(e=>e.best);
+  if(best&&best.edge>=HOT){c.classList.add("hot");c.title="优势 ≥10¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge)}
   if(it.missing){c.append($("p","","概率暂缺："+it.missing));if(it.predict)c.append(book(it.predict));return c}
-  const o=$("div","odds"),a=$("div"),b=$("div");
-  a.append($("span","lbl","涨"),$("b",style==="us"?"d":"u",pct(it.fair_up)+"¢"));
-  b.append($("span","lbl","跌"),$("b",style==="us"?"u":"d",pct(it.fair_down)+"¢"));o.append(a,b);c.append(o);
-  const bar=$("div","bar");[[it.up,upColor()],[it.flat,"var(--flat)"],[it.down,downColor()]].forEach(([w,col])=>{const i=$("i");i.style.width=(w*100)+"%";i.style.background=col;bar.append(i)});c.append(bar);
-  c.append($("div","target","目标 "+it.close_label));
-  const px=$("div","px"),unit=it.unit?" "+it.unit:"";
-  px.append($("span","k","参考"));if(it.ref_day)px.append($("span","rd",it.ref_day+" 收盘"));px.append($("span","",it.ref+unit),$("span","k","→ 有效"),$("span","",it.effective+unit));
-  const chip=$("span","chip",(it.move>=0?"+":"")+it.move.toFixed(2)+"%");chip.style.color=it.move>0?upColor():it.move<0?downColor():"var(--muted)";px.append(chip);c.append(px);
+  const o=$("div","odds"),a=$("b",style==="us"?"d":"u"),b=$("b",style==="us"?"u":"d");
+  a.append($("span","lbl","涨"),pct(it.fair_up)+"¢");b.append(pct(it.fair_down)+"¢",$("span","lbl","跌"));
+  const bar=$("div","bar");[[it.up,upColor()],[it.flat,"var(--flat)"],[it.down,downColor()]].forEach(([w,col])=>{const i=$("i");i.style.width=(w*100)+"%";i.style.background=col;bar.append(i)});
+  o.append(a,bar,b);c.append(o);
+  const unit=it.unit?" "+it.unit:"";
   const det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
-  det.append($("summary","","计算明细"));const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
-  row("参考",it.ref+unit+"（"+it.ref_note+"）");row("代理",it.proxy_note);
+  const sm=$("summary");sm.title="点开看计算明细";
+  sm.append($("span","",(it.ref_day?it.ref_day+" 收":"参考")),$("span","v",it.ref),"→",$("span","v",it.effective+unit));
+  const chip=$("span","chip",(it.move>=0?"+":"")+it.move.toFixed(2)+"%");chip.style.color=it.move>0?upColor():it.move<0?downColor():"var(--muted)";sm.append(chip);det.append(sm);
+  const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
+  row("目标",it.close_label);row("参考",it.ref+unit+"（"+it.ref_note+"）");row("有效",it.effective+unit);row("代理",it.proxy_note);
   row("σ","日 "+(it.sigma_daily*100).toFixed(2)+"% × √"+it.remaining.toFixed(3)+" = "+(it.sigma*100).toFixed(2)+"%");
   row("σ 来源",it.sigma_note);row("涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%");row("z",it.z.toFixed(3));
-  det.append(dl);if(it.predict)c.append(book(it.predict));c.append(det);return c}
+  det.append(dl);c.append(det);if(it.predict)c.append(book(it.predict));return c}
 function tick(){
   const now=Date.now()+skew;
   document.querySelectorAll(".cd").forEach(el=>{const left=Math.floor((Number(el.dataset.close)-now)/1000);
@@ -2970,7 +2970,9 @@ async function load(){
     document.getElementById("meta").replaceChildren(...(d.today?[$("span","","今天 "+d.today)]:[]),$("span","","数据 "+d.generated_at),$("span","","",),$("span","","基准 "+d.mode),$("span","","v"+d.version));
     document.getElementById("meta").children[d.today?2:1].id="ago";
     const lg=document.getElementById("legend");const sw=$("span","sw");[["涨",upColor()],["平","var(--flat)"],["跌",downColor()]].forEach(([t,col])=>{const i=$("i");i.style.background=col;sw.append(i,t)});
-    lg.replaceChildren(sw,$("span","","¢ = 公平价（平盘两边各半）"),$("span","","盘口优势 = 公平价 − 成交价：挂涨@买1 · 挂跌@1−卖1 · 吃涨@卖1 · 吃跌@1−买1"));
+    const hot=$("span","sw hot");hot.append($("i"),"红框 = 优势 ≥10¢");
+    const rule=$("span","","¢ 公平价 · 优势 = 公平价 − 成交价");rule.title="挂涨@买1 · 挂跌@1−卖1 · 吃涨@卖1 · 吃跌@1−买1；平盘两边各半";
+    lg.replaceChildren(sw,rule,hot);
     document.getElementById("foot").textContent=d.note;tick();
   }catch(e){document.getElementById("meta").replaceChildren($("span","warn","刷新失败："+e.message+"，稍后自动重试"))}
 }
