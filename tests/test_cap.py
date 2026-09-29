@@ -3,7 +3,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
 D = m.D
-(NIU,) = m.CAP_MARKETS
+NIU, ANSEM, PONS = m.CAP_MARKETS
 TOKEN = NIU.token
 
 # --- the market as its rules state it ----------------------------------------------------------------------------
@@ -28,7 +28,7 @@ pair = lambda base, price, liq, cap=None, dex="pancakeswap": {"dexId": dex, "bas
                                                                "liquidity": {"usd": liq}, "marketCap": cap, "fdv": cap}
 answer = [pair("0xother", "5", 9e9), pair(TOKEN.upper().replace("0X", "0x"), "0.083", 1e6, 83_000_000, "v2"),
           pair(TOKEN, "0.084", 3e6, 84_000_000), {"baseToken": {"address": TOKEN}, "priceUsd": "x"}]
-assert m.dex_price(answer, TOKEN) == (D("0.084"), D("84000000"), "pancakeswap")
+assert m.dex_price(answer, TOKEN) == (D("0.084"), D("84000000"), D("84000000"), "pancakeswap")
 assert m.dex_price({"schemaVersion": "1.0.0", "pairs": answer}, TOKEN)[0] == D("0.084")
 for bad in ([], {"pairs": None}, [pair("0xother", "1", 1)]):
     try: m.dex_price(bad, TOKEN); assert False, bad
@@ -36,13 +36,23 @@ for bad in ([], {"pairs": None}, [pair("0xother", "1", 1)]):
 # GeckoTerminal
 pools = {"data": [{"attributes": {"address": "0xPOOLA", "reserve_in_usd": "1000"}},
                   {"attributes": {"address": "0xPOOLB", "reserve_in_usd": "250000.5"}}, {"attributes": {}}]}
-assert m.gecko_pool(pools) == "0xpoolb"
+assert m.gecko_pool(pools) == "0xPOOLB"  # kept as given: Solana addresses are case-sensitive
 bars = {"data": {"attributes": {"ohlcv_list": [[7200, "1", "2", "0.5", "1.5", "9"], [3600, 1, 1.2, 0.9, 1.1, 3], ["x"]]}}}
 assert m.gecko_bars(bars) == [(3600, 1.0, 1.2, 0.9, 1.1), (7200, 1.0, 2.0, 0.5, 1.5)]
 assert m.gecko_bars({"data": {}}) == [] and m.gecko_bars(None) == []
 assert m.rpc_uint({"jsonrpc": "2.0", "id": 1, "result": "0x3b9aca00"}) == 10 ** 9 and m.rpc_uint({"result": "0x"}) == 0
 try: m.rpc_uint({"error": {"code": -32000, "message": "execution reverted"}}); assert False
 except ValueError as error: assert "execution reverted" in str(error)
+
+# ANSEM (Solana / pump.fun) and PONS (Robinhood chain, settled on its DexScreener pair), windows in EDT
+assert ANSEM.start_ms == int(dt.datetime(2026, 8, 17, 17, 0, tzinfo=dt.timezone.utc).timestamp() * 1000) and ANSEM.chain == "solana"
+assert ANSEM.token == "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump" and ANSEM.supply == "fdv" and ANSEM.gecko == "solana"
+assert PONS.start_ms == int(dt.datetime(2026, 8, 31, 10, 0, tzinfo=dt.timezone.utc).timestamp() * 1000) and PONS.chain == "robinhood"
+assert PONS.pair == "0x10cc6bd38112cac182db90b6a71d8bb5939526ba" and PONS.gecko == "" and ANSEM.end_ms == PONS.end_ms == NIU.end_ms
+# a named pair's answer ({"pair": {...}}), the base matched without regard to case, FDV kept apart from market cap
+single = {"schemaVersion": "1.0.0", "pair": {"dexId": "uniswap", "baseToken": {"address": PONS.token.lower()}, "priceUsd": "0.8",
+                                           "liquidity": {"usd": 5e5}, "marketCap": 6e8, "fdv": 7.2e8}}
+assert m.dex_price(single, PONS.token) == (D("0.8"), D("6E+8"), D("7.2E+8"), "uniswap")
 
 H = 3600
 NOW = int(dt.datetime(2026, 9, 29, 12, 10, tzinfo=m.BEIJING).timestamp() * 1000)
@@ -69,7 +79,7 @@ def world(peak_hour=None, peak_price=0.25, first_minutes=None):
             raise AssertionError(data)
         if url.endswith("/pools?page=1"):
             return pools
-        assert "/pools/0xpoolb/ohlcv/" in url and f"token={TOKEN}" in url and "currency=usd" in url, url
+        assert "/pools/0xPOOLB/ohlcv/" in url and f"token={TOKEN}" in url and "currency=usd" in url, url
         q = dict(part.split("=") for part in url.split("?")[1].split("&"))
         before, limit = int(q["before_timestamp"]), int(q["limit"])
         if "/ohlcv/minute" in url:
@@ -203,6 +213,40 @@ async def run():
     fresh = m.CapMarket(m.Store(":memory:"), NIU)
     bare = m.Bot(cfg, m.Store(":memory:"), FakeMarket(), None).cap_payload(fresh, NOW)
     assert bare["missing"] == "等待市值数据" and [r["label"] for r in bare["ladder"]["rows"]] == ["$200M", "$300M", "$500M", "$1B"]
+
+    # --- FDV from DexScreener (no RPC), a named pair, no bars: prior σ, live-observed high --------------------------------
+    pons_calls = []
+    async def pons_get(url, payload=None):
+        pons_calls.append(url)
+        assert payload is None and url == f"https://api.dexscreener.com/latest/dex/pairs/robinhood/{PONS.pair}", url
+        return {"pairs": [{"dexId": "uniswap", "baseToken": {"address": PONS.token}, "priceUsd": price["v"],
+                           "liquidity": {"usd": 5e5}, "fdv": float(D(price["v"]) * D("985000000"))}]}
+    price = {"v": "0.52"}
+    pons = m.CapMarket(m.Store(":memory:"), PONS); pons.get = pons_get
+    await pons.refresh(NOW)
+    assert pons.error == "" and pons.supply == D("985000000") and pons.cap == D("0.52") * D("985000000"), (pons.error, pons.supply)
+    assert pons.sigma == PONS.prior_sigma and "先验" in pons.sigma_note and all("geckoterminal" not in u for u in pons_calls)
+    price["v"] = "0.61"; pons.times["price"] = -1e9
+    await pons.refresh(NOW + 60_000)
+    price["v"] = "0.55"; pons.times["price"] = -1e9
+    await pons.refresh(NOW + 120_000)
+    high, at = pons.window_high()
+    assert high == D("0.61") * D("985000000") and at == (NOW + 60_000) // 1000, (high, at)  # the 0.61 seen a minute ago
+    assert pons.probability(D("6e8"), NOW) == 1.0 and 0 < pons.probability(D("7e8"), NOW) < 1
+    pons_item = bot.cap_payload(pons, NOW)
+    assert pons_item["name"] == "$PONS FDV" and pons_item["ladder"]["metric"] == "FDV" and pons_item["ladder"]["settle"] == "DexScreener"
+    assert pons_item["ladder"]["bars"] is False and "FDV ÷ 价格" in pons_item["ladder"]["supply_note"], pons_item["ladder"]
+    # a market Predict has settled before the window closed counts as reached, whatever our data says
+    bot.predict.ladders["PONS"] = [m.LadderRow(D("9e8"), "31", "$900M", None, "HTTP 404: 接口请求失败")]
+    bot.predict.market_meta["31"] = ({"outcomes": ["Yes", "No"], "status": "RESOLVED"}, time.monotonic())
+    row = bot.cap_payload(pons, NOW)["ladder"]["rows"][0]
+    assert row["fair"] == 1.0 and row["touched"] is True, row
+    # the observed high and a later GeckoTerminal scan share one record
+    mix = m.CapMarket(m.Store(":memory:"), NIU); mix.get, _ = world()
+    mix.price = D("0.5"); mix.observe(NOW)
+    assert mix.history["high"] == 0.5 and "through" not in mix.history
+    await mix.scan(NOW)
+    assert mix.history["high"] == 0.5 and mix.history["through"] == NOW_S - NOW_S % H, mix.history
 
 asyncio.run(run())
 print("CAP_OK")
