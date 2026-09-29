@@ -3613,7 +3613,8 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 .edge.best{border-color:var(--best);background:var(--best-bg)}.edge.best .el{color:var(--text)}.edge.best b{color:var(--best)}
 .edge.hot{border-color:var(--hot);background:var(--hot-bg)}.edge.hot b{color:var(--hot)}
 .quote .qe{white-space:normal;word-break:break-all}
-.grid.wide{grid-template-columns:repeat(auto-fill,minmax(min(440px,100%),1fr))}
+.grid.wide{display:flex;flex-wrap:wrap;align-items:flex-start}.grid.wide>.card{width:max-content;max-width:100%}
+.card.lad .name{flex:0 1 auto}.card.lad .cd{margin-left:6px}
 .lg{display:grid;grid-template-columns:auto auto auto auto 1fr;gap:3px 12px;margin-top:5px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
 .lg .lh{color:var(--faint);font-size:11px;white-space:nowrap}.lg .lr{text-align:right}.lg .ln{text-align:right;white-space:nowrap}.lg .ld{color:var(--muted)}
 .lg .lt{font-weight:650;white-space:nowrap}.lg .lq{color:var(--muted);white-space:nowrap}
@@ -3662,6 +3663,7 @@ function book(p){
   return w}
 function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
 function ladder(c,it){
+  c.classList.add("lad");
   // a market-cap ladder: one Yes/No market per threshold; reached ones fold into one line, open ones get a row each
   const L=it.ladder,det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   const sm=$("summary");sm.title="点开看计算明细";
@@ -3674,7 +3676,7 @@ function ladder(c,it){
   row("模型",(L.bars?"":"σ 为先验值（这条链没有 K 线来源），仅供参考。")+"碰到即 Yes：零漂移、固定波动率的单边触及概率 Φ((−h−s²/2)/s) + (M/K)·Φ((−h+s²/2)/s)，h = ln(K/M)，s = σ√T");
   det.append(dl);c.append(det);
   if(it.missing)c.append($("p","","概率暂缺："+it.missing));else if(L.error)c.append($("div","warn small","⚠️ "+L.error));
-  if(!L.bars&&!it.missing)c.append($("div","warn small","⚠️ 这条链没有 K 线来源：σ 用先验 "+(L.sigma*100).toFixed(0)+"%，优势只作参考，不标红"));
+  if(!L.bars&&!it.missing)c.append($("div","warn small","⚠️ 无 K 线：σ 为先验 "+(L.sigma*100).toFixed(0)+"%，优势仅供参考"));
   const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
   if(done.length){const t=$("div","touched");t.append($("span","k","✓ 已触及"));
     done.forEach(r=>{const x=$("span","tchip",r.label);x.title=r.label+"：窗口内"+L.metric+"已达到"+(r.bid!=null||r.ask!=null?"｜盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1)):"｜已结算或无盘口");t.append(x)});
