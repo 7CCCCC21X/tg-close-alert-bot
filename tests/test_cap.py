@@ -241,6 +241,38 @@ async def run():
     bot.predict.market_meta["31"] = ({"outcomes": ["Yes", "No"], "status": "RESOLVED"}, time.monotonic())
     row = bot.cap_payload(pons, NOW)["ladder"]["rows"][0]
     assert row["fair"] == 1.0 and row["touched"] is True, row
+    # GeckoTerminal rate-limits (429): the σ saved from the last good fetch stands in, and the bars are not asked
+    # for again on every refresh, only after RETRY_SECONDS
+    rl_store = m.Store(":memory:")
+    ok = m.CapMarket(rl_store, NIU); ok.get, _ = world()
+    await ok.refresh(NOW)
+    good = ok.sigma
+    assert good and rl_store.get(f"capsigma:{NIU.slug}")[0] == good
+    limited = m.CapMarket(rl_store, NIU)
+    ok_get, _ = world()
+    gecko = []
+    async def limited_get(url, payload=None):
+        if "geckoterminal" in url:
+            gecko.append(url)
+            raise m.RemoteError("HTTP 429: 接口限流，等待后重试", 30)
+        return await ok_get(url, payload)
+    limited.get = limited_get
+    await limited.refresh(NOW + 60_000)
+    assert limited.sigma == good and "保存" in limited.sigma_note and "波动率" not in limited.error, (limited.sigma_note, limited.error)
+    assert "missing" not in bot.cap_payload(limited, NOW + 60_000)
+    n = len(gecko)
+    for _ in range(5):
+        limited.times["price"] = -1e9
+        await limited.refresh(NOW + 90_000)
+    assert len(gecko) == n, gecko[n:]  # no GeckoTerminal request at all during the back-off
+    limited.times["vol"] -= m.CapMarket.RETRY_SECONDS  # five minutes later it tries again
+    await limited.refresh(NOW + 400_000)
+    assert len(gecko) > n
+    # with no saved σ the error is shown
+    fresh_rl = m.CapMarket(m.Store(":memory:"), NIU); fresh_rl.get = limited_get
+    await fresh_rl.refresh(NOW)
+    assert fresh_rl.sigma is None and "429" in fresh_rl.error
+
     # the observed high and a later GeckoTerminal scan share one record
     mix = m.CapMarket(m.Store(":memory:"), NIU); mix.get, _ = world()
     mix.price = D("0.5"); mix.observe(NOW)

@@ -3399,6 +3399,8 @@ class CapMarket:
     SUPPLY_SECONDS = 600
     VOL_SECONDS = 3600
     SCAN_SECONDS = 300
+    RETRY_SECONDS = 300   # after a failed σ request (GeckoTerminal allows ~30 calls a minute): wait, never hammer
+    SIGMA_KEEP_MS = 24 * 3600_000  # a saved σ stands in for this long while fresh bars cannot be fetched
 
     def __init__(self, store: "Store", spec: CapSpec):
         self.store, self.spec = store, spec
@@ -3489,7 +3491,7 @@ class CapMarket:
                 failures.append(f"供应量：{clean_error(error)}")
         if not self.spec.gecko:
             self.sigma, self.sigma_note = self.spec.prior_sigma, "先验：没有 K 线来源"
-        elif mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
+        elif mono - self.times["vol"] >= self.VOL_SECONDS:
             self.times["vol"] = mono
             self.pool = ""  # look the most liquid pool up again (a token can move pools)
             try:
@@ -3500,8 +3502,15 @@ class CapMarket:
                 mean = sum(rets) / len(rets)
                 self.sigma = math.sqrt(sum((r - mean) ** 2 for r in rets) / (len(rets) - 1) * 24 * 365)
                 self.sigma_note = f"{len(rets) / 24:.0f} 日小时收盘"
+                self.store.put(f"capsigma:{self.spec.slug}", [self.sigma, self.sigma_note, now_ms])
             except Exception as error:
-                failures.append(f"波动率：{clean_error(error)}")
+                self.times["vol"] = mono - self.VOL_SECONDS + self.RETRY_SECONDS  # try again in 5 minutes
+                saved = self.store.get(f"capsigma:{self.spec.slug}")
+                with contextlib.suppress(TypeError, ValueError, IndexError):
+                    if self.sigma is None and now_ms - int(saved[2]) < self.SIGMA_KEEP_MS:
+                        self.sigma, self.sigma_note = float(saved[0]), f"{saved[1]}，{stamp(int(saved[2]), seconds=False)} 保存"
+                if self.sigma is None:
+                    failures.append(f"波动率：{clean_error(error)}")
         if self.spec.gecko and mono - self.times["scan"] >= self.SCAN_SECONDS:
             self.times["scan"] = mono
             try:
@@ -3613,7 +3622,7 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 .edge.best{border-color:var(--best);background:var(--best-bg)}.edge.best .el{color:var(--text)}.edge.best b{color:var(--best)}
 .edge.hot{border-color:var(--hot);background:var(--hot-bg)}.edge.hot b{color:var(--hot)}
 .quote .qe{white-space:normal;word-break:break-all}
-.grid.wide{display:flex;flex-wrap:wrap;align-items:flex-start}.grid.wide>.card{width:max-content;max-width:100%}
+.grid.wide{grid-template-columns:repeat(auto-fill,minmax(min(100%,520px),520px));align-items:start}
 .card.lad .name{flex:0 1 auto}.card.lad .cd{margin-left:6px}
 .lg{display:grid;grid-template-columns:auto auto auto auto auto 1fr;gap:3px 12px;margin-top:5px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
 .lg .lh{color:var(--faint);font-size:11px;white-space:nowrap}.lg .lr{text-align:right}.lg .ln{text-align:right;white-space:nowrap}.lg .ld{color:var(--muted)}
@@ -3680,7 +3689,9 @@ function ladder(c,it){
   if(!L.bars&&!it.missing)c.append($("div","warn small","⚠️ 无 K 线：σ 为先验 "+(L.sigma*100).toFixed(0)+"%，优势仅供参考"));
   const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
   if(done.length){const t=$("div","touched");t.append($("span","k","✓ 已触及"));
-    done.forEach(r=>{const x=$("span","tchip",r.label);x.title=r.label+"：窗口内"+L.metric+"已达到"+(r.bid!=null||r.ask!=null?"｜盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1)):"｜已结算或无盘口");t.append(x)});
+    const tip=done.map(r=>r.label+(r.bid!=null||r.ask!=null?"（盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1))+"）":"")).join("、");
+    const shown=done.length>3?[{label:"≤ "+done[done.length-1].label+" · "+done.length+" 档"}]:done;  // many levels: one chip
+    shown.forEach(r=>{const x=$("span","tchip",r.label);x.title="窗口内"+L.metric+"已达到："+tip;t.append(x)});
     c.append(t)}
   const w=it.predict?$("a","pb"):$("div","pb");
   if(it.predict){w.href=it.predict.url;w.target="_blank";w.rel="noopener noreferrer";w.title="打开 Predict 市场"}
