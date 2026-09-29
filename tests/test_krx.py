@@ -58,5 +58,30 @@ async def run():
     base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 15, 27))
     assert base.value == D("1761000") and base.source.endswith("·Naver"), base
 
+    # --- KOSPI: the dated daily-chart close wins over a realtime figure frozen before the closing auction -------------
+    class FakeMarket:
+        def now_ms(self): return kr(2026, 9, 29, 10, 0)
+    bot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT"}), m.Store(":memory:"), FakeMarket(), None)
+    kospi_chart = ('<item data="20260925|0|0|0|7080.92|1" /><item data="20260928|0|0|0|6910.89|1" />'
+                   '<item data="20260929|0|0|0|6830.00|1" />').encode()
+    answers = {"fchart": kospi_chart}
+    await bot.kospi.refresh_daily(kr(2026, 9, 29, 10, 0))
+    assert bot.kospi.daily == {dt.date(2026, 9, 25): D("7080.92"), dt.date(2026, 9, 28): D("6910.89")}, bot.kospi.daily  # 09-29 not final
+    ref, note = bot.kospi_ref(dt.date(2026, 9, 28), D("6889.74"))
+    assert ref == D("6910.89") and note == "09-28 收盘（日K；实时行情为 6,889.74）", note
+    assert bot.kospi_ref(dt.date(2026, 9, 28), D("6910.89")) == (D("6910.89"), "09-28 收盘")      # they agree: plain label
+    assert bot.kospi_ref(dt.date(2026, 9, 29), D("6824.90")) == (D("6824.90"), "09-29 收盘")      # not in the chart yet
+    # the day's bar is looked for every minute after the close, every 10 minutes otherwise
+    n = bot.kospi.daily_refreshed
+    await bot.kospi.refresh_daily(kr(2026, 9, 29, 10, 5)); assert bot.kospi.daily_refreshed == n
+    bot.kospi.daily_refreshed -= 61
+    await bot.kospi.refresh_daily(kr(2026, 9, 29, 15, 50))
+    assert bot.kospi.daily[dt.date(2026, 9, 29)] == D("6830.00")
+    # during the session the KOSPI card measures from the dated close
+    k = m.IndexQuote("KOSPI", D("6824.90"), D("6889.74"), None, None, None, kr(2026, 9, 29, 10, 0), "Naver")
+    bot.kospi.quote = k
+    odds = bot.kospi_odds(kr(2026, 9, 29, 10, 0))
+    assert odds.ref == D("6910.89") and "实时行情为 6,889.74" in odds.ref_note and odds.effective == D("6824.90"), odds
+
 asyncio.run(run())
 print("KRX_OK")

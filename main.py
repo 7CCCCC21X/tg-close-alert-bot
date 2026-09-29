@@ -2184,6 +2184,11 @@ class KospiIndex:
         self.error = ""
         self.error200 = ""
         self.refreshed = -1e9
+        self.daily: dict[dt.date, D] = {}   # dated official closes (Naver daily chart; the index has no NXT hours)
+        self.daily_refreshed = -1e9
+        self.daily_error = ""
+
+    DAILY_URL = "https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=10&symbol=KOSPI"
 
     @staticmethod
     def parse(source: str, raw: bytes, now_ms: int) -> IndexQuote:
@@ -2191,12 +2196,33 @@ class KospiIndex:
             return parse_naver_index(raw, now_ms)
         return parse_eastmoney_index(raw, now_ms, "韩国KOSPI")
 
+    def official_close(self, day: dt.date) -> D | None:
+        """The dated close of ``day`` from the daily chart (only once that session is final)."""
+        return self.daily.get(day)
+
+    async def refresh_daily(self, now_ms: int) -> None:
+        """Every 10 minutes, and every minute from the close until the day's bar is in."""
+        kst = dt.timezone(dt.timedelta(hours=9))
+        local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
+        waiting = local.weekday() < 5 and local.time() >= dt.time(15, 45) and local.date() not in self.daily
+        if time.monotonic() - self.daily_refreshed < (60 if waiting else 600):
+            return
+        self.daily_refreshed = time.monotonic()
+        try:
+            bars = finished_bars(parse_daily_ohlc("kr", await fetch_source(self.DAILY_URL, {"Referer": "https://finance.naver.com/"})),
+                                 "kr", now_ms)
+            self.daily = {day: close for day, _, close in bars}
+            self.daily_error = ""
+        except Exception as error:
+            self.daily_error = clean_error(error) or type(error).__name__
+
     async def refresh(self, now_ms: int, force: bool = False) -> bool | None:
         if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
             return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         self.quote, self.error = await self._fetch(self.SOURCES, now_ms, self.quote)
         self.quote200, self.error200 = await self._fetch(self.SOURCES_200, now_ms, self.quote200)
+        await self.refresh_daily(now_ms)
 
     async def _fetch(self, sources: tuple, now_ms: int, previous: IndexQuote | None) -> tuple[IndexQuote | None, str]:
         failures = []
@@ -4890,7 +4916,8 @@ class Bot:
         k = self.kospi.quote
         kst = dt.timezone(dt.timedelta(hours=9))
         if k and dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).time() >= dt.time(15, 30):
-            self.store.put(f"outcome:KOSPI:{dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date().isoformat()}", float(k.last))
+            day = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date()
+            self.store.put(f"outcome:KOSPI:{day.isoformat()}", float(self.kospi.official_close(day) or k.last))
         q, local = self.hsi.quote, dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
         if (q and q.spot is not None and not self.hsi.error and local.time() >= dt.time(16, 15)
                 and self.hk_cash_close_date(now_ms, self.hsi.holidays) == local.date()):
@@ -5156,6 +5183,17 @@ class Bot:
     A50_SOFT_STALE_MS = 60 * 60_000  # A50 silent longer than this: no odds at all (shorter: odds with a warning)
     HL_STALE_MS = 10 * 60_000  # an HL mark older than this (refresh failing) is not used for new probabilities
 
+    def kospi_ref(self, day: dt.date, live: D | None) -> tuple[D, str]:
+        """The close a KOSPI up/down market compares with: the dated daily-chart close of ``day``, else the
+        realtime feed's figure (Naver's index feed has been seen frozen at 15:15, before the closing auction)."""
+        official = self.kospi.official_close(day)
+        label = f"{day.strftime('%m-%d')} 收盘"
+        if official is None:
+            return live, label
+        if live is not None and abs(percent(official, live)) >= D("0.005"):
+            return official, f"{label}（日K；实时行情为 {fmt(live)}）"
+        return official, label
+
     def kospi_odds(self, now_ms: int) -> CloseOdds | str | None:
         k = self.kospi.quote
         if not self.config.probability or not self.config.kospi_index:
@@ -5171,7 +5209,8 @@ class Bot:
             remaining, target = session_remaining("kr", now_ms, quoted_day - dt.timedelta(days=1), holidays)
             sigma, sigma_note = self.vols.get("KOSPI", "KOSPI", intraday=True)
             prev_day = expected_close_date("kr", now_ms, holidays)
-            return close_odds("KOSPI", k.prev_close, k.last, sigma, remaining, target, D("0.01"), f"{prev_day.strftime('%m-%d')} 收盘",
+            ref, ref_note = self.kospi_ref(prev_day, k.prev_close)
+            return close_odds("KOSPI", ref, k.last, sigma, remaining, target, D("0.01"), ref_note,
                               f"KOSPI 现货 {fmt(k.last)}（盘中直接用现货）", sigma_note)
         hl, anchor = self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
         holidays = self.config.holidays.get("kr", frozenset())
@@ -5190,9 +5229,9 @@ class Bot:
         base, base_note = anchor[1], "收盘时刻" if self.kospi_anchor_note == "15:30 一分钟K" else self.kospi_anchor_note
         price, kind = kr200_price(hl)
         beta = self.config.kospi_beta
-        effective = k.last * D(str(math.exp(beta * math.log(float(price / base)))))
-        return close_odds("KOSPI", k.last, effective, sigma, remaining, target, D("0.01"),
-                          f"{quoted_day.strftime('%m-%d')} 收盘",
+        ref, ref_note = self.kospi_ref(quoted_day, k.last)
+        effective = ref * D(str(math.exp(beta * math.log(float(price / base)))))
+        return close_odds("KOSPI", ref, effective, sigma, remaining, target, D("0.01"), ref_note,
                           f"HL KR200 {kind} {fmt(price)} / {base_note} {fmt(base)} → {percent(price, base):+.3f}%"
                           + (f" × β {beta:g}" if beta != 1 else "") + "（KOSPI200 代理）", sigma_note, beta=beta, mode="盘后")
 
@@ -5885,6 +5924,9 @@ class Bot:
                 lines.append(f"  上证概率：暂缺——{odds}")
         if self.config.kospi_index:
             k, hl, anchor = self.kospi.quote, self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
+            daily = max(self.kospi.daily.items()) if self.kospi.daily else None
+            lines.append(f"  KOSPI 日K收盘：{f'{daily[0]:%m-%d} {fmt(daily[1])}' if daily else '未取得'}"
+                         + (f"｜错误：{brief_error(self.kospi.daily_error, 60)}" if self.kospi.daily_error else ""))
             lines.append(f"  KOSPI 基准：{f'{fmt(k.last)}｜{stamp(k.quoted_ms, seconds=False)}｜{k.source}' if k else '无'}"
                          + (f"｜错误：{brief_error(self.kospi.error, 80)}" if self.kospi.error else ""))
             lines.append(f"  KR200 代理：{f'{fmt(kr200_price(hl)[0])}（HL {hl.coin} {kr200_price(hl)[1]}；标记价 {fmt(hl.mark)}）｜{int((now_ms - hl.fetched_ms) / 1000)} 秒前' if hl else '无'}")
