@@ -32,7 +32,7 @@ for bad in [b'v_sh688836="";', b"garbage", b'var hq_str_sh688836="a,b";']:
 src = m.StockMarket.sources(m.StockTicker("hk", "00625"))
 assert [n for n, _, _ in src] == ["东方财富", "腾讯", "新浪"] and "secid=116.00625" in src[0][1] and src[1][1].endswith("q=hk00625") and src[2][1].endswith("list=rt_hk00625")
 assert all("Referer" in h for _, _, h in src)
-assert [n for n, _, _ in m.StockMarket.sources(m.StockTicker("kr", "000660"))] == ["Naver"]
+assert [n for n, _, _ in m.StockMarket.sources(m.StockTicker("kr", "000660"))] == ["Yahoo", "Naver"]
 
 async def run():
     m.StockMarket.ATTEMPTS = 2

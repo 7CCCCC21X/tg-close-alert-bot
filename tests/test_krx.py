@@ -23,6 +23,14 @@ def realtime(price, change, direction, at):
                                   "fluctuationsRatio": "0.06", "marketStatus": "OPEN", "localTradedAt": at}]}).encode()
 
 
+def yahoo(bars, offset=32400):
+    """A Yahoo v8 chart body: bars are (date, close); stamps at 09:00 local like Yahoo's."""
+    stamps = [int(dt.datetime(d.year, d.month, d.day, 9, tzinfo=dt.timezone(dt.timedelta(seconds=offset))).timestamp()) for d, _ in bars]
+    return json.dumps({"chart": {"result": [{"meta": {"gmtoffset": offset}, "timestamp": stamps,
+                                             "indicators": {"quote": [{"open": [c for _, c in bars], "close": [c for _, c in bars]}]}}],
+                                 "error": None}}).encode()
+
+
 async def run():
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT"})
     stocks = m.StockMarket(cfg, m.Store(":memory:"))
@@ -73,6 +81,28 @@ async def run():
     base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 15, 27))
     assert base.value == D("1761000") and base.source.endswith("·Naver"), base
 
+    # --- Yahoo 000660.KS: KRX-only daily bars (no NXT) come first ----------------------------------------------------
+    ybars = yahoo([(dt.date(2026, 9, 25), 1750000.0), (dt.date(2026, 9, 28), 1768000.0), (dt.date(2026, 9, 29), 1765000.0),
+                   (dt.date(2026, 9, 30), None)])
+    answers = {"finance.yahoo.com": ybars, "fchart": CHART,
+               "polling": realtime("1,785,000", "17,000", "2", "2026-09-29T19:50:00+09:00")}  # NXT after-hours print
+    ystocks = m.StockMarket(cfg, m.Store(":memory:"))
+    base = await ystocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 19, 50))
+    assert base.value == D("1765000") and base.prev_value == D("1768000") and base.source.endswith("·Yahoo"), base
+    assert base.close_ms == kr(2026, 9, 29, 15, 30), base
+    # 15:36: Yahoo's 09-29 bar is not final yet, but the KRX close captured from 15:33 is newer -> it wins
+    answers = {"finance.yahoo.com": ybars, "fchart": CHART, "polling": realtime("1,765,000", "3,000", "5", "2026-09-29T15:30:00+09:00")}
+    base = await m.StockMarket(cfg, m.Store(":memory:")).fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 15, 36))
+    assert base.value == D("1765000") and base.close_ms == kr(2026, 9, 29, 15, 30) and "Naver KRX" in base.source, base
+    # 10:00 the next day: Yahoo's 09-29 close (the 09-30 bar has no close yet)
+    answers = {"finance.yahoo.com": ybars, "fchart": CHART, "polling": m.RemoteError("x")}
+    base = await ystocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 30, 10, 0))
+    assert base.value == D("1765000") and base.source.endswith("·Yahoo"), base
+    assert [c for _, _, c in m.parse_yahoo_daily(ybars)] == [D("1750000.00"), D("1768000.00"), D("1765000.00")]
+    for bad in (b"garbage", b'{"chart":{"result":null}}'):
+        try: m.parse_yahoo_daily(bad); assert False
+        except ValueError: pass
+
     # --- KOSPI: the dated daily-chart close wins over a realtime figure frozen before the closing auction -------------
     class FakeMarket:
         def now_ms(self): return kr(2026, 9, 29, 10, 0)
@@ -92,6 +122,11 @@ async def run():
     bot.kospi.daily_refreshed -= 61
     await bot.kospi.refresh_daily(kr(2026, 9, 29, 15, 50))
     assert bot.kospi.daily[dt.date(2026, 9, 29)] == D("6830.00")
+    # Yahoo ^KS11 (what Predict settles on) comes before Naver's chart
+    kbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT"}), m.Store(":memory:"), FakeMarket(), None)
+    answers = {"finance.yahoo.com": yahoo([(dt.date(2026, 9, 28), 6911.5), (dt.date(2026, 9, 29), 6831.2)]), "fchart": kospi_chart}
+    await kbot.kospi.refresh_daily(kr(2026, 9, 29, 16, 0))
+    assert kbot.kospi.daily == {dt.date(2026, 9, 28): D("6911.50"), dt.date(2026, 9, 29): D("6831.20")}, kbot.kospi.daily
     # during the session the KOSPI card measures from the dated close
     k = m.IndexQuote("KOSPI", D("6824.90"), D("6889.74"), None, None, None, kr(2026, 9, 29, 10, 0), "Naver")
     bot.kospi.quote = k

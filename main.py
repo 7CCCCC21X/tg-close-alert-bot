@@ -917,6 +917,33 @@ def parse_daily_ohlc(market: str, raw: bytes) -> list[tuple[dt.date, D | None, D
     return bars
 
 
+def yahoo_url(symbol: str) -> str:
+    return f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}?range=15d&interval=1d"
+
+
+def parse_yahoo_daily(raw: bytes) -> list[tuple[dt.date, D | None, D]]:
+    """Yahoo v8 chart (interval=1d) -> (exchange-local date, open, close), oldest first. Yahoo's .KS / ^KS11 bars are
+    the KRX regular session only (no Nextrade hours); ^KS11 is also what Predict's KOSPI markets settle on."""
+    try:
+        result = json.loads(raw)["chart"]["result"][0]
+        offset = int(result["meta"].get("gmtoffset") or 0)
+        quote = result["indicators"]["quote"][0]
+        stamps, closes, opens = result["timestamp"], quote["close"], quote.get("open") or []
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise ValueError("Yahoo 日 K 返回格式异常") from None
+    bars = []
+    for i, ts in enumerate(stamps):
+        close = closes[i] if i < len(closes) else None
+        if close is None:
+            continue
+        day = dt.datetime.fromtimestamp(int(ts) + offset, dt.timezone.utc).date()
+        bars.append((day, _open_price(str(opens[i])) if i < len(opens) and opens[i] is not None else None,
+                     D(str(close)).quantize(D("0.01"))))
+    if not bars:
+        raise ValueError("Yahoo 日 K 没有返回任何交易日")
+    return sorted(bars)
+
+
 def _open_price(text: str) -> D | None:
     """A daily bar's open, or None when missing / not a positive number (it only feeds volatility)."""
     try:
@@ -1068,7 +1095,8 @@ class StockMarket:
         """(name, url, extra headers) in preference order."""
         code = urllib.parse.quote(ticker.code)
         if ticker.market == "kr":
-            return [("Naver", f"https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=10&symbol={code}",
+            return [("Yahoo", yahoo_url(f"{ticker.code}.KS"), {}),
+                    ("Naver", f"https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=10&symbol={code}",
                      {"Referer": "https://finance.naver.com/"})]
         secid = {"sh": "1", "sz": "0", "hk": "116"}[ticker.market] + "." + ticker.code
         sina = ("rt_hk" if ticker.market == "hk" else ticker.market) + ticker.code
@@ -1156,7 +1184,16 @@ class StockMarket:
             for name, url, extra in SOURCE_HEALTH.order(self.sources(ticker)):
                 try:
                     raw = await fetch_source(url, extra)
-                    if name in {"东方财富", "Naver"}:
+                    if name == "Yahoo":
+                        day, close, prev = last_completed_bar([(d, c) for d, _, c in parse_yahoo_daily(raw)], info, now_ms)
+                        if ticker.market == "kr":
+                            close = close.quantize(D(1))  # whole won
+                            prev = prev.quantize(D(1)) if prev is not None else None
+                            # today's bar only counts from 15:45: until then a KRX close captured from 15:33 is newer
+                            kday, kclose, kprev, kname = await self.krx_official(ticker, day, close, prev, now_ms)
+                            if kday > day:
+                                day, close, prev, name = kday, kclose, kprev, kname
+                    elif name in {"东方财富", "Naver"}:
                         day, close, prev = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
                         if ticker.market == "kr":
                             day, close, prev, name = await self.krx_official(ticker, day, close, prev, now_ms)
@@ -2199,6 +2236,8 @@ class DailyCloses:
             node = next(iter(json.loads(raw)["data"].values()))
             return [(dt.date.fromisoformat(r[0]), _open_price(r[1]), number(r[2], "收盘")) for r in (node.get("day") or node.get("qfqday") or [])
                     if len(r) > 2]
+        if kind == "yahoo":
+            return parse_yahoo_daily(raw)
         return parse_daily_ohlc(market, raw)
 
     async def refresh(self, now_ms: int) -> None:
@@ -2254,6 +2293,7 @@ class KospiIndex:
         self.daily_error = ""
 
     DAILY_URL = "https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=10&symbol=KOSPI"
+    YAHOO_URL = yahoo_url("^KS11")  # Predict's KOSPI markets resolve on Yahoo ^KS11
 
     @staticmethod
     def parse(source: str, raw: bytes, now_ms: int) -> IndexQuote:
@@ -2273,13 +2313,20 @@ class KospiIndex:
         if time.monotonic() - self.daily_refreshed < (60 if waiting else 600):
             return
         self.daily_refreshed = time.monotonic()
-        try:
-            bars = finished_bars(parse_daily_ohlc("kr", await fetch_source(self.DAILY_URL, {"Referer": "https://finance.naver.com/"})),
-                                 "kr", now_ms)
-            self.daily = {day: close for day, _, close in bars}
-            self.daily_error = ""
-        except Exception as error:
-            self.daily_error = clean_error(error) or type(error).__name__
+        failures = []
+        for name, url, parse in (("Yahoo", self.YAHOO_URL, parse_yahoo_daily),
+                                 ("Naver", self.DAILY_URL, lambda raw: parse_daily_ohlc("kr", raw))):
+            try:
+                extra = {"Referer": "https://finance.naver.com/"} if name == "Naver" else {}
+                bars = finished_bars(parse(await fetch_source(url, extra)), "kr", now_ms)
+                if not bars:
+                    raise ValueError("no daily bars")
+                self.daily = {day: close for day, _, close in bars}
+                self.daily_error = ""
+                return
+            except Exception as error:
+                failures.append(f"{name}: {clean_error(error) or type(error).__name__}")
+        self.daily_error = "；".join(failures)
 
     async def refresh(self, now_ms: int, force: bool = False) -> bool | None:
         if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
@@ -4495,7 +4542,8 @@ class Bot:
         self.hsi_daily = DailyCloses("hk", (
             ("tencent", "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=hkHSI,day,,,10,"),
             ("eastmoney", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=10"
-                          "&fields1=f1&fields2=f51,f52,f53&secid=100.HSI")))
+                          "&fields1=f1&fields2=f51,f52,f53&secid=100.HSI"),
+            ("yahoo", yahoo_url("^HSI"))))
         self.touches = {spec.key: TouchMarket(store, spec) for spec in TOUCH_MARKETS}
         self.caps = {spec.key: CapMarket(store, spec) for spec in CAP_MARKETS}
         if config.touch:
