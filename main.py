@@ -1193,6 +1193,11 @@ class StockMarket:
                             kday, kclose, kprev, kname = await self.krx_official(ticker, day, close, prev, now_ms)
                             if kday > day:
                                 day, close, prev, name = kday, kclose, kprev, kname
+                            elif self.store and (saved := self.store.get(f"krx_close:{ticker.code}:{day.isoformat()}")):
+                                # KRX now also trades after hours (to 20:00): the regular-session close captured
+                                # 15:33–15:40 is known-good, so it wins should Yahoo's bar carry an after-hours print
+                                with contextlib.suppress(decimal.InvalidOperation, TypeError, IndexError):
+                                    close, prev, name = D(saved[0]), D(saved[1]) if saved[1] else prev, "Naver KRX"
                     elif name in {"东方财富", "Naver"}:
                         day, close, prev = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
                         if ticker.market == "kr":

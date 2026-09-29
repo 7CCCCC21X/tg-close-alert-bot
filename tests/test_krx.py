@@ -94,6 +94,12 @@ async def run():
     answers = {"finance.yahoo.com": ybars, "fchart": CHART, "polling": realtime("1,765,000", "3,000", "5", "2026-09-29T15:30:00+09:00")}
     base = await m.StockMarket(cfg, m.Store(":memory:")).fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 15, 36))
     assert base.value == D("1765000") and base.close_ms == kr(2026, 9, 29, 15, 30) and "Naver KRX" in base.source, base
+    # a KRX close captured that day wins over a Yahoo bar that would carry an after-hours print
+    answers = {"finance.yahoo.com": yahoo([(dt.date(2026, 9, 28), 1768000.0), (dt.date(2026, 9, 29), 1782000.0)]),
+               "polling": m.RemoteError("x")}
+    cap = m.StockMarket(cfg, m.Store(":memory:")); cap.store.put("krx_close:000660:2026-09-29", ["1765000", "1768000"])
+    base = await cap.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 19, 50))
+    assert base.value == D("1765000") and "Naver KRX" in base.source, base
     # 10:00 the next day: Yahoo's 09-29 close (the 09-30 bar has no close yet)
     answers = {"finance.yahoo.com": ybars, "fchart": CHART, "polling": m.RemoteError("x")}
     base = await ystocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 30, 10, 0))
