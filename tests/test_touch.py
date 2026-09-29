@@ -3,7 +3,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
 D = m.D
-BNB, SOL, BTC = m.TOUCH_MARKETS
+BNB, SOL, BTC, ETH = m.TOUCH_MARKETS
 
 # --- model: symmetric-ish band, long horizon -> both sides ~50%, none ~0; short -> mostly none ------------------
 o = m.first_touch(800, 700, 900, 0.6, 0, 1.0)
@@ -35,6 +35,10 @@ assert BTC.deadline_ms == int(dt.datetime(2026, 10, 26, 3, 59, tzinfo=dt.timezon
 assert BTC.close_label() == "10-25 23:59 ET（北京 10-26 11:59）截止；都没碰到按 50/50 结算", BTC.close_label()
 assert BNB.close_label() == "12-31 23:59 ET（北京 01-01 12:59）截止；都没碰到按 50/50 结算"
 assert BTC.label(BTC.low) == "70k" and BNB.label(BNB.high) == "900" and SOL.label(SOL.low) == "60"
+# ETH: 1k / 3k, deadline 12-31 ET, window from Predict's creation time (none in the rules)
+assert ETH.symbol == "ETHUSDT" and ETH.label(ETH.low) == "1k" and ETH.label(ETH.high) == "3k" and ETH.created_ms == 0
+assert ETH.deadline_ms == BNB.deadline_ms and not ETH.fixed_start
+assert m.touch_outcome("$1,000", ETH) == "low" and m.touch_outcome("3k", ETH) == "high" and m.touch_outcome("$13,000", ETH) == ""
 assert m.touch_outcome("$70,000", BTC) == "low" and m.touch_outcome("90k first", BTC) == "high" and m.touch_outcome("$7,000", BTC) == ""
 
 # --- volatility: 721 hourly closes alternating ±1% -> σ ≈ 1% × √8760 -----------------------------------------------

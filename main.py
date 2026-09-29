@@ -2899,8 +2899,8 @@ class TouchSpec:
     fixed_start: bool = False  # the rules name the window start: it wins over Predict's creation time
 
     def label(self, value: D) -> str:
-        """$70,000 -> 70k, $900 -> 900: short enough for the edge chips."""
-        return f"{int(value) // 1000}k" if value >= 10000 and value % 1000 == 0 else fmt(value)
+        """$70,000 -> 70k, $3,000 -> 3k, $900 -> 900: short enough for the edge chips."""
+        return f"{int(value) // 1000}k" if value >= 1000 and value % 1000 == 0 else fmt(value)
 
     def close_label(self) -> str:
         et = dt.datetime.fromtimestamp(self.deadline_ms / 1000, dt.timezone(dt.timedelta(hours=self.et_offset)))
@@ -2915,6 +2915,8 @@ TOUCH_MARKETS = (
     # "between August 25th, 2026 at 10:00 AM ET and October 25th, 2026 at 11:59 PM ET" (both EDT)
     TouchSpec("BTC", "will-btc-hit-70000-or-90000-first", "BTCUSDT", D("70000"), D("90000"),
               et_ms(2026, 8, 25, 10, 0, -4), et_ms(2026, 10, 25, 23, 59, -4), -4, fixed_start=True),
+    # window opens at the market's creation (from Predict; the rules give no date)
+    TouchSpec("ETH", "will-ethereum-hit-1k-or-3k-first", "ETHUSDT", D("1000"), D("3000")),
 )
 TOUCH_SPOT = ("https://data-api.binance.vision", "https://api.binance.com", "https://api1.binance.com")
 YEAR_MS = 365 * 24 * 3600 * 1000

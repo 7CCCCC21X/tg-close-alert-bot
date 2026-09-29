@@ -77,7 +77,7 @@ async def run():
     bot.anchors["A50"] = (bot.sse_close_ms(), D("14160"))
     payload = bot.odds_payload()
     names = [i["name"] for i in payload["items"]]
-    assert names == ["上证指数", "宇树 UNITREE", "BNB 先触 $700 / $900", "SOL 先触 $60 / $140", "BTC 先触 $70k / $90k"], names
+    assert names == ["上证指数", "宇树 UNITREE", "BNB 先触 $700 / $900", "SOL 先触 $60 / $140", "BTC 先触 $70k / $90k", "ETH 先触 $1k / $3k"], names
     bnb = payload["items"][2]
     assert bnb["group"] == "crypto" and bnb["labels"] == ["$900", "$700"] and bnb["missing"].startswith("等待币安行情"), bnb
     assert payload["items"][0]["group"] == "index" and payload["items"][1]["symbol"] == "UNITREEUSDT" and payload["items"][1]["group"] == "contract"
