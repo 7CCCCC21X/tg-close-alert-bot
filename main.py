@@ -2747,9 +2747,10 @@ def day_fields(target: dt.date, now_ms: int) -> dict:
     return {"day": target.isoformat(), "day_label": f"{target:%m-%d} {week}", "day_tag": tag, "day_ahead": ahead}
 
 
-# After the close, how long before the cards move on to the next session: KRX's closing price still
-# changes for a few minutes after 15:30 KST (14:30 Beijing), so Korea rolls over at 15:35 (14:35 Beijing).
-CLOSE_SETTLE_MS = {"kr": 5 * 60_000}
+# After the close, how long before the cards move on to the next session. KRX's closing auction ends at a
+# random moment up to 30 s after 15:30 KST (랜덤엔드), and feeds such as Naver publish the fixed price a minute
+# or so later, so Korea rolls over at 15:33 KST (14:33 Beijing).
+CLOSE_SETTLE_MS = {"kr": 3 * 60_000}
 
 
 def ref_relative(ref_day: str, target: dt.date, now_ms: int) -> str:

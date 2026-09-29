@@ -83,22 +83,22 @@ async def run():
     odds = bot.kospi_odds(kr(2026, 9, 29, 10, 0))
     assert odds.ref == D("6910.89") and "实时行情为 6,889.74" in odds.ref_note and odds.effective == D("6824.90"), odds
 
-    # --- Korea rolls over at 15:35 KST (14:35 Beijing), not 15:30: the closing price still moves for a few minutes ---
+    # --- Korea rolls over at 15:33 KST (14:33 Beijing), not 15:30: the auction ends at a random moment, feeds lag ---
     bot.kospi.daily = {dt.date(2026, 9, 28): D("6910.89")}
-    bot.kospi.quote = m.IndexQuote("KOSPI", D("6850.00"), D("6910.89"), None, None, None, kr(2026, 9, 29, 15, 33), "Naver")
-    early = bot.kospi_odds(kr(2026, 9, 29, 15, 33))
+    bot.kospi.quote = m.IndexQuote("KOSPI", D("6850.00"), D("6910.89"), None, None, None, kr(2026, 9, 29, 15, 32), "Naver")
+    early = bot.kospi_odds(kr(2026, 9, 29, 15, 32))
     assert isinstance(early, m.CloseOdds) and early.target == dt.date(2026, 9, 29) and early.direct, early
-    late = bot.kospi_odds(kr(2026, 9, 29, 15, 36))
+    late = bot.kospi_odds(kr(2026, 9, 29, 15, 33))
     assert not (isinstance(late, m.CloseOdds) and late.target == dt.date(2026, 9, 29)), late  # moved on (or waiting for the proxy)
-    # SK Hynix: its closing print is taken as the day's close only from 15:35
+    # SK Hynix: its closing print is taken as the day's close only from 15:33
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT"})
     hbot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(), None)
     tk = cfg.tickers["SKHYNIXUSDT"]
     hbot.stocks.live["SKHYNIXUSDT"] = m.dataclasses.replace(
         m.IndexQuote("SK", D("1769000"), D("1768000"), None, None, None, kr(2026, 9, 29, 15, 30), "Naver"))
-    hbot.note_live_close("SKHYNIXUSDT", tk, kr(2026, 9, 29, 15, 33))
+    hbot.note_live_close("SKHYNIXUSDT", tk, kr(2026, 9, 29, 15, 32))
     assert hbot.store.get("live_close:SKHYNIXUSDT") is None
-    hbot.note_live_close("SKHYNIXUSDT", tk, kr(2026, 9, 29, 15, 36))
+    hbot.note_live_close("SKHYNIXUSDT", tk, kr(2026, 9, 29, 15, 33))
     assert hbot.store.get("live_close:SKHYNIXUSDT")[:2] == [kr(2026, 9, 29, 15, 30), "1769000"]
 
 asyncio.run(run())
