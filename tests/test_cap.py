@@ -173,7 +173,7 @@ async def run():
     bot.predict.ladders["NIULAI"] = [m.dataclasses.replace(r, book=m.dataclasses.replace(r.book, fetched_ms=NOW)) if r.book else r
                                      for r in bot.predict.ladders["NIULAI"]]  # fresh on the fake clock
     item = bot.cap_payload(cap, NOW)
-    assert item["kind"] == "ladder" and item["group"] == "crypto" and item["close_ms"] == NIU.end_ms and "missing" not in item, item
+    assert item["kind"] == "ladder" and item["group"] == "ladder" and item["close_ms"] == NIU.end_ms and "missing" not in item, item
     assert item["close_label"] == "10-31 23:59 ET（北京 11-01 11:59）截止；Predict 交易至北京 11-01 07:59", item["close_label"]
     L = item["ladder"]
     assert L["cap"] == "$81.8M" and L["high"] == "$246M" and L["supply"] == "985,000,000" and L["window"] == "08-16 23:30 ET（北京 08-17 11:30）起", L
@@ -181,6 +181,8 @@ async def run():
     assert [r["label"] for r in L["rows"]] == ["$200M", "$300M", "$500M", "$1B"]
     # touched by our (approximate) history, yet the book still trades at 10-14¢: flagged, never a +90¢ "edge"
     assert r200["fair"] == 1.0 and r200["bid"] == 0.10 and "edges" not in r200 and "请核实" in r200["error"], r200
+    assert r200["touched"] is False  # a disagreement stays a row of its own, with the warning
+    assert abs(r300["dist"] - (3e8 / (0.083 * 985e6) - 1)) < 1e-9 and r300["touched"] is False
     assert L["first_skipped"] is False
     # the same threshold with the book already at 98-99¢ agrees with the history: priced normally
     agree = bot.predict.ladders["NIULAI"][:]
@@ -188,6 +190,12 @@ async def run():
     bot.predict.ladders["NIULAI"] = agree
     r = bot.cap_payload(cap, NOW)["ladder"]["rows"][0]
     assert r["error"] == "" and [e["label"] for e in r["edges"] if e["best"]] == ["挂Yes"], r
+    assert r["touched"] is True  # reached and the book agrees: folded into the "已触及" line
+    # a reached level whose market is settled (its book is gone) is folded too
+    gone = bot.predict.ladders["NIULAI"][:]
+    gone[0] = m.dataclasses.replace(gone[0], book=None, error="HTTP 404: 接口请求失败")
+    bot.predict.ladders["NIULAI"] = gone
+    assert bot.cap_payload(cap, NOW)["ladder"]["rows"][0]["touched"] is True
     assert r300["bid"] == 0.86 and {e["label"] for e in r300["edges"]} == {"挂Yes", "挂No", "吃Yes", "吃No"}
     assert "方向未确认" in r500["error"] and "edges" not in r500 and 0 < r500["fair"] < 1
     assert "404" in r1b["error"] and "bid" not in r1b
