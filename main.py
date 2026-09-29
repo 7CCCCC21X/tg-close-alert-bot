@@ -1178,14 +1178,26 @@ class StockMarket:
             q = parse_naver_index(await fetch_source(url, {"Referer": "https://finance.naver.com/"}), now_ms)
         except Exception:
             return day, close, prev, "Naver"
-        kst = dt.timezone(dt.timedelta(hours=9))
+        kst, info = dt.timezone(dt.timedelta(hours=9)), STOCK_MARKETS["kr"]
         quoted = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst)
-        regular_over = quoted.time() >= STOCK_MARKETS["kr"].close_time or q.status == "已收盘"
-        if quoted.date() == day and regular_over:
-            return day, q.last, q.prev_close or prev, "Naver KRX"
-        if quoted.date() > day and q.prev_close:
+        qday = quoted.date()  # may be newer than the chart's last final bar (today's counts only from 15:45)
+        key = f"krx_close:{ticker.code}:{qday.isoformat()}"
+        close_ms = int(dt.datetime.combine(qday, info.close_time, kst).timestamp() * 1000)
+        settled = now_ms >= close_ms + CLOSE_SETTLE_MS["kr"]  # the auction's random end and feed lag are past
+        after_close = qday >= day and quoted.time() >= info.close_time
+        if after_close and settled and quoted.time() < KRX_NXT_AFTER:
+            # between the KRX close and Nextrade's after-hours session the quote is the KRX close: keep it
+            if self.store:
+                self.store.put(key, [str(q.last), str(q.prev_close or "")])
+            return qday, q.last, q.prev_close or prev, "Naver KRX"
+        saved = self.store.get(key) if self.store else None
+        if after_close and saved:
+            # from 15:40 the quote follows NXT after-hours trades: use the KRX close captured before that
+            with contextlib.suppress(decimal.InvalidOperation, TypeError, IndexError):
+                return qday, D(saved[0]), D(saved[1]) if saved[1] else prev, "Naver KRX"
+        if qday > day and q.prev_close and not after_close:
             return day, q.prev_close, prev, "Naver KRX"  # today's 기준가 = the close of the chart's last session
-        return day, close, prev, "Naver"
+        return day, close, prev, "Naver 日K（含 NXT）"
 
     @staticmethod
     def baseline(ticker: StockTicker, info: StockMarketInfo, source: str, day: dt.date | None, close: D,
@@ -2753,6 +2765,7 @@ def day_fields(target: dt.date, now_ms: int) -> dict:
 # random moment up to 30 s after 15:30 KST (랜덤엔드), and feeds such as Naver publish the fixed price a minute
 # or so later, so Korea rolls over at 15:33 KST (14:33 Beijing).
 CLOSE_SETTLE_MS = {"kr": 3 * 60_000}
+KRX_NXT_AFTER = dt.time(15, 40)  # Nextrade's after-hours session: from here Naver's realtime quote is no longer KRX
 
 
 # Closing auctions, Beijing time: (start, end, description). The indicative price in the last minutes is
@@ -5137,6 +5150,11 @@ class Bot:
         live, _ = self.stocks.live_quote(symbol, now_ms)  # None once the close is final (+15 min): keep the last one
         if live is None or live.quoted_ms < close_ms - 5 * 60_000:
             return  # no print from the closing auction yet
+        if ticker.market == "kr" and live.quoted_ms >= close_ms + 10 * 60_000:
+            return  # 15:40 KST on: Nextrade after-hours prints, not the KRX close
+        if ticker.market == "kr" and live.quoted_ms >= close_ms and not self.store.get(f"krx_close:{ticker.code}:{today.isoformat()}"):
+            # the KRX close, seen before the after-hours session: the daily close refresh (every 10 min) may miss this window
+            self.store.put(f"krx_close:{ticker.code}:{today.isoformat()}", [str(live.last), str(live.prev_close or "")])
         record = [close_ms, str(live.last), live.source]
         if self.store.get(f"live_close:{symbol}") != record:
             self.store.put(f"live_close:{symbol}", record)

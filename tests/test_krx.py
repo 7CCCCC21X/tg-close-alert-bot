@@ -25,7 +25,7 @@ def realtime(price, change, direction, at):
 
 async def run():
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT"})
-    stocks = m.StockMarket(cfg)
+    stocks = m.StockMarket(cfg, m.Store(":memory:"))
     ticker = cfg.tickers["SKHYNIXUSDT"]
     answers = {}
 
@@ -45,12 +45,27 @@ async def run():
 
     # 09-29 16:00, after the KRX close, NXT still trading: the day's close is KRX's own last price
     answers = {"fchart": CHART, "polling": realtime("1,769,000", "1,000", "2", "2026-09-29T15:30:00+09:00")}
-    base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 16, 0))
+    base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 15, 36))
     assert base.value == D("1769000") and base.close_ms == kr(2026, 9, 29, 15, 30) and base.prev_value == D("1768000"), base
+
+    # 16:20: Naver's quote now follows Nextrade after-hours trades (1,786,000): the KRX close kept above stands
+    answers = {"fchart": CHART, "polling": realtime("1,786,000", "18,000", "2", "2026-09-29T16:20:00+09:00")}
+    base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 16, 20))
+    assert base.value == D("1769000") and base.prev_value == D("1768000") and "Naver KRX" in base.source, base
+    # without a KRX close captured in time the chart is used, and says it includes NXT
+    fresh = m.StockMarket(cfg, m.Store(":memory:"))
+    base = await fresh.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 16, 20))
+    assert base.value == D("1769000") and "含 NXT" in base.source, base  # the chart's 09-29 bar
+    # 15:31: the auction may not be settled yet: nothing is kept
+    early = m.StockMarket(cfg, m.Store(":memory:"))
+    answers = {"fchart": CHART, "polling": realtime("1,770,000", "2,000", "2", "2026-09-29T15:30:05+09:00")}
+    await early.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 15, 31))
+    assert early.store.get("krx_close:000660:2026-09-29") is None
 
     # a falling day: change is negative (code 5 = 하락)
     answers = {"fchart": CHART, "polling": realtime("1,760,000", "8,000", "5", "2026-09-29T15:30:00+09:00")}
-    base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 16, 0))
+    stocks.store.delete_prefix("krx_close:")
+    base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 15, 35))
     assert base.value == D("1760000") and base.prev_value == D("1768000"), base
 
     # the realtime quote fails: the chart's value stands (and still says where it came from)
@@ -100,6 +115,10 @@ async def run():
     assert hbot.store.get("live_close:SKHYNIXUSDT") is None
     hbot.note_live_close("SKHYNIXUSDT", tk, kr(2026, 9, 29, 15, 33))
     assert hbot.store.get("live_close:SKHYNIXUSDT")[:2] == [kr(2026, 9, 29, 15, 30), "1769000"]
+    assert hbot.store.get("krx_close:000660:2026-09-29") == ["1769000", "1768000"]
+    hbot.stocks.live["SKHYNIXUSDT"] = m.IndexQuote("SK", D("1786000"), D("1768000"), None, None, None, kr(2026, 9, 29, 15, 41), "Naver")
+    hbot.note_live_close("SKHYNIXUSDT", tk, kr(2026, 9, 29, 15, 42))
+    assert hbot.store.get("live_close:SKHYNIXUSDT")[1] == "1769000"  # the 15:41 NXT print is not taken
 
 asyncio.run(run())
 print("KRX_OK")
