@@ -25,7 +25,7 @@ def realtime(price, change, direction, at):
 
 async def run():
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT"})
-    stocks = m.StockMarket(cfg)
+    stocks = m.StockMarket(cfg, m.Store(":memory:"))
     ticker = cfg.tickers["SKHYNIXUSDT"]
     answers = {}
 
@@ -45,12 +45,27 @@ async def run():
 
     # 09-29 16:00, after the KRX close, NXT still trading: the day's close is KRX's own last price
     answers = {"fchart": CHART, "polling": realtime("1,769,000", "1,000", "2", "2026-09-29T15:30:00+09:00")}
-    base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 16, 0))
+    base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 15, 36))
     assert base.value == D("1769000") and base.close_ms == kr(2026, 9, 29, 15, 30) and base.prev_value == D("1768000"), base
+
+    # 16:20: Naver's quote now follows Nextrade after-hours trades (1,786,000): the KRX close kept above stands
+    answers = {"fchart": CHART, "polling": realtime("1,786,000", "18,000", "2", "2026-09-29T16:20:00+09:00")}
+    base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 16, 20))
+    assert base.value == D("1769000") and base.prev_value == D("1768000") and "Naver KRX" in base.source, base
+    # without a KRX close captured in time the chart is used, and says it includes NXT
+    fresh = m.StockMarket(cfg, m.Store(":memory:"))
+    base = await fresh.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 16, 20))
+    assert base.value == D("1769000") and "含 NXT" in base.source, base  # the chart's 09-29 bar
+    # 15:31: the auction may not be settled yet: nothing is kept
+    early = m.StockMarket(cfg, m.Store(":memory:"))
+    answers = {"fchart": CHART, "polling": realtime("1,770,000", "2,000", "2", "2026-09-29T15:30:05+09:00")}
+    await early.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 15, 31))
+    assert early.store.get("krx_close:000660:2026-09-29") is None
 
     # a falling day: change is negative (code 5 = 하락)
     answers = {"fchart": CHART, "polling": realtime("1,760,000", "8,000", "5", "2026-09-29T15:30:00+09:00")}
-    base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 16, 0))
+    stocks.store.delete_prefix("krx_close:")
+    base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 15, 35))
     assert base.value == D("1760000") and base.prev_value == D("1768000"), base
 
     # the realtime quote fails: the chart's value stands (and still says where it came from)
@@ -100,6 +115,10 @@ async def run():
     assert hbot.store.get("live_close:SKHYNIXUSDT") is None
     hbot.note_live_close("SKHYNIXUSDT", tk, kr(2026, 9, 29, 15, 33))
     assert hbot.store.get("live_close:SKHYNIXUSDT")[:2] == [kr(2026, 9, 29, 15, 30), "1769000"]
+    assert hbot.store.get("krx_close:000660:2026-09-29") == ["1769000", "1768000"]
+    hbot.stocks.live["SKHYNIXUSDT"] = m.IndexQuote("SK", D("1786000"), D("1768000"), None, None, None, kr(2026, 9, 29, 15, 41), "Naver")
+    hbot.note_live_close("SKHYNIXUSDT", tk, kr(2026, 9, 29, 15, 42))
+    assert hbot.store.get("live_close:SKHYNIXUSDT")[1] == "1769000"  # the 15:41 NXT print is not taken
 
 asyncio.run(run())
 print("KRX_OK")
@@ -112,3 +131,38 @@ assert m.ref_relative("09-29", dt.date(2026, 9, 30), bj(2026, 9, 29, 17)) == "�
 assert m.ref_relative("12-31", dt.date(2027, 1, 4), bj(2027, 1, 4, 10)) == "昨收"     # across the year end
 assert m.ref_relative("", dt.date(2026, 9, 29), bj(2026, 9, 29, 10)) == "参考"
 print("LABELS_OK")
+
+
+# --- HSI: dated daily closes (Tencent, Eastmoney fallback) win over a realtime spot read before the final close ----------
+async def hsi():
+    bj2 = lambda d, h, mi: int(dt.datetime(2026, 9, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
+    tencent = json.dumps({"data": {"hkHSI": {"day": [["2026-09-26", "24400", "24510.09", "0", "0", "1"],
+                                                     ["2026-09-29", "24500", "24529.24", "0", "0", "1"],
+                                                     ["2026-09-30", "24530", "24600.00", "0", "0", "1"]]}}}).encode()
+    calls = []
+    async def fake_get(url, timeout=15, headers=None):
+        calls.append(url)
+        if "gtimg" in url:
+            if isinstance(state["tencent"], Exception): raise state["tencent"]
+            return state["tencent"]
+        if "eastmoney" in url:
+            return json.dumps({"data": {"klines": ["2026-09-26,24400,24510.09", "2026-09-29,24500,24529.24"]}}).encode()
+        raise AssertionError(url)
+    m.http_get = fake_get
+    state = {"tencent": tencent}
+    feed = m.DailyCloses("hk", (("tencent", "https://web.ifzq.gtimg.cn/x"), ("eastmoney", "https://push2his.eastmoney.com/x")))
+    await feed.refresh(bj2(30, 10, 0))   # 09-30 session running: its bar is not final
+    assert feed.daily == {dt.date(2026, 9, 26): D("24510.09"), dt.date(2026, 9, 29): D("24529.24")} and feed.error == "", feed.daily
+    ref, note = m.dated_ref(feed.daily, dt.date(2026, 9, 29), D("24523.57"))
+    assert ref == D("24529.24") and note == "09-29 收盘（日K；实时行情为 24,523.57）", note
+    # after 16:25 the day's bar is looked for every minute
+    n = len(calls); await feed.refresh(bj2(30, 16, 26)); assert len(calls) == n  # within the minute
+    feed.refreshed -= 61; await feed.refresh(bj2(30, 16, 26))
+    assert feed.daily[dt.date(2026, 9, 30)] == D("24600.00")
+    # Tencent down: Eastmoney
+    state["tencent"] = m.RemoteError("网络错误 (URLError)")
+    feed2 = m.DailyCloses("hk", feed.sources); await feed2.refresh(bj2(30, 10, 0))
+    assert feed2.daily[dt.date(2026, 9, 29)] == D("24529.24")
+
+asyncio.run(hsi())
+print("HSI_OK")

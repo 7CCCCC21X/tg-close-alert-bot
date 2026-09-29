@@ -1178,14 +1178,26 @@ class StockMarket:
             q = parse_naver_index(await fetch_source(url, {"Referer": "https://finance.naver.com/"}), now_ms)
         except Exception:
             return day, close, prev, "Naver"
-        kst = dt.timezone(dt.timedelta(hours=9))
+        kst, info = dt.timezone(dt.timedelta(hours=9)), STOCK_MARKETS["kr"]
         quoted = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst)
-        regular_over = quoted.time() >= STOCK_MARKETS["kr"].close_time or q.status == "已收盘"
-        if quoted.date() == day and regular_over:
-            return day, q.last, q.prev_close or prev, "Naver KRX"
-        if quoted.date() > day and q.prev_close:
+        qday = quoted.date()  # may be newer than the chart's last final bar (today's counts only from 15:45)
+        key = f"krx_close:{ticker.code}:{qday.isoformat()}"
+        close_ms = int(dt.datetime.combine(qday, info.close_time, kst).timestamp() * 1000)
+        settled = now_ms >= close_ms + CLOSE_SETTLE_MS["kr"]  # the auction's random end and feed lag are past
+        after_close = qday >= day and quoted.time() >= info.close_time
+        if after_close and settled and quoted.time() < KRX_NXT_AFTER:
+            # between the KRX close and Nextrade's after-hours session the quote is the KRX close: keep it
+            if self.store:
+                self.store.put(key, [str(q.last), str(q.prev_close or "")])
+            return qday, q.last, q.prev_close or prev, "Naver KRX"
+        saved = self.store.get(key) if self.store else None
+        if after_close and saved:
+            # from 15:40 the quote follows NXT after-hours trades: use the KRX close captured before that
+            with contextlib.suppress(decimal.InvalidOperation, TypeError, IndexError):
+                return qday, D(saved[0]), D(saved[1]) if saved[1] else prev, "Naver KRX"
+        if qday > day and q.prev_close and not after_close:
             return day, q.prev_close, prev, "Naver KRX"  # today's 기준가 = the close of the chart's last session
-        return day, close, prev, "Naver"
+        return day, close, prev, "Naver 日K（含 NXT）"
 
     @staticmethod
     def baseline(ticker: StockTicker, info: StockMarketInfo, source: str, day: dt.date | None, close: D,
@@ -2170,6 +2182,57 @@ class CnIndex:
         return line + f"｜⚠️ 刷新失败：{brief_error(self.a50_error)}" if self.a50_error else line
 
 
+class DailyCloses:
+    """Dated official closes of an index from daily bars (a session's bar counts once it is final), refreshed every
+    10 minutes and every minute from 15 minutes after the close until the day's bar is in. Realtime index feeds can
+    be read before the closing auction's final value is published; a dated bar is the settled close."""
+
+    def __init__(self, market: str, sources: tuple[tuple[str, str], ...]):
+        self.market, self.sources = market, sources
+        self.daily: dict[dt.date, D] = {}
+        self.refreshed = -1e9
+        self.error = ""
+
+    @staticmethod
+    def parse(kind: str, market: str, raw: bytes) -> list[tuple[dt.date, D | None, D]]:
+        if kind == "tencent":  # {"data": {"hkHSI": {"day": [["2026-09-28", open, close, high, low, volume], ...]}}}
+            node = next(iter(json.loads(raw)["data"].values()))
+            return [(dt.date.fromisoformat(r[0]), _open_price(r[1]), number(r[2], "收盘")) for r in (node.get("day") or node.get("qfqday") or [])
+                    if len(r) > 2]
+        return parse_daily_ohlc(market, raw)
+
+    async def refresh(self, now_ms: int) -> None:
+        info = STOCK_MARKETS[self.market]
+        tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+        local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
+        final = dt.datetime.combine(local.date(), info.close_time, tz) + dt.timedelta(minutes=15)
+        waiting = local.weekday() < 5 and local >= final and local.date() not in self.daily
+        if time.monotonic() - self.refreshed < (60 if waiting else 600):
+            return
+        self.refreshed, failures = time.monotonic(), []
+        for kind, url in self.sources:
+            try:
+                bars = finished_bars(sorted(self.parse(kind, self.market, await fetch_source(url))), self.market, now_ms)
+                if not bars:
+                    raise ValueError("日 K 为空")
+                self.daily, self.error = {day: close for day, _, close in bars}, ""
+                return
+            except Exception as error:
+                failures.append(f"{kind}: {clean_error(error)}")
+        self.error = "；".join(failures)
+
+
+def dated_ref(daily: dict[dt.date, D], day: dt.date, live: D | None) -> tuple[D | None, str]:
+    """(reference close, label): the dated daily close of ``day`` when known, else the realtime figure; when the
+    two differ the label shows both."""
+    official, label = daily.get(day), f"{day.strftime('%m-%d')} 收盘"
+    if official is None:
+        return live, label
+    if live is not None and abs(percent(official, live)) >= D("0.005"):
+        return official, f"{label}（日K；实时行情为 {fmt(live)}）"
+    return official, label
+
+
 class KospiIndex:
     """KOSPI composite index: Naver's realtime index feed first, Eastmoney (100.KS11) as fallback."""
     REFRESH_SECONDS = 60
@@ -2753,6 +2816,7 @@ def day_fields(target: dt.date, now_ms: int) -> dict:
 # random moment up to 30 s after 15:30 KST (랜덤엔드), and feeds such as Naver publish the fixed price a minute
 # or so later, so Korea rolls over at 15:33 KST (14:33 Beijing).
 CLOSE_SETTLE_MS = {"kr": 3 * 60_000}
+KRX_NXT_AFTER = dt.time(15, 40)  # Nextrade's after-hours session: from here Naver's realtime quote is no longer KRX
 
 
 # Closing auctions, Beijing time: (start, end, description). The indicative price in the last minutes is
@@ -4428,6 +4492,10 @@ class Bot:
         self.web: WebServer | None = None
         self.vols = VolBook(config.prob_vol)
         self.predict = PredictFeed(config)
+        self.hsi_daily = DailyCloses("hk", (
+            ("tencent", "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=hkHSI,day,,,10,"),
+            ("eastmoney", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=10"
+                          "&fields1=f1&fields2=f51,f52,f53&secid=100.HSI")))
         self.touches = {spec.key: TouchMarket(store, spec) for spec in TOUCH_MARKETS}
         self.caps = {spec.key: CapMarket(store, spec) for spec in CAP_MARKETS}
         if config.touch:
@@ -5137,6 +5205,11 @@ class Bot:
         live, _ = self.stocks.live_quote(symbol, now_ms)  # None once the close is final (+15 min): keep the last one
         if live is None or live.quoted_ms < close_ms - 5 * 60_000:
             return  # no print from the closing auction yet
+        if ticker.market == "kr" and live.quoted_ms >= close_ms + 10 * 60_000:
+            return  # 15:40 KST on: Nextrade after-hours prints, not the KRX close
+        if ticker.market == "kr" and live.quoted_ms >= close_ms and not self.store.get(f"krx_close:{ticker.code}:{today.isoformat()}"):
+            # the KRX close, seen before the after-hours session: the daily close refresh (every 10 min) may miss this window
+            self.store.put(f"krx_close:{ticker.code}:{today.isoformat()}", [str(live.last), str(live.prev_close or "")])
         record = [close_ms, str(live.last), live.source]
         if self.store.get(f"live_close:{symbol}") != record:
             self.store.put(f"live_close:{symbol}", record)
@@ -5207,7 +5280,8 @@ class Bot:
             remaining, target = session_remaining("hk", now_ms, local.date() - dt.timedelta(days=1), self.config.holidays.get("hk", frozenset()))
             sigma, sigma_note = self.vols.get("HSI", "HSI", intraday=True)
             prev_day = expected_close_date("hk", now_ms, self.config.holidays.get("hk", frozenset()))
-            return close_odds("恒生指数", q.spot_prev, q.spot, sigma, remaining, target, D("0.01"), f"{prev_day.strftime('%m-%d')} 收盘",
+            ref, ref_note = dated_ref(self.hsi_daily.daily, prev_day, q.spot_prev)
+            return close_odds("恒生指数", ref, q.spot, sigma, remaining, target, D("0.01"), ref_note,
                               f"恒指现货 {fmt(q.spot)}（盘中直接用现货）", sigma_note)
         close_date = self.hk_cash_close_date(now_ms, holidays)
         anchor, anchor_note = None, "收市时"
@@ -5222,8 +5296,9 @@ class Bot:
         if anchor is None:
             return "缺少期货在现货收市时的价格"
         remaining, target = session_remaining("hk", now_ms, close_date, self.config.holidays.get("hk", frozenset()))
-        return close_odds("恒生指数", q.spot, q.spot * q.last / anchor, sigma, remaining, target, D("0.01"),
-                          f"{close_date.strftime('%m-%d')} 收盘", f"恒指期货 {fmt(q.last)} / {anchor_note} {fmt(anchor)} → {percent(q.last, anchor):+.3f}%",
+        ref, ref_note = dated_ref(self.hsi_daily.daily, close_date, q.spot)
+        return close_odds("恒生指数", ref, ref * q.last / anchor, sigma, remaining, target, D("0.01"),
+                          ref_note, f"恒指期货 {fmt(q.last)} / {anchor_note} {fmt(anchor)} → {percent(q.last, anchor):+.3f}%",
                           sigma_note, mode="盘后")
 
     A50_SOFT_STALE_MS = 60 * 60_000  # A50 silent longer than this: no odds at all (shorter: odds with a warning)
@@ -5232,13 +5307,7 @@ class Bot:
     def kospi_ref(self, day: dt.date, live: D | None) -> tuple[D, str]:
         """The close a KOSPI up/down market compares with: the dated daily-chart close of ``day``, else the
         realtime feed's figure (Naver's index feed has been seen frozen at 15:15, before the closing auction)."""
-        official = self.kospi.official_close(day)
-        label = f"{day.strftime('%m-%d')} 收盘"
-        if official is None:
-            return live, label
-        if live is not None and abs(percent(official, live)) >= D("0.005"):
-            return official, f"{label}（日K；实时行情为 {fmt(live)}）"
-        return official, label
+        return dated_ref(self.kospi.daily, day, live)
 
     def kospi_odds(self, now_ms: int) -> CloseOdds | str | None:
         k = self.kospi.quote
@@ -6087,7 +6156,7 @@ class Bot:
         now = self.market.now_ms
         jobs = [("交易所收盘", lambda: self.stocks.refresh(now())), ("股票实时", lambda: self.stocks.refresh_live(now())),
                 ("汇率", self.fx.refresh),
-                ("恒指期货", lambda: self.hsi.refresh(now())), ("Hyperliquid", self.hl.refresh),
+                ("恒指期货", lambda: self.refresh_hsi(now())), ("Hyperliquid", self.hl.refresh),
                 ("KOSPI", lambda: self.kospi.refresh(now())), ("上证/A50", lambda: self.cn.refresh(now()))]
         if self.config.probability:
             jobs.append(("概率输入", lambda: self.refresh_odds_inputs(now())))
@@ -6097,6 +6166,11 @@ class Bot:
             jobs.append(("先触市场", lambda: self.refresh_touch(now())))
             jobs.append(("市值阶梯", lambda: self.refresh_caps(now())))
         return jobs
+
+    async def refresh_hsi(self, now_ms: int) -> None:
+        await self.hsi.refresh(now_ms)
+        if self.config.hsi_futures and self.config.probability:
+            await self.hsi_daily.refresh(now_ms)
 
     async def refresh_caps(self, now_ms: int) -> None:
         for cap in self.caps.values():
