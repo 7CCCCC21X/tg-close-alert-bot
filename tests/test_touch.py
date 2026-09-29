@@ -1,0 +1,124 @@
+import asyncio, sys, math, time, datetime as dt
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+import offline  # noqa: F401  (blocks real HTTP)
+import main as m
+D = m.D
+
+# --- model: symmetric-ish band, long horizon -> both sides ~50%, none ~0; short -> mostly none ------------------
+o = m.first_touch(800, 700, 900, 0.6, 0, 1.0)
+assert abs(o.lower + o.upper + o.none - 1) < 1e-9 and o.none < 1e-3 and abs(o.lower - 0.5) < 0.02, o
+o = m.first_touch(800, 700, 900, 0.6, 0, 0.001)
+assert o.none > 0.999 and abs(o.fair_lower - 0.5) < 1e-3 and abs(o.fair_upper - 0.5) < 1e-3, o
+o = m.first_touch(880, 700, 900, 0.3, 0, 0.1)  # close to $900: that side dominates
+assert o.upper > 0.75 and o.lower < 0.03 and abs(o.fair_upper - (o.upper + o.none / 2)) < 1e-12, o
+assert m.first_touch(690, 700, 900, 0.5, 0, 1) == m.TouchOdds(1.0, 0.0, 0.0)
+assert m.first_touch(905, 700, 900, 0.5, 0, 1) == m.TouchOdds(0.0, 1.0, 0.0)
+assert m.first_touch(800, 700, 900, 0.5, 0, 0) == m.TouchOdds(0.0, 0.0, 1.0)
+# the two numerical branches (images for short horizons, eigenfunctions for long) agree where they meet
+a, v = math.log(900 / 700), 0.6 ** 2
+t_edge = 0.08 * a * a / v
+lo_, hi_ = m.first_touch(800, 700, 900, 0.6, 0, t_edge * 0.999), m.first_touch(800, 700, 900, 0.6, 0, t_edge * 1.001)
+assert abs(lo_.lower - hi_.lower) < 2e-3 and abs(lo_.upper - hi_.upper) < 2e-3, (lo_, hi_)
+
+# --- outcome names -> which side the orderbook prices -------------------------------------------------------------
+assert m.touch_outcome("$700") == "low" and m.touch_outcome("Yes, $900 first") == "high" and m.touch_outcome("Yes") == ""
+assert m.touch_outcome("700 or 900") == ""
+
+# --- volatility: 721 hourly closes alternating ±1% -> σ ≈ 1% × √8760 -----------------------------------------------
+NOW = int(dt.datetime(2026, 9, 29, 12, 0, tzinfo=m.BEIJING).timestamp() * 1000)
+H = 3_600_000
+rows = [[NOW - (722 - i) * H, "0", "0", "0", str(800 * (1.01 if i % 2 else 1)), "0", NOW - (721 - i) * H - 1] for i in range(722)]
+sigma = m.realized_vol(rows, NOW)
+assert abs(sigma - 0.00995 * 1.0003 * math.sqrt(8760)) / sigma < 0.02, sigma
+try: m.realized_vol(rows[:100], NOW); assert False
+except ValueError: pass
+
+
+async def run():
+    store = m.Store(":memory:")
+    t = m.TouchMarket(store)
+    start = NOW - 5 * H
+    hits = {}  # hour open -> (hi, lo) in that hour's minute 17
+
+    async def get(path, **p):
+        if path == "ticker/price":
+            return {"symbol": "BNBUSDT", "price": "812.50"}
+        if p["interval"] == "1h" and p.get("limit") == 721:
+            return rows
+        if p["interval"] == "1h":
+            first = p["startTime"]
+            out = []
+            for h in range(first, min(p["endTime"], NOW), H):
+                hi, lo = hits.get(h, (820, 800))
+                out.append([h, "0", str(hi), str(lo), "810", "0", h + H - 1])
+            return out
+        base = p["startTime"]
+        hi, lo = hits.get(base, (820, 800))
+        return [[base + i * 60_000, "0", str(hi if i == 17 else 820), str(lo if i == 17 else 800), "810", "0", base + (i + 1) * 60_000 - 1]
+                for i in range(60)]
+    t.get = get
+
+    # unknown opening time: prices, σ, and says it assumed no earlier touch
+    await t.refresh(NOW)
+    assert t.price == D("812.50") and t.sigma and t.error == "" and "开盘时间未知" in t.status()
+    odds = t.odds(NOW)
+    assert isinstance(odds, m.TouchOdds) and 0 < odds.fair_upper < 1
+
+    # known opening time, nothing touched: clear through the last finished hour, persisted
+    t.start_ms = start; t.times["scan"] = -1e9
+    await t.refresh(NOW)
+    assert t.history["kind"] == "clear" and t.history["through"] >= NOW - H and "未触线" in t.status(), t.history
+
+    # a later hour reaches $900 at minute 17: the result is fixed at 100/0 and never re-scanned
+    hour = NOW - H
+    hits[hour] = (905, 800)
+    t.times["scan"] = -1e9; t.history  # noqa
+    store.put(f"touch:{m.TOUCH_SLUG}", {"kind": "clear", "through": hour, "start": start})
+    await t.scan(NOW + H)
+    h = t.history
+    assert h["kind"] == "high" and h["time"] == hour + 17 * 60_000 and t.odds(NOW) == m.TouchOdds(0.0, 1.0, 0.0), h
+    assert "先触及 $900" in t.status()
+
+    # a minute that spans both barriers cannot be ordered: flagged for a manual check
+    store.put(f"touch:{m.TOUCH_SLUG}", {"kind": "clear", "through": hour, "start": start})
+    hits[hour] = (905, 695)
+    await t.scan(NOW + H)
+    assert t.history["kind"] == "ambiguous" and t.status().startswith("需人工核对"), t.history
+    # a new opening time discards the old answer
+    t.start_ms = start - H
+    assert t.history == {}
+
+    # --- Bot: the Predict book is oriented to "$900 first" whatever the outcome order ------------------------------------
+    class FakeMarket:
+        def now_ms(self): return NOW
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
+    bot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(), None)
+    assert bot.predict_targets(NOW)["BNB"] == m.TOUCH_SLUG and m.TOUCH_SLUG in bot.predict.want_info
+    bot.touch.get = get; hits.clear()
+    bot.predict.info[m.TOUCH_SLUG] = {"outcomes": ["$700", "$900"], "created_ms": start}
+    await bot.refresh_touch(NOW)
+    assert bot.touch.start_ms == start and bot.touch.history["kind"] == "clear"
+    bot.predict.books["BNB"] = m.PredictBook("BNB", m.TOUCH_SLUG, "1", "BNB", ((D("0.40"), D("100")),), ((D("0.45"), D("50")),), NOW)
+    book, why = bot.touch_book()
+    assert why == "" and book.bid == (D("0.55"), D("50")) and book.ask == (D("0.60"), D("100")), book  # 1 − $700 prices
+    item = bot.touch_payload(NOW)
+    assert item["group"] == "crypto" and item["labels"] == ["$900", "$700"] and item["touch"]["price"] == "812.50", item
+    assert abs(item["fair_up"] + item["fair_down"] - 1) < 1e-9 and item["predict"]["bids"][0] == [0.55, 50.0]
+    assert {e["label"] for e in item["predict"]["edges"]} == {"挂900", "挂700", "吃900", "吃700"}, item["predict"]["edges"]
+    bot.predict.info[m.TOUCH_SLUG]["outcomes"] = ["$900", "$700"]
+    assert bot.touch_book()[0].bid == (D("0.40"), D("100"))
+    bot.predict.info[m.TOUCH_SLUG]["outcomes"] = ["Yes", "No"]
+    assert bot.touch_book()[0] is None and "方向未确认" in bot.touch_payload(NOW)["predict"]["error"]
+    # Predict REST market details -> outcome order and creation time
+    async def fetch(url, payload=None):
+        assert url.endswith("/markets/1")
+        return {"success": True, "data": {"id": 1, "createdAt": "2026-09-20T08:00:00.000Z",
+                                          "outcomes": [{"name": "$900", "indexSet": 2}, {"name": "$700", "indexSet": 1}]}}
+    bot.predict.fetch = fetch
+    await bot.predict.market_info(m.TOUCH_SLUG, "1")
+    assert bot.predict.info[m.TOUCH_SLUG] == {"outcomes": ["$700", "$900"],
+                                             "created_ms": int(dt.datetime(2026, 9, 20, 8, tzinfo=dt.timezone.utc).timestamp() * 1000)}
+    assert not m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BNB_TOUCH": "off"}), m.Store(":memory:"), FakeMarket(), None).predict_targets(NOW).get("BNB")
+
+asyncio.run(run())
+print("TOUCH_OK")

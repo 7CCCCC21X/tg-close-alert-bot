@@ -401,6 +401,7 @@ class Config:
     predict_api_key: str = ""  # Optional x-api-key for api.predict.fun (REST orderbook).
     predict_poll: int = 15   # seconds between orderbook refreshes
     predict_ref: str = "B00EA"  # referral code appended to Predict market links (?ref=); empty = none
+    touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -450,6 +451,7 @@ class Config:
             predict_api_key=e.get("PREDICT_API_KEY", "").strip(),
             predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 15, 5, 3600),
             predict_ref=parse_ref_code(e.get("PREDICT_REF_CODE", "B00EA")),
+            touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
             probability=e.get("PROBABILITY", "on").strip().lower() not in {"off", "0", "false", "no"},
             prob_vol=parse_prob_vol(e.get("PROB_VOL", "")),
             sse_index=e.get("SSE_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -2731,6 +2733,8 @@ class PredictFeed:
         self.types: dict[str, str] = {}                          # slug -> GraphQL category type
         self.strikes: dict[str, tuple[D | None, float]] = {}     # slug -> (target price shown on the site, when)
         self.no_strike: set[str] = set()                         # category types without marketData.startPrice
+        self.info: dict[str, dict] = {}                          # slug -> {"outcomes": [...], "created_ms": int}
+        self.want_info: set[str] = set()                         # slugs whose outcome names / creation time matter
         self.refreshed = -1e9
 
     def headers(self) -> dict[str, str]:
@@ -2827,6 +2831,19 @@ class PredictFeed:
         self.strikes[slug] = (value, time.monotonic())
         return value
 
+    async def market_info(self, slug: str, market_id: str) -> None:
+        """Outcome names in index order (the orderbook prices the first one) and the creation time, via REST."""
+        data = await self.fetch(f"{PREDICT_REST}/markets/{urllib.parse.quote(market_id)}")
+        market = data.get("data", data) if isinstance(data, dict) else {}
+        outcomes = market.get("outcomes") if isinstance(market, dict) else None
+        if not isinstance(outcomes, list) or not outcomes:
+            raise RemoteError("Predict 市场详情缺少 outcomes")
+        rows = sorted((o for o in outcomes if isinstance(o, dict)), key=lambda o: int(o.get("indexSet") or 0))
+        created = 0
+        with contextlib.suppress(ValueError, TypeError):
+            created = int(dt.datetime.fromisoformat(str(market.get("createdAt")).replace("Z", "+00:00")).timestamp() * 1000)
+        self.info[slug] = {"outcomes": [str(o.get("name") or "") for o in rows], "created_ms": created}
+
     async def refresh_one(self, key: str, slug: str) -> None:
         try:
             market = await self.resolve(slug)
@@ -2835,6 +2852,8 @@ class PredictFeed:
                 self.errors[key] = f"Predict 上还没有这个市场（{slug}）"
                 return
             await self.strike(slug, market["id"])
+            if slug in self.want_info and slug not in self.info:
+                await self.market_info(slug, market["id"])
             bids, asks, _ = await self.orderbook(market)
             self.books[key] = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000))
             self.errors.pop(key, None)
@@ -2855,6 +2874,250 @@ class PredictFeed:
         self.slugs = dict(targets)
         await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in targets.items()))
         return True
+
+
+# --- first-touch market (which barrier does BNB hit first?) ------------------------------------------
+TOUCH_SLUG = "will-bnb-hit-700-or-900"
+TOUCH_SYMBOL = "BNBUSDT"
+TOUCH_LOW, TOUCH_HIGH = D("700"), D("900")
+TOUCH_DEADLINE_MS = int(dt.datetime(2026, 12, 31, 23, 59, tzinfo=dt.timezone(dt.timedelta(hours=-5))).timestamp() * 1000)
+TOUCH_SPOT = ("https://data-api.binance.vision", "https://api.binance.com", "https://api1.binance.com")
+YEAR_MS = 365 * 24 * 3600 * 1000
+
+
+def _log_erfc_pos(z: float) -> float:
+    """log(erfc(z)) for z ≥ 0 without underflow (Numerical Recipes' erfcc, |rel err| < 1.2e-7)."""
+    if z == 0:
+        return 0.0
+    t = 1 / (1 + 0.5 * z)
+    return (math.log(t) - z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (
+        -0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
+
+
+def _log_phi(z: float) -> float:
+    if z == 0:
+        return -math.log(2)
+    q = -math.log(2) + _log_erfc_pos(abs(z) / math.sqrt(2))
+    return q if z < 0 else math.log1p(-math.exp(q))
+
+
+def _log_add(a: float, b: float) -> float:
+    m = max(a, b)
+    return m if m == -math.inf else m + math.log(math.exp(a - m) + math.exp(b - m))
+
+
+def _infinite_upper(x: float, a: float, sigma: float, mu: float) -> float:
+    """P(hit the upper barrier first) with no deadline; x = ln(S/L), a = ln(U/L)."""
+    r = 2 * (mu - 0.5 * sigma * sigma) / (sigma * sigma)
+    if abs(r * a) < 1e-7:
+        return x / a + r * x * (a - x) / (2 * a)
+    if r > 0:
+        return math.expm1(-r * x) / math.expm1(-r * a)
+    return math.exp(r * (a - x)) * (-math.expm1(r * x)) / (-math.expm1(r * a))
+
+
+@dataclass(frozen=True)
+class TouchOdds:
+    lower: float   # P(the low barrier is hit first, before the deadline)
+    upper: float
+    none: float    # neither by the deadline (settles 50/50)
+
+    @property
+    def fair_lower(self) -> float:
+        return self.lower + self.none / 2
+
+    @property
+    def fair_upper(self) -> float:
+        return self.upper + self.none / 2
+
+
+def first_touch(spot: float, low: float, high: float, sigma: float, mu: float, years: float) -> TouchOdds:
+    """Double-barrier first passage of a geometric Brownian motion (constant σ, drift μ) before a deadline.
+
+    Short horizons use the method of images; long ones the eigenfunction series. Neither side hit by
+    the deadline settles 50/50, which is what fair_lower / fair_upper price in."""
+    if spot <= low:
+        return TouchOdds(1.0, 0.0, 0.0)
+    if spot >= high:
+        return TouchOdds(0.0, 1.0, 0.0)
+    if years <= 0:
+        return TouchOdds(0.0, 0.0, 1.0)
+    if not sigma > 0:
+        raise ValueError("波动率无效")
+    v = sigma * sigma
+    b = mu - v / 2
+    k = b / v
+    a = math.log(high / low)
+    x = math.log(spot / low)
+    tau = v * years / (a * a)
+    if tau < 0.08 or abs(k * a) > 12:
+        st, ab = sigma * math.sqrt(years), abs(b)
+
+        def image(d: float, pref: float) -> float:
+            z = abs(d)
+            if z == 0:
+                return 0.0
+            log_j = _log_add(-ab * z / v + _log_phi((ab * years - z) / st), ab * z / v + _log_phi((-ab * years - z) / st))
+            return math.copysign(math.exp(pref + log_j), d)
+
+        lower, upper = image(x, -k * x), image(a - x, k * (a - x))
+        for n in range(1, 10001):
+            terms = (image(x + 2 * n * a, -k * x), image(x - 2 * n * a, -k * x),
+                     image(a - x + 2 * n * a, k * (a - x)), image(a - x - 2 * n * a, k * (a - x)))
+            lower += terms[0] + terms[1]
+            upper += terms[2] + terms[3]
+            if max(map(abs, terms)) < 1e-15:
+                break
+    else:
+        p_inf = _infinite_upper(x, a, sigma, mu)
+        coeff = v * math.pi / (a * a)
+        count = max(5, math.ceil(math.sqrt(2 * (45 + abs(k * a)) / (math.pi * math.pi * tau))) + 3)
+        tail_l = tail_u = 0.0
+        for n in range(1, count + 1):
+            lam = (v * (n * math.pi / a) ** 2 + b * b / v) / 2
+            term = n * math.sin(n * math.pi * x / a) * math.exp(-lam * years) / lam
+            tail_l += term
+            tail_u += term if n % 2 else -term
+        lower = 1 - p_inf - coeff * math.exp(-k * x) * tail_l
+        upper = p_inf - coeff * math.exp(k * (a - x)) * tail_u
+    lower, upper = min(1.0, max(0.0, lower)), min(1.0, max(0.0, upper))
+    if lower + upper > 1:
+        total = lower + upper
+        lower, upper = lower / total, upper / total
+    return TouchOdds(lower, upper, max(0.0, 1 - lower - upper))
+
+
+def realized_vol(rows: list, now_ms: int) -> float:
+    """Annualised σ from the last 720 finished hourly closes (30 days)."""
+    done = [r for r in rows if isinstance(r, list) and len(r) > 6 and int(r[6]) < now_ms][-721:]
+    if len(done) < 721:
+        raise ValueError("30 日小时 K 线不足")
+    rets = [math.log(float(done[i][4]) / float(done[i - 1][4])) for i in range(1, len(done))]
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var * 365 * 24)
+
+
+def touch_outcome(name: str) -> str:
+    """'$700' / 'Yes, $700' / '900 first' -> 'low' | 'high' | ''."""
+    low, high = str(int(TOUCH_LOW)), str(int(TOUCH_HIGH))
+    has_low, has_high = low in name, high in name
+    return "low" if has_low and not has_high else "high" if has_high and not has_low else ""
+
+
+class TouchMarket:
+    """BNB/USDT spot vs the $700 / $900 barriers: live price, 30-day σ, and the path since the market opened.
+
+    The path check reads hourly bars and drills into 1-minute bars only for an hour that reached a barrier,
+    so a hit is dated to the minute; a minute that spans both barriers, or the market's opening minute,
+    cannot be ordered from OHLC and is reported for a manual check."""
+    PRICE_SECONDS = 30
+    VOL_SECONDS = 3600
+    SCAN_SECONDS = 300
+
+    def __init__(self, store: "Store"):
+        self.store = store
+        self.price: D | None = None
+        self.priced_ms = 0
+        self.sigma: float | None = None
+        self.error = ""
+        self.times = {"price": -1e9, "vol": -1e9, "scan": -1e9}
+        self.start_ms = 0          # market creation (from Predict), 0 = unknown
+
+    async def get(self, path: str, **params: Any) -> Any:
+        query = urllib.parse.urlencode(params)
+        failures = []
+        for base in TOUCH_SPOT:
+            try:
+                return json.loads(await fetch_source(f"{base}/api/v3/{path}?{query}"))
+            except Exception as error:
+                failures.append(f"{urllib.parse.urlsplit(base).hostname}: {clean_error(error)}")
+        raise RemoteError("；".join(failures))
+
+    @property
+    def history(self) -> dict:
+        """{'kind': 'clear'|'low'|'high'|'ambiguous', 'through'/'time': ms, 'start': ms} or {}."""
+        saved = self.store.get(f"touch:{TOUCH_SLUG}", {})
+        return saved if isinstance(saved, dict) and saved.get("start") == self.start_ms else {}
+
+    async def refresh(self, now_ms: int) -> None:
+        mono = time.monotonic()
+        try:
+            if mono - self.times["price"] >= self.PRICE_SECONDS:
+                self.times["price"] = mono
+                data = await self.get("ticker/price", symbol=TOUCH_SYMBOL)
+                self.price, self.priced_ms = number(data["price"], "BNB"), now_ms
+            if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
+                self.times["vol"] = mono
+                self.sigma = realized_vol(await self.get("klines", symbol=TOUCH_SYMBOL, interval="1h", limit=721), now_ms)
+            if self.start_ms and mono - self.times["scan"] >= self.SCAN_SECONDS:
+                self.times["scan"] = mono
+                await self.scan(now_ms)
+            self.error = ""
+        except Exception as error:
+            self.error = clean_error(error) or type(error).__name__
+
+    async def scan(self, now_ms: int) -> None:
+        """Extend the barrier check from where it stopped (persisted) up to now."""
+        hist = self.history
+        if hist.get("kind") in {"low", "high", "ambiguous"}:
+            return
+        end = min(now_ms, TOUCH_DEADLINE_MS)
+        cursor = int(hist.get("through") or self.start_ms)
+        low, high = float(TOUCH_LOW), float(TOUCH_HIGH)
+        for _ in range(50):  # 50 000 hours: far more than the market can span
+            rows = await self.get("klines", symbol=TOUCH_SYMBOL, interval="1h", startTime=cursor - cursor % 3_600_000,
+                                  endTime=end, limit=1000)
+            done = [r for r in rows if isinstance(r, list) and len(r) > 6 and int(r[6]) < end]
+            for row in done:
+                if int(row[6]) < cursor or not (float(row[3]) <= low or float(row[2]) >= high):
+                    continue
+                result = await self.scan_hour(int(row[0]), cursor, end)
+                if result:
+                    self.store.put(f"touch:{TOUCH_SLUG}", {**result, "start": self.start_ms})
+                    return
+            if not done:
+                break
+            cursor = int(done[-1][6]) + 1
+            if len(rows) < 1000:
+                break
+        self.store.put(f"touch:{TOUCH_SLUG}", {"kind": "clear", "through": cursor, "start": self.start_ms})
+
+    async def scan_hour(self, hour_ms: int, start: int, end: int) -> dict | None:
+        rows = await self.get("klines", symbol=TOUCH_SYMBOL, interval="1m", startTime=hour_ms, endTime=hour_ms + 3_599_999, limit=60)
+        for row in rows:
+            opened, closed, hi, lo = int(row[0]), int(row[6]), float(row[2]), float(row[3])
+            if closed < start:
+                continue
+            hit_low, hit_high = lo <= float(TOUCH_LOW), hi >= float(TOUCH_HIGH)
+            if not (hit_low or hit_high):
+                continue
+            if opened < self.start_ms or closed > end or (hit_low and hit_high):
+                return {"kind": "ambiguous", "time": opened, "hi": hi, "lo": lo}
+            return {"kind": "low" if hit_low else "high", "time": opened, "hi": hi, "lo": lo}
+        return None
+
+    def odds(self, now_ms: int) -> TouchOdds | str:
+        hist = self.history
+        if hist.get("kind") == "low":
+            return TouchOdds(1.0, 0.0, 0.0)
+        if hist.get("kind") == "high":
+            return TouchOdds(0.0, 1.0, 0.0)
+        if self.price is None or self.sigma is None:
+            return f"等待币安行情（{brief_error(self.error, 60)}）" if self.error else "等待币安行情"
+        return first_touch(float(self.price), float(TOUCH_LOW), float(TOUCH_HIGH), self.sigma, 0.0,
+                           max(0.0, (TOUCH_DEADLINE_MS - now_ms) / YEAR_MS))
+
+    def status(self) -> str:
+        hist = self.history
+        kind = hist.get("kind")
+        if kind in {"low", "high"}:
+            return f"已于 {stamp(hist['time'], seconds=False)} 先触及 ${int(TOUCH_LOW if kind == 'low' else TOUCH_HIGH)}"
+        if kind == "ambiguous":
+            return f"需人工核对：{stamp(hist['time'], seconds=False)} 这一分钟无法判断先后（高 {hist['hi']:g}·低 {hist['lo']:g}）"
+        if kind == "clear":
+            return f"开盘以来未触线（核至 {stamp(hist['through'], seconds=False)}）"
+        return "开盘以来是否触线：待核验" if self.start_ms else "开盘时间未知：按此前未触线计算"
 
 
 # --- read-only probability web page -------------------------------------------------------------
@@ -2909,6 +3172,7 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 <div class="legend" id="legend"></div>
 <h2 id="h-index">指数</h2><div class="grid" id="g-index"></div>
 <h2 id="h-contract">合约标的</h2><div class="grid" id="g-contract"></div>
+<h2 id="h-crypto">加密</h2><div class="grid" id="g-crypto"></div>
 <footer id="foot">模型参考，非投资建议。</footer>
 </div>
 <script>
@@ -2948,10 +3212,20 @@ function card(it){
   if(best&&best.edge>=HOT){c.classList.add("hot");c.title="优势 ≥10¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge)}
   if(it.missing){c.append($("p","","概率暂缺："+it.missing));if(it.predict)c.append(book(it.predict));return c}
   const o=$("div","odds"),a=$("b",style==="us"?"d":"u"),b=$("b",style==="us"?"u":"d");
-  a.append($("span","lbl","涨"),pct(it.fair_up)+"¢");b.append(pct(it.fair_down)+"¢",$("span","lbl","跌"));
+  const lb=it.labels||["涨","跌"];a.append($("span","lbl",lb[0]),pct(it.fair_up)+"¢");b.append(pct(it.fair_down)+"¢",$("span","lbl",lb[1]));
   const bar=$("div","bar");[[it.up,upColor()],[it.flat,"var(--flat)"],[it.down,downColor()]].forEach(([w,col])=>{const i=$("i");i.style.width=(w*100)+"%";i.style.background=col;bar.append(i)});
   o.append(a,bar,b);c.append(o);
   const unit=it.unit?" "+it.unit:"";
+  if(it.touch){const t=it.touch,det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
+    const sm=$("summary"),sg=x=>(x>=0?"+":"")+x.toFixed(1)+"%";sm.title="点开看计算明细";
+    sm.append($("span","rd","BNB"),$("span","v",t.price),$("span","rd","距"+lb[1]),$("span","v",sg(t.to_low)),$("span","rd","距"+lb[0]),$("span","v",sg(t.to_high)));det.append(sm);
+    const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
+    row("截止",it.close_label);row("先 "+lb[0],(t.p_high*100).toFixed(2)+"%");row("先 "+lb[1],(t.p_low*100).toFixed(2)+"%");row("都没碰到",(t.p_none*100).toFixed(2)+"%（各算一半）");
+    row("σ","30 日小时收盘年化 "+(t.sigma*100).toFixed(1)+"%｜剩 "+(t.years*365).toFixed(1)+" 天");row("开盘以来",t.status);
+    row("模型","双边界首达，连续路径、固定波动率、零漂移；公平价 = P(先触该边) + ½·P(都没碰到)");
+    det.append(dl);c.append(det);if(t.error)c.append($("div","warn small","⚠️ 币安刷新失败："+t.error));
+    if(t.status.startsWith("需人工核对"))c.append($("div","warn small","⚠️ "+t.status));
+    if(it.predict)c.append(book(it.predict));return c}
   const det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   const sm=$("summary");sm.title=(it.ref_day?it.ref_day+" 收盘 → 有效价":"参考 → 有效价")+"；点开看计算明细";
   sm.append($("span","rd",it.ref_day||"参考"),$("span","v",it.ref),$("span","","→"),$("span","v",like(it.effective,it.ref)));if(it.unit)sm.append($("span","un",it.unit));
@@ -2974,7 +3248,7 @@ async function load(){
     const r=await fetch(location.pathname.replace(/\\/$/,"")+"/data.json",{cache:"no-store"});
     if(!r.ok)throw new Error("HTTP "+r.status);
     const d=await r.json();if(d.server_ms)skew=d.server_ms-Date.now();fetchedAt=Date.now();style=d.color_style||"cn";
-    for(const g of["index","contract"]){const items=d.items.filter(i=>(i.group||"contract")===g);
+    for(const g of["index","contract","crypto"]){const items=d.items.filter(i=>(i.group||"contract")===g);
       document.getElementById("g-"+g).replaceChildren(...items.map(card));document.getElementById("h-"+g).hidden=!items.length}
     document.getElementById("meta").replaceChildren(...(d.today?[$("span","","今天 "+d.today)]:[]),$("span","","数据 "+d.generated_at),$("span","","",),$("span","","基准 "+d.mode),$("span","","v"+d.version));
     document.getElementById("meta").children[d.today?2:1].id="ago";
@@ -3471,6 +3745,9 @@ class Bot:
         self.web: WebServer | None = None
         self.vols = VolBook(config.prob_vol)
         self.predict = PredictFeed(config)
+        self.touch = TouchMarket(store)
+        if config.touch:
+            self.predict.want_info.add(TOUCH_SLUG)
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
         self.reference_pool: ThreadPoolExecutor | None = None
@@ -4371,6 +4648,8 @@ class Bot:
                 "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down,
             })
+        if self.config.touch:
+            items.append(self.touch_payload(now_ms))
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION, "server_ms": now_ms,
                 "today": f"{today:%m-%d} {WEEKDAYS[today.weekday()]}",
@@ -4379,6 +4658,54 @@ class Bot:
                 "note": ("模型参考，非投资建议。有效价 = 参考收盘 × 代理现价 ÷ 代理在参考收盘时刻的价格；"
                          "P(涨) = 1 − Φ(ln((参考+半跳)/有效)/σ剩余)，平盘两边各计一半。目标日跳过周末和已配置的交易所假期。"
                          if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")}
+
+    def touch_book(self) -> tuple[PredictBook | None, str]:
+        """The BNB book priced as "$900 first" (the card's 涨 side), whatever the market's outcome order."""
+        book = self.predict.books.get("BNB")
+        if book is None:
+            return None, ""
+        names = (self.predict.info.get(TOUCH_SLUG) or {}).get("outcomes") or []
+        first = touch_outcome(names[0]) if names else ""
+        if first == "high":
+            return book, ""
+        if first == "low":  # the book prices "$700 first": its complement is "$900 first"
+            flip = lambda rows: tuple((D(1) - p, q) for p, q in rows)
+            return dataclasses.replace(book, bids=flip(book.asks), asks=flip(book.bids)), ""
+        return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}），暂不比较"
+
+    def touch_payload(self, now_ms: int) -> dict:
+        """Web card for the BNB first-touch market: 涨 = "$900 first", 跌 = "$700 first"."""
+        low, high = int(TOUCH_LOW), int(TOUCH_HIGH)
+        base = {"name": "BNB 先触 $700 / $900", "symbol": TOUCH_SYMBOL, "group": "crypto",
+                "labels": [f"${high}", f"${low}"], "close_ms": TOUCH_DEADLINE_MS,
+                "close_label": "12-31 23:59 ET（北京 01-01 12:59）截止；都没碰到按 50/50 结算"}
+        out: dict[str, Any] = {"url": predict_url(TOUCH_SLUG, self.config.predict_ref), "error": self.predict.errors.get("BNB", "")}
+        book, why = self.touch_book()
+        odds = self.touch.odds(now_ms)
+        if book is not None:
+            out.update(bids=[[float(p), float(q)] for p, q in book.bids], asks=[[float(p), float(q)] for p, q in book.asks],
+                       age=max(0, (now_ms - book.fetched_ms) // 1000), stale=book.stale(now_ms))
+            if isinstance(odds, TouchOdds):
+                edges = book_edges(odds.fair_upper, book)
+                best = None if book.stale(now_ms) else best_edge(edges)
+                out["edges"] = [{"label": e.label.replace("涨", str(high)).replace("跌", str(low)), "maker": e.maker,
+                                 "price": e.price, "edge": e.edge, "size": e.size, "best": e is best} for e in edges]
+        elif why and "BNB" in self.predict.books:
+            out["error"] = why
+        if self.config.predict:
+            base["predict"] = out
+        if isinstance(odds, str):
+            return {**base, "missing": odds}
+        price = self.touch.price
+        years = max(0.0, (TOUCH_DEADLINE_MS - now_ms) / YEAR_MS)
+        return {**base, "fair_up": odds.fair_upper, "fair_down": odds.fair_lower, "up": odds.upper, "flat": odds.none,
+                "down": odds.lower, "touch": {
+                    "price": f"{price:,.2f}" if price is not None else "—",
+                    "to_low": float(percent(TOUCH_LOW, price)) if price else 0.0,
+                    "to_high": float(percent(TOUCH_HIGH, price)) if price else 0.0,
+                    "sigma": self.touch.sigma or 0.0, "years": years, "status": self.touch.status(),
+                    "p_low": odds.lower, "p_high": odds.upper, "p_none": odds.none,
+                    "error": self.touch.error}}
 
     def card_currency(self, symbol: str) -> str:
         """Every contract card names its price currency, also when the contract is quoted in it (HKD)."""
@@ -4413,6 +4740,8 @@ class Bot:
             day = (item.target if isinstance(item, CloseOdds)
                    else session_remaining(market, now_ms, None, self.config.holidays.get(market, frozenset()))[1])
             targets[key] = predict_slug(stem, day)
+        if self.config.touch:
+            targets["BNB"] = TOUCH_SLUG
         return targets
 
     def predict_payload(self, title: str, odds: CloseOdds | str | None, now_ms: int) -> dict | None:
@@ -4955,7 +5284,16 @@ class Bot:
             jobs.append(("概率输入", lambda: self.refresh_odds_inputs(now())))
         if self.config.predict:
             jobs.append(("Predict 盘口", lambda: self.predict.refresh(self.predict_targets(now()))))
+        if self.config.touch:
+            jobs.append(("BNB 首达", lambda: self.refresh_touch(now())))
         return jobs
+
+    async def refresh_touch(self, now_ms: int) -> None:
+        created = (self.predict.info.get(TOUCH_SLUG) or {}).get("created_ms") or 0
+        if created and created != self.touch.start_ms:
+            self.touch.start_ms = created
+            self.touch.times["scan"] = -1e9  # check the path from the (new) opening time at once
+        await self.touch.refresh(now_ms)
 
     async def reference_loop(self, name: str, job: Any) -> None:
         """Refresh one reference feed forever, isolated from the price-alert loop and from the other feeds."""
