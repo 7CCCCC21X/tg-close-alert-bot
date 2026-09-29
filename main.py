@@ -402,6 +402,7 @@ class Config:
     predict_poll: int = 15   # seconds between orderbook refreshes
     predict_ref: str = "B00EA"  # referral code appended to Predict market links (?ref=); empty = none
     touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
+    auction_alert: bool = True  # Telegram reminder when a market's closing auction starts
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -452,6 +453,7 @@ class Config:
             predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 15, 5, 3600),
             predict_ref=parse_ref_code(e.get("PREDICT_REF_CODE", "B00EA")),
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
+            auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
             probability=e.get("PROBABILITY", "on").strip().lower() not in {"off", "0", "false", "no"},
             prob_vol=parse_prob_vol(e.get("PROB_VOL", "")),
             sse_index=e.get("SSE_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -2753,6 +2755,28 @@ def day_fields(target: dt.date, now_ms: int) -> dict:
 CLOSE_SETTLE_MS = {"kr": 3 * 60_000}
 
 
+# Closing auctions, Beijing time: (start, end, description). The indicative price in the last minutes is
+# nearly the close, so up/down is mostly decided once the auction runs.
+AUCTIONS = {
+    "kr": (dt.time(14, 20), dt.time(14, 30), "韩交所收盘集合竞价（首尔 15:20–15:30，随机结束至 15:30:30）"),
+    "hk": (dt.time(16, 0), dt.time(16, 10), "港交所收市竞价（16:00–16:10，16:08 后随机收市）"),
+    "sh": (dt.time(14, 57), dt.time(15, 0), "沪深收盘集合竞价（14:57–15:00）"),
+}
+AUCTIONS["sz"] = AUCTIONS["sh"]
+
+
+def auction_running(market: str, now_ms: int, holidays: frozenset = frozenset()) -> bool:
+    """Whether ``market``'s closing auction is under way now (a weekday that is not a configured holiday)."""
+    window = AUCTIONS.get(market)
+    if not window:
+        return False
+    local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+    day = local.date()
+    if STOCK_MARKETS[market].utc_offset != 8:  # holidays are listed in the venue's own dates
+        day = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=STOCK_MARKETS[market].utc_offset))).date()
+    return day.weekday() < 5 and day not in holidays and window[0] <= local.time() < window[1]
+
+
 def ref_relative(ref_day: str, target: dt.date, now_ms: int) -> str:
     """'09-28' -> 昨收 (a close before today, Beijing) / 今收 (today's own close, after the session) / 参考."""
     if not ref_day:
@@ -3721,7 +3745,7 @@ h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin
 .star{flex:none;border:0;background:none;padding:0;margin:0 -2px 0 -1px;font-size:14px;line-height:1;cursor:pointer;color:var(--faint)}.star.on{color:#f5b301}.star:hover{color:#f5b301}
 .name{font-weight:650;font-size:14.5px;min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tag{border-radius:6px;padding:1px 5px;font-size:12px;font-weight:600;background:var(--chip);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
-.tag.next{background:var(--best-bg);color:var(--best)}.tag.new{background:var(--best);color:#fff}.tag.hotk{background:var(--hot);color:#fff}
+.tag.next{background:var(--best-bg);color:var(--best)}.tag.auc{background:var(--warn);color:#fff}.tag.new{background:var(--best);color:#fff}.tag.hotk{background:var(--hot);color:#fff}
 .cd{font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;background:var(--chip);border-radius:999px;padding:1px 7px}
 .cd.done{color:var(--muted)}.cd.soon{color:var(--warn);font-weight:600}
 .odds{display:flex;align-items:center;gap:8px;font-variant-numeric:tabular-nums}
@@ -3854,6 +3878,7 @@ function card(it){
   if(it.day){const t=$("span","tag"+(it.day_ahead>0?" next":""),(it.day_tag?it.day_label.split(" ")[0]+" "+it.day_tag:it.day_label));t.title="交易日 "+it.day_label;head.append(t);
     const k=it.name+"|"+(it.symbol||"");if(seen[k]&&seen[k]<it.day)rolled[k]=Date.now();seen[k]=it.day;
     if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");t.className="tag new";t.textContent+=" 新"}}
+  if(it.auction){const a=$("span","tag auc","集合竞价");a.title=it.auction+"：此时价格基本就是收盘价";head.append(a)}
   if(it.close_ms){const cd=$("span","cd");cd.dataset.close=it.close_ms;cd.title="目标 "+it.close_label;head.append(cd)}
   c.append(head);
   if(it.kind==="ladder")return ladder(c,it);
@@ -5311,6 +5336,9 @@ class Bot:
                 items.append({**base, "missing": odds, **(day_fields(target, now_ms) if target else {})})
                 continue
             close_ms, close_label = self.target_close(title, odds.target)
+            market = self.item_market(title)
+            if market and auction_running(market, now_ms, self.config.holidays.get(market, frozenset())):
+                base["auction"] = AUCTIONS[market][2]
             ref_day = re.search(r"\b\d\d-\d\d\b", odds.ref_note)
             items.append({
                 **base, **day_fields(odds.target, now_ms), "ref_day": ref_day.group(0) if ref_day else "",
@@ -5435,6 +5463,49 @@ class Bot:
         if cap.cap is None or cap.sigma is None:
             item["missing"] = f"等待市值数据（{brief_error(cap.error, 80)}）" if cap.error else "等待市值数据"
         return item
+
+    def item_market(self, title: str) -> str | None:
+        """The exchange an odds item follows: hk / kr / sh for the indices, the ticker's market for contracts."""
+        market = {"恒生指数": "hk", "KOSPI": "kr", "上证指数": "sh"}.get(title)
+        ticker = self.config.tickers.get(title.split("｜")[-1])
+        return market or (ticker.market if ticker else None)
+
+    async def auction_reminders(self, now_ms: int) -> None:
+        """Once per market and day, as its closing auction starts: where each card stands and the best trade."""
+        if not self.config.auction_alert or not self.config.probability:
+            return
+        for market, (start, end, label) in AUCTIONS.items():
+            if market == "sz" or not auction_running(market, now_ms, self.config.holidays.get(market, frozenset())):
+                continue
+            local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+            opened = dt.datetime.combine(local.date(), start, BEIJING)
+            key = f"auction:{market}:{local.date().isoformat()}"
+            if self.store.get(key) or local - opened > dt.timedelta(minutes=2):
+                continue  # sent already, or joined too late for a reminder to help
+            items = [(title, odds) for title, odds in self.odds_items(now_ms)
+                     if self.item_market(title) in ({market, "sz"} if market == "sh" else {market})]
+            if not items:
+                continue
+            self.store.put(key, now_ms)
+            lines = [f"🔔 {bold(label + ' 开始')}", "竞价最后几分钟的价格基本就是收盘价，涨跌大体已定："]
+            for title, odds in items:
+                lines.append("\n" + bold(f"📍 {title}"))
+                if not isinstance(odds, CloseOdds):
+                    lines.extend(tree([f"概率暂缺：{odds}"]))
+                    continue
+                unit = f" {odds.unit}" if odds.unit else ""
+                rows = [f"昨收 {fmt(odds.ref)}{unit} → 现 {fmt(odds.effective)}{unit}（{percent(odds.effective, odds.ref):+.2f}%）",
+                        f"模型 涨 {bold(cents(odds.fair_up))}｜跌 {bold(cents(odds.fair_down))}"]
+                book = self.predict.books.get(self.predict_key(title))
+                if book is not None and not book.stale(now_ms):
+                    best = best_edge(book_edges(odds.fair_up, book))
+                    quote = f"Predict 买1 {cents(float(book.bid[0])) if book.bid else '无'}｜卖1 {cents(float(book.ask[0])) if book.ask else '无'}"
+                    rows.append(quote + (f"｜👉 {bold(best.label)} @ {cents(best.price)} 优势 {cents(best.edge, True)}" if best else "｜四个方向都没有正优势"))
+                lines.extend(tree(rows))
+            text = "\n".join(lines)
+            for sub_id, sub in self.subscriptions().items():
+                if sub.get("active"):
+                    await self.tell(sub["chat"], sub["thread"], text, html_mode=True)
 
     def card_currency(self, symbol: str) -> str:
         """Every contract card names its price currency, also when the contract is quoted in it (HKD)."""
@@ -5710,6 +5781,10 @@ class Bot:
         if inline and self.config.probability:
             with contextlib.suppress(Exception):  # Probabilities are informational; never block alerts.
                 await self.refresh_odds_inputs(now_ms)
+        try:
+            await self.auction_reminders(now_ms)
+        except Exception as error:  # a reminder must never block price alerts
+            self.log_limited("auction", f"集合竞价提醒失败：{clean_error(error)}")
         for sub_id, sub in self.subscriptions().items():
             if not sub.get("active"):
                 continue
