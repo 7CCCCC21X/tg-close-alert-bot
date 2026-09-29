@@ -19,7 +19,8 @@ for bad in ["UNITREEUSDT=nyse:UNI", "UNITREEUSDT=688836", "=sh:1"]:
 url = lambda t: m.StockMarket.sources(t)[0][1]
 assert url(m.StockTicker("sh", "688836")).endswith("secid=1.688836") and "push2his.eastmoney.com" in url(m.StockTicker("sh", "688836"))
 assert url(m.StockTicker("hk", "00625")).endswith("secid=116.00625") and url(m.StockTicker("sz", "000001")).endswith("secid=0.000001")
-assert url(m.StockTicker("kr", "000660")).endswith("symbol=000660") and "fchart.stock.naver.com" in url(m.StockTicker("kr", "000660"))
+assert "finance.yahoo.com/v8/finance/chart/000660.KS" in url(m.StockTicker("kr", "000660"))  # KRX-only daily bars
+assert m.StockMarket.sources(m.StockTicker("kr", "000660"))[1][1].endswith("symbol=000660")
 
 # --- parsers
 em = json.dumps({"rc": 0, "data": {"code": "688836", "name": "宇树科技", "klines": [
