@@ -3615,12 +3615,13 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 .quote .qe{white-space:normal;word-break:break-all}
 .grid.wide{display:flex;flex-wrap:wrap;align-items:flex-start}.grid.wide>.card{width:max-content;max-width:100%}
 .card.lad .name{flex:0 1 auto}.card.lad .cd{margin-left:6px}
-.lg{display:grid;grid-template-columns:auto auto auto auto 1fr;gap:3px 12px;margin-top:5px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
+.lg{display:grid;grid-template-columns:auto auto auto auto auto 1fr;gap:3px 12px;margin-top:5px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
 .lg .lh{color:var(--faint);font-size:11px;white-space:nowrap}.lg .lr{text-align:right}.lg .ln{text-align:right;white-space:nowrap}.lg .ld{color:var(--muted)}
 .lg .lt{font-weight:650;white-space:nowrap}.lg .lq{color:var(--muted);white-space:nowrap}
 .touched{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font-size:12px}.touched .k{color:var(--down);font-weight:600}
 .tchip{border-radius:6px;padding:0 6px;background:var(--chip);color:var(--muted);font-variant-numeric:tabular-nums}
-.lg .lb{color:var(--faint);white-space:nowrap}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}
+.lg .lb{color:var(--faint);white-space:nowrap}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}.lg .lk b{color:var(--faint)}.lg .lk.pos b{color:var(--best)}.lg .lz{color:var(--faint);font-size:11px;margin-left:3px}
+@media (max-width:560px){.lg{gap:3px 7px;font-size:12px}.lg .ld,.lg .lz,.lg .lp{display:none}.lg{grid-template-columns:auto auto auto auto 1fr}}
 .small{font-size:12px;margin-top:3px}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
 </style></head><body><div class="wrap">
 <header><h1>收盘涨跌概率</h1><div class="hr"><div class="meta" id="meta">加载中…</div><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label></div></header>
@@ -3687,7 +3688,7 @@ function ladder(c,it){
   w.append(h);let hot=null;
   if(live.length){const g=$("div","lg");
     const hd=(t,cl,tip)=>{const x=$("span","lh"+(cl?" "+cl:""),t);if(tip)x.title=tip;return x};
-    g.append(hd("目标"),hd("距离","ln","还要涨多少才碰到"),hd("模型","ln","模型给 Yes 的公平价"),hd("买1 / 卖1","","Yes 的盘口"),hd("最优"));
+    g.append(hd("目标"),hd("距离","ln ld","还要涨多少才碰到"),hd("模型","ln","模型给 Yes 的公平价"),hd("买1 / 卖1","","Yes 的盘口"),hd("最优"),hd("吃单","","立即成交的较优一边：吃Yes@卖1 或 吃No@1−买1，× 为卖1/买1 的量"));
     live.forEach(r=>{const best=r.edges&&r.edges.find(e=>e.best),n=x=>x==null?"无":(x*100).toFixed(1);
       const q=r.bid==null&&r.ask==null?(r.error?"—":"…"):n(r.bid)+" / "+n(r.ask);
       const b=$("span","lb"+(best&&L.bars?(best.edge>=HOT?" hot":" pos"):""));
@@ -3696,7 +3697,10 @@ function ladder(c,it){
         else if(best.edge>=HOT&&(!hot||best.edge>hot.edge))hot={...best,row:r.label}}
       else b.textContent=r.error?"⚠️":r.stale?"过期":"—";
       if(r.error)b.title=r.error;
-      g.append($("span","lt",r.label),$("span","ln ld",r.dist==null?"—":"+"+(r.dist*100).toFixed(0)+"%"),$("span","ln",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b)});
+      const tk=r.edges&&r.edges.filter(e=>!e.maker).sort((x,y)=>y.edge-x.edge)[0],t=$("span","lb lk"+(tk&&tk.edge>0&&L.bars&&!r.stale?" pos":""));
+      if(tk){t.append(tk.label+" ",$("span","lp",(tk.price*100).toFixed(1)+" "),$("b","",(tk.edge>=0?"+":"")+cent(tk.edge)),$("span","lz","×"+qty(tk.size)));t.title=tk.label+" @ "+cent(tk.price)+"，立即成交，最多 "+qty(tk.size)+" 份"+(r.stale?"（盘口过期）":"")}
+      else t.textContent="—";
+      g.append($("span","lt",r.label),$("span","ln ld",r.dist==null?"—":"+"+(r.dist*100).toFixed(0)+"%"),$("span","ln",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b,t)});
     w.append(g)}
   c.append(w);
   if(hot){c.classList.add("hot");c.title="优势 ≥10¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" +"+cent(hot.edge)}
