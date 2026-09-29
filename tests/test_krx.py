@@ -131,3 +131,38 @@ assert m.ref_relative("09-29", dt.date(2026, 9, 30), bj(2026, 9, 29, 17)) == "�
 assert m.ref_relative("12-31", dt.date(2027, 1, 4), bj(2027, 1, 4, 10)) == "昨收"     # across the year end
 assert m.ref_relative("", dt.date(2026, 9, 29), bj(2026, 9, 29, 10)) == "参考"
 print("LABELS_OK")
+
+
+# --- HSI: dated daily closes (Tencent, Eastmoney fallback) win over a realtime spot read before the final close ----------
+async def hsi():
+    bj2 = lambda d, h, mi: int(dt.datetime(2026, 9, d, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)
+    tencent = json.dumps({"data": {"hkHSI": {"day": [["2026-09-26", "24400", "24510.09", "0", "0", "1"],
+                                                     ["2026-09-29", "24500", "24529.24", "0", "0", "1"],
+                                                     ["2026-09-30", "24530", "24600.00", "0", "0", "1"]]}}}).encode()
+    calls = []
+    async def fake_get(url, timeout=15, headers=None):
+        calls.append(url)
+        if "gtimg" in url:
+            if isinstance(state["tencent"], Exception): raise state["tencent"]
+            return state["tencent"]
+        if "eastmoney" in url:
+            return json.dumps({"data": {"klines": ["2026-09-26,24400,24510.09", "2026-09-29,24500,24529.24"]}}).encode()
+        raise AssertionError(url)
+    m.http_get = fake_get
+    state = {"tencent": tencent}
+    feed = m.DailyCloses("hk", (("tencent", "https://web.ifzq.gtimg.cn/x"), ("eastmoney", "https://push2his.eastmoney.com/x")))
+    await feed.refresh(bj2(30, 10, 0))   # 09-30 session running: its bar is not final
+    assert feed.daily == {dt.date(2026, 9, 26): D("24510.09"), dt.date(2026, 9, 29): D("24529.24")} and feed.error == "", feed.daily
+    ref, note = m.dated_ref(feed.daily, dt.date(2026, 9, 29), D("24523.57"))
+    assert ref == D("24529.24") and note == "09-29 收盘（日K；实时行情为 24,523.57）", note
+    # after 16:25 the day's bar is looked for every minute
+    n = len(calls); await feed.refresh(bj2(30, 16, 26)); assert len(calls) == n  # within the minute
+    feed.refreshed -= 61; await feed.refresh(bj2(30, 16, 26))
+    assert feed.daily[dt.date(2026, 9, 30)] == D("24600.00")
+    # Tencent down: Eastmoney
+    state["tencent"] = m.RemoteError("网络错误 (URLError)")
+    feed2 = m.DailyCloses("hk", feed.sources); await feed2.refresh(bj2(30, 10, 0))
+    assert feed2.daily[dt.date(2026, 9, 29)] == D("24529.24")
+
+asyncio.run(hsi())
+print("HSI_OK")
