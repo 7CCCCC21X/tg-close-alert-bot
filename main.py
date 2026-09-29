@@ -3262,15 +3262,22 @@ class TouchMarket:
 # --- market-cap ladder (will a token's market cap reach each threshold?) ----------------------------
 @dataclass(frozen=True)
 class CapSpec:
-    """A "what market cap will X hit" category: Yes/No per threshold, touched on any 1-minute candle."""
+    """A "what market cap / FDV will X hit" category: Yes/No per threshold, touched on any 1-minute candle."""
     key: str
     slug: str
     name: str             # card title
-    token: str            # BSC contract (lower case)
+    token: str            # contract / mint, as the chain spells it
     start_ms: int         # resolution window, from the rules
     end_ms: int
     targets: tuple[D, ...]  # shown until Predict's own market titles are read
     trade_end: str = ""   # when Predict stops trading, if earlier than the window
+    chain: str = "bsc"    # DexScreener chain id
+    pair: str = ""        # a named DexScreener pair (the rules' source); else the token's most liquid pair
+    supply: str = "rpc"   # "rpc": BSC totalSupply − dead balances; "fdv": DexScreener's FDV ÷ price
+    gecko: str = "bsc"    # GeckoTerminal network for hourly bars; "" = none (σ prior, live-observed high only)
+    metric: str = "市值"
+    settle: str = "Flap.sh"
+    prior_sigma: float = 3.0  # annualised σ assumed when there are no bars to measure it
 
 
 CAP_MARKETS = (
@@ -3278,10 +3285,22 @@ CAP_MARKETS = (
     CapSpec("NIULAI", "what-marketcap-will-niu-lai-hit-before-nov-2026", "$牛来 市值", "0xbeea1d618e533a387d941f58a7d4c9b7bd377777",
             et_ms(2026, 8, 16, 23, 30, -4), et_ms(2026, 10, 31, 23, 59, -4),
             (D("2e8"), D("3e8"), D("5e8"), D("1e9")), "Predict 交易至北京 11-01 07:59"),
+    # "between market creation on August 17, 13:00 PM ET to 11:59 PM ET on October 31, 2026"; FDV = price × total supply
+    CapSpec("ANSEM", "what-fdv-will-ansem-hit-before-nov-2026", "$ANSEM FDV", "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump",
+            et_ms(2026, 8, 17, 13, 0, -4), et_ms(2026, 10, 31, 23, 59, -4),
+            tuple(D(f"{n}e8") for n in (5, 6, 7, 8, 9)) + (D("1e9"),),
+            chain="solana", supply="fdv", gecko="solana", metric="FDV", settle="pump.fun"),
+    # "between market creation on August 31, 2026 at 06:00 AM ET to October 31, 2026 at 11:59 PM ET"; the rules' own
+    # source is this DexScreener pair; FDV = (total supply − burned) × price
+    CapSpec("PONS", "what-fdv-will-pons-hit-before-nov-2026", "$PONS FDV", "0x39dBED3a2bd333467115dE45665cC57F813C4571",
+            et_ms(2026, 8, 31, 6, 0, -4), et_ms(2026, 10, 31, 23, 59, -4),
+            (D("7e8"), D("8e8"), D("9e8"), D("1e9")),
+            chain="robinhood", pair="0x10cc6bd38112cac182db90b6a71d8bb5939526ba", supply="fdv", gecko="",
+            metric="FDV", settle="DexScreener"),
 )
 BSC_RPC = ("https://bsc-dataseed.bnbchain.org", "https://bsc-dataseed.binance.org", "https://bsc-rpc.publicnode.com")
 BURN_ADDRESSES = ("0x000000000000000000000000000000000000dead", "0x0000000000000000000000000000000000000000")
-GECKO = "https://api.geckoterminal.com/api/v2/networks/bsc"
+GECKO = "https://api.geckoterminal.com/api/v2/networks"
 
 
 def hit_probability(spot: float, level: float, sigma: float, years: float) -> float:
@@ -3307,13 +3326,19 @@ def usd_short(value: D | float | None) -> str:
     return f"${v:,.2f}"
 
 
-def dex_price(data: Any, token: str) -> tuple[D, D | None, str]:
-    """DexScreener token answer ([pairs] or {"pairs": [...]}) -> (USD price, market cap if given, pair label)
+def dex_price(data: Any, token: str) -> tuple[D, D | None, D | None, str]:
+    """DexScreener answer ([pairs], {"pairs": [...]} or {"pair": {...}}) -> (USD price, market cap, FDV, pair label)
     from the most liquid pair that has the token as its base."""
-    pairs = data if isinstance(data, list) else (data or {}).get("pairs") if isinstance(data, dict) else None
+    if isinstance(data, list):
+        pairs = data
+    elif isinstance(data, dict):
+        pairs = data.get("pairs") or ([data["pair"]] if isinstance(data.get("pair"), dict) else [])
+    else:
+        pairs = []
     best = None
+    number_or_none = lambda value: D(str(value)) if value not in (None, "", 0) else None
     for pair in pairs or []:
-        if not isinstance(pair, dict) or str((pair.get("baseToken") or {}).get("address", "")).lower() != token:
+        if not isinstance(pair, dict) or str((pair.get("baseToken") or {}).get("address", "")).lower() != token.lower():
             continue
         try:
             price = D(str(pair.get("priceUsd")))
@@ -3321,13 +3346,13 @@ def dex_price(data: Any, token: str) -> tuple[D, D | None, str]:
         except (decimal.InvalidOperation, TypeError, ValueError):
             continue
         if price > 0 and (best is None or liquidity > best[0]):
-            cap = pair.get("marketCap") or pair.get("fdv")
+            cap = fdv = None
             with contextlib.suppress(decimal.InvalidOperation, TypeError, ValueError):
-                cap = D(str(cap)) if cap else None
-            best = (liquidity, price, cap if isinstance(cap, D) and cap > 0 else None, f"{pair.get('dexId', '')}")
+                cap, fdv = number_or_none(pair.get("marketCap")), number_or_none(pair.get("fdv"))
+            best = (liquidity, price, cap or fdv, fdv or cap, f"{pair.get('dexId', '')}")
     if best is None:
         raise ValueError("DexScreener 没有这个代币的交易对")
-    return best[1], best[2], best[3]
+    return best[1], best[2], best[3], best[4]
 
 
 def gecko_pool(data: Any) -> str:
@@ -3341,7 +3366,7 @@ def gecko_pool(data: Any) -> str:
         except (TypeError, ValueError):
             reserve = 0.0
         if attrs.get("address") and (best is None or reserve > best[0]):
-            best = (reserve, str(attrs["address"]).lower())
+            best = (reserve, str(attrs["address"]))  # Solana addresses are case-sensitive
     if best is None:
         raise ValueError("GeckoTerminal 没有这个代币的池子")
     return best[1]
@@ -3365,10 +3390,11 @@ def rpc_uint(data: Any) -> int:
 
 
 class CapMarket:
-    """A BSC token's market cap = price × (total supply − burned), its 30-day σ, and its highest point since
-    the resolution window opened (hourly bars, the window's first partial hour from 1-minute bars).
+    """A token's market cap / FDV = price × supply (BSC: total − burned via RPC; else DexScreener's FDV ÷ price),
+    its 30-day σ, and its highest point since the resolution window opened (GeckoTerminal hourly bars, the
+    window's first partial hour from 1-minute bars, plus every price the bot itself sees).
 
-    Settlement reads Flap.sh's own 1-minute chart; DexScreener / GeckoTerminal prices are a close stand-in."""
+    Settlement reads the rules' own chart (Flap.sh, pump.fun, DexScreener); these feeds are a close stand-in."""
     PRICE_SECONDS = 30
     SUPPLY_SECONDS = 600
     VOL_SECONDS = 3600
@@ -3378,6 +3404,7 @@ class CapMarket:
         self.store, self.spec = store, spec
         self.price: D | None = None
         self.dex_cap: D | None = None
+        self.dex_fdv: D | None = None
         self.source = ""
         self.supply: D | None = None      # total − burned, in whole tokens
         self.sigma: float | None = None
@@ -3408,10 +3435,20 @@ class CapMarket:
         raise RemoteError("；".join(failures))
 
     async def ohlcv(self, frame: str, before_s: int, limit: int) -> list[tuple[int, float, float, float, float]]:
+        base = f"{GECKO}/{self.spec.gecko}"
         if not self.pool:
-            self.pool = gecko_pool(await self.get(f"{GECKO}/tokens/{self.spec.token}/pools?page=1"))
-        return gecko_bars(await self.get(f"{GECKO}/pools/{self.pool}/ohlcv/{frame}?aggregate=1&limit={limit}"
+            self.pool = self.spec.pair or gecko_pool(await self.get(f"{base}/tokens/{self.spec.token}/pools?page=1"))
+        return gecko_bars(await self.get(f"{base}/pools/{self.pool}/ohlcv/{frame}?aggregate=1&limit={limit}"
                                          f"&before_timestamp={before_s}&currency=usd&token={self.spec.token}"))
+
+    def observe(self, now_ms: int) -> None:
+        """Keep the highest price the bot itself has seen inside the window (persisted with the scan)."""
+        if self.price is None or not self.spec.start_ms <= now_ms <= self.spec.end_ms:
+            return
+        hist = dict(self.history) or {"start": self.spec.start_ms, "high": 0.0, "at": 0}
+        if float(self.price) > float(hist.get("high") or 0):
+            hist["high"], hist["at"] = float(self.price), now_ms // 1000
+            self.store.put(f"cap:{self.spec.slug}", hist)
 
     @property
     def cap(self) -> D | None:
@@ -3430,12 +3467,16 @@ class CapMarket:
         if mono - self.times["price"] >= self.PRICE_SECONDS:
             self.times["price"] = mono
             try:
-                self.price, self.dex_cap, self.source = dex_price(
-                    await self.get(f"https://api.dexscreener.com/tokens/v1/bsc/{self.spec.token}"), self.spec.token)
+                url = (f"https://api.dexscreener.com/latest/dex/pairs/{self.spec.chain}/{self.spec.pair}" if self.spec.pair
+                       else f"https://api.dexscreener.com/tokens/v1/{self.spec.chain}/{self.spec.token}")
+                self.price, self.dex_cap, self.dex_fdv, self.source = dex_price(await self.get(url), self.spec.token)
                 self.source = f"DexScreener {self.source}".strip()
+                if self.spec.supply == "fdv" and self.dex_fdv:
+                    self.supply = self.dex_fdv / self.price
+                self.observe(now_ms)
             except Exception as error:
                 failures.append(f"价格：{clean_error(error)}")
-        if mono - self.times["supply"] >= self.SUPPLY_SECONDS or self.supply is None:
+        if self.spec.supply == "rpc" and (mono - self.times["supply"] >= self.SUPPLY_SECONDS or self.supply is None):
             self.times["supply"] = mono
             try:
                 decimals = await self.rpc("0x313ce567")
@@ -3446,7 +3487,9 @@ class CapMarket:
                 self.supply = D(total - burned) / (D(10) ** decimals)
             except Exception as error:
                 failures.append(f"供应量：{clean_error(error)}")
-        if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
+        if not self.spec.gecko:
+            self.sigma, self.sigma_note = self.spec.prior_sigma, "先验：没有 K 线来源"
+        elif mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
             self.times["vol"] = mono
             self.pool = ""  # look the most liquid pool up again (a token can move pools)
             try:
@@ -3459,7 +3502,7 @@ class CapMarket:
                 self.sigma_note = f"{len(rets) / 24:.0f} 日小时收盘"
             except Exception as error:
                 failures.append(f"波动率：{clean_error(error)}")
-        if mono - self.times["scan"] >= self.SCAN_SECONDS:
+        if self.spec.gecko and mono - self.times["scan"] >= self.SCAN_SECONDS:
             self.times["scan"] = mono
             try:
                 await self.scan(now_ms)
@@ -3472,8 +3515,8 @@ class CapMarket:
         start_s, end_s = self.spec.start_ms // 1000, min(now_ms, self.spec.end_ms) // 1000
         if end_s <= start_s:
             return
-        hist = dict(self.history) or {"start": self.spec.start_ms, "high": 0.0, "at": 0,
-                                      "through": start_s - start_s % 3600 + (3600 if start_s % 3600 else 0)}
+        hist = dict(self.history) or {"start": self.spec.start_ms, "high": 0.0, "at": 0}
+        hist.setdefault("through", start_s - start_s % 3600 + (3600 if start_s % 3600 else 0))
         if start_s % 3600 and "first" not in hist:
             # the window opens mid-hour: that hour counts only from the opening minute
             try:
@@ -3622,18 +3665,19 @@ function ladder(c,it){
   // a market-cap ladder: one Yes/No market per threshold; reached ones fold into one line, open ones get a row each
   const L=it.ladder,det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   const sm=$("summary");sm.title="点开看计算明细";
-  sm.append($("span","rd","市值"),$("span","v",L.cap),$("span","rd","窗口最高"),$("span","v",L.high));
+  sm.append($("span","rd",L.metric),$("span","v",L.cap),$("span","rd","窗口最高"),$("span","v",L.high));
   if(L.sigma)sm.append($("span","rd","σ"),$("span","v",(L.sigma*100).toFixed(0)+"%"));
   det.append(sm);const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
-  row("窗口",L.window+" → "+it.close_label);row("价格",L.price+" USD（"+L.source+"）");row("流通量",L.supply+"（总量 − 销毁）");
-  row("窗口最高",L.high+(L.high_at?"（"+L.high_at+"）":"")+"：GeckoTerminal 小时 K 近似，结算以 Flap.sh 1 分钟 K 为准"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
+  row("窗口",L.window+" → "+it.close_label);row("价格",L.price+" USD（"+L.source+"）");row("供应量",L.supply+"（"+L.supply_note+"）");
+  row("窗口最高",L.high+(L.high_at?"（"+L.high_at+"）":"")+"："+(L.bars?"GeckoTerminal 小时 K 近似":"只含机器人运行以来看到的价格")+"，结算以 "+L.settle+" 1 分钟 K 为准；Predict 已结算的档位算已触及"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
   if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
-  row("模型","碰到即 Yes：零漂移、固定波动率的单边触及概率 Φ((−h−s²/2)/s) + (M/K)·Φ((−h+s²/2)/s)，h = ln(K/M)，s = σ√T");
+  row("模型",(L.bars?"":"σ 为先验值（这条链没有 K 线来源），仅供参考。")+"碰到即 Yes：零漂移、固定波动率的单边触及概率 Φ((−h−s²/2)/s) + (M/K)·Φ((−h+s²/2)/s)，h = ln(K/M)，s = σ√T");
   det.append(dl);c.append(det);
   if(it.missing)c.append($("p","","概率暂缺："+it.missing));else if(L.error)c.append($("div","warn small","⚠️ "+L.error));
+  if(!L.bars&&!it.missing)c.append($("div","warn small","⚠️ 这条链没有 K 线来源：σ 用先验 "+(L.sigma*100).toFixed(0)+"%，优势只作参考，不标红"));
   const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
   if(done.length){const t=$("div","touched");t.append($("span","k","✓ 已触及"));
-    done.forEach(r=>{const x=$("span","tchip",r.label);x.title=r.label+"：窗口内市值已达到"+(r.bid!=null||r.ask!=null?"｜盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1)):"｜已结算或无盘口");t.append(x)});
+    done.forEach(r=>{const x=$("span","tchip",r.label);x.title=r.label+"：窗口内"+L.metric+"已达到"+(r.bid!=null||r.ask!=null?"｜盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1)):"｜已结算或无盘口");t.append(x)});
     c.append(t)}
   const w=it.predict?$("a","pb"):$("div","pb");
   if(it.predict){w.href=it.predict.url;w.target="_blank";w.rel="noopener noreferrer";w.title="打开 Predict 市场"}
@@ -3644,9 +3688,10 @@ function ladder(c,it){
     g.append(hd("目标"),hd("距离","ln","还要涨多少才碰到"),hd("模型","ln","模型给 Yes 的公平价"),hd("买1 / 卖1","","Yes 的盘口"),hd("最优"));
     live.forEach(r=>{const best=r.edges&&r.edges.find(e=>e.best),n=x=>x==null?"无":(x*100).toFixed(1);
       const q=r.bid==null&&r.ask==null?(r.error?"—":"…"):n(r.bid)+" / "+n(r.ask);
-      const b=$("span","lb"+(best?(best.edge>=HOT?" hot":" pos"):""));
+      const b=$("span","lb"+(best&&L.bars?(best.edge>=HOT?" hot":" pos"):""));
       if(best){b.append(best.label+" "+(best.price*100).toFixed(1)+" ",$("b","","+"+cent(best.edge)));b.title=best.maker?"挂单排队，成交不保证":"立即成交，量 "+qty(best.size);
-        if(best.edge>=HOT&&(!hot||best.edge>hot.edge))hot={...best,row:r.label}}
+        if(!L.bars)b.title="σ 是先验值，这个优势只作参考、不提醒";
+        else if(best.edge>=HOT&&(!hot||best.edge>hot.edge))hot={...best,row:r.label}}
       else b.textContent=r.error?"⚠️":r.stale?"过期":"—";
       if(r.error)b.title=r.error;
       g.append($("span","lt",r.label),$("span","ln ld",r.dist==null?"—":"+"+(r.dist*100).toFixed(0)+"%"),$("span","ln",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b)});
@@ -5183,6 +5228,9 @@ class Bot:
         rows = []
         for row in rows_in:
             fair = cap.probability(row.target, now_ms)
+            meta = (self.predict.market_meta.get(row.market_id) or ({}, 0))[0] if row.market_id else {}
+            if "RESOLVED" in str(meta.get("status", "")).upper() and now_ms < spec.end_ms:
+                fair = 1.0  # settled before the window closed: only a touch settles early, so it was Yes
             book, why = self.predict.yes_book(row) if row.market_id else (None, "")
             out: dict[str, Any] = {"label": usd_short(row.target), "fair": fair, "error": why,
                                    "dist": float(row.target / cap.cap - 1) if cap.cap else None}
@@ -5211,7 +5259,9 @@ class Bot:
                        "supply": fmt(cap.supply.quantize(D(1))) if cap.supply else "—",
                        "window": f"{start:%m-%d %H:%M} ET（北京 {bj(spec.start_ms)}）起",
                        "years": max(0.0, (spec.end_ms - max(now_ms, spec.start_ms)) / YEAR_MS),
-                       "first_skipped": cap.history.get("first") == "skipped"},
+                       "first_skipped": cap.history.get("first") == "skipped",
+                       "metric": spec.metric, "settle": spec.settle, "bars": bool(spec.gecko),
+                       "supply_note": "总量 − 销毁" if spec.supply == "rpc" else f"DexScreener {spec.metric} ÷ 价格"},
         }
         if self.config.predict:
             item["predict"] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
