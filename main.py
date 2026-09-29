@@ -6087,6 +6087,14 @@ class Bot:
                     last, prev = IndexFutures.parse_spot(name, raw)
                     return f"{fmt(last)}（昨收 {fmt(prev) if prev else '—'}）"
                 probes.append(("恒指现货", name, get(url, extra), check_spot))
+            for kind, url in self.hsi_daily.sources:
+                def check_hsi_daily(raw: bytes, kind=kind) -> str:
+                    bars = finished_bars(sorted(DailyCloses.parse(kind, "hk", raw)), "hk", now_ms)
+                    if not bars:
+                        raise ValueError("日 K 为空")
+                    return f"最新完结 {bars[-1][0]:%m-%d} 收盘 {fmt(bars[-1][2])}（共 {len(bars)} 根）"
+                probes.append(("恒指日K", {"tencent": "腾讯日K", "eastmoney": "东方财富日K", "yahoo": "Yahoo ^HSI"}.get(kind, kind),
+                               get(url, DailyCloses.REFERERS.get(kind)), check_hsi_daily))
 
         if self.config.kospi_index:
             for group, sources in (("KOSPI", KospiIndex.SOURCES), ("KOSPI200", KospiIndex.SOURCES_200)):
@@ -6173,6 +6181,10 @@ class Bot:
                 lines.append(f"  上证概率：涨 {odds.fair_up * 100:.1f}¢（有效 {fmt(odds.effective.quantize(D('0.01')))}·σ {odds.sigma * 100:.2f}%·{odds.sigma_note}）")
             elif odds is not None:
                 lines.append(f"  上证概率：暂缺——{odds}")
+        if self.config.hsi_futures:
+            daily = max(self.hsi_daily.daily.items()) if self.hsi_daily.daily else None
+            lines.append(f"  恒指日K收盘：{f'{daily[0]:%m-%d} {fmt(daily[1])}' if daily else '未取得'}"
+                         + (f"｜错误：{brief_error(self.hsi_daily.error, 60)}" if self.hsi_daily.error else ""))
         if self.config.kospi_index:
             k, hl, anchor = self.kospi.quote, self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
             daily = max(self.kospi.daily.items()) if self.kospi.daily else None
