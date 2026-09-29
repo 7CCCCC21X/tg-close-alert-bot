@@ -3049,7 +3049,8 @@ class TouchMarket:
                 self.price, self.priced_ms = number(data["price"], "BNB"), now_ms
             if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
                 self.times["vol"] = mono
-                self.sigma = realized_vol(await self.get("klines", symbol=TOUCH_SYMBOL, interval="1h", limit=721), now_ms)
+                # 722: the newest bar is the hour still running, which realized_vol drops; 721 finished bars remain
+                self.sigma = realized_vol(await self.get("klines", symbol=TOUCH_SYMBOL, interval="1h", limit=722), now_ms)
             if self.start_ms and mono - self.times["scan"] >= self.SCAN_SECONDS:
                 self.times["scan"] = mono
                 await self.scan(now_ms)

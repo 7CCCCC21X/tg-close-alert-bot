@@ -30,6 +30,9 @@ H = 3_600_000
 rows = [[NOW - (722 - i) * H, "0", "0", "0", str(800 * (1.01 if i % 2 else 1)), "0", NOW - (721 - i) * H - 1] for i in range(722)]
 sigma = m.realized_vol(rows, NOW)
 assert abs(sigma - 0.00995 * 1.0003 * math.sqrt(8760)) / sigma < 0.02, sigma
+# Binance's answer to limit=721 ends in the running hour: only 720 finished bars, not enough (the old bug)
+try: m.realized_vol((rows + [[NOW, "0", "0", "0", "812", "0", NOW + H - 1]])[-721:], NOW); assert False
+except ValueError: pass
 try: m.realized_vol(rows[:100], NOW); assert False
 except ValueError: pass
 
@@ -43,8 +46,9 @@ async def run():
     async def get(path, **p):
         if path == "ticker/price":
             return {"symbol": "BNBUSDT", "price": "812.50"}
-        if p["interval"] == "1h" and p.get("limit") == 721:
-            return rows
+        if p["interval"] == "1h" and p.get("limit") == 722:
+            # like Binance: the newest `limit` bars, the last one still open (its close time is in the future)
+            return (rows + [[NOW, "0", "0", "0", "812", "0", NOW + H - 1]])[-722:]
         if p["interval"] == "1h":
             first = p["startTime"]
             out = []
