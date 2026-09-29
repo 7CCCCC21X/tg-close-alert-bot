@@ -3570,9 +3570,13 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 .edge.best{border-color:var(--best);background:var(--best-bg)}.edge.best .el{color:var(--text)}.edge.best b{color:var(--best)}
 .edge.hot{border-color:var(--hot);background:var(--hot-bg)}.edge.hot b{color:var(--hot)}
 .quote .qe{white-space:normal;word-break:break-all}
-.lg{display:grid;grid-template-columns:auto auto 1fr auto;gap:3px 10px;margin-top:5px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
-.lg .lh{color:var(--faint);font-size:11px}.lg .lr{text-align:right}.lg .lt{font-weight:650}.lg .lq{color:var(--muted);white-space:nowrap}
-.lg .lb{color:var(--faint);text-align:right;white-space:nowrap}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}
+.grid.wide{grid-template-columns:repeat(auto-fill,minmax(min(440px,100%),1fr))}
+.lg{display:grid;grid-template-columns:auto auto auto auto 1fr;gap:3px 12px;margin-top:5px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
+.lg .lh{color:var(--faint);font-size:11px;white-space:nowrap}.lg .lr{text-align:right}.lg .ln{text-align:right;white-space:nowrap}.lg .ld{color:var(--muted)}
+.lg .lt{font-weight:650;white-space:nowrap}.lg .lq{color:var(--muted);white-space:nowrap}
+.touched{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font-size:12px}.touched .k{color:var(--down);font-weight:600}
+.tchip{border-radius:6px;padding:0 6px;background:var(--chip);color:var(--muted);font-variant-numeric:tabular-nums}
+.lg .lb{color:var(--faint);white-space:nowrap}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}
 .small{font-size:12px;margin-top:3px}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
 </style></head><body><div class="wrap">
 <header><h1>收盘涨跌概率</h1><div class="hr"><div class="meta" id="meta">加载中…</div><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label></div></header>
@@ -3581,6 +3585,7 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 <h2 id="h-index">指数</h2><div class="grid" id="g-index"></div>
 <h2 id="h-contract">合约标的</h2><div class="grid" id="g-contract"></div>
 <h2 id="h-crypto">加密</h2><div class="grid" id="g-crypto"></div>
+<h2 id="h-ladder">市值阶梯</h2><div class="grid wide" id="g-ladder"></div>
 <footer id="foot">模型参考，非投资建议。</footer>
 </div>
 <script>
@@ -3614,7 +3619,7 @@ function book(p){
   return w}
 function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
 function ladder(c,it){
-  // a market-cap ladder: one Yes/No market per threshold, each with the model's P(Yes) and its best trade
+  // a market-cap ladder: one Yes/No market per threshold; reached ones fold into one line, open ones get a row each
   const L=it.ladder,det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   const sm=$("summary");sm.title="点开看计算明细";
   sm.append($("span","rd","市值"),$("span","v",L.cap),$("span","rd","窗口最高"),$("span","v",L.high));
@@ -3626,20 +3631,27 @@ function ladder(c,it){
   row("模型","碰到即 Yes：零漂移、固定波动率的单边触及概率 Φ((−h−s²/2)/s) + (M/K)·Φ((−h+s²/2)/s)，h = ln(K/M)，s = σ√T");
   det.append(dl);c.append(det);
   if(it.missing)c.append($("p","","概率暂缺："+it.missing));else if(L.error)c.append($("div","warn small","⚠️ "+L.error));
+  const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
+  if(done.length){const t=$("div","touched");t.append($("span","k","✓ 已触及"));
+    done.forEach(r=>{const x=$("span","tchip",r.label);x.title=r.label+"：窗口内市值已达到"+(r.bid!=null||r.ask!=null?"｜盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1)):"｜已结算或无盘口");t.append(x)});
+    c.append(t)}
   const w=it.predict?$("a","pb"):$("div","pb");
   if(it.predict){w.href=it.predict.url;w.target="_blank";w.rel="noopener noreferrer";w.title="打开 Predict 市场"}
   const h=$("div","quote");h.append($("span","pt","Predict ↗"));if(it.predict&&it.predict.error)h.append($("span","warn qe",it.predict.error));
-  const g=$("div","lg");g.append($("span","lh","目标"),$("span","lh","模型 Yes"),$("span","lh","买1 / 卖1"),$("span","lh lr","最优"));
-  let hot=null;
-  L.rows.forEach(r=>{const best=r.edges&&r.edges.find(e=>e.best),n=x=>x==null?"无":(x*100).toFixed(1);
-    const q=r.bid==null&&r.ask==null?(r.error?"—":"…"):n(r.bid)+" / "+n(r.ask);
-    const b=$("span","lb"+(best?(best.edge>=HOT?" hot":" pos"):""));
-    if(best){b.append(best.label+" "+(best.price*100).toFixed(1)+" ",$("b","","+"+cent(best.edge)));b.title=best.maker?"挂单排队，成交不保证":"立即成交，量 "+qty(best.size);
-      if(best.edge>=HOT&&(!hot||best.edge>hot.edge))hot={...best,row:r.label}}
-    else b.textContent=r.error?"⚠️":r.stale?"过期":"—";
-    if(r.error)b.title=r.error;
-    g.append($("span","lt",r.label),$("span","lf",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b)});
-  w.append(h,g);c.append(w);
+  w.append(h);let hot=null;
+  if(live.length){const g=$("div","lg");
+    const hd=(t,cl,tip)=>{const x=$("span","lh"+(cl?" "+cl:""),t);if(tip)x.title=tip;return x};
+    g.append(hd("目标"),hd("距离","ln","还要涨多少才碰到"),hd("模型","ln","模型给 Yes 的公平价"),hd("买1 / 卖1","","Yes 的盘口"),hd("最优"));
+    live.forEach(r=>{const best=r.edges&&r.edges.find(e=>e.best),n=x=>x==null?"无":(x*100).toFixed(1);
+      const q=r.bid==null&&r.ask==null?(r.error?"—":"…"):n(r.bid)+" / "+n(r.ask);
+      const b=$("span","lb"+(best?(best.edge>=HOT?" hot":" pos"):""));
+      if(best){b.append(best.label+" "+(best.price*100).toFixed(1)+" ",$("b","","+"+cent(best.edge)));b.title=best.maker?"挂单排队，成交不保证":"立即成交，量 "+qty(best.size);
+        if(best.edge>=HOT&&(!hot||best.edge>hot.edge))hot={...best,row:r.label}}
+      else b.textContent=r.error?"⚠️":r.stale?"过期":"—";
+      if(r.error)b.title=r.error;
+      g.append($("span","lt",r.label),$("span","ln ld",r.dist==null?"—":"+"+(r.dist*100).toFixed(0)+"%"),$("span","ln",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b)});
+    w.append(g)}
+  c.append(w);
   if(hot){c.classList.add("hot");c.title="优势 ≥10¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" +"+cent(hot.edge)}
   return c}
 function card(it){
@@ -3692,7 +3704,7 @@ function render(d){
   // starred cards leave their own section for the one on top, in the order they were starred
   const starred=favs.map(k=>d.items.find(i=>favKey(i)===k)).filter(Boolean);
   document.getElementById("g-fav").replaceChildren(...starred.map(card));document.getElementById("h-fav").hidden=!starred.length;
-  for(const g of["index","contract","crypto"]){const items=d.items.filter(i=>(i.group||"contract")===g&&!favs.includes(favKey(i)));
+  for(const g of["index","contract","crypto","ladder"]){const items=d.items.filter(i=>(i.group||"contract")===g&&!favs.includes(favKey(i)));
     document.getElementById("g-"+g).replaceChildren(...items.map(card));document.getElementById("h-"+g).hidden=!items.length}
   tick()}
 async function load(){
@@ -5172,7 +5184,8 @@ class Bot:
         for row in rows_in:
             fair = cap.probability(row.target, now_ms)
             book, why = self.predict.yes_book(row) if row.market_id else (None, "")
-            out: dict[str, Any] = {"label": usd_short(row.target), "fair": fair, "error": why}
+            out: dict[str, Any] = {"label": usd_short(row.target), "fair": fair, "error": why,
+                                   "dist": float(row.target / cap.cap - 1) if cap.cap else None}
             if book is not None:
                 out.update(bid=float(book.bid[0]) if book.bid else None, ask=float(book.ask[0]) if book.ask else None,
                            stale=book.stale(now_ms))
@@ -5185,10 +5198,12 @@ class Bot:
                     best = None if book.stale(now_ms) else best_edge(edges)
                     out["edges"] = [{"label": e.label.replace("涨", "Yes").replace("跌", "No"), "maker": e.maker,
                                      "price": e.price, "edge": e.edge, "size": e.size, "best": e is best} for e in edges]
+            # reached, and the book agrees (settled, gone, or ≥ 90¢): folded into one "已触及" line on the card
+            out["touched"] = fair == 1.0 and "请核实" not in out["error"]
             rows.append(out)
         high, high_at = cap.window_high()
         item: dict[str, Any] = {
-            "name": spec.name, "symbol": spec.key, "group": "crypto", "kind": "ladder", "close_ms": spec.end_ms,
+            "name": spec.name, "symbol": spec.key, "group": "ladder", "kind": "ladder", "close_ms": spec.end_ms,
             "close_label": f"{end:%m-%d %H:%M} ET（北京 {bj(spec.end_ms)}）截止" + (f"；{spec.trade_end}" if spec.trade_end else ""),
             "ladder": {"cap": usd_short(cap.cap), "high": usd_short(high), "high_at": stamp(high_at * 1000, seconds=False) if high_at else "",
                        "sigma": cap.sigma, "sigma_note": cap.sigma_note, "rows": rows, "error": cap.error,
