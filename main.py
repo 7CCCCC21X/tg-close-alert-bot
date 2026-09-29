@@ -1532,6 +1532,11 @@ def _opt(value: Any) -> D | None:
         return None
 
 
+def hsi_anchor_key(q: "FuturesQuote") -> str:
+    """HKEX-contract prints and the Sina CFD fallback keep separate close anchors (their levels differ)."""
+    return "HSI" if q.exchange_contract else "HSI:cfd"
+
+
 class IndexFutures:
     """Hang Seng Index futures (main contract, incl. the 17:15-03:00 after-hours session) with the
     cash index for the 高水/低水 basis. Eastmoney first, Sina as fallback; read-only, best effort."""
@@ -1552,6 +1557,10 @@ class IndexFutures:
         self.quote: FuturesQuote | None = None
         self.error = ""
         self.refreshed = -1e9
+        self.spot_at = -1e9      # monotonic time of the last cash-index read
+        self.spot_error = ""
+
+    SPOT_KEEP_SECONDS = 5 * 60
 
     @staticmethod
     def parse_futures(source: str, raw: bytes, now_ms: int, holidays: frozenset = frozenset()) -> FuturesQuote:
@@ -1612,8 +1621,15 @@ class IndexFutures:
             if quote.spot is None:  # etnet already carries the cash index
                 spot, spot_prev = await self._first(self.SPOT_SOURCES, self.parse_spot)
                 quote = FuturesQuote(**{**quote.__dict__, "spot": spot, "spot_prev": spot_prev})
+            self.spot_at, self.spot_error = time.monotonic(), ""
         except Exception as error:  # Basis is a nice-to-have; the futures quote alone is still shown.
-            LOG.debug("HSI spot unavailable: %s", clean_error(error))
+            self.spot_error = clean_error(error)
+            LOG.debug("HSI spot unavailable: %s", self.spot_error)
+            prev = self.quote
+            if prev is not None and prev.spot is not None and time.monotonic() - self.spot_at < self.SPOT_KEEP_SECONDS:
+                # one failed round must not blank the HSI card: keep the last cash index for a few minutes
+                quote = FuturesQuote(**{**quote.__dict__, "spot": prev.spot, "spot_prev": prev.spot_prev,
+                                        "spot_source": prev.spot_source})
         self.quote, self.error = quote, ""
 
     def line(self, now_ms: int, style: str) -> str:
@@ -1639,6 +1655,8 @@ class IndexFutures:
         source = q.source if q.exchange_contract else f"{q.source}·非港交所合约，仅参考"
         parts.append(f"{stamp(q.quoted_ms, seconds=False)} {source}" + stale_note(q.quoted_ms, now_ms, BEIJING))
         line = "｜".join(parts)
+        if self.spot_error:
+            line += f"｜⚠️ 恒指现货刷新失败：{brief_error(self.spot_error)}"
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error)}" if self.error else line
 
 
@@ -2235,6 +2253,8 @@ class DailyCloses:
         self.refreshed = -1e9
         self.error = ""
 
+    REFERERS = {"tencent": {"Referer": "https://gu.qq.com/"}, "eastmoney": {"Referer": "https://quote.eastmoney.com/"}}
+
     @staticmethod
     def parse(kind: str, market: str, raw: bytes) -> list[tuple[dt.date, D | None, D]]:
         if kind == "tencent":  # {"data": {"hkHSI": {"day": [["2026-09-28", open, close, high, low, volume], ...]}}}
@@ -2253,17 +2273,24 @@ class DailyCloses:
         waiting = local.weekday() < 5 and local >= final and local.date() not in self.daily
         if time.monotonic() - self.refreshed < (60 if waiting else 600):
             return
-        self.refreshed, failures = time.monotonic(), []
+        self.refreshed, failures, merged = time.monotonic(), [], {}
         for kind, url in self.sources:
             try:
-                bars = finished_bars(sorted(self.parse(kind, self.market, await fetch_source(url))), self.market, now_ms)
+                raw = await fetch_source(url, self.REFERERS.get(kind))
+                bars = finished_bars(sorted(self.parse(kind, self.market, raw)), self.market, now_ms)
                 if not bars:
                     raise ValueError("日 K 为空")
-                self.daily, self.error = {day: close for day, _, close in bars}, ""
-                return
+                merged = {**{day: close for day, _, close in bars}, **merged}  # an earlier source wins a shared day
             except Exception as error:
                 failures.append(f"{kind}: {clean_error(error)}")
-        self.error = "；".join(failures)
+                continue
+            if not waiting or local.date() in merged:
+                break  # the day's bar is in (or not due yet): no need to ask the fallbacks
+        if merged:
+            # a failed or lagging round keeps the closes already known; the newest ~30 sessions are enough
+            keep = {**self.daily, **merged}
+            self.daily = dict(sorted(keep.items())[-30:])
+        self.error = "" if merged else "；".join(failures)
 
 
 def dated_ref(daily: dict[dt.date, D], day: dt.date, live: D | None) -> tuple[D | None, str]:
@@ -4972,8 +4999,8 @@ class Bot:
             close_ms = int(dt.datetime.combine(close_date, dt.time(16, 10), BEIJING).timestamp() * 1000)
             # First futures print after the cash close = the futures level the close is anchored to.
             if (q.session_name(self.hsi.holidays) != "夜市" and local.date() == close_date and local.time() >= dt.time(16, 10)
-                    and self.anchors.get("HSI", (0,))[0] != close_ms):
-                self.anchors["HSI"] = (close_ms, q.last)
+                    and self.anchors.get(hsi_anchor_key(q), (0,))[0] != close_ms):
+                self.anchors[hsi_anchor_key(q)] = (close_ms, q.last)
 
         a50 = self.cn.a50
         if a50 is not None:
@@ -5344,8 +5371,8 @@ class Bot:
             # The night block's 前收市 is the day session it followed. Only valid when that day is the
             # cash close being mapped; the block choice in parse_etnet_futures guarantees it.
             anchor, anchor_note = q.prev_settle, "日市收市"
-        elif self.anchors.get("HSI") and dt.datetime.fromtimestamp(self.anchors["HSI"][0] / 1000, BEIJING).date() == close_date:
-            anchor = self.anchors["HSI"][1]
+        elif (saved := self.anchors.get(hsi_anchor_key(q))) and dt.datetime.fromtimestamp(saved[0] / 1000, BEIJING).date() == close_date:
+            anchor = saved[1]  # same family only: the Sina CFD and the HKEX contract trade at different levels
         if anchor is None:
             return "缺少期货在现货收市时的价格"
         remaining, target = session_remaining("hk", now_ms, close_date, self.config.holidays.get("hk", frozenset()))

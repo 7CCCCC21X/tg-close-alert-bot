@@ -204,6 +204,38 @@ async def hsi():
     state["tencent"] = m.RemoteError("网络错误 (URLError)")
     feed2 = m.DailyCloses("hk", feed.sources); await feed2.refresh(bj2(30, 10, 0))
     assert feed2.daily[dt.date(2026, 9, 29)] == D("24529.24")
+    # a failed round keeps the closes already known
+    feed.refreshed -= 601; await feed.refresh(bj2(30, 12, 0))
+    assert feed.daily[dt.date(2026, 9, 30)] == D("24600.00"), feed.daily
+    # Tencent answers but lags (no 09-30 bar) after the close: Eastmoney is asked for it, Tencent keeps its days
+    state["tencent"] = json.dumps({"data": {"hkHSI": {"day": [["2026-09-29", "24500", "24529.24", "0", "0", "1"]]}}}).encode()
+    em30 = json.dumps({"data": {"klines": ["2026-09-29,24500,24529.00", "2026-09-30,24530,24601.00"]}}).encode()
+    lag = m.DailyCloses("hk", feed.sources)
+    m.http_get = lambda url, timeout=15, headers=None: fake_get(url) if "gtimg" in url else asyncio.sleep(0, em30)
+    await lag.refresh(bj2(30, 16, 30))
+    assert lag.daily == {dt.date(2026, 9, 29): D("24529.24"), dt.date(2026, 9, 30): D("24601.00")}, lag.daily
+    m.http_get = fake_get
+
+    # the cash index: a failed spot round keeps the last value for a few minutes instead of blanking the card
+    hf = m.IndexFutures()
+    etnet_like = m.FuturesQuote("恒指期货", D("24600"), D("24500"), None, None, None, bj2(30, 11, 0), "东方财富")
+    spot = {"v": (D("24529.24"), D("24400"))}
+    async def first(sources, parse):
+        if sources is hf.FUTURES_SOURCES: return etnet_like
+        if isinstance(spot["v"], Exception): raise spot["v"]
+        return spot["v"]
+    hf._first = first
+    await hf.refresh(bj2(30, 11, 0), force=True); assert hf.quote.spot == D("24529.24")
+    spot["v"] = ValueError("腾讯: 超时")
+    await hf.refresh(bj2(30, 11, 1), force=True)
+    assert hf.quote.spot == D("24529.24") and hf.quote.spot_prev == D("24400") and "超时" in hf.spot_error, hf.quote
+    hf.spot_at -= hf.SPOT_KEEP_SECONDS + 1
+    await hf.refresh(bj2(30, 11, 7), force=True); assert hf.quote.spot is None  # too old: not passed off as current
+
+    # anchors are per contract family: a Sina CFD night print is never divided by an HKEX-contract anchor
+    cfd = m.FuturesQuote("恒指CFD", D("24650.5"), None, None, None, None, bj2(30, 22, 0), "新浪CFD", D("24600"),
+                         exchange_contract=False, session="夜市")
+    assert m.hsi_anchor_key(cfd) == "HSI:cfd" and m.hsi_anchor_key(etnet_like) == "HSI"
 
 asyncio.run(hsi())
 print("HSI_OK")
