@@ -85,3 +85,12 @@ async def run():
 
 asyncio.run(run())
 print("KRX_OK")
+
+# price-line labels: a close before today is 昨收, today's own close (after the session) 今收
+bj = lambda y, mo, d, h: int(dt.datetime(y, mo, d, h, tzinfo=m.BEIJING).timestamp() * 1000)
+assert m.ref_relative("09-28", dt.date(2026, 9, 29), bj(2026, 9, 29, 10)) == "昨收"
+assert m.ref_relative("09-25", dt.date(2026, 9, 28), bj(2026, 9, 28, 10)) == "昨收"   # Friday's close on Monday
+assert m.ref_relative("09-29", dt.date(2026, 9, 30), bj(2026, 9, 29, 17)) == "今收"
+assert m.ref_relative("12-31", dt.date(2027, 1, 4), bj(2027, 1, 4, 10)) == "昨收"     # across the year end
+assert m.ref_relative("", dt.date(2026, 9, 29), bj(2026, 9, 29, 10)) == "参考"
+print("LABELS_OK")

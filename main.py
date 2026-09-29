@@ -2747,6 +2747,18 @@ def day_fields(target: dt.date, now_ms: int) -> dict:
     return {"day": target.isoformat(), "day_label": f"{target:%m-%d} {week}", "day_tag": tag, "day_ahead": ahead}
 
 
+def ref_relative(ref_day: str, target: dt.date, now_ms: int) -> str:
+    """'09-28' -> 昨收 (a close before today, Beijing) / 今收 (today's own close, after the session) / 参考."""
+    if not ref_day:
+        return "参考"
+    today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+    with contextlib.suppress(ValueError):
+        month, day = map(int, ref_day.split("-"))
+        year = target.year if (month, day) <= (target.month, target.day) else target.year - 1
+        return "今收" if dt.date(year, month, day) == today else "昨收"
+    return "参考"
+
+
 def cents(value: float, sign: bool = False) -> str:
     return f"{value * 100:+.1f}¢" if sign else f"{value * 100:.1f}¢"
 
@@ -3711,7 +3723,7 @@ h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin
 .u{color:var(--up)}.d{color:var(--down)}
 .bar{flex:1;display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--line)}.bar i{display:block;height:100%}
 details{font-size:12.5px}summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:4px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:0}
-summary>*{flex:none}summary .v{color:var(--text)}summary .un{color:var(--faint);font-size:11px}summary .rd{color:var(--faint);font-size:12px}summary .chip{margin-left:auto}
+summary>*{flex:none}summary .sep{margin-left:4px}summary .v{color:var(--text)}summary .un{color:var(--faint);font-size:11px}summary .rd{color:var(--faint);font-size:12px}summary .chip{margin-left:auto}
 summary::-webkit-details-marker{display:none}summary:before{content:"▸";color:var(--faint)}details[open] summary:before{content:"▾"}
 summary .v{color:var(--text)}.chip{font-size:12px;border-radius:6px;padding:0 5px;background:var(--chip);font-weight:600}
 dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:6px 0 2px;font-size:12px}dt{color:var(--muted)}dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
@@ -3859,7 +3871,10 @@ function card(it){
     if(it.predict)c.append(book(it.predict));return c}
   const det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   const sm=$("summary");sm.title=(it.ref_day?it.ref_day+" 收盘 → 有效价":"参考 → 有效价")+"；点开看计算明细";
-  sm.append($("span","rd",it.ref_day||"参考"),$("span","v",it.ref),$("span","","→"),$("span","v",like(it.effective,it.ref)));if(it.unit)sm.append($("span","un",it.unit));
+  // 昨收 1,768,000 · 今日 1,769,000 (while trading) / 今收 … · 估算 … (after the close: the proxy's view of the next close)
+  sm.append($("span","rd",it.ref_rel||it.ref_day||"参考"),$("span","v",it.ref),$("span","rd sep",it.eff_label||"→"),$("span","v",like(it.effective,it.ref)));
+  if(it.unit)sm.append($("span","un",it.unit));
+  sm.title=(it.ref_day?it.ref_day+" 收盘 ":"参考 ")+it.ref+unit+"；"+(it.eff_label==="今日"?"今日现价":"按代理估算的下一收盘")+" "+it.effective+unit+"；点开看计算明细";
   const chip=$("span","chip",(it.move>=0?"+":"")+it.move.toFixed(2)+"%");chip.style.color=it.move>0?upColor():it.move<0?downColor():"var(--muted)";sm.append(chip);det.append(sm);
   const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("目标",it.close_label);row("参考",it.ref+unit+"（"+it.ref_note+"）");row("有效",it.effective+unit);row("代理",it.proxy_note);
@@ -5292,6 +5307,8 @@ class Bot:
             ref_day = re.search(r"\b\d\d-\d\d\b", odds.ref_note)
             items.append({
                 **base, **day_fields(odds.target, now_ms), "ref_day": ref_day.group(0) if ref_day else "",
+                "ref_rel": ref_relative(ref_day.group(0) if ref_day else "", odds.target, now_ms),
+                "eff_label": "今日" if odds.direct else "估算",
                 "target": odds.target.strftime("%m-%d"), "unit": odds.unit or self.card_currency(symbol),
                 "close_ms": close_ms, "close_label": close_label,
                 "ref": fmt(odds.ref), "ref_note": odds.ref_note, "effective": fmt(odds.effective.quantize(D("0.0001"))),
