@@ -43,6 +43,22 @@ async def browser_check(async_playwright, chrome, port, token):
         await page.click("#g-index details summary"); assert await page.is_visible("#g-index dl")
         await page.wait_for_timeout(10500)  # survives one data refresh
         assert await page.is_visible("#g-index dl"), "open details must stay open across refresh"
+        # ☆ moves a card into the starred section on top; the choice survives a reload; ★ puts it back
+        assert not await page.is_visible("#h-fav") and await page.locator("#g-contract .card").count() == 1
+        await page.click("#g-contract .card .star")
+        assert await page.is_visible("#h-fav") and await page.inner_text("#g-fav .name") == "宇树 UNITREE"
+        assert await page.locator("#g-contract .card").count() == 0 and await page.inner_text("#g-fav .star") == "★"
+        assert await page.evaluate("document.getElementById('g-fav').compareDocumentPosition(document.getElementById('g-index')) & 4")
+        await page.reload(); await page.wait_for_selector("#g-fav .card")
+        assert await page.inner_text("#g-fav .name") == "宇树 UNITREE" and not await page.is_visible("#h-contract")
+        assert await page.evaluate("localStorage.getItem('favs')") == '["UNITREEUSDT"]'  # stored locally, by ticker
+        # stars saved by the earlier build ("name|symbol") are carried over
+        await page.evaluate("localStorage.setItem('favs', JSON.stringify(['宇树 UNITREE|UNITREEUSDT', '上证指数|']))")
+        await page.reload(); await page.wait_for_selector("#g-fav .card")
+        assert await page.locator("#g-fav .card").count() == 2 and await page.locator("#g-index .card").count() == 0
+        await page.click("#g-fav .card:nth-child(2) .star")
+        await page.click("#g-fav .card .star")
+        assert not await page.is_visible("#h-fav") and await page.locator("#g-contract .card").count() == 1
         if os.environ.get("WEB_SCREENSHOT"):
             await page.screenshot(path=os.environ["WEB_SCREENSHOT"], full_page=True)
         await browser.close()
@@ -77,7 +93,7 @@ async def run():
     bot.anchors["A50"] = (bot.sse_close_ms(), D("14160"))
     payload = bot.odds_payload()
     names = [i["name"] for i in payload["items"]]
-    assert names == ["上证指数", "宇树 UNITREE", "BNB 先触 $700 / $900", "SOL 先触 $60 / $140", "BTC 先触 $70k / $90k"], names
+    assert names == ["上证指数", "宇树 UNITREE", "BNB 先触 700/900", "SOL 先触 60/140", "BTC 先触 70k/90k", "ETH 先触 1k/3k"], names
     bnb = payload["items"][2]
     assert bnb["group"] == "crypto" and bnb["labels"] == ["$900", "$700"] and bnb["missing"].startswith("等待币安行情"), bnb
     assert payload["items"][0]["group"] == "index" and payload["items"][1]["symbol"] == "UNITREEUSDT" and payload["items"][1]["group"] == "contract"
