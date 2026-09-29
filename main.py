@@ -3222,8 +3222,10 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 <script>
 const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
 const open=new Set(),seen={},rolled={};let skew=0,fetchedAt=0,style="cn",last=null;
-const favKey=it=>it.name+"|"+(it.symbol||"");let favs=[];try{favs=JSON.parse(localStorage.getItem("favs")||"[]")}catch(e){}
+// saved in this browser only (localStorage), keyed by the ticker (or the index name) so a renamed card keeps its star
+const favKey=it=>it.symbol||it.name;let favs=[];try{favs=JSON.parse(localStorage.getItem("favs")||"[]")}catch(e){}
 if(!Array.isArray(favs))favs=[];
+favs=[...new Set(favs.filter(k=>typeof k==="string").map(k=>k.includes("|")?(k.split("|")[1]||k.split("|")[0]):k))];  // old "name|symbol" keys
 function toggleFav(k){favs=favs.includes(k)?favs.filter(x=>x!==k):[...favs,k];try{localStorage.setItem("favs",JSON.stringify(favs))}catch(e){}if(last)render(last)}
 const two=n=>String(n).padStart(2,"0"),pct=x=>(x*100).toFixed(1),cent=x=>(x*100).toFixed(1)+"¢";
 const like=(v,ref)=>{const d=(String(ref).split(".")[1]||"").length,n=Number(String(v).replace(/,/g,""));

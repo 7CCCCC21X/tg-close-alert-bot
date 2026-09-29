@@ -51,6 +51,12 @@ async def browser_check(async_playwright, chrome, port, token):
         assert await page.evaluate("document.getElementById('g-fav').compareDocumentPosition(document.getElementById('g-index')) & 4")
         await page.reload(); await page.wait_for_selector("#g-fav .card")
         assert await page.inner_text("#g-fav .name") == "宇树 UNITREE" and not await page.is_visible("#h-contract")
+        assert await page.evaluate("localStorage.getItem('favs')") == '["UNITREEUSDT"]'  # stored locally, by ticker
+        # stars saved by the earlier build ("name|symbol") are carried over
+        await page.evaluate("localStorage.setItem('favs', JSON.stringify(['宇树 UNITREE|UNITREEUSDT', '上证指数|']))")
+        await page.reload(); await page.wait_for_selector("#g-fav .card")
+        assert await page.locator("#g-fav .card").count() == 2 and await page.locator("#g-index .card").count() == 0
+        await page.click("#g-fav .card:nth-child(2) .star")
         await page.click("#g-fav .card .star")
         assert not await page.is_visible("#h-fav") and await page.locator("#g-contract .card").count() == 1
         if os.environ.get("WEB_SCREENSHOT"):
