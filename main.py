@@ -3314,6 +3314,19 @@ def hit_probability(spot: float, level: float, sigma: float, years: float) -> fl
     return min(1.0, norm_cdf((-h - s * s / 2) / s) + spot / level * norm_cdf((-h + s * s / 2) / s))
 
 
+def sampled_sigma(samples: list) -> tuple[float, float] | None:
+    """(annualised σ, hours covered) from [[epoch s, price], ...]; gaps over an hour are skipped; None under 12 h."""
+    pts = sorted((int(t), float(p)) for t, p in samples if float(p) > 0)
+    squares = seconds = 0.0
+    for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
+        if 0 < t1 - t0 <= 3600:
+            squares += math.log(p1 / p0) ** 2
+            seconds += t1 - t0
+    if seconds < 12 * 3600:
+        return None
+    return math.sqrt(squares / (seconds / (365 * 86400))), seconds / 3600
+
+
 def usd_short(value: D | float | None) -> str:
     """83_200_000 -> $83.2M; 1_000_000_000 -> $1B."""
     if value is None:
@@ -3401,6 +3414,11 @@ class CapMarket:
     SCAN_SECONDS = 300
     RETRY_SECONDS = 300   # after a failed σ request (GeckoTerminal allows ~30 calls a minute): wait, never hammer
     SIGMA_KEEP_MS = 24 * 3600_000  # a saved σ stands in for this long while fresh bars cannot be fetched
+    SAMPLE_MS = 300_000   # own price samples, for σ where no bars are served (PONS) or while they fail
+    GECKO_GAP = 2.5       # seconds between GeckoTerminal requests across all ladders (it allows ~30 a minute)
+    _gecko_lock: asyncio.Lock | None = None
+    _gecko_loop: Any = None
+    _gecko_last = 0.0
 
     def __init__(self, store: "Store", spec: CapSpec):
         self.store, self.spec = store, spec
@@ -3413,10 +3431,26 @@ class CapMarket:
         self.sigma_note = ""
         self.pool = ""
         self.hour_high: float = 0.0       # the running hour's high (not yet in the persisted scan)
+        self.sigma_kind = ""              # "bars" | "saved" | "samples" | "prior"
+        self.vol_error = ""               # why hourly bars could not be read (shown with a prior σ)
+        self.sampled_ms = 0
         self.error = ""
         self.times = {"price": -1e9, "supply": -1e9, "vol": -1e9, "scan": -1e9}
 
+    async def gecko_turn(self) -> None:
+        """Space GeckoTerminal requests out (shared by every ladder) so a burst never earns a 429."""
+        cls, loop = CapMarket, asyncio.get_running_loop()
+        if cls._gecko_lock is None or cls._gecko_loop is not loop:
+            cls._gecko_lock, cls._gecko_loop = asyncio.Lock(), loop
+        async with cls._gecko_lock:
+            wait = cls._gecko_last + self.GECKO_GAP - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            cls._gecko_last = time.monotonic()
+
     async def get(self, url: str, payload: dict | None = None) -> Any:
+        if "geckoterminal" in url:
+            await self.gecko_turn()
         if payload is None:
             raw = await fetch_source(url, {"Accept": "application/json"})
         else:
@@ -3442,6 +3476,33 @@ class CapMarket:
             self.pool = self.spec.pair or gecko_pool(await self.get(f"{base}/tokens/{self.spec.token}/pools?page=1"))
         return gecko_bars(await self.get(f"{base}/pools/{self.pool}/ohlcv/{frame}?aggregate=1&limit={limit}"
                                          f"&before_timestamp={before_s}&currency=usd&token={self.spec.token}"))
+
+    def fallback_sigma(self, now_ms: int) -> None:
+        """Without fresh hourly bars: the σ saved from the last good fetch (a day at most), else σ measured
+        from the bot's own 5-minute price samples (12 hours at least), else the spec's prior."""
+        saved = self.store.get(f"capsigma:{self.spec.slug}")
+        with contextlib.suppress(TypeError, ValueError, IndexError):
+            if now_ms - int(saved[2]) < self.SIGMA_KEEP_MS:
+                self.sigma, self.sigma_kind = float(saved[0]), "saved"
+                self.sigma_note = f"{saved[1]}，{stamp(int(saved[2]), seconds=False)} 保存"
+                return
+        measured = sampled_sigma(self.store.get(f"capsamples:{self.spec.slug}", []))
+        if measured:
+            self.sigma, self.sigma_kind = measured[0], "samples"
+            self.sigma_note = f"机器人自采 5 分钟价，{measured[1]:.0f} 小时"
+            return
+        self.sigma, self.sigma_kind = self.spec.prior_sigma, "prior"
+        self.sigma_note = "先验"
+
+    def sample(self, now_ms: int) -> None:
+        """Every 5 minutes, keep the live price (30 days) so σ can be measured where no bars are served."""
+        if self.price is None or now_ms - self.sampled_ms < self.SAMPLE_MS:
+            return
+        self.sampled_ms = now_ms
+        rows = [r for r in self.store.get(f"capsamples:{self.spec.slug}", []) if isinstance(r, list) and len(r) == 2
+                and now_ms // 1000 - int(r[0]) < 30 * 86400]
+        rows.append([now_ms // 1000, float(self.price)])
+        self.store.put(f"capsamples:{self.spec.slug}", rows)
 
     def observe(self, now_ms: int) -> None:
         """Keep the highest price the bot itself has seen inside the window (persisted with the scan)."""
@@ -3489,9 +3550,8 @@ class CapMarket:
                 self.supply = D(total - burned) / (D(10) ** decimals)
             except Exception as error:
                 failures.append(f"供应量：{clean_error(error)}")
-        if not self.spec.gecko:
-            self.sigma, self.sigma_note = self.spec.prior_sigma, "先验：没有 K 线来源"
-        elif mono - self.times["vol"] >= self.VOL_SECONDS:
+        self.sample(now_ms)
+        if self.spec.gecko and mono - self.times["vol"] >= self.VOL_SECONDS:
             self.times["vol"] = mono
             self.pool = ""  # look the most liquid pool up again (a token can move pools)
             try:
@@ -3501,16 +3561,13 @@ class CapMarket:
                 rets = [math.log(bars[i][4] / bars[i - 1][4]) for i in range(1, len(bars)) if bars[i][4] > 0 and bars[i - 1][4] > 0]
                 mean = sum(rets) / len(rets)
                 self.sigma = math.sqrt(sum((r - mean) ** 2 for r in rets) / (len(rets) - 1) * 24 * 365)
-                self.sigma_note = f"{len(rets) / 24:.0f} 日小时收盘"
+                self.sigma_note, self.sigma_kind, self.vol_error = f"{len(rets) / 24:.0f} 日小时收盘", "bars", ""
                 self.store.put(f"capsigma:{self.spec.slug}", [self.sigma, self.sigma_note, now_ms])
             except Exception as error:
                 self.times["vol"] = mono - self.VOL_SECONDS + self.RETRY_SECONDS  # try again in 5 minutes
-                saved = self.store.get(f"capsigma:{self.spec.slug}")
-                with contextlib.suppress(TypeError, ValueError, IndexError):
-                    if self.sigma is None and now_ms - int(saved[2]) < self.SIGMA_KEEP_MS:
-                        self.sigma, self.sigma_note = float(saved[0]), f"{saved[1]}，{stamp(int(saved[2]), seconds=False)} 保存"
-                if self.sigma is None:
-                    failures.append(f"波动率：{clean_error(error)}")
+                self.vol_error = clean_error(error) or type(error).__name__
+        if self.sigma_kind != "bars":
+            self.fallback_sigma(now_ms)
         if self.spec.gecko and mono - self.times["scan"] >= self.SCAN_SECONDS:
             self.times["scan"] = mono
             try:
@@ -3683,10 +3740,12 @@ function ladder(c,it){
   row("窗口",L.window+" → "+it.close_label);row("价格",L.price+" USD（"+L.source+"）");row("供应量",L.supply+"（"+L.supply_note+"）");
   row("窗口最高",L.high+(L.high_at?"（"+L.high_at+"）":"")+"："+(L.bars?"GeckoTerminal 小时 K 近似":"只含机器人运行以来看到的价格")+"，结算以 "+L.settle+" 1 分钟 K 为准；Predict 已结算的档位算已触及"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
   if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
-  row("模型",(L.bars?"":"σ 为先验值（这条链没有 K 线来源），仅供参考。")+"碰到即 Yes：零漂移、固定波动率的单边触及概率 Φ((−h−s²/2)/s) + (M/K)·Φ((−h+s²/2)/s)，h = ln(K/M)，s = σ√T");
+  row("模型",(L.sigma_kind==="prior"?"σ 为先验值，仅供参考。":"")+"碰到即 Yes：零漂移、固定波动率的单边触及概率 Φ((−h−s²/2)/s) + (M/K)·Φ((−h+s²/2)/s)，h = ln(K/M)，s = σ√T");
   det.append(dl);c.append(det);
   if(it.missing)c.append($("p","","概率暂缺："+it.missing));else if(L.error)c.append($("div","warn small","⚠️ "+L.error));
-  if(!L.bars&&!it.missing)c.append($("div","warn small","⚠️ 无 K 线：σ 为先验 "+(L.sigma*100).toFixed(0)+"%，优势仅供参考"));
+  const prior=L.sigma_kind==="prior";
+  if(prior&&!it.missing){const w=$("div","warn small","⚠️ σ 暂用先验 "+(L.sigma*100).toFixed(0)+"%，优势仅供参考");
+    w.title=(L.bars?"K 线暂不可用"+(L.vol_error?"（"+L.vol_error+"）":""):"这条链没有 K 线来源")+"；机器人自采价格满 12 小时后自动改用实测 σ";c.append(w)}
   const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
   if(done.length){const t=$("div","touched");t.append($("span","k","✓ 已触及"));
     const tip=done.map(r=>r.label+(r.bid!=null||r.ask!=null?"（盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1))+"）":"")).join("、");
@@ -3702,13 +3761,13 @@ function ladder(c,it){
     g.append(hd("目标"),hd("距离","ln ld","还要涨多少才碰到"),hd("模型","ln","模型给 Yes 的公平价"),hd("买1 / 卖1","","Yes 的盘口"),hd("最优"),hd("吃单","","立即成交的较优一边：吃Yes@卖1 或 吃No@1−买1，× 为卖1/买1 的量"));
     live.forEach(r=>{const best=r.edges&&r.edges.find(e=>e.best),n=x=>x==null?"无":(x*100).toFixed(1);
       const q=r.bid==null&&r.ask==null?(r.error?"—":"…"):n(r.bid)+" / "+n(r.ask);
-      const b=$("span","lb"+(best&&L.bars?(best.edge>=HOT?" hot":" pos"):""));
+      const b=$("span","lb"+(best&&!prior?(best.edge>=HOT?" hot":" pos"):""));
       if(best){b.append(best.label+" "+(best.price*100).toFixed(1)+" ",$("b","","+"+cent(best.edge)));b.title=best.maker?"挂单排队，成交不保证":"立即成交，量 "+qty(best.size);
-        if(!L.bars)b.title="σ 是先验值，这个优势只作参考、不提醒";
+        if(prior)b.title="σ 是先验值，这个优势只作参考、不提醒";
         else if(best.edge>=HOT&&(!hot||best.edge>hot.edge))hot={...best,row:r.label}}
       else b.textContent=r.error?"⚠️":r.stale?"过期":"—";
       if(r.error)b.title=r.error;
-      const tk=r.edges&&r.edges.filter(e=>!e.maker).sort((x,y)=>y.edge-x.edge)[0],t=$("span","lb lk"+(tk&&tk.edge>0&&L.bars&&!r.stale?" pos":""));
+      const tk=r.edges&&r.edges.filter(e=>!e.maker).sort((x,y)=>y.edge-x.edge)[0],t=$("span","lb lk"+(tk&&tk.edge>0&&!prior&&!r.stale?" pos":""));
       if(tk){t.append(tk.label+" ",$("span","lp",(tk.price*100).toFixed(1)+" "),$("b","",(tk.edge>=0?"+":"")+cent(tk.edge)),$("span","lz","×"+qty(tk.size)));t.title=tk.label+" @ "+cent(tk.price)+"，立即成交，最多 "+qty(tk.size)+" 份"+(r.stale?"（盘口过期）":"")}
       else t.textContent="—";
       g.append($("span","lt",r.label),$("span","ln ld",r.dist==null?"—":"+"+(r.dist*100).toFixed(0)+"%"),$("span","ln",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b,t)});
@@ -5278,6 +5337,7 @@ class Bot:
                        "years": max(0.0, (spec.end_ms - max(now_ms, spec.start_ms)) / YEAR_MS),
                        "first_skipped": cap.history.get("first") == "skipped",
                        "metric": spec.metric, "settle": spec.settle, "bars": bool(spec.gecko),
+                       "sigma_kind": cap.sigma_kind, "vol_error": cap.vol_error,
                        "supply_note": "总量 − 销毁" if spec.supply == "rpc" else f"DexScreener {spec.metric} ÷ 价格"},
         }
         if self.config.predict:
