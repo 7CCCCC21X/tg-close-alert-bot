@@ -2553,6 +2553,7 @@ PREDICT_SITE = "https://predict.fun/zh-cn/market/"
 PREDICT_ITEMS = (("HSI", "恒生指数", "hk"), ("KOSPI", "KOSPI", "kr"), ("SSE", "上证指数", "sh"))
 PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
 PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and never recommended
+PREDICT_META_SECONDS = 600     # outcome names / status of a ladder market are re-read this often
 PREDICT_STRIKE_SECONDS = 300   # a known target price is re-read this often (the site may correct it)
 PREDICT_MISS_SECONDS = 60      # an unknown slug is looked up again after this long (new markets show up within a minute)
 PREDICT_DEPTH = 5
@@ -2626,6 +2627,30 @@ class PredictBook:
 
     def stale(self, now_ms: int) -> bool:
         return now_ms - self.fetched_ms > PREDICT_STALE_MS
+
+
+def flip_book(book: "PredictBook") -> "PredictBook":
+    """The complementary outcome's book: its bids are 1 − the asks, its asks 1 − the bids."""
+    flip = lambda rows: tuple((D(1) - p, q) for p, q in rows)
+    return dataclasses.replace(book, bids=flip(book.asks), asks=flip(book.bids))
+
+
+@dataclass(frozen=True)
+class LadderRow:
+    """One market of a threshold ladder (e.g. "$200M" of "what market cap will X hit")."""
+    target: D
+    market_id: str
+    title: str
+    book: PredictBook | None
+    error: str = ""
+
+
+def cap_target(title: str) -> D | None:
+    """'$200M' / '↑ 1B' / 'Will X hit $1.5B?' -> 200000000 / 1000000000 / 1500000000; None when absent."""
+    match = re.search(r"(\d+(?:\.\d+)?)\s*([KMB])\b", str(title).replace(",", ""), re.I)
+    if not match:
+        return None
+    return D(match.group(1)) * {"K": D(10) ** 3, "M": D(10) ** 6, "B": D(10) ** 9}[match.group(2).upper()]
 
 
 @dataclass(frozen=True)
@@ -2735,6 +2760,10 @@ class PredictFeed:
         self.no_strike: set[str] = set()                         # category types without marketData.startPrice
         self.info: dict[str, dict] = {}                          # slug -> {"outcomes": [...], "created_ms": int}
         self.want_info: set[str] = set()                         # slugs whose outcome names / creation time matter
+        self.market_lists: dict[str, tuple[list[dict] | None, float]] = {}  # slug -> every market of the category
+        self.market_meta: dict[str, tuple[dict, float]] = {}     # market id -> ({"outcomes": [...], "status": str}, when)
+        self.ladder_keys: set[str] = set()                       # item keys whose category holds several Yes/No markets
+        self.ladders: dict[str, list[LadderRow]] = {}            # item key -> one row per market, by threshold
         self.refreshed = -1e9
 
     def headers(self) -> dict[str, str]:
@@ -2754,10 +2783,27 @@ class PredictFeed:
         return data.get("data") if isinstance(data, dict) else None
 
     async def resolve(self, slug: str) -> dict | None:
-        """slug -> market via GraphQL category(id: slug) → markets(categoryId); REST /categories/<slug> as fallback."""
+        """slug -> its (first) market; see find()."""
         cached = self.markets.get(slug)
         if cached and (cached[0] is not None or time.monotonic() - cached[1] < PREDICT_MISS_SECONDS):
             return cached[0]
+        found = await self.find(slug)
+        market = found[0] if found else None
+        self.markets[slug] = (market, time.monotonic())
+        return market
+
+    async def resolve_all(self, slug: str) -> list[dict] | None:
+        """slug -> every market of the category (a ladder such as $200M / $300M / ...); None = not listed."""
+        cached = self.market_lists.get(slug)
+        if cached and (cached[0] is not None or time.monotonic() - cached[1] < PREDICT_MISS_SECONDS):
+            return cached[0]
+        found = await self.find(slug) or None
+        self.market_lists[slug] = (found, time.monotonic())
+        return found
+
+    async def find(self, slug: str) -> list[dict]:
+        """slug -> markets via GraphQL category(id: slug) → markets(categoryId); REST /categories/<slug> as fallback.
+        [] = not listed; network trouble raises (and is not cached as "not listed")."""
         found: list[dict] = []
         errors = []  # only failures that leave the answer unknown; "no such category" is an answer
         try:
@@ -2782,9 +2828,7 @@ class PredictFeed:
                     errors.clear()  # GraphQL answered "no such category", or REST did (404)
         if not found and errors:
             raise RemoteError("；".join(errors))  # network trouble: not cached as "not listed"
-        market = found[0] if found else None
-        self.markets[slug] = (market, time.monotonic())
-        return market
+        return found
 
     async def orderbook(self, market: dict) -> tuple[tuple, tuple, str]:
         keys = [k for k in dict.fromkeys([self.book_keys.get(market["id"]), market["id"], market.get("conditionId")]) if k]
@@ -2831,8 +2875,8 @@ class PredictFeed:
         self.strikes[slug] = (value, time.monotonic())
         return value
 
-    async def market_info(self, slug: str, market_id: str) -> None:
-        """Outcome names in index order (the orderbook prices the first one) and the creation time, via REST."""
+    async def market_details(self, market_id: str) -> dict:
+        """Outcome names in index order (the orderbook prices the first one), status and creation time, via REST."""
         data = await self.fetch(f"{PREDICT_REST}/markets/{urllib.parse.quote(market_id)}")
         market = data.get("data", data) if isinstance(data, dict) else {}
         outcomes = market.get("outcomes") if isinstance(market, dict) else None
@@ -2842,9 +2886,59 @@ class PredictFeed:
         created = 0
         with contextlib.suppress(ValueError, TypeError):
             created = int(dt.datetime.fromisoformat(str(market.get("createdAt")).replace("Z", "+00:00")).timestamp() * 1000)
-        self.info[slug] = {"outcomes": [str(o.get("name") or "") for o in rows], "created_ms": created}
+        return {"outcomes": [str(o.get("name") or "") for o in rows], "created_ms": created, "status": str(market.get("status") or "")}
+
+    async def market_info(self, slug: str, market_id: str) -> None:
+        details = await self.market_details(market_id)
+        self.info[slug] = {"outcomes": details["outcomes"], "created_ms": details["created_ms"]}
+
+    async def ladder_row(self, key: str, slug: str, market: dict) -> "LadderRow | None":
+        target = cap_target(market.get("title", ""))
+        if target is None:
+            return None
+        meta = self.market_meta.get(market["id"])
+        if meta is None or time.monotonic() - meta[1] > PREDICT_META_SECONDS:
+            with contextlib.suppress(RemoteError, TimeoutError, OSError):
+                self.market_meta[market["id"]] = (await self.market_details(market["id"]), time.monotonic())
+        try:
+            bids, asks, _ = await self.orderbook(market)
+        except (RemoteError, TimeoutError, OSError) as error:
+            return LadderRow(target, market["id"], market["title"], None, clean_error(error) or type(error).__name__)
+        book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000))
+        return LadderRow(target, market["id"], market["title"], book, "")
+
+    async def refresh_ladder(self, key: str, slug: str) -> None:
+        """A category of Yes/No markets, one per threshold: every market's book, sorted by threshold."""
+        markets = await self.resolve_all(slug)
+        if not markets:
+            self.ladders.pop(key, None)
+            self.errors[key] = f"Predict 上还没有这个市场（{slug}）"
+            return
+        rows = [row for row in await asyncio.gather(*(self.ladder_row(key, slug, m) for m in markets)) if row]
+        if not rows:
+            raise RemoteError("Predict 市场标题里没有可识别的市值档位")
+        self.ladders[key] = sorted(rows, key=lambda row: row.target)
+        self.errors.pop(key, None)
+
+    def yes_book(self, row: "LadderRow") -> tuple["PredictBook | None", str]:
+        """The row's book priced as "Yes", whatever the market's outcome order."""
+        if row.book is None:
+            return None, row.error
+        names = ((self.market_meta.get(row.market_id) or ({}, 0))[0]).get("outcomes") or []
+        first = names[0].strip().lower() if names else ""
+        if first == "yes":
+            return row.book, ""
+        if first == "no":
+            return flip_book(row.book), ""
+        return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}）"
 
     async def refresh_one(self, key: str, slug: str) -> None:
+        if key in self.ladder_keys:
+            try:
+                await self.refresh_ladder(key, slug)
+            except (RemoteError, TimeoutError, OSError) as error:
+                self.errors[key] = clean_error(error) or type(error).__name__
+            return
         try:
             market = await self.resolve(slug)
             if market is None:
@@ -2871,6 +2965,9 @@ class PredictFeed:
         for key in list(self.errors):
             if key not in targets:
                 self.errors.pop(key)
+        for key in list(self.ladders):
+            if key not in targets:
+                self.ladders.pop(key)
         self.slugs = dict(targets)
         await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in targets.items()))
         return True
@@ -3162,6 +3259,269 @@ class TouchMarket:
         return "开盘以来是否触线：待核验" if self.start_ms else "开盘时间未知：按此前未触线计算"
 
 
+# --- market-cap ladder (will a token's market cap reach each threshold?) ----------------------------
+@dataclass(frozen=True)
+class CapSpec:
+    """A "what market cap will X hit" category: Yes/No per threshold, touched on any 1-minute candle."""
+    key: str
+    slug: str
+    name: str             # card title
+    token: str            # BSC contract (lower case)
+    start_ms: int         # resolution window, from the rules
+    end_ms: int
+    targets: tuple[D, ...]  # shown until Predict's own market titles are read
+    trade_end: str = ""   # when Predict stops trading, if earlier than the window
+
+
+CAP_MARKETS = (
+    # "from 11:30 PM ET on August 16, 2026 to 11:59 PM ET on October 31, 2026" (both EDT); settles on Flap.sh
+    CapSpec("NIULAI", "what-marketcap-will-niu-lai-hit-before-nov-2026", "$牛来 市值", "0xbeea1d618e533a387d941f58a7d4c9b7bd377777",
+            et_ms(2026, 8, 16, 23, 30, -4), et_ms(2026, 10, 31, 23, 59, -4),
+            (D("2e8"), D("3e8"), D("5e8"), D("1e9")), "Predict 交易至北京 11-01 07:59"),
+)
+BSC_RPC = ("https://bsc-dataseed.bnbchain.org", "https://bsc-dataseed.binance.org", "https://bsc-rpc.publicnode.com")
+BURN_ADDRESSES = ("0x000000000000000000000000000000000000dead", "0x0000000000000000000000000000000000000000")
+GECKO = "https://api.geckoterminal.com/api/v2/networks/bsc"
+
+
+def hit_probability(spot: float, level: float, sigma: float, years: float) -> float:
+    """P(the running maximum reaches ``level`` before ``years``) for a zero-drift GBM (log drift −σ²/2):
+    Φ((−h − s²/2)/s) + (S/K)·Φ((−h + s²/2)/s), h = ln(K/S), s = σ√T."""
+    if spot >= level:
+        return 1.0
+    if years <= 0 or sigma <= 0:
+        return 0.0
+    h, s = math.log(level / spot), sigma * math.sqrt(years)
+    return min(1.0, norm_cdf((-h - s * s / 2) / s) + spot / level * norm_cdf((-h + s * s / 2) / s))
+
+
+def usd_short(value: D | float | None) -> str:
+    """83_200_000 -> $83.2M; 1_000_000_000 -> $1B."""
+    if value is None:
+        return "—"
+    v = float(value)
+    for size, unit in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(v) >= size:
+            text = f"{v / size:.3g}" if v / size < 100 else f"{v / size:.0f}"
+            return f"${text}{unit}"
+    return f"${v:,.2f}"
+
+
+def dex_price(data: Any, token: str) -> tuple[D, D | None, str]:
+    """DexScreener token answer ([pairs] or {"pairs": [...]}) -> (USD price, market cap if given, pair label)
+    from the most liquid pair that has the token as its base."""
+    pairs = data if isinstance(data, list) else (data or {}).get("pairs") if isinstance(data, dict) else None
+    best = None
+    for pair in pairs or []:
+        if not isinstance(pair, dict) or str((pair.get("baseToken") or {}).get("address", "")).lower() != token:
+            continue
+        try:
+            price = D(str(pair.get("priceUsd")))
+            liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
+        except (decimal.InvalidOperation, TypeError, ValueError):
+            continue
+        if price > 0 and (best is None or liquidity > best[0]):
+            cap = pair.get("marketCap") or pair.get("fdv")
+            with contextlib.suppress(decimal.InvalidOperation, TypeError, ValueError):
+                cap = D(str(cap)) if cap else None
+            best = (liquidity, price, cap if isinstance(cap, D) and cap > 0 else None, f"{pair.get('dexId', '')}")
+    if best is None:
+        raise ValueError("DexScreener 没有这个代币的交易对")
+    return best[1], best[2], best[3]
+
+
+def gecko_pool(data: Any) -> str:
+    """GeckoTerminal token-pools answer -> the address of the pool with the most liquidity."""
+    rows = (data or {}).get("data") if isinstance(data, dict) else None
+    best = None
+    for row in rows or []:
+        attrs = (row or {}).get("attributes") or {}
+        try:
+            reserve = float(attrs.get("reserve_in_usd") or 0)
+        except (TypeError, ValueError):
+            reserve = 0.0
+        if attrs.get("address") and (best is None or reserve > best[0]):
+            best = (reserve, str(attrs["address"]).lower())
+    if best is None:
+        raise ValueError("GeckoTerminal 没有这个代币的池子")
+    return best[1]
+
+
+def gecko_bars(data: Any) -> list[tuple[int, float, float, float, float]]:
+    """GeckoTerminal OHLCV answer -> [(open time s, open, high, low, close)] oldest first."""
+    rows = (((data or {}).get("data") or {}).get("attributes") or {}).get("ohlcv_list") if isinstance(data, dict) else None
+    out = []
+    for row in rows or []:
+        with contextlib.suppress(TypeError, ValueError, IndexError):
+            out.append((int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4])))
+    return sorted(set(out))
+
+
+def rpc_uint(data: Any) -> int:
+    result = (data or {}).get("result") if isinstance(data, dict) else None
+    if not isinstance(result, str) or not result.startswith("0x"):
+        raise ValueError(f"BSC 节点返回异常：{clean_error(json.dumps((data or {}).get('error', data), ensure_ascii=False))[:80]}")
+    return int(result, 16) if len(result) > 2 else 0
+
+
+class CapMarket:
+    """A BSC token's market cap = price × (total supply − burned), its 30-day σ, and its highest point since
+    the resolution window opened (hourly bars, the window's first partial hour from 1-minute bars).
+
+    Settlement reads Flap.sh's own 1-minute chart; DexScreener / GeckoTerminal prices are a close stand-in."""
+    PRICE_SECONDS = 30
+    SUPPLY_SECONDS = 600
+    VOL_SECONDS = 3600
+    SCAN_SECONDS = 300
+
+    def __init__(self, store: "Store", spec: CapSpec):
+        self.store, self.spec = store, spec
+        self.price: D | None = None
+        self.dex_cap: D | None = None
+        self.source = ""
+        self.supply: D | None = None      # total − burned, in whole tokens
+        self.sigma: float | None = None
+        self.sigma_note = ""
+        self.pool = ""
+        self.hour_high: float = 0.0       # the running hour's high (not yet in the persisted scan)
+        self.error = ""
+        self.times = {"price": -1e9, "supply": -1e9, "vol": -1e9, "scan": -1e9}
+
+    async def get(self, url: str, payload: dict | None = None) -> Any:
+        if payload is None:
+            raw = await fetch_source(url, {"Accept": "application/json"})
+        else:
+            raw = await _blocking(_http_get, url, payload, SOURCE_TIMEOUT, {"User-Agent": BROWSER_UA})
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise RemoteError("接口未返回有效 JSON") from None
+
+    async def rpc(self, data: str) -> int:
+        failures = []
+        for url in BSC_RPC:
+            try:
+                return rpc_uint(await self.get(url, {"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                                                     "params": [{"to": self.spec.token, "data": data}, "latest"]}))
+            except Exception as error:
+                failures.append(f"{urllib.parse.urlsplit(url).hostname}: {clean_error(error)}")
+        raise RemoteError("；".join(failures))
+
+    async def ohlcv(self, frame: str, before_s: int, limit: int) -> list[tuple[int, float, float, float, float]]:
+        if not self.pool:
+            self.pool = gecko_pool(await self.get(f"{GECKO}/tokens/{self.spec.token}/pools?page=1"))
+        return gecko_bars(await self.get(f"{GECKO}/pools/{self.pool}/ohlcv/{frame}?aggregate=1&limit={limit}"
+                                         f"&before_timestamp={before_s}&currency=usd&token={self.spec.token}"))
+
+    @property
+    def cap(self) -> D | None:
+        if self.price is None:
+            return None
+        return self.price * self.supply if self.supply else self.dex_cap
+
+    @property
+    def history(self) -> dict:
+        """{'high': USD price, 'at': s, 'through': s (next hour to read), 'first': 'done'|'skipped'} for this window."""
+        saved = self.store.get(f"cap:{self.spec.slug}", {})
+        return saved if isinstance(saved, dict) and saved.get("start") == self.spec.start_ms else {}
+
+    async def refresh(self, now_ms: int) -> None:
+        mono, failures = time.monotonic(), []
+        if mono - self.times["price"] >= self.PRICE_SECONDS:
+            self.times["price"] = mono
+            try:
+                self.price, self.dex_cap, self.source = dex_price(
+                    await self.get(f"https://api.dexscreener.com/tokens/v1/bsc/{self.spec.token}"), self.spec.token)
+                self.source = f"DexScreener {self.source}".strip()
+            except Exception as error:
+                failures.append(f"价格：{clean_error(error)}")
+        if mono - self.times["supply"] >= self.SUPPLY_SECONDS or self.supply is None:
+            self.times["supply"] = mono
+            try:
+                decimals = await self.rpc("0x313ce567")
+                total = await self.rpc("0x18160ddd")
+                burned = 0
+                for address in BURN_ADDRESSES:
+                    burned += await self.rpc("0x70a08231" + address[2:].rjust(64, "0"))
+                self.supply = D(total - burned) / (D(10) ** decimals)
+            except Exception as error:
+                failures.append(f"供应量：{clean_error(error)}")
+        if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
+            self.times["vol"] = mono
+            self.pool = ""  # look the most liquid pool up again (a token can move pools)
+            try:
+                bars = [b for b in await self.ohlcv("hour", now_ms // 1000, 1000) if b[0] + 3600 <= now_ms // 1000][-721:]
+                if len(bars) < 49:
+                    raise ValueError(f"小时 K 线只有 {len(bars)} 根，不足 2 天")
+                rets = [math.log(bars[i][4] / bars[i - 1][4]) for i in range(1, len(bars)) if bars[i][4] > 0 and bars[i - 1][4] > 0]
+                mean = sum(rets) / len(rets)
+                self.sigma = math.sqrt(sum((r - mean) ** 2 for r in rets) / (len(rets) - 1) * 24 * 365)
+                self.sigma_note = f"{len(rets) / 24:.0f} 日小时收盘"
+            except Exception as error:
+                failures.append(f"波动率：{clean_error(error)}")
+        if mono - self.times["scan"] >= self.SCAN_SECONDS:
+            self.times["scan"] = mono
+            try:
+                await self.scan(now_ms)
+            except Exception as error:
+                failures.append(f"窗口最高：{clean_error(error)}")
+        self.error = "；".join(failures)
+
+    async def scan(self, now_ms: int) -> None:
+        """Extend the window's highest price (persisted) with the hours finished since the last scan."""
+        start_s, end_s = self.spec.start_ms // 1000, min(now_ms, self.spec.end_ms) // 1000
+        if end_s <= start_s:
+            return
+        hist = dict(self.history) or {"start": self.spec.start_ms, "high": 0.0, "at": 0,
+                                      "through": start_s - start_s % 3600 + (3600 if start_s % 3600 else 0)}
+        if start_s % 3600 and "first" not in hist:
+            # the window opens mid-hour: that hour counts only from the opening minute
+            try:
+                bars = [b for b in await self.ohlcv("minute", start_s - start_s % 3600 + 3600, 60) if b[0] >= start_s]
+                hist["first"] = "done" if bars else "skipped"
+                for bar in bars:
+                    if bar[2] > hist["high"]:
+                        hist["high"], hist["at"] = bar[2], bar[0]
+            except Exception:
+                hist["first"] = "skipped"
+        rows: list[tuple[int, float, float, float, float]] = []
+        before = end_s
+        for _ in range(10):  # 1000 hours per page, newest first
+            page = await self.ohlcv("hour", before, 1000)
+            rows += page
+            if not page or page[0][0] <= hist["through"] or len(page) < 1000:
+                break
+            before = page[0][0]
+        finished = [b for b in rows if b[0] >= hist["through"] and b[0] + 3600 <= end_s]
+        running = [b for b in rows if b[0] + 3600 > end_s and b[0] >= hist["through"]]
+        for bar in finished:
+            if bar[2] > hist["high"]:
+                hist["high"], hist["at"] = bar[2], bar[0]
+        if finished:
+            hist["through"] = max(b[0] for b in finished) + 3600
+        self.hour_high = max((b[2] for b in running), default=0.0)
+        self.store.put(f"cap:{self.spec.slug}", hist)
+
+    def window_high(self) -> tuple[D | None, int]:
+        """Highest market cap in the window so far (persisted hours, the running hour, the live price)."""
+        hist = self.history
+        prices = [(float(hist.get("high") or 0), int(hist.get("at") or 0)), (self.hour_high, 0)]
+        if self.price is not None:
+            prices.append((float(self.price), 0))
+        top, at = max(prices)
+        supply = self.supply or (self.dex_cap / self.price if self.dex_cap and self.price else None)
+        return (D(str(top)) * supply if top and supply else None), at
+
+    def probability(self, target: D, now_ms: int) -> float | None:
+        cap, (high, _) = self.cap, self.window_high()
+        if high is not None and high >= target:
+            return 1.0
+        if cap is None or self.sigma is None:
+            return None
+        years = max(0.0, (self.spec.end_ms - max(now_ms, self.spec.start_ms)) / YEAR_MS)
+        return hit_probability(float(cap), float(target), self.sigma, years)
+
+
 # --- read-only probability web page -------------------------------------------------------------
 WEB_PAGE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -3209,6 +3569,10 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 .edge b{font-weight:650;font-size:14px;color:var(--faint);white-space:nowrap;font-variant-numeric:tabular-nums}.edge.pos b{color:var(--text)}.edge.pos .el{color:var(--muted)}
 .edge.best{border-color:var(--best);background:var(--best-bg)}.edge.best .el{color:var(--text)}.edge.best b{color:var(--best)}
 .edge.hot{border-color:var(--hot);background:var(--hot-bg)}.edge.hot b{color:var(--hot)}
+.quote .qe{white-space:normal;word-break:break-all}
+.lg{display:grid;grid-template-columns:auto auto 1fr auto;gap:3px 10px;margin-top:5px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
+.lg .lh{color:var(--faint);font-size:11px}.lg .lr{text-align:right}.lg .lt{font-weight:650}.lg .lq{color:var(--muted);white-space:nowrap}
+.lg .lb{color:var(--faint);text-align:right;white-space:nowrap}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}
 .small{font-size:12px;margin-top:3px}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
 </style></head><body><div class="wrap">
 <header><h1>收盘涨跌概率</h1><div class="hr"><div class="meta" id="meta">加载中…</div><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label></div></header>
@@ -3249,6 +3613,35 @@ function book(p){
     w.append(g);if(p.stale)w.append($("div","warn small","盘口过期，不给建议"))}
   return w}
 function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
+function ladder(c,it){
+  // a market-cap ladder: one Yes/No market per threshold, each with the model's P(Yes) and its best trade
+  const L=it.ladder,det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
+  const sm=$("summary");sm.title="点开看计算明细";
+  sm.append($("span","rd","市值"),$("span","v",L.cap),$("span","rd","窗口最高"),$("span","v",L.high));
+  if(L.sigma)sm.append($("span","rd","σ"),$("span","v",(L.sigma*100).toFixed(0)+"%"));
+  det.append(sm);const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
+  row("窗口",L.window+" → "+it.close_label);row("价格",L.price+" USD（"+L.source+"）");row("流通量",L.supply+"（总量 − 销毁）");
+  row("窗口最高",L.high+(L.high_at?"（"+L.high_at+"）":"")+"：GeckoTerminal 小时 K 近似，结算以 Flap.sh 1 分钟 K 为准"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
+  if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
+  row("模型","碰到即 Yes：零漂移、固定波动率的单边触及概率 Φ((−h−s²/2)/s) + (M/K)·Φ((−h+s²/2)/s)，h = ln(K/M)，s = σ√T");
+  det.append(dl);c.append(det);
+  if(it.missing)c.append($("p","","概率暂缺："+it.missing));else if(L.error)c.append($("div","warn small","⚠️ "+L.error));
+  const w=it.predict?$("a","pb"):$("div","pb");
+  if(it.predict){w.href=it.predict.url;w.target="_blank";w.rel="noopener noreferrer";w.title="打开 Predict 市场"}
+  const h=$("div","quote");h.append($("span","pt","Predict ↗"));if(it.predict&&it.predict.error)h.append($("span","warn qe",it.predict.error));
+  const g=$("div","lg");g.append($("span","lh","目标"),$("span","lh","模型 Yes"),$("span","lh","买1 / 卖1"),$("span","lh lr","最优"));
+  let hot=null;
+  L.rows.forEach(r=>{const best=r.edges&&r.edges.find(e=>e.best),n=x=>x==null?"无":(x*100).toFixed(1);
+    const q=r.bid==null&&r.ask==null?(r.error?"—":"…"):n(r.bid)+" / "+n(r.ask);
+    const b=$("span","lb"+(best?(best.edge>=HOT?" hot":" pos"):""));
+    if(best){b.append(best.label+" "+(best.price*100).toFixed(1)+" ",$("b","","+"+cent(best.edge)));b.title=best.maker?"挂单排队，成交不保证":"立即成交，量 "+qty(best.size);
+      if(best.edge>=HOT&&(!hot||best.edge>hot.edge))hot={...best,row:r.label}}
+    else b.textContent=r.error?"⚠️":r.stale?"过期":"—";
+    if(r.error)b.title=r.error;
+    g.append($("span","lt",r.label),$("span","lf",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b)});
+  w.append(h,g);c.append(w);
+  if(hot){c.classList.add("hot");c.title="优势 ≥10¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" +"+cent(hot.edge)}
+  return c}
 function card(it){
   const c=$("div","card"+(it.missing?" missing":"")),head=$("div","head"),nm=$("div","name",it.name);
   nm.title=it.symbol||it.name;const fk=favKey(it),on=favs.includes(fk),st=$("button","star"+(on?" on":""),on?"★":"☆");
@@ -3259,6 +3652,7 @@ function card(it){
     if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");t.className="tag new";t.textContent+=" 新"}}
   if(it.close_ms){const cd=$("span","cd");cd.dataset.close=it.close_ms;cd.title="目标 "+it.close_label;head.append(cd)}
   c.append(head);
+  if(it.kind==="ladder")return ladder(c,it);
   const best=it.predict&&it.predict.edges&&it.predict.edges.find(e=>e.best);
   if(best&&best.edge>=HOT){c.classList.add("hot");c.title="优势 ≥10¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge)}
   if(it.missing){c.append($("p","","概率暂缺："+it.missing));if(it.predict)c.append(book(it.predict));return c}
@@ -3803,8 +4197,10 @@ class Bot:
         self.vols = VolBook(config.prob_vol)
         self.predict = PredictFeed(config)
         self.touches = {spec.key: TouchMarket(store, spec) for spec in TOUCH_MARKETS}
+        self.caps = {spec.key: CapMarket(store, spec) for spec in CAP_MARKETS}
         if config.touch:
             self.predict.want_info.update(spec.slug for spec in TOUCH_MARKETS)
+            self.predict.ladder_keys.update(self.caps)
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
         self.reference_pool: ThreadPoolExecutor | None = None
@@ -4707,6 +5103,7 @@ class Bot:
             })
         if self.config.touch:
             items.extend(self.touch_payload(t, now_ms) for t in self.touches.values())
+            items.extend(self.cap_payload(c, now_ms) for c in self.caps.values())
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION, "server_ms": now_ms,
                 "today": f"{today:%m-%d} {WEEKDAYS[today.weekday()]}",
@@ -4726,8 +5123,7 @@ class Bot:
         if first == "high":
             return book, ""
         if first == "low":  # the book prices "low first": its complement is "high first"
-            flip = lambda rows: tuple((D(1) - p, q) for p, q in rows)
-            return dataclasses.replace(book, bids=flip(book.asks), asks=flip(book.bids)), ""
+            return flip_book(book), ""
         return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}），暂不比较"
 
     def touch_payload(self, touch: "TouchMarket", now_ms: int) -> dict:
@@ -4765,6 +5161,49 @@ class Bot:
                     "p_low": odds.lower, "p_high": odds.upper, "p_none": odds.none,
                     "error": touch.error}}
 
+    def cap_payload(self, cap: "CapMarket", now_ms: int) -> dict:
+        """Web card for a market-cap ladder: per threshold the model's P(Yes), the Yes book and its best edge."""
+        spec = cap.spec
+        start = dt.datetime.fromtimestamp(spec.start_ms / 1000, dt.timezone(dt.timedelta(hours=-4)))
+        end = dt.datetime.fromtimestamp(spec.end_ms / 1000, dt.timezone(dt.timedelta(hours=-4)))
+        bj = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING).strftime("%m-%d %H:%M")
+        rows_in = self.predict.ladders.get(spec.key) or [LadderRow(t, "", "", None, "") for t in spec.targets]
+        rows = []
+        for row in rows_in:
+            fair = cap.probability(row.target, now_ms)
+            book, why = self.predict.yes_book(row) if row.market_id else (None, "")
+            out: dict[str, Any] = {"label": usd_short(row.target), "fair": fair, "error": why}
+            if book is not None:
+                out.update(bid=float(book.bid[0]) if book.bid else None, ask=float(book.ask[0]) if book.ask else None,
+                           stale=book.stale(now_ms))
+                top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0)
+                if fair == 1.0 and top < 0.9:
+                    # our history says touched, the market does not: sources disagree, so no "sure thing" edge
+                    out["error"] = "数据显示已触及，但盘口仍低于 90¢；以 Flap.sh 为准，请核实"
+                elif fair is not None:
+                    edges = book_edges(fair, book)
+                    best = None if book.stale(now_ms) else best_edge(edges)
+                    out["edges"] = [{"label": e.label.replace("涨", "Yes").replace("跌", "No"), "maker": e.maker,
+                                     "price": e.price, "edge": e.edge, "size": e.size, "best": e is best} for e in edges]
+            rows.append(out)
+        high, high_at = cap.window_high()
+        item: dict[str, Any] = {
+            "name": spec.name, "symbol": spec.key, "group": "crypto", "kind": "ladder", "close_ms": spec.end_ms,
+            "close_label": f"{end:%m-%d %H:%M} ET（北京 {bj(spec.end_ms)}）截止" + (f"；{spec.trade_end}" if spec.trade_end else ""),
+            "ladder": {"cap": usd_short(cap.cap), "high": usd_short(high), "high_at": stamp(high_at * 1000, seconds=False) if high_at else "",
+                       "sigma": cap.sigma, "sigma_note": cap.sigma_note, "rows": rows, "error": cap.error,
+                       "price": f"{cap.price:.10g}" if cap.price is not None else "—", "source": cap.source or "—",
+                       "supply": fmt(cap.supply.quantize(D(1))) if cap.supply else "—",
+                       "window": f"{start:%m-%d %H:%M} ET（北京 {bj(spec.start_ms)}）起",
+                       "years": max(0.0, (spec.end_ms - max(now_ms, spec.start_ms)) / YEAR_MS),
+                       "first_skipped": cap.history.get("first") == "skipped"},
+        }
+        if self.config.predict:
+            item["predict"] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
+        if cap.cap is None or cap.sigma is None:
+            item["missing"] = f"等待市值数据（{brief_error(cap.error, 80)}）" if cap.error else "等待市值数据"
+        return item
+
     def card_currency(self, symbol: str) -> str:
         """Every contract card names its price currency, also when the contract is quoted in it (HKD)."""
         ticker = self.config.tickers.get(symbol) if symbol else None
@@ -4800,6 +5239,7 @@ class Bot:
             targets[key] = predict_slug(stem, day)
         if self.config.touch:
             targets.update({spec.key: spec.slug for spec in TOUCH_MARKETS})
+            targets.update({spec.key: spec.slug for spec in CAP_MARKETS})
         return targets
 
     def predict_payload(self, title: str, odds: CloseOdds | str | None, now_ms: int) -> dict | None:
@@ -5344,7 +5784,12 @@ class Bot:
             jobs.append(("Predict 盘口", lambda: self.predict.refresh(self.predict_targets(now()))))
         if self.config.touch:
             jobs.append(("先触市场", lambda: self.refresh_touch(now())))
+            jobs.append(("市值阶梯", lambda: self.refresh_caps(now())))
         return jobs
+
+    async def refresh_caps(self, now_ms: int) -> None:
+        for cap in self.caps.values():
+            await cap.refresh(now_ms)
 
     async def refresh_touch(self, now_ms: int) -> None:
         for touch in self.touches.values():
