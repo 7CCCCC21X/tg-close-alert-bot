@@ -2,6 +2,7 @@ import asyncio, os, sys, time, json, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
+m.CapMarket.GECKO_GAP = 0  # no real GeckoTerminal here
 D = m.D
 # config
 c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PORT": "8080", "RAILWAY_PUBLIC_DOMAIN": "bot.up.railway.app"})

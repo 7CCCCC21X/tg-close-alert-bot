@@ -4,6 +4,7 @@ import offline  # noqa: F401  (blocks real HTTP)
 import main as m
 D = m.D
 NIU, ANSEM, PONS = m.CAP_MARKETS
+m.CapMarket.GECKO_GAP = 0  # request spacing is tested on its own below
 TOKEN = NIU.token
 
 # --- the market as its rules state it ----------------------------------------------------------------------------
@@ -241,6 +242,69 @@ async def run():
     bot.predict.market_meta["31"] = ({"outcomes": ["Yes", "No"], "status": "RESOLVED"}, time.monotonic())
     row = bot.cap_payload(pons, NOW)["ladder"]["rows"][0]
     assert row["fair"] == 1.0 and row["touched"] is True, row
+    # GeckoTerminal rate-limits (429): the σ saved from the last good fetch stands in, and the bars are not asked
+    # for again on every refresh, only after RETRY_SECONDS
+    rl_store = m.Store(":memory:")
+    ok = m.CapMarket(rl_store, NIU); ok.get, _ = world()
+    await ok.refresh(NOW)
+    good = ok.sigma
+    assert good and rl_store.get(f"capsigma:{NIU.slug}")[0] == good
+    limited = m.CapMarket(rl_store, NIU)
+    ok_get, _ = world()
+    gecko = []
+    async def limited_get(url, payload=None):
+        if "geckoterminal" in url:
+            gecko.append(url)
+            raise m.RemoteError("HTTP 429: 接口限流，等待后重试", 30)
+        return await ok_get(url, payload)
+    limited.get = limited_get
+    await limited.refresh(NOW + 60_000)
+    assert limited.sigma == good and "保存" in limited.sigma_note and "波动率" not in limited.error, (limited.sigma_note, limited.error)
+    assert "missing" not in bot.cap_payload(limited, NOW + 60_000)
+    n = len(gecko)
+    for _ in range(5):
+        limited.times["price"] = -1e9
+        await limited.refresh(NOW + 90_000)
+    assert len(gecko) == n, gecko[n:]  # no GeckoTerminal request at all during the back-off
+    limited.times["vol"] -= m.CapMarket.RETRY_SECONDS  # five minutes later it tries again
+    await limited.refresh(NOW + 400_000)
+    assert len(gecko) > n
+    # with nothing saved: a labelled prior instead of a blank card, the reason kept for the tooltip
+    fresh_rl = m.CapMarket(m.Store(":memory:"), NIU); fresh_rl.get = limited_get
+    await fresh_rl.refresh(NOW)
+    assert fresh_rl.sigma == NIU.prior_sigma and fresh_rl.sigma_kind == "prior" and "429" in fresh_rl.vol_error, fresh_rl.vol_error
+    assert "波动率" not in fresh_rl.error
+    item = bot.cap_payload(fresh_rl, NOW)
+    assert "missing" not in item and item["ladder"]["sigma_kind"] == "prior" and "429" in item["ladder"]["vol_error"]
+
+    # own 5-minute samples: σ measured once 12 hours are covered (gaps over an hour skipped)
+    assert m.sampled_sigma([[i * 300, 1.0] for i in range(100)]) is None  # 8 hours
+    alt = [[i * 300, 1.01 if i % 2 else 1.0] for i in range(200)]       # ±1% every 5 minutes, 16.6 hours
+    sig, hours = m.sampled_sigma(alt + [[10 ** 6, 5.0]])                 # a far-away point after a gap: ignored
+    expected = math.log(1.01) * math.sqrt(365 * 86400 / 300)
+    assert abs(sig - expected) / expected < 1e-9 and abs(hours - 199 * 300 / 3600) < 1e-9, (sig, hours)
+    own = m.CapMarket(m.Store(":memory:"), PONS)
+    for i in range(160):  # 13+ hours of 5-minute refreshes
+        own.price = D("0.50") * (D("1.02") if i % 2 else 1)
+        own.sample(NOW + i * 300_000)
+        own.sample(NOW + i * 300_000 + 30_000)  # within 5 minutes: not sampled again
+    assert len(own.store.get(f"capsamples:{PONS.slug}")) == 160
+    own.fallback_sigma(NOW + 160 * 300_000)
+    want = math.log(1.02) * math.sqrt(365 * 86400 / 300)  # ±2% every 5 minutes ≈ 640% a year
+    assert own.sigma_kind == "samples" and "自采" in own.sigma_note and abs(own.sigma - want) / want < 1e-9, (own.sigma, own.sigma_note)
+    assert bot.cap_payload(own, NOW)["ladder"]["sigma_kind"] == "samples"
+
+    # GeckoTerminal requests are spaced out across ladders
+    m.CapMarket.GECKO_GAP = 0.2
+    spaced = [m.CapMarket(m.Store(":memory:"), NIU), m.CapMarket(m.Store(":memory:"), ANSEM)]
+    stamps = []
+    async def turn(c):
+        await c.gecko_turn(); stamps.append(time.monotonic())
+    await asyncio.gather(*(turn(c) for c in spaced * 2))
+    gaps = [b - a for a, b in zip(sorted(stamps), sorted(stamps)[1:])]
+    assert min(gaps) >= 0.19, gaps
+    m.CapMarket.GECKO_GAP = 0
+
     # the observed high and a later GeckoTerminal scan share one record
     mix = m.CapMarket(m.Store(":memory:"), NIU); mix.get, _ = world()
     mix.price = D("0.5"); mix.observe(NOW)
