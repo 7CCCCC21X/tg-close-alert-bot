@@ -386,6 +386,7 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-september-28-2026
 - 未计手续费、积分和 LP 奖励；模型本身有误差（见 `/calib`），优势只是参考。
 - 超过 90 秒没刷新成功的盘口只显示、不给建议；目标日切换时旧盘口立即丢弃。
 - 市场页面上的“目标价”（结算基准，如 KOSPI 按 Yahoo ^KS11 / KRX 官方收盘）能从 Predict GraphQL（`marketData.startPrice`）读到时，概率改以它为参考线：盘后代理估算按同一比例平移到目标价，盘中现货价不变；本地参考收盘保留在说明里。与本地参考相差 ≥5% 时视为单位不符，不采用。
+- 网页“加密”栏：BNB 先触 $700 还是 $900（[will-bnb-hit-700-or-900](https://predict.fun/zh-cn/market/will-bnb-hit-700-or-900)，截止 2026-12-31 23:59 ET，都没碰到按 50/50）。币安现货 BNBUSDT 每 30 秒取价，30 日小时收盘算年化 σ，双边界首达模型（零漂移）给出两边公平价；从 Predict 市场创建时间起按小时 K 线核验是否已触线，命中的那一小时再用 1 分钟 K 线定到分钟，已触线则按 100/0 显示，同一分钟两边都碰到则提示人工核对。Predict 盘口按市场结果名称（$700 / $900）自动换算成“先 $900”一侧；名称认不出时只显示盘口、不比较。`BNB_TOUCH=off` 关闭。
 - Predict 上还没上架的市场显示“Predict 上还没有这个市场（slug）”，1 分钟后再查（新上架的市场最多延迟约 1 分钟出现）；网络失败会显示原因并保留上次盘口。
 - 订单簿走 `https://api.predict.fun/v1/markets/<id>/orderbook`。如果 `/book` 显示 HTTP 401/403，到 Predict.fun 申请 API key 填进 `PREDICT_API_KEY`（建议单独一个 key，别和交易程序共用限流桶）。
 
