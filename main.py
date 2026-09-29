@@ -1156,12 +1156,34 @@ class StockMarket:
                     raw = await fetch_source(url, extra)
                     if name in {"东方财富", "Naver"}:
                         day, close, prev = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
+                        if ticker.market == "kr":
+                            day, close, prev, name = await self.krx_official(ticker, day, close, prev, now_ms)
                     else:
                         day, close, prev = parse_quote_close(name, ticker.market, raw, info, now_ms)
                     return self.baseline(ticker, info, name, day, close, prev)
                 except Exception as error:
                     failures.append(f"{name}: {clean_error(error)}")
         raise ValueError("；".join(dict.fromkeys(failures)))
+
+    async def krx_official(self, ticker: StockTicker, day: dt.date, close: D, prev: D | None,
+                           now_ms: int) -> tuple[dt.date, D, D | None, str]:
+        """Naver's daily chart now blends in Nextrade (NXT) after-hours trades up to 20:00, so its "close" drifts
+        away from the KRX closing auction. Naver's realtime quote is the KRX regular session: its price is the
+        official close once the session is over, and price − change is the official previous close (기준가).
+        Best effort: on any failure the chart's values stand."""
+        try:
+            url = self.live_sources(ticker)[0][1]
+            q = parse_naver_index(await fetch_source(url, {"Referer": "https://finance.naver.com/"}), now_ms)
+        except Exception:
+            return day, close, prev, "Naver"
+        kst = dt.timezone(dt.timedelta(hours=9))
+        quoted = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst)
+        regular_over = quoted.time() >= STOCK_MARKETS["kr"].close_time or q.status == "已收盘"
+        if quoted.date() == day and regular_over:
+            return day, q.last, q.prev_close or prev, "Naver KRX"
+        if quoted.date() > day and q.prev_close:
+            return day, q.prev_close, prev, "Naver KRX"  # today's 기준가 = the close of the chart's last session
+        return day, close, prev, "Naver"
 
     @staticmethod
     def baseline(ticker: StockTicker, info: StockMarketInfo, source: str, day: dt.date | None, close: D,
@@ -5704,7 +5726,8 @@ class Bot:
                         day, close, _ = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
                     else:
                         day, close, _ = parse_quote_close(name, ticker.market, raw, info, now_ms)
-                    return f"{day.strftime('%m-%d') if day else '上一交易日（无日期）'} 收盘 {fmt(close)} {info.currency}"
+                    note = "（日 K 含 NXT 盘后；实际使用 KRX 实时价校正后的收盘）" if ticker.market == "kr" else ""
+                    return f"{day.strftime('%m-%d') if day else '上一交易日（无日期）'} 收盘 {fmt(close)} {info.currency}{note}"
                 probes.append((f"交易所收盘·{short_name(symbol)}", f"{name} {ticker.market}:{ticker.code}", get(url, extra), check_stock))
 
         if self.config.sse_index:
