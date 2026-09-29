@@ -2877,10 +2877,45 @@ class PredictFeed:
 
 
 # --- first-touch market (which barrier does BNB hit first?) ------------------------------------------
-TOUCH_SLUG = "will-bnb-hit-700-or-900"
-TOUCH_SYMBOL = "BNBUSDT"
-TOUCH_LOW, TOUCH_HIGH = D("700"), D("900")
-TOUCH_DEADLINE_MS = int(dt.datetime(2026, 12, 31, 23, 59, tzinfo=dt.timezone(dt.timedelta(hours=-5))).timestamp() * 1000)
+def et_ms(year: int, month: int, day: int, hour: int, minute: int, utc_offset: int) -> int:
+    """US Eastern wall time -> epoch ms; utc_offset is -4 (EDT, Mar-Nov) or -5 (EST)."""
+    return int(dt.datetime(year, month, day, hour, minute, tzinfo=dt.timezone(dt.timedelta(hours=utc_offset))).timestamp() * 1000)
+
+
+TOUCH_DEADLINE_MS = et_ms(2026, 12, 31, 23, 59, -5)
+
+
+@dataclass(frozen=True)
+class TouchSpec:
+    """One "which price is hit first" market: Binance spot pair, the two barriers, and its Predict slug."""
+    key: str          # item / book key, e.g. BNB
+    slug: str
+    symbol: str       # Binance spot pair (the resolution source)
+    low: D
+    high: D
+    created_ms: int = 0  # window start from the rules (the creation time unless the rules name a date)
+    deadline_ms: int = TOUCH_DEADLINE_MS
+    et_offset: int = -5  # US Eastern offset at the deadline, for its label
+    fixed_start: bool = False  # the rules name the window start: it wins over Predict's creation time
+
+    def label(self, value: D) -> str:
+        """$70,000 -> 70k, $900 -> 900: short enough for the edge chips."""
+        return f"{int(value) // 1000}k" if value >= 10000 and value % 1000 == 0 else fmt(value)
+
+    def close_label(self) -> str:
+        et = dt.datetime.fromtimestamp(self.deadline_ms / 1000, dt.timezone(dt.timedelta(hours=self.et_offset)))
+        bj = dt.datetime.fromtimestamp(self.deadline_ms / 1000, BEIJING)
+        return f"{et:%m-%d %H:%M} ET（北京 {bj:%m-%d %H:%M}）截止；都没碰到按 50/50 结算"
+
+
+TOUCH_MARKETS = (
+    TouchSpec("BNB", "will-bnb-hit-700-or-900", "BNBUSDT", D("700"), D("900")),
+    TouchSpec("SOL", "will-solana-hit-60-or-140-first", "SOLUSDT", D("60"), D("140"),
+              int(dt.datetime(2026, 3, 12, 13, 27, 8, 415000, tzinfo=dt.timezone.utc).timestamp() * 1000)),
+    # "between August 25th, 2026 at 10:00 AM ET and October 25th, 2026 at 11:59 PM ET" (both EDT)
+    TouchSpec("BTC", "will-btc-hit-70000-or-90000-first", "BTCUSDT", D("70000"), D("90000"),
+              et_ms(2026, 8, 25, 10, 0, -4), et_ms(2026, 10, 25, 23, 59, -4), -4, fixed_start=True),
+)
 TOUCH_SPOT = ("https://data-api.binance.vision", "https://api.binance.com", "https://api1.binance.com")
 YEAR_MS = 365 * 24 * 3600 * 1000
 
@@ -2998,15 +3033,17 @@ def realized_vol(rows: list, now_ms: int) -> float:
     return math.sqrt(var * 365 * 24)
 
 
-def touch_outcome(name: str) -> str:
-    """'$700' / 'Yes, $700' / '900 first' -> 'low' | 'high' | ''."""
-    low, high = str(int(TOUCH_LOW)), str(int(TOUCH_HIGH))
-    has_low, has_high = low in name, high in name
+def touch_outcome(name: str, spec: TouchSpec) -> str:
+    """'$700' / 'Yes, $700' / '900 first' -> 'low' | 'high' | '' (whole numbers only: 60 is not in 160)."""
+    name = name.replace(",", "")
+    has = lambda value: any(re.search(rf"(?<![\d.]){n}(?![\d])", name, re.I) for n in
+                            (str(int(value)), *([f"{int(value) // 1000}k"] if value % 1000 == 0 else [])))
+    has_low, has_high = has(spec.low), has(spec.high)
     return "low" if has_low and not has_high else "high" if has_high and not has_low else ""
 
 
 class TouchMarket:
-    """BNB/USDT spot vs the $700 / $900 barriers: live price, 30-day σ, and the path since the market opened.
+    """A Binance spot pair vs its two barriers: live price, 30-day σ, and the path since the market opened.
 
     The path check reads hourly bars and drills into 1-minute bars only for an hour that reached a barrier,
     so a hit is dated to the minute; a minute that spans both barriers, or the market's opening minute,
@@ -3015,14 +3052,14 @@ class TouchMarket:
     VOL_SECONDS = 3600
     SCAN_SECONDS = 300
 
-    def __init__(self, store: "Store"):
-        self.store = store
+    def __init__(self, store: "Store", spec: TouchSpec):
+        self.store, self.spec = store, spec
         self.price: D | None = None
         self.priced_ms = 0
         self.sigma: float | None = None
         self.error = ""
         self.times = {"price": -1e9, "vol": -1e9, "scan": -1e9}
-        self.start_ms = 0          # market creation (from Predict), 0 = unknown
+        self.start_ms = spec.created_ms  # market creation (Predict, else the rules), 0 = unknown
 
     async def get(self, path: str, **params: Any) -> Any:
         query = urllib.parse.urlencode(params)
@@ -3037,7 +3074,7 @@ class TouchMarket:
     @property
     def history(self) -> dict:
         """{'kind': 'clear'|'low'|'high'|'ambiguous', 'through'/'time': ms, 'start': ms} or {}."""
-        saved = self.store.get(f"touch:{TOUCH_SLUG}", {})
+        saved = self.store.get(f"touch:{self.spec.slug}", {})
         return saved if isinstance(saved, dict) and saved.get("start") == self.start_ms else {}
 
     async def refresh(self, now_ms: int) -> None:
@@ -3045,11 +3082,12 @@ class TouchMarket:
         try:
             if mono - self.times["price"] >= self.PRICE_SECONDS:
                 self.times["price"] = mono
-                data = await self.get("ticker/price", symbol=TOUCH_SYMBOL)
+                data = await self.get("ticker/price", symbol=self.spec.symbol)
                 self.price, self.priced_ms = number(data["price"], "BNB"), now_ms
             if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
                 self.times["vol"] = mono
-                self.sigma = realized_vol(await self.get("klines", symbol=TOUCH_SYMBOL, interval="1h", limit=721), now_ms)
+                # 722: the newest bar is the hour still running, which realized_vol drops; 721 finished bars remain
+                self.sigma = realized_vol(await self.get("klines", symbol=self.spec.symbol, interval="1h", limit=722), now_ms)
             if self.start_ms and mono - self.times["scan"] >= self.SCAN_SECONDS:
                 self.times["scan"] = mono
                 await self.scan(now_ms)
@@ -3062,11 +3100,13 @@ class TouchMarket:
         hist = self.history
         if hist.get("kind") in {"low", "high", "ambiguous"}:
             return
-        end = min(now_ms, TOUCH_DEADLINE_MS)
+        end = min(now_ms, self.spec.deadline_ms)
+        if end <= self.start_ms:
+            return  # the window has not opened yet: nothing to check
         cursor = int(hist.get("through") or self.start_ms)
-        low, high = float(TOUCH_LOW), float(TOUCH_HIGH)
+        low, high = float(self.spec.low), float(self.spec.high)
         for _ in range(50):  # 50 000 hours: far more than the market can span
-            rows = await self.get("klines", symbol=TOUCH_SYMBOL, interval="1h", startTime=cursor - cursor % 3_600_000,
+            rows = await self.get("klines", symbol=self.spec.symbol, interval="1h", startTime=cursor - cursor % 3_600_000,
                                   endTime=end, limit=1000)
             done = [r for r in rows if isinstance(r, list) and len(r) > 6 and int(r[6]) < end]
             for row in done:
@@ -3074,22 +3114,22 @@ class TouchMarket:
                     continue
                 result = await self.scan_hour(int(row[0]), cursor, end)
                 if result:
-                    self.store.put(f"touch:{TOUCH_SLUG}", {**result, "start": self.start_ms})
+                    self.store.put(f"touch:{self.spec.slug}", {**result, "start": self.start_ms})
                     return
             if not done:
                 break
             cursor = int(done[-1][6]) + 1
             if len(rows) < 1000:
                 break
-        self.store.put(f"touch:{TOUCH_SLUG}", {"kind": "clear", "through": cursor, "start": self.start_ms})
+        self.store.put(f"touch:{self.spec.slug}", {"kind": "clear", "through": cursor, "start": self.start_ms})
 
     async def scan_hour(self, hour_ms: int, start: int, end: int) -> dict | None:
-        rows = await self.get("klines", symbol=TOUCH_SYMBOL, interval="1m", startTime=hour_ms, endTime=hour_ms + 3_599_999, limit=60)
+        rows = await self.get("klines", symbol=self.spec.symbol, interval="1m", startTime=hour_ms, endTime=hour_ms + 3_599_999, limit=60)
         for row in rows:
             opened, closed, hi, lo = int(row[0]), int(row[6]), float(row[2]), float(row[3])
             if closed < start:
                 continue
-            hit_low, hit_high = lo <= float(TOUCH_LOW), hi >= float(TOUCH_HIGH)
+            hit_low, hit_high = lo <= float(self.spec.low), hi >= float(self.spec.high)
             if not (hit_low or hit_high):
                 continue
             if opened < self.start_ms or closed > end or (hit_low and hit_high):
@@ -3105,14 +3145,14 @@ class TouchMarket:
             return TouchOdds(0.0, 1.0, 0.0)
         if self.price is None or self.sigma is None:
             return f"等待币安行情（{brief_error(self.error, 60)}）" if self.error else "等待币安行情"
-        return first_touch(float(self.price), float(TOUCH_LOW), float(TOUCH_HIGH), self.sigma, 0.0,
-                           max(0.0, (TOUCH_DEADLINE_MS - now_ms) / YEAR_MS))
+        return first_touch(float(self.price), float(self.spec.low), float(self.spec.high), self.sigma, 0.0,
+                           max(0.0, (self.spec.deadline_ms - max(now_ms, self.start_ms)) / YEAR_MS))
 
     def status(self) -> str:
         hist = self.history
         kind = hist.get("kind")
         if kind in {"low", "high"}:
-            return f"已于 {stamp(hist['time'], seconds=False)} 先触及 ${int(TOUCH_LOW if kind == 'low' else TOUCH_HIGH)}"
+            return f"已于 {stamp(hist['time'], seconds=False)} 先触及 ${int(self.spec.low if kind == 'low' else self.spec.high)}"
         if kind == "ambiguous":
             return f"需人工核对：{stamp(hist['time'], seconds=False)} 这一分钟无法判断先后（高 {hist['hi']:g}·低 {hist['lo']:g}）"
         if kind == "clear":
@@ -3218,7 +3258,7 @@ function card(it){
   const unit=it.unit?" "+it.unit:"";
   if(it.touch){const t=it.touch,det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
     const sm=$("summary"),sg=x=>(x>=0?"+":"")+x.toFixed(1)+"%";sm.title="点开看计算明细";
-    sm.append($("span","rd","BNB"),$("span","v",t.price),$("span","rd","距"+lb[1]),$("span","v",sg(t.to_low)),$("span","rd","距"+lb[0]),$("span","v",sg(t.to_high)));det.append(sm);
+    sm.append($("span","rd",t.coin),$("span","v",t.price),$("span","rd","距"+lb[1]),$("span","v",sg(t.to_low)),$("span","rd","距"+lb[0]),$("span","v",sg(t.to_high)));det.append(sm);
     const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
     row("截止",it.close_label);row("先 "+lb[0],(t.p_high*100).toFixed(2)+"%");row("先 "+lb[1],(t.p_low*100).toFixed(2)+"%");row("都没碰到",(t.p_none*100).toFixed(2)+"%（各算一半）");
     row("σ","30 日小时收盘年化 "+(t.sigma*100).toFixed(1)+"%｜剩 "+(t.years*365).toFixed(1)+" 天");row("开盘以来",t.status);
@@ -3745,9 +3785,9 @@ class Bot:
         self.web: WebServer | None = None
         self.vols = VolBook(config.prob_vol)
         self.predict = PredictFeed(config)
-        self.touch = TouchMarket(store)
+        self.touches = {spec.key: TouchMarket(store, spec) for spec in TOUCH_MARKETS}
         if config.touch:
-            self.predict.want_info.add(TOUCH_SLUG)
+            self.predict.want_info.update(spec.slug for spec in TOUCH_MARKETS)
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
         self.reference_pool: ThreadPoolExecutor | None = None
@@ -4649,7 +4689,7 @@ class Bot:
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down,
             })
         if self.config.touch:
-            items.append(self.touch_payload(now_ms))
+            items.extend(self.touch_payload(t, now_ms) for t in self.touches.values())
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION, "server_ms": now_ms,
                 "today": f"{today:%m-%d} {WEEKDAYS[today.weekday()]}",
@@ -4659,53 +4699,54 @@ class Bot:
                          "P(涨) = 1 − Φ(ln((参考+半跳)/有效)/σ剩余)，平盘两边各计一半。目标日跳过周末和已配置的交易所假期。"
                          if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")}
 
-    def touch_book(self) -> tuple[PredictBook | None, str]:
-        """The BNB book priced as "$900 first" (the card's 涨 side), whatever the market's outcome order."""
-        book = self.predict.books.get("BNB")
+    def touch_book(self, spec: TouchSpec) -> tuple[PredictBook | None, str]:
+        """The book priced as "high barrier first" (the card's 涨 side), whatever the market's outcome order."""
+        book = self.predict.books.get(spec.key)
         if book is None:
             return None, ""
-        names = (self.predict.info.get(TOUCH_SLUG) or {}).get("outcomes") or []
-        first = touch_outcome(names[0]) if names else ""
+        names = (self.predict.info.get(spec.slug) or {}).get("outcomes") or []
+        first = touch_outcome(names[0], spec) if names else ""
         if first == "high":
             return book, ""
-        if first == "low":  # the book prices "$700 first": its complement is "$900 first"
+        if first == "low":  # the book prices "low first": its complement is "high first"
             flip = lambda rows: tuple((D(1) - p, q) for p, q in rows)
             return dataclasses.replace(book, bids=flip(book.asks), asks=flip(book.bids)), ""
         return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}），暂不比较"
 
-    def touch_payload(self, now_ms: int) -> dict:
-        """Web card for the BNB first-touch market: 涨 = "$900 first", 跌 = "$700 first"."""
-        low, high = int(TOUCH_LOW), int(TOUCH_HIGH)
-        base = {"name": "BNB 先触 $700 / $900", "symbol": TOUCH_SYMBOL, "group": "crypto",
-                "labels": [f"${high}", f"${low}"], "close_ms": TOUCH_DEADLINE_MS,
-                "close_label": "12-31 23:59 ET（北京 01-01 12:59）截止；都没碰到按 50/50 结算"}
-        out: dict[str, Any] = {"url": predict_url(TOUCH_SLUG, self.config.predict_ref), "error": self.predict.errors.get("BNB", "")}
-        book, why = self.touch_book()
-        odds = self.touch.odds(now_ms)
+    def touch_payload(self, touch: "TouchMarket", now_ms: int) -> dict:
+        """Web card for a first-touch market: 涨 = the high barrier first, 跌 = the low one first."""
+        spec = touch.spec
+        low, high = spec.label(spec.low), spec.label(spec.high)
+        base = {"name": f"{spec.symbol.removesuffix('USDT')} 先触 ${low} / ${high}", "symbol": spec.symbol, "group": "crypto",
+                "labels": [f"${high}", f"${low}"], "close_ms": spec.deadline_ms, "close_label": spec.close_label()}
+        out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
+        book, why = self.touch_book(spec)
+        odds = touch.odds(now_ms)
         if book is not None:
             out.update(bids=[[float(p), float(q)] for p, q in book.bids], asks=[[float(p), float(q)] for p, q in book.asks],
                        age=max(0, (now_ms - book.fetched_ms) // 1000), stale=book.stale(now_ms))
             if isinstance(odds, TouchOdds):
                 edges = book_edges(odds.fair_upper, book)
                 best = None if book.stale(now_ms) else best_edge(edges)
-                out["edges"] = [{"label": e.label.replace("涨", str(high)).replace("跌", str(low)), "maker": e.maker,
+                out["edges"] = [{"label": e.label.replace("涨", high).replace("跌", low), "maker": e.maker,
                                  "price": e.price, "edge": e.edge, "size": e.size, "best": e is best} for e in edges]
-        elif why and "BNB" in self.predict.books:
+        elif why and spec.key in self.predict.books:
             out["error"] = why
         if self.config.predict:
             base["predict"] = out
         if isinstance(odds, str):
             return {**base, "missing": odds}
-        price = self.touch.price
-        years = max(0.0, (TOUCH_DEADLINE_MS - now_ms) / YEAR_MS)
+        price = touch.price
+        years = max(0.0, (spec.deadline_ms - now_ms) / YEAR_MS)
         return {**base, "fair_up": odds.fair_upper, "fair_down": odds.fair_lower, "up": odds.upper, "flat": odds.none,
                 "down": odds.lower, "touch": {
+                    "coin": spec.symbol.removesuffix("USDT"),
                     "price": f"{price:,.2f}" if price is not None else "—",
-                    "to_low": float(percent(TOUCH_LOW, price)) if price else 0.0,
-                    "to_high": float(percent(TOUCH_HIGH, price)) if price else 0.0,
-                    "sigma": self.touch.sigma or 0.0, "years": years, "status": self.touch.status(),
+                    "to_low": float(percent(spec.low, price)) if price else 0.0,
+                    "to_high": float(percent(spec.high, price)) if price else 0.0,
+                    "sigma": touch.sigma or 0.0, "years": years, "status": touch.status(),
                     "p_low": odds.lower, "p_high": odds.upper, "p_none": odds.none,
-                    "error": self.touch.error}}
+                    "error": touch.error}}
 
     def card_currency(self, symbol: str) -> str:
         """Every contract card names its price currency, also when the contract is quoted in it (HKD)."""
@@ -4741,7 +4782,7 @@ class Bot:
                    else session_remaining(market, now_ms, None, self.config.holidays.get(market, frozenset()))[1])
             targets[key] = predict_slug(stem, day)
         if self.config.touch:
-            targets["BNB"] = TOUCH_SLUG
+            targets.update({spec.key: spec.slug for spec in TOUCH_MARKETS})
         return targets
 
     def predict_payload(self, title: str, odds: CloseOdds | str | None, now_ms: int) -> dict | None:
@@ -5285,15 +5326,17 @@ class Bot:
         if self.config.predict:
             jobs.append(("Predict 盘口", lambda: self.predict.refresh(self.predict_targets(now()))))
         if self.config.touch:
-            jobs.append(("BNB 首达", lambda: self.refresh_touch(now())))
+            jobs.append(("先触市场", lambda: self.refresh_touch(now())))
         return jobs
 
     async def refresh_touch(self, now_ms: int) -> None:
-        created = (self.predict.info.get(TOUCH_SLUG) or {}).get("created_ms") or 0
-        if created and created != self.touch.start_ms:
-            self.touch.start_ms = created
-            self.touch.times["scan"] = -1e9  # check the path from the (new) opening time at once
-        await self.touch.refresh(now_ms)
+        for touch in self.touches.values():
+            created = touch.spec.created_ms if touch.spec.fixed_start else (
+                (self.predict.info.get(touch.spec.slug) or {}).get("created_ms") or touch.spec.created_ms)
+            if created and created != touch.start_ms:
+                touch.start_ms = created
+                touch.times["scan"] = -1e9  # check the path from the (new) opening time at once
+            await touch.refresh(now_ms)
 
     async def reference_loop(self, name: str, job: Any) -> None:
         """Refresh one reference feed forever, isolated from the price-alert loop and from the other feeds."""

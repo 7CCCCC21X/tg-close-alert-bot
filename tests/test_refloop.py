@@ -55,7 +55,7 @@ async def run():
     bot.start_reference_tasks()
     assert [t.get_name() for t in bot.reference_tasks] == ["reference:交易所收盘", "reference:股票实时", "reference:汇率", "reference:恒指期货",
                                                             "reference:Hyperliquid", "reference:KOSPI", "reference:上证/A50", "reference:概率输入",
-                                                            "reference:Predict 盘口", "reference:BNB 首达"]
+                                                            "reference:Predict 盘口", "reference:先触市场"]
     started = time.monotonic()
     await bot.one_cycle()
     assert time.monotonic() - started < 1.0, "the alert loop must not wait for reference feeds"
