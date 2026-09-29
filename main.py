@@ -2747,6 +2747,11 @@ def day_fields(target: dt.date, now_ms: int) -> dict:
     return {"day": target.isoformat(), "day_label": f"{target:%m-%d} {week}", "day_tag": tag, "day_ahead": ahead}
 
 
+# After the close, how long before the cards move on to the next session: KRX's closing price still
+# changes for a few minutes after 15:30 KST (14:30 Beijing), so Korea rolls over at 15:35 (14:35 Beijing).
+CLOSE_SETTLE_MS = {"kr": 5 * 60_000}
+
+
 def ref_relative(ref_day: str, target: dt.date, now_ms: int) -> str:
     """'09-28' -> 昨收 (a close before today, Beijing) / 今收 (today's own close, after the session) / 参考."""
     if not ref_day:
@@ -5101,7 +5106,7 @@ class Bot:
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         today = dt.datetime.fromtimestamp(now_ms / 1000, tz).date()
         close_ms = int(dt.datetime.combine(today, info.close_time, tz).timestamp() * 1000)
-        if now_ms < close_ms + 60_000:
+        if now_ms < close_ms + CLOSE_SETTLE_MS.get(ticker.market, 60_000):
             return
         live, _ = self.stocks.live_quote(symbol, now_ms)  # None once the close is final (+15 min): keep the last one
         if live is None or live.quoted_ms < close_ms - 5 * 60_000:
@@ -5219,7 +5224,8 @@ class Bot:
         kst = dt.timezone(dt.timedelta(hours=9))
         quoted_day = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date()
         local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
-        if quoted_day == local.date() and krx_session(now_ms) == "交易中" and k.prev_close:
+        settled = dt.time(15, 30 + CLOSE_SETTLE_MS["kr"] // 60_000)  # the closing price keeps moving for a few minutes
+        if quoted_day == local.date() and dt.time(9, 0) <= local.time() < settled and k.prev_close:
             holidays = self.config.holidays.get("kr", frozenset())
             remaining, target = session_remaining("kr", now_ms, quoted_day - dt.timedelta(days=1), holidays)
             sigma, sigma_note = self.vols.get("KOSPI", "KOSPI", intraday=True)
@@ -5231,7 +5237,7 @@ class Bot:
         holidays = self.config.holidays.get("kr", frozenset())
         remaining, target = session_remaining("kr", now_ms, quoted_day, holidays)
         expected = expected_close_date("kr", now_ms, holidays)
-        if quoted_day < expected or (quoted_day == local.date() and local.time() < dt.time(15, 30)):
+        if quoted_day < expected or (quoted_day == local.date() and local.time() < settled):
             return f"KOSPI 基准停在 {stamp(k.quoted_ms, seconds=False)}，应为 {expected.strftime('%m-%d')} 收盘；暂不输出概率"
         if hl is None:
             return "缺少 HL KR200 代理"
