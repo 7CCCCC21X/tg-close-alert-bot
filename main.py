@@ -3679,9 +3679,11 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 .edge.best{border-color:var(--best);background:var(--best-bg)}.edge.best .el{color:var(--text)}.edge.best b{color:var(--best)}
 .edge.hot{border-color:var(--hot);background:var(--hot-bg)}.edge.hot b{color:var(--hot)}
 .quote .qe{white-space:normal;word-break:break-all}
-.grid.wide{grid-template-columns:repeat(auto-fill,minmax(min(100%,520px),520px));align-items:start}
+.grid.wide{grid-template-columns:repeat(auto-fill,minmax(min(100%,500px),500px));align-items:stretch}
+.card.lad a.pb,.card.lad div.pb{margin-top:0}.lstat{display:flex;flex-direction:column;gap:4px}.lstat:empty{display:none}
+@media (min-width:1040px){.grid.wide .lstat{min-height:44px;display:flex}}
 .card.lad .name{flex:0 1 auto}.card.lad .cd{margin-left:6px}
-.lg{display:grid;grid-template-columns:auto auto auto auto auto 1fr;gap:3px 12px;margin-top:5px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
+.lg{display:grid;grid-template-columns:auto auto auto auto auto 1fr;gap:3px 9px;margin-top:5px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
 .lg .lh{color:var(--faint);font-size:11px;white-space:nowrap}.lg .lr{text-align:right}.lg .ln{text-align:right;white-space:nowrap}.lg .ld{color:var(--muted)}
 .lg .lt{font-weight:650;white-space:nowrap}.lg .lq{color:var(--muted);white-space:nowrap}
 .touched{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font-size:12px}.touched .k{color:var(--down);font-weight:600}
@@ -3710,13 +3712,14 @@ function toggleFav(k){favs=favs.includes(k)?favs.filter(x=>x!==k):[...favs,k];tr
 const two=n=>String(n).padStart(2,"0"),pct=x=>(x*100).toFixed(1),cent=x=>(x*100).toFixed(1)+"¢";
 const like=(v,ref)=>{const d=(String(ref).split(".")[1]||"").length,n=Number(String(v).replace(/,/g,""));
   if(!isFinite(n))return v;const k=d>=2?d:(Math.abs(n)>=1000?0:2);return n.toLocaleString("en-US",{minimumFractionDigits:k,maximumFractionDigits:k})};
+const qk=n=>n>=1000?(n/1000).toFixed(n>=9950?0:1).replace(/\.0$/,"")+"k":qty(n);  // 1,609 -> 1.6k: quote lines stay on one line
 const qty=n=>Number(n).toLocaleString("en-US",{maximumFractionDigits:n>=100?0:n>=10?1:2});
 const HOT=0.1;  // an edge this large (10¢) gets the red frame
 function book(p){
   const w=$("a","pb");w.href=p.url;w.target="_blank";w.rel="noopener noreferrer";w.title="打开 Predict 市场";
   const q=$("div","quote");q.append($("span","pt","Predict ↗"));w.append(q);
   const has=p.bids||p.asks;
-  if(has){const b=p.bids[0],k=p.asks[0],lv=(t,l)=>{const x=$("span","",t+" ");x.append($("b","",l?cent(l[0]):"无"));if(l)x.append("×"+qty(l[1]));return x};
+  if(has){const b=p.bids[0],k=p.asks[0],lv=(t,l)=>{const x=$("span","",t+" ");x.append($("b","",l?cent(l[0]):"无"));if(l)x.append("×"+qk(l[1]));if(l)x.title=qty(l[1])+" 份";return x};
     q.append(lv("买1",b),lv("卖1",k));if(b&&k)q.title="价差 "+cent(k[0]-b[0]);
     if(p.stale)q.append($("span","warn",p.age+" 秒前"))}
   else if(!p.error)q.append($("span","","等待获取"));
@@ -3742,16 +3745,18 @@ function ladder(c,it){
   if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
   row("模型",(L.sigma_kind==="prior"?"σ 为先验值，仅供参考。":"")+"碰到即 Yes：零漂移、固定波动率的单边触及概率 Φ((−h−s²/2)/s) + (M/K)·Φ((−h+s²/2)/s)，h = ln(K/M)，s = σ√T");
   det.append(dl);c.append(det);
-  if(it.missing)c.append($("p","","概率暂缺："+it.missing));else if(L.error)c.append($("div","warn small","⚠️ "+L.error));
+  const st=$("div","lstat");  // status lines (missing / errors / prior σ / reached): a fixed band so tables line up
+  if(it.missing)st.append($("p","","概率暂缺："+it.missing));else if(L.error)st.append($("div","warn small","⚠️ "+L.error));
   const prior=L.sigma_kind==="prior";
   if(prior&&!it.missing){const w=$("div","warn small","⚠️ σ 暂用先验 "+(L.sigma*100).toFixed(0)+"%，优势仅供参考");
-    w.title=(L.bars?"K 线暂不可用"+(L.vol_error?"（"+L.vol_error+"）":""):"这条链没有 K 线来源")+"；机器人自采价格满 12 小时后自动改用实测 σ";c.append(w)}
+    w.title=(L.bars?"K 线暂不可用"+(L.vol_error?"（"+L.vol_error+"）":""):"这条链没有 K 线来源")+"；机器人自采价格满 12 小时后自动改用实测 σ";st.append(w)}
   const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
   if(done.length){const t=$("div","touched");t.append($("span","k","✓ 已触及"));
     const tip=done.map(r=>r.label+(r.bid!=null||r.ask!=null?"（盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1))+"）":"")).join("、");
     const shown=done.length>3?[{label:"≤ "+done[done.length-1].label+" · "+done.length+" 档"}]:done;  // many levels: one chip
     shown.forEach(r=>{const x=$("span","tchip",r.label);x.title="窗口内"+L.metric+"已达到："+tip;t.append(x)});
-    c.append(t)}
+    st.append(t)}
+  c.append(st);
   const w=it.predict?$("a","pb"):$("div","pb");
   if(it.predict){w.href=it.predict.url;w.target="_blank";w.rel="noopener noreferrer";w.title="打开 Predict 市场"}
   const h=$("div","quote");h.append($("span","pt","Predict ↗"));if(it.predict&&it.predict.error)h.append($("span","warn qe",it.predict.error));
@@ -3768,7 +3773,7 @@ function ladder(c,it){
       else b.textContent=r.error?"⚠️":r.stale?"过期":"—";
       if(r.error)b.title=r.error;
       const tk=r.edges&&r.edges.filter(e=>!e.maker).sort((x,y)=>y.edge-x.edge)[0],t=$("span","lb lk"+(tk&&tk.edge>0&&!prior&&!r.stale?" pos":""));
-      if(tk){t.append(tk.label+" ",$("span","lp",(tk.price*100).toFixed(1)+" "),$("b","",(tk.edge>=0?"+":"")+cent(tk.edge)),$("span","lz","×"+qty(tk.size)));t.title=tk.label+" @ "+cent(tk.price)+"，立即成交，最多 "+qty(tk.size)+" 份"+(r.stale?"（盘口过期）":"")}
+      if(tk){t.append(tk.label+" ",$("span","lp",(tk.price*100).toFixed(1)+" "),$("b","",(tk.edge>=0?"+":"")+cent(tk.edge)),$("span","lz","×"+qk(tk.size)));t.title=tk.label+" @ "+cent(tk.price)+"，立即成交，最多 "+qty(tk.size)+" 份"+(r.stale?"（盘口过期）":"")}
       else t.textContent="—";
       g.append($("span","lt",r.label),$("span","ln ld",r.dist==null?"—":"+"+(r.dist*100).toFixed(0)+"%"),$("span","ln",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b,t)});
     w.append(g)}
