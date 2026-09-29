@@ -402,6 +402,7 @@ class Config:
     predict_poll: int = 15   # seconds between orderbook refreshes
     predict_ref: str = "B00EA"  # referral code appended to Predict market links (?ref=); empty = none
     touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
+    auction_alert: bool = True  # Telegram reminder when a market's closing auction starts
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -452,6 +453,7 @@ class Config:
             predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 15, 5, 3600),
             predict_ref=parse_ref_code(e.get("PREDICT_REF_CODE", "B00EA")),
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
+            auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
             probability=e.get("PROBABILITY", "on").strip().lower() not in {"off", "0", "false", "no"},
             prob_vol=parse_prob_vol(e.get("PROB_VOL", "")),
             sse_index=e.get("SSE_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -1156,12 +1158,34 @@ class StockMarket:
                     raw = await fetch_source(url, extra)
                     if name in {"东方财富", "Naver"}:
                         day, close, prev = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
+                        if ticker.market == "kr":
+                            day, close, prev, name = await self.krx_official(ticker, day, close, prev, now_ms)
                     else:
                         day, close, prev = parse_quote_close(name, ticker.market, raw, info, now_ms)
                     return self.baseline(ticker, info, name, day, close, prev)
                 except Exception as error:
                     failures.append(f"{name}: {clean_error(error)}")
         raise ValueError("；".join(dict.fromkeys(failures)))
+
+    async def krx_official(self, ticker: StockTicker, day: dt.date, close: D, prev: D | None,
+                           now_ms: int) -> tuple[dt.date, D, D | None, str]:
+        """Naver's daily chart now blends in Nextrade (NXT) after-hours trades up to 20:00, so its "close" drifts
+        away from the KRX closing auction. Naver's realtime quote is the KRX regular session: its price is the
+        official close once the session is over, and price − change is the official previous close (기준가).
+        Best effort: on any failure the chart's values stand."""
+        try:
+            url = self.live_sources(ticker)[0][1]
+            q = parse_naver_index(await fetch_source(url, {"Referer": "https://finance.naver.com/"}), now_ms)
+        except Exception:
+            return day, close, prev, "Naver"
+        kst = dt.timezone(dt.timedelta(hours=9))
+        quoted = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst)
+        regular_over = quoted.time() >= STOCK_MARKETS["kr"].close_time or q.status == "已收盘"
+        if quoted.date() == day and regular_over:
+            return day, q.last, q.prev_close or prev, "Naver KRX"
+        if quoted.date() > day and q.prev_close:
+            return day, q.prev_close, prev, "Naver KRX"  # today's 기준가 = the close of the chart's last session
+        return day, close, prev, "Naver"
 
     @staticmethod
     def baseline(ticker: StockTicker, info: StockMarketInfo, source: str, day: dt.date | None, close: D,
@@ -2162,6 +2186,11 @@ class KospiIndex:
         self.error = ""
         self.error200 = ""
         self.refreshed = -1e9
+        self.daily: dict[dt.date, D] = {}   # dated official closes (Naver daily chart; the index has no NXT hours)
+        self.daily_refreshed = -1e9
+        self.daily_error = ""
+
+    DAILY_URL = "https://fchart.stock.naver.com/sise.nhn?requestType=0&timeframe=day&count=10&symbol=KOSPI"
 
     @staticmethod
     def parse(source: str, raw: bytes, now_ms: int) -> IndexQuote:
@@ -2169,12 +2198,33 @@ class KospiIndex:
             return parse_naver_index(raw, now_ms)
         return parse_eastmoney_index(raw, now_ms, "韩国KOSPI")
 
+    def official_close(self, day: dt.date) -> D | None:
+        """The dated close of ``day`` from the daily chart (only once that session is final)."""
+        return self.daily.get(day)
+
+    async def refresh_daily(self, now_ms: int) -> None:
+        """Every 10 minutes, and every minute from the close until the day's bar is in."""
+        kst = dt.timezone(dt.timedelta(hours=9))
+        local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
+        waiting = local.weekday() < 5 and local.time() >= dt.time(15, 45) and local.date() not in self.daily
+        if time.monotonic() - self.daily_refreshed < (60 if waiting else 600):
+            return
+        self.daily_refreshed = time.monotonic()
+        try:
+            bars = finished_bars(parse_daily_ohlc("kr", await fetch_source(self.DAILY_URL, {"Referer": "https://finance.naver.com/"})),
+                                 "kr", now_ms)
+            self.daily = {day: close for day, _, close in bars}
+            self.daily_error = ""
+        except Exception as error:
+            self.daily_error = clean_error(error) or type(error).__name__
+
     async def refresh(self, now_ms: int, force: bool = False) -> bool | None:
         if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
             return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         self.quote, self.error = await self._fetch(self.SOURCES, now_ms, self.quote)
         self.quote200, self.error200 = await self._fetch(self.SOURCES_200, now_ms, self.quote200)
+        await self.refresh_daily(now_ms)
 
     async def _fetch(self, sources: tuple, now_ms: int, previous: IndexQuote | None) -> tuple[IndexQuote | None, str]:
         failures = []
@@ -2697,6 +2747,46 @@ def day_fields(target: dt.date, now_ms: int) -> dict:
     tag = {0: "今天", 1: "明天", 2: "后天"}.get(ahead) or (
         ("下" if target.isocalendar()[1] != today.isocalendar()[1] else "本") + week if 0 < ahead < 14 else "")
     return {"day": target.isoformat(), "day_label": f"{target:%m-%d} {week}", "day_tag": tag, "day_ahead": ahead}
+
+
+# After the close, how long before the cards move on to the next session. KRX's closing auction ends at a
+# random moment up to 30 s after 15:30 KST (랜덤엔드), and feeds such as Naver publish the fixed price a minute
+# or so later, so Korea rolls over at 15:33 KST (14:33 Beijing).
+CLOSE_SETTLE_MS = {"kr": 3 * 60_000}
+
+
+# Closing auctions, Beijing time: (start, end, description). The indicative price in the last minutes is
+# nearly the close, so up/down is mostly decided once the auction runs.
+AUCTIONS = {
+    "kr": (dt.time(14, 20), dt.time(14, 30), "韩交所收盘集合竞价（首尔 15:20–15:30，随机结束至 15:30:30）"),
+    "hk": (dt.time(16, 0), dt.time(16, 10), "港交所收市竞价（16:00–16:10，16:08 后随机收市）"),
+    "sh": (dt.time(14, 57), dt.time(15, 0), "沪深收盘集合竞价（14:57–15:00）"),
+}
+AUCTIONS["sz"] = AUCTIONS["sh"]
+
+
+def auction_running(market: str, now_ms: int, holidays: frozenset = frozenset()) -> bool:
+    """Whether ``market``'s closing auction is under way now (a weekday that is not a configured holiday)."""
+    window = AUCTIONS.get(market)
+    if not window:
+        return False
+    local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+    day = local.date()
+    if STOCK_MARKETS[market].utc_offset != 8:  # holidays are listed in the venue's own dates
+        day = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=STOCK_MARKETS[market].utc_offset))).date()
+    return day.weekday() < 5 and day not in holidays and window[0] <= local.time() < window[1]
+
+
+def ref_relative(ref_day: str, target: dt.date, now_ms: int) -> str:
+    """'09-28' -> 昨收 (a close before today, Beijing) / 今收 (today's own close, after the session) / 参考."""
+    if not ref_day:
+        return "参考"
+    today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+    with contextlib.suppress(ValueError):
+        month, day = map(int, ref_day.split("-"))
+        year = target.year if (month, day) <= (target.month, target.day) else target.year - 1
+        return "今收" if dt.date(year, month, day) == today else "昨收"
+    return "参考"
 
 
 def cents(value: float, sign: bool = False) -> str:
@@ -3655,7 +3745,7 @@ h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin
 .star{flex:none;border:0;background:none;padding:0;margin:0 -2px 0 -1px;font-size:14px;line-height:1;cursor:pointer;color:var(--faint)}.star.on{color:#f5b301}.star:hover{color:#f5b301}
 .name{font-weight:650;font-size:14.5px;min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tag{border-radius:6px;padding:1px 5px;font-size:12px;font-weight:600;background:var(--chip);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
-.tag.next{background:var(--best-bg);color:var(--best)}.tag.new{background:var(--best);color:#fff}.tag.hotk{background:var(--hot);color:#fff}
+.tag.next{background:var(--best-bg);color:var(--best)}.tag.auc{background:var(--warn);color:#fff}.tag.new{background:var(--best);color:#fff}.tag.hotk{background:var(--hot);color:#fff}
 .cd{font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;background:var(--chip);border-radius:999px;padding:1px 7px}
 .cd.done{color:var(--muted)}.cd.soon{color:var(--warn);font-weight:600}
 .odds{display:flex;align-items:center;gap:8px;font-variant-numeric:tabular-nums}
@@ -3663,7 +3753,7 @@ h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin
 .u{color:var(--up)}.d{color:var(--down)}
 .bar{flex:1;display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--line)}.bar i{display:block;height:100%}
 details{font-size:12.5px}summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:4px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:0}
-summary>*{flex:none}summary .v{color:var(--text)}summary .un{color:var(--faint);font-size:11px}summary .rd{color:var(--faint);font-size:12px}summary .chip{margin-left:auto}
+summary>*{flex:none}summary .sep{margin-left:4px}summary .v{color:var(--text)}summary .un{color:var(--faint);font-size:11px}summary .rd{color:var(--faint);font-size:12px}summary .chip{margin-left:auto}
 summary::-webkit-details-marker{display:none}summary:before{content:"▸";color:var(--faint)}details[open] summary:before{content:"▾"}
 summary .v{color:var(--text)}.chip{font-size:12px;border-radius:6px;padding:0 5px;background:var(--chip);font-weight:600}
 dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:6px 0 2px;font-size:12px}dt{color:var(--muted)}dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
@@ -3788,6 +3878,7 @@ function card(it){
   if(it.day){const t=$("span","tag"+(it.day_ahead>0?" next":""),(it.day_tag?it.day_label.split(" ")[0]+" "+it.day_tag:it.day_label));t.title="交易日 "+it.day_label;head.append(t);
     const k=it.name+"|"+(it.symbol||"");if(seen[k]&&seen[k]<it.day)rolled[k]=Date.now();seen[k]=it.day;
     if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");t.className="tag new";t.textContent+=" 新"}}
+  if(it.auction){const a=$("span","tag auc","集合竞价");a.title=it.auction+"：此时价格基本就是收盘价";head.append(a)}
   if(it.close_ms){const cd=$("span","cd");cd.dataset.close=it.close_ms;cd.title="目标 "+it.close_label;head.append(cd)}
   c.append(head);
   if(it.kind==="ladder")return ladder(c,it);
@@ -3811,7 +3902,10 @@ function card(it){
     if(it.predict)c.append(book(it.predict));return c}
   const det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   const sm=$("summary");sm.title=(it.ref_day?it.ref_day+" 收盘 → 有效价":"参考 → 有效价")+"；点开看计算明细";
-  sm.append($("span","rd",it.ref_day||"参考"),$("span","v",it.ref),$("span","","→"),$("span","v",like(it.effective,it.ref)));if(it.unit)sm.append($("span","un",it.unit));
+  // 昨收 1,768,000 · 今日 1,769,000 (while trading) / 今收 … · 估算 … (after the close: the proxy's view of the next close)
+  sm.append($("span","rd",it.ref_rel||it.ref_day||"参考"),$("span","v",it.ref),$("span","rd sep",it.eff_label||"→"),$("span","v",like(it.effective,it.ref)));
+  if(it.unit)sm.append($("span","un",it.unit));
+  sm.title=(it.ref_day?it.ref_day+" 收盘 ":"参考 ")+it.ref+unit+"；"+(it.eff_label==="今日"?"今日现价":"按代理估算的下一收盘")+" "+it.effective+unit+"；点开看计算明细";
   const chip=$("span","chip",(it.move>=0?"+":"")+it.move.toFixed(2)+"%");chip.style.color=it.move>0?upColor():it.move<0?downColor():"var(--muted)";sm.append(chip);det.append(sm);
   const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("目标",it.close_label);row("参考",it.ref+unit+"（"+it.ref_note+"）");row("有效",it.effective+unit);row("代理",it.proxy_note);
@@ -4868,7 +4962,8 @@ class Bot:
         k = self.kospi.quote
         kst = dt.timezone(dt.timedelta(hours=9))
         if k and dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).time() >= dt.time(15, 30):
-            self.store.put(f"outcome:KOSPI:{dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date().isoformat()}", float(k.last))
+            day = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date()
+            self.store.put(f"outcome:KOSPI:{day.isoformat()}", float(self.kospi.official_close(day) or k.last))
         q, local = self.hsi.quote, dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
         if (q and q.spot is not None and not self.hsi.error and local.time() >= dt.time(16, 15)
                 and self.hk_cash_close_date(now_ms, self.hsi.holidays) == local.date()):
@@ -5037,7 +5132,7 @@ class Bot:
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         today = dt.datetime.fromtimestamp(now_ms / 1000, tz).date()
         close_ms = int(dt.datetime.combine(today, info.close_time, tz).timestamp() * 1000)
-        if now_ms < close_ms + 60_000:
+        if now_ms < close_ms + CLOSE_SETTLE_MS.get(ticker.market, 60_000):
             return
         live, _ = self.stocks.live_quote(symbol, now_ms)  # None once the close is final (+15 min): keep the last one
         if live is None or live.quoted_ms < close_ms - 5 * 60_000:
@@ -5134,6 +5229,17 @@ class Bot:
     A50_SOFT_STALE_MS = 60 * 60_000  # A50 silent longer than this: no odds at all (shorter: odds with a warning)
     HL_STALE_MS = 10 * 60_000  # an HL mark older than this (refresh failing) is not used for new probabilities
 
+    def kospi_ref(self, day: dt.date, live: D | None) -> tuple[D, str]:
+        """The close a KOSPI up/down market compares with: the dated daily-chart close of ``day``, else the
+        realtime feed's figure (Naver's index feed has been seen frozen at 15:15, before the closing auction)."""
+        official = self.kospi.official_close(day)
+        label = f"{day.strftime('%m-%d')} 收盘"
+        if official is None:
+            return live, label
+        if live is not None and abs(percent(official, live)) >= D("0.005"):
+            return official, f"{label}（日K；实时行情为 {fmt(live)}）"
+        return official, label
+
     def kospi_odds(self, now_ms: int) -> CloseOdds | str | None:
         k = self.kospi.quote
         if not self.config.probability or not self.config.kospi_index:
@@ -5144,18 +5250,20 @@ class Bot:
         kst = dt.timezone(dt.timedelta(hours=9))
         quoted_day = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date()
         local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
-        if quoted_day == local.date() and krx_session(now_ms) == "交易中" and k.prev_close:
+        settled = dt.time(15, 30 + CLOSE_SETTLE_MS["kr"] // 60_000)  # the closing price keeps moving for a few minutes
+        if quoted_day == local.date() and dt.time(9, 0) <= local.time() < settled and k.prev_close:
             holidays = self.config.holidays.get("kr", frozenset())
             remaining, target = session_remaining("kr", now_ms, quoted_day - dt.timedelta(days=1), holidays)
             sigma, sigma_note = self.vols.get("KOSPI", "KOSPI", intraday=True)
             prev_day = expected_close_date("kr", now_ms, holidays)
-            return close_odds("KOSPI", k.prev_close, k.last, sigma, remaining, target, D("0.01"), f"{prev_day.strftime('%m-%d')} 收盘",
+            ref, ref_note = self.kospi_ref(prev_day, k.prev_close)
+            return close_odds("KOSPI", ref, k.last, sigma, remaining, target, D("0.01"), ref_note,
                               f"KOSPI 现货 {fmt(k.last)}（盘中直接用现货）", sigma_note)
         hl, anchor = self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
         holidays = self.config.holidays.get("kr", frozenset())
         remaining, target = session_remaining("kr", now_ms, quoted_day, holidays)
         expected = expected_close_date("kr", now_ms, holidays)
-        if quoted_day < expected or (quoted_day == local.date() and local.time() < dt.time(15, 30)):
+        if quoted_day < expected or (quoted_day == local.date() and local.time() < settled):
             return f"KOSPI 基准停在 {stamp(k.quoted_ms, seconds=False)}，应为 {expected.strftime('%m-%d')} 收盘；暂不输出概率"
         if hl is None:
             return "缺少 HL KR200 代理"
@@ -5168,9 +5276,9 @@ class Bot:
         base, base_note = anchor[1], "收盘时刻" if self.kospi_anchor_note == "15:30 一分钟K" else self.kospi_anchor_note
         price, kind = kr200_price(hl)
         beta = self.config.kospi_beta
-        effective = k.last * D(str(math.exp(beta * math.log(float(price / base)))))
-        return close_odds("KOSPI", k.last, effective, sigma, remaining, target, D("0.01"),
-                          f"{quoted_day.strftime('%m-%d')} 收盘",
+        ref, ref_note = self.kospi_ref(quoted_day, k.last)
+        effective = ref * D(str(math.exp(beta * math.log(float(price / base)))))
+        return close_odds("KOSPI", ref, effective, sigma, remaining, target, D("0.01"), ref_note,
                           f"HL KR200 {kind} {fmt(price)} / {base_note} {fmt(base)} → {percent(price, base):+.3f}%"
                           + (f" × β {beta:g}" if beta != 1 else "") + "（KOSPI200 代理）", sigma_note, beta=beta, mode="盘后")
 
@@ -5228,9 +5336,14 @@ class Bot:
                 items.append({**base, "missing": odds, **(day_fields(target, now_ms) if target else {})})
                 continue
             close_ms, close_label = self.target_close(title, odds.target)
+            market = self.item_market(title)
+            if market and auction_running(market, now_ms, self.config.holidays.get(market, frozenset())):
+                base["auction"] = AUCTIONS[market][2]
             ref_day = re.search(r"\b\d\d-\d\d\b", odds.ref_note)
             items.append({
                 **base, **day_fields(odds.target, now_ms), "ref_day": ref_day.group(0) if ref_day else "",
+                "ref_rel": ref_relative(ref_day.group(0) if ref_day else "", odds.target, now_ms),
+                "eff_label": "今日" if odds.direct else "估算",
                 "target": odds.target.strftime("%m-%d"), "unit": odds.unit or self.card_currency(symbol),
                 "close_ms": close_ms, "close_label": close_label,
                 "ref": fmt(odds.ref), "ref_note": odds.ref_note, "effective": fmt(odds.effective.quantize(D("0.0001"))),
@@ -5350,6 +5463,49 @@ class Bot:
         if cap.cap is None or cap.sigma is None:
             item["missing"] = f"等待市值数据（{brief_error(cap.error, 80)}）" if cap.error else "等待市值数据"
         return item
+
+    def item_market(self, title: str) -> str | None:
+        """The exchange an odds item follows: hk / kr / sh for the indices, the ticker's market for contracts."""
+        market = {"恒生指数": "hk", "KOSPI": "kr", "上证指数": "sh"}.get(title)
+        ticker = self.config.tickers.get(title.split("｜")[-1])
+        return market or (ticker.market if ticker else None)
+
+    async def auction_reminders(self, now_ms: int) -> None:
+        """Once per market and day, as its closing auction starts: where each card stands and the best trade."""
+        if not self.config.auction_alert or not self.config.probability:
+            return
+        for market, (start, end, label) in AUCTIONS.items():
+            if market == "sz" or not auction_running(market, now_ms, self.config.holidays.get(market, frozenset())):
+                continue
+            local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+            opened = dt.datetime.combine(local.date(), start, BEIJING)
+            key = f"auction:{market}:{local.date().isoformat()}"
+            if self.store.get(key) or local - opened > dt.timedelta(minutes=2):
+                continue  # sent already, or joined too late for a reminder to help
+            items = [(title, odds) for title, odds in self.odds_items(now_ms)
+                     if self.item_market(title) in ({market, "sz"} if market == "sh" else {market})]
+            if not items:
+                continue
+            self.store.put(key, now_ms)
+            lines = [f"🔔 {bold(label + ' 开始')}", "竞价最后几分钟的价格基本就是收盘价，涨跌大体已定："]
+            for title, odds in items:
+                lines.append("\n" + bold(f"📍 {title}"))
+                if not isinstance(odds, CloseOdds):
+                    lines.extend(tree([f"概率暂缺：{odds}"]))
+                    continue
+                unit = f" {odds.unit}" if odds.unit else ""
+                rows = [f"昨收 {fmt(odds.ref)}{unit} → 现 {fmt(odds.effective)}{unit}（{percent(odds.effective, odds.ref):+.2f}%）",
+                        f"模型 涨 {bold(cents(odds.fair_up))}｜跌 {bold(cents(odds.fair_down))}"]
+                book = self.predict.books.get(self.predict_key(title))
+                if book is not None and not book.stale(now_ms):
+                    best = best_edge(book_edges(odds.fair_up, book))
+                    quote = f"Predict 买1 {cents(float(book.bid[0])) if book.bid else '无'}｜卖1 {cents(float(book.ask[0])) if book.ask else '无'}"
+                    rows.append(quote + (f"｜👉 {bold(best.label)} @ {cents(best.price)} 优势 {cents(best.edge, True)}" if best else "｜四个方向都没有正优势"))
+                lines.extend(tree(rows))
+            text = "\n".join(lines)
+            for sub_id, sub in self.subscriptions().items():
+                if sub.get("active"):
+                    await self.tell(sub["chat"], sub["thread"], text, html_mode=True)
 
     def card_currency(self, symbol: str) -> str:
         """Every contract card names its price currency, also when the contract is quoted in it (HKD)."""
@@ -5625,6 +5781,10 @@ class Bot:
         if inline and self.config.probability:
             with contextlib.suppress(Exception):  # Probabilities are informational; never block alerts.
                 await self.refresh_odds_inputs(now_ms)
+        try:
+            await self.auction_reminders(now_ms)
+        except Exception as error:  # a reminder must never block price alerts
+            self.log_limited("auction", f"集合竞价提醒失败：{clean_error(error)}")
         for sub_id, sub in self.subscriptions().items():
             if not sub.get("active"):
                 continue
@@ -5704,7 +5864,8 @@ class Bot:
                         day, close, _ = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
                     else:
                         day, close, _ = parse_quote_close(name, ticker.market, raw, info, now_ms)
-                    return f"{day.strftime('%m-%d') if day else '上一交易日（无日期）'} 收盘 {fmt(close)} {info.currency}"
+                    note = "（日 K 含 NXT 盘后；实际使用 KRX 实时价校正后的收盘）" if ticker.market == "kr" else ""
+                    return f"{day.strftime('%m-%d') if day else '上一交易日（无日期）'} 收盘 {fmt(close)} {info.currency}{note}"
                 probes.append((f"交易所收盘·{short_name(symbol)}", f"{name} {ticker.market}:{ticker.code}", get(url, extra), check_stock))
 
         if self.config.sse_index:
@@ -5862,6 +6023,9 @@ class Bot:
                 lines.append(f"  上证概率：暂缺——{odds}")
         if self.config.kospi_index:
             k, hl, anchor = self.kospi.quote, self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
+            daily = max(self.kospi.daily.items()) if self.kospi.daily else None
+            lines.append(f"  KOSPI 日K收盘：{f'{daily[0]:%m-%d} {fmt(daily[1])}' if daily else '未取得'}"
+                         + (f"｜错误：{brief_error(self.kospi.daily_error, 60)}" if self.kospi.daily_error else ""))
             lines.append(f"  KOSPI 基准：{f'{fmt(k.last)}｜{stamp(k.quoted_ms, seconds=False)}｜{k.source}' if k else '无'}"
                          + (f"｜错误：{brief_error(self.kospi.error, 80)}" if self.kospi.error else ""))
             lines.append(f"  KR200 代理：{f'{fmt(kr200_price(hl)[0])}（HL {hl.coin} {kr200_price(hl)[1]}；标记价 {fmt(hl.mark)}）｜{int((now_ms - hl.fetched_ms) / 1000)} 秒前' if hl else '无'}")
