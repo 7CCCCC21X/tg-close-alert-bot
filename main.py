@@ -6009,11 +6009,14 @@ class Bot:
             info = STOCK_MARKETS[ticker.market]
             for name, url, extra in StockMarket.sources(ticker):
                 def check_stock(raw: bytes, name=name, ticker=ticker, info=info) -> str:
-                    if name in {"东方财富", "Naver"}:
+                    if name == "Yahoo":
+                        day, close, _ = last_completed_bar([(d, c) for d, _, c in parse_yahoo_daily(raw)], info, now_ms)
+                    elif name in {"东方财富", "Naver"}:
                         day, close, _ = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
                     else:
                         day, close, _ = parse_quote_close(name, ticker.market, raw, info, now_ms)
-                    note = "（日 K 含 NXT 盘后；实际使用 KRX 实时价校正后的收盘）" if ticker.market == "kr" else ""
+                    note = ("（日 K 含 NXT 盘后；实际使用 KRX 实时价校正后的收盘）" if name == "Naver"
+                            else "（日 K 仅 KRX 正规时段）" if name == "Yahoo" else "")
                     return f"{day.strftime('%m-%d') if day else '上一交易日（无日期）'} 收盘 {fmt(close)} {info.currency}{note}"
                 probes.append((f"交易所收盘·{short_name(symbol)}", f"{name} {ticker.market}:{ticker.code}", get(url, extra), check_stock))
 
