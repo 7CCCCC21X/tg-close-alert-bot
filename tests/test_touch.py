@@ -3,7 +3,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
 D = m.D
-BNB, SOL = m.TOUCH_MARKETS
+BNB, SOL, BTC = m.TOUCH_MARKETS
 
 # --- model: symmetric-ish band, long horizon -> both sides ~50%, none ~0; short -> mostly none ------------------
 o = m.first_touch(800, 700, 900, 0.6, 0, 1.0)
@@ -29,6 +29,13 @@ assert m.touch_outcome("$60", SOL) == "low" and m.touch_outcome("$140", SOL) == 
 # SOL's creation time comes from its rules when Predict gives none
 assert SOL.symbol == "SOLUSDT" and SOL.created_ms == int(dt.datetime(2026, 3, 12, 13, 27, 8, 415000, tzinfo=dt.timezone.utc).timestamp() * 1000)
 assert m.TouchMarket(m.Store(":memory:"), SOL).start_ms == SOL.created_ms
+# BTC: its own window, both ends in EDT (UTC−4); outcome names with thousands separators or "k" are recognised
+assert BTC.created_ms == int(dt.datetime(2026, 8, 25, 14, 0, tzinfo=dt.timezone.utc).timestamp() * 1000) and BTC.fixed_start
+assert BTC.deadline_ms == int(dt.datetime(2026, 10, 26, 3, 59, tzinfo=dt.timezone.utc).timestamp() * 1000)
+assert BTC.close_label() == "10-25 23:59 ET（北京 10-26 11:59）截止；都没碰到按 50/50 结算", BTC.close_label()
+assert BNB.close_label() == "12-31 23:59 ET（北京 01-01 12:59）截止；都没碰到按 50/50 结算"
+assert BTC.label(BTC.low) == "70k" and BNB.label(BNB.high) == "900" and SOL.label(SOL.low) == "60"
+assert m.touch_outcome("$70,000", BTC) == "low" and m.touch_outcome("90k first", BTC) == "high" and m.touch_outcome("$7,000", BTC) == ""
 
 # --- volatility: 721 hourly closes alternating ±1% -> σ ≈ 1% × √8760 -----------------------------------------------
 NOW = int(dt.datetime(2026, 9, 29, 12, 0, tzinfo=m.BEIJING).timestamp() * 1000)
@@ -132,6 +139,19 @@ async def run():
     await bot.predict.market_info(BNB.slug, "1")
     assert bot.predict.info[BNB.slug] == {"outcomes": ["$700", "$900"],
                                              "created_ms": int(dt.datetime(2026, 9, 20, 8, tzinfo=dt.timezone.utc).timestamp() * 1000)}
+    btc = bot.touch_payload(bot.touches["BTC"], NOW)
+    assert btc["name"] == "BTC 先触 $70k / $90k" and btc["labels"] == ["$90k", "$70k"] and btc["close_ms"] == BTC.deadline_ms, btc
+    # the rules' window start wins over Predict's creation time
+    bot.predict.info[BTC.slug] = {"outcomes": ["$70,000", "$90,000"], "created_ms": BTC.created_ms - 86_400_000}
+    for t in bot.touches.values():
+        t.refresh = quiet
+    await bot.refresh_touch(NOW)
+    assert bot.touches["BTC"].start_ms == BTC.created_ms
+    # before the window opens there is nothing to scan; the horizon counts from the opening
+    early = m.TouchMarket(m.Store(":memory:"), BTC); early.get = get
+    await early.scan(BTC.created_ms - H); assert early.history == {}
+    early.price, early.sigma = D("80000"), 0.5
+    assert early.odds(BTC.created_ms - 30 * 86_400_000) == early.odds(BTC.created_ms)
     sol = bot.touch_payload(bot.touches["SOL"], NOW)
     assert sol["name"] == "SOL 先触 $60 / $140" and sol["labels"] == ["$140", "$60"] and sol["missing"].startswith("等待币安行情"), sol
     assert not m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BNB_TOUCH": "off"}), m.Store(":memory:"), FakeMarket(), None).predict_targets(NOW).get("BNB")

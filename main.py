@@ -2877,6 +2877,14 @@ class PredictFeed:
 
 
 # --- first-touch market (which barrier does BNB hit first?) ------------------------------------------
+def et_ms(year: int, month: int, day: int, hour: int, minute: int, utc_offset: int) -> int:
+    """US Eastern wall time -> epoch ms; utc_offset is -4 (EDT, Mar-Nov) or -5 (EST)."""
+    return int(dt.datetime(year, month, day, hour, minute, tzinfo=dt.timezone(dt.timedelta(hours=utc_offset))).timestamp() * 1000)
+
+
+TOUCH_DEADLINE_MS = et_ms(2026, 12, 31, 23, 59, -5)
+
+
 @dataclass(frozen=True)
 class TouchSpec:
     """One "which price is hit first" market: Binance spot pair, the two barriers, and its Predict slug."""
@@ -2885,15 +2893,29 @@ class TouchSpec:
     symbol: str       # Binance spot pair (the resolution source)
     low: D
     high: D
-    created_ms: int = 0  # the market's creation time from its rules, used when Predict does not give one
+    created_ms: int = 0  # window start from the rules (the creation time unless the rules name a date)
+    deadline_ms: int = TOUCH_DEADLINE_MS
+    et_offset: int = -5  # US Eastern offset at the deadline, for its label
+    fixed_start: bool = False  # the rules name the window start: it wins over Predict's creation time
+
+    def label(self, value: D) -> str:
+        """$70,000 -> 70k, $900 -> 900: short enough for the edge chips."""
+        return f"{int(value) // 1000}k" if value >= 10000 and value % 1000 == 0 else fmt(value)
+
+    def close_label(self) -> str:
+        et = dt.datetime.fromtimestamp(self.deadline_ms / 1000, dt.timezone(dt.timedelta(hours=self.et_offset)))
+        bj = dt.datetime.fromtimestamp(self.deadline_ms / 1000, BEIJING)
+        return f"{et:%m-%d %H:%M} ET（北京 {bj:%m-%d %H:%M}）截止；都没碰到按 50/50 结算"
 
 
 TOUCH_MARKETS = (
     TouchSpec("BNB", "will-bnb-hit-700-or-900", "BNBUSDT", D("700"), D("900")),
     TouchSpec("SOL", "will-solana-hit-60-or-140-first", "SOLUSDT", D("60"), D("140"),
               int(dt.datetime(2026, 3, 12, 13, 27, 8, 415000, tzinfo=dt.timezone.utc).timestamp() * 1000)),
+    # "between August 25th, 2026 at 10:00 AM ET and October 25th, 2026 at 11:59 PM ET" (both EDT)
+    TouchSpec("BTC", "will-btc-hit-70000-or-90000-first", "BTCUSDT", D("70000"), D("90000"),
+              et_ms(2026, 8, 25, 10, 0, -4), et_ms(2026, 10, 25, 23, 59, -4), -4, fixed_start=True),
 )
-TOUCH_DEADLINE_MS = int(dt.datetime(2026, 12, 31, 23, 59, tzinfo=dt.timezone(dt.timedelta(hours=-5))).timestamp() * 1000)
 TOUCH_SPOT = ("https://data-api.binance.vision", "https://api.binance.com", "https://api1.binance.com")
 YEAR_MS = 365 * 24 * 3600 * 1000
 
@@ -3013,7 +3035,9 @@ def realized_vol(rows: list, now_ms: int) -> float:
 
 def touch_outcome(name: str, spec: TouchSpec) -> str:
     """'$700' / 'Yes, $700' / '900 first' -> 'low' | 'high' | '' (whole numbers only: 60 is not in 160)."""
-    has = lambda value: re.search(rf"(?<![\d.]){int(value)}(?![\d])", name) is not None
+    name = name.replace(",", "")
+    has = lambda value: any(re.search(rf"(?<![\d.]){n}(?![\d])", name, re.I) for n in
+                            (str(int(value)), *([f"{int(value) // 1000}k"] if value % 1000 == 0 else [])))
     has_low, has_high = has(spec.low), has(spec.high)
     return "low" if has_low and not has_high else "high" if has_high and not has_low else ""
 
@@ -3076,7 +3100,9 @@ class TouchMarket:
         hist = self.history
         if hist.get("kind") in {"low", "high", "ambiguous"}:
             return
-        end = min(now_ms, TOUCH_DEADLINE_MS)
+        end = min(now_ms, self.spec.deadline_ms)
+        if end <= self.start_ms:
+            return  # the window has not opened yet: nothing to check
         cursor = int(hist.get("through") or self.start_ms)
         low, high = float(self.spec.low), float(self.spec.high)
         for _ in range(50):  # 50 000 hours: far more than the market can span
@@ -3120,7 +3146,7 @@ class TouchMarket:
         if self.price is None or self.sigma is None:
             return f"等待币安行情（{brief_error(self.error, 60)}）" if self.error else "等待币安行情"
         return first_touch(float(self.price), float(self.spec.low), float(self.spec.high), self.sigma, 0.0,
-                           max(0.0, (TOUCH_DEADLINE_MS - now_ms) / YEAR_MS))
+                           max(0.0, (self.spec.deadline_ms - max(now_ms, self.start_ms)) / YEAR_MS))
 
     def status(self) -> str:
         hist = self.history
@@ -4690,10 +4716,9 @@ class Bot:
     def touch_payload(self, touch: "TouchMarket", now_ms: int) -> dict:
         """Web card for a first-touch market: 涨 = the high barrier first, 跌 = the low one first."""
         spec = touch.spec
-        low, high = fmt(spec.low), fmt(spec.high)
+        low, high = spec.label(spec.low), spec.label(spec.high)
         base = {"name": f"{spec.symbol.removesuffix('USDT')} 先触 ${low} / ${high}", "symbol": spec.symbol, "group": "crypto",
-                "labels": [f"${high}", f"${low}"], "close_ms": TOUCH_DEADLINE_MS,
-                "close_label": "12-31 23:59 ET（北京 01-01 12:59）截止；都没碰到按 50/50 结算"}
+                "labels": [f"${high}", f"${low}"], "close_ms": spec.deadline_ms, "close_label": spec.close_label()}
         out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
         book, why = self.touch_book(spec)
         odds = touch.odds(now_ms)
@@ -4712,7 +4737,7 @@ class Bot:
         if isinstance(odds, str):
             return {**base, "missing": odds}
         price = touch.price
-        years = max(0.0, (TOUCH_DEADLINE_MS - now_ms) / YEAR_MS)
+        years = max(0.0, (spec.deadline_ms - now_ms) / YEAR_MS)
         return {**base, "fair_up": odds.fair_upper, "fair_down": odds.fair_lower, "up": odds.upper, "flat": odds.none,
                 "down": odds.lower, "touch": {
                     "coin": spec.symbol.removesuffix("USDT"),
@@ -5306,7 +5331,8 @@ class Bot:
 
     async def refresh_touch(self, now_ms: int) -> None:
         for touch in self.touches.values():
-            created = (self.predict.info.get(touch.spec.slug) or {}).get("created_ms") or touch.spec.created_ms
+            created = touch.spec.created_ms if touch.spec.fixed_start else (
+                (self.predict.info.get(touch.spec.slug) or {}).get("created_ms") or touch.spec.created_ms)
             if created and created != touch.start_ms:
                 touch.start_ms = created
                 touch.times["scan"] = -1e9  # check the path from the (new) opening time at once
