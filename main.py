@@ -3183,6 +3183,7 @@ h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin
 .card.hot{border:2px solid var(--hot);box-shadow:0 0 0 3px var(--hot-bg);padding:9px 11px 7px}
 .card.rolled{border-color:var(--best);box-shadow:0 0 0 1px var(--best)}
 .head{display:flex;align-items:center;gap:5px}
+.star{flex:none;border:0;background:none;padding:0;margin:0 -2px 0 -1px;font-size:14px;line-height:1;cursor:pointer;color:var(--faint)}.star.on{color:#f5b301}.star:hover{color:#f5b301}
 .name{font-weight:650;font-size:14.5px;min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tag{border-radius:6px;padding:1px 5px;font-size:12px;font-weight:600;background:var(--chip);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
 .tag.next{background:var(--best-bg);color:var(--best)}.tag.new{background:var(--best);color:#fff}.tag.hotk{background:var(--hot);color:#fff}
@@ -3212,6 +3213,7 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 </style></head><body><div class="wrap">
 <header><h1>收盘涨跌概率</h1><div class="hr"><div class="meta" id="meta">加载中…</div><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label></div></header>
 <div class="legend" id="legend"></div>
+<h2 id="h-fav" hidden>⭐ 收藏</h2><div class="grid" id="g-fav"></div>
 <h2 id="h-index">指数</h2><div class="grid" id="g-index"></div>
 <h2 id="h-contract">合约标的</h2><div class="grid" id="g-contract"></div>
 <h2 id="h-crypto">加密</h2><div class="grid" id="g-crypto"></div>
@@ -3219,7 +3221,10 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 </div>
 <script>
 const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
-const open=new Set(),seen={},rolled={};let skew=0,fetchedAt=0,style="cn";
+const open=new Set(),seen={},rolled={};let skew=0,fetchedAt=0,style="cn",last=null;
+const favKey=it=>it.name+"|"+(it.symbol||"");let favs=[];try{favs=JSON.parse(localStorage.getItem("favs")||"[]")}catch(e){}
+if(!Array.isArray(favs))favs=[];
+function toggleFav(k){favs=favs.includes(k)?favs.filter(x=>x!==k):[...favs,k];try{localStorage.setItem("favs",JSON.stringify(favs))}catch(e){}if(last)render(last)}
 const two=n=>String(n).padStart(2,"0"),pct=x=>(x*100).toFixed(1),cent=x=>(x*100).toFixed(1)+"¢";
 const like=(v,ref)=>{const d=(String(ref).split(".")[1]||"").length,n=Number(String(v).replace(/,/g,""));
   if(!isFinite(n))return v;const k=d>=2?d:(Math.abs(n)>=1000?0:2);return n.toLocaleString("en-US",{minimumFractionDigits:k,maximumFractionDigits:k})};
@@ -3244,7 +3249,9 @@ function book(p){
 function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
 function card(it){
   const c=$("div","card"+(it.missing?" missing":"")),head=$("div","head"),nm=$("div","name",it.name);
-  nm.title=it.symbol||it.name;head.append(nm);
+  nm.title=it.symbol||it.name;const fk=favKey(it),on=favs.includes(fk),st=$("button","star"+(on?" on":""),on?"★":"☆");
+  st.type="button";st.title=on?"取消收藏":"收藏（排到最前）";st.setAttribute("aria-label",st.title);st.addEventListener("click",e=>{e.preventDefault();toggleFav(fk)});
+  head.append(st,nm);
   if(it.day){const t=$("span","tag"+(it.day_ahead>0?" next":""),(it.day_tag?it.day_label.split(" ")[0]+" "+it.day_tag:it.day_label));t.title="交易日 "+it.day_label;head.append(t);
     const k=it.name+"|"+(it.symbol||"");if(seen[k]&&seen[k]<it.day)rolled[k]=Date.now();seen[k]=it.day;
     if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");t.className="tag new";t.textContent+=" 新"}}
@@ -3285,13 +3292,19 @@ function tick(){
     const d=Math.floor(left/86400),h=Math.floor(left%86400/3600),m=Math.floor(left%3600/60),s=left%60;
     el.className="cd"+(left<1800?" soon":"");el.textContent="⏳ "+(d?d+"天 ":"")+two(h)+":"+two(m)+":"+two(s)});
   const ago=document.getElementById("ago");if(ago&&fetchedAt)ago.textContent=Math.max(0,Math.round((Date.now()-fetchedAt)/1000))+" 秒前刷新"}
+function render(d){
+  // starred cards leave their own section for the one on top, in the order they were starred
+  const starred=favs.map(k=>d.items.find(i=>favKey(i)===k)).filter(Boolean);
+  document.getElementById("g-fav").replaceChildren(...starred.map(card));document.getElementById("h-fav").hidden=!starred.length;
+  for(const g of["index","contract","crypto"]){const items=d.items.filter(i=>(i.group||"contract")===g&&!favs.includes(favKey(i)));
+    document.getElementById("g-"+g).replaceChildren(...items.map(card));document.getElementById("h-"+g).hidden=!items.length}
+  tick()}
 async function load(){
   try{
     const r=await fetch(location.pathname.replace(/\\/$/,"")+"/data.json",{cache:"no-store"});
     if(!r.ok)throw new Error("HTTP "+r.status);
     const d=await r.json();if(d.server_ms)skew=d.server_ms-Date.now();fetchedAt=Date.now();style=d.color_style||"cn";
-    for(const g of["index","contract","crypto"]){const items=d.items.filter(i=>(i.group||"contract")===g);
-      document.getElementById("g-"+g).replaceChildren(...items.map(card));document.getElementById("h-"+g).hidden=!items.length}
+    last=d;render(d);
     document.getElementById("meta").replaceChildren(...(d.today?[$("span","","今天 "+d.today)]:[]),$("span","","数据 "+d.generated_at),$("span","","",),$("span","","基准 "+d.mode),$("span","","v"+d.version));
     document.getElementById("meta").children[d.today?2:1].id="ago";
     const lg=document.getElementById("legend");const sw=$("span","sw");[["涨",upColor()],["平","var(--flat)"],["跌",downColor()]].forEach(([t,col])=>{const i=$("i");i.style.background=col;sw.append(i,t)});
@@ -4719,7 +4732,7 @@ class Bot:
         """Web card for a first-touch market: 涨 = the high barrier first, 跌 = the low one first."""
         spec = touch.spec
         low, high = spec.label(spec.low), spec.label(spec.high)
-        base = {"name": f"{spec.symbol.removesuffix('USDT')} 先触 ${low} / ${high}", "symbol": spec.symbol, "group": "crypto",
+        base = {"name": f"{spec.symbol.removesuffix('USDT')} 先触 {low}/{high}", "symbol": spec.symbol, "group": "crypto",
                 "labels": [f"${high}", f"${low}"], "close_ms": spec.deadline_ms, "close_label": spec.close_label()}
         out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
         book, why = self.touch_book(spec)

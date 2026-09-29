@@ -126,7 +126,7 @@ async def run():
     book, why = bot.touch_book(BNB)
     assert why == "" and book.bid == (D("0.55"), D("50")) and book.ask == (D("0.60"), D("100")), book  # 1 − $700 prices
     item = bot.touch_payload(bot.touches["BNB"], NOW)
-    assert item["name"] == "BNB 先触 $700 / $900" and item["touch"]["coin"] == "BNB"
+    assert item["name"] == "BNB 先触 700/900" and item["touch"]["coin"] == "BNB"
     assert item["group"] == "crypto" and item["labels"] == ["$900", "$700"] and item["touch"]["price"] == "812.50", item
     assert abs(item["fair_up"] + item["fair_down"] - 1) < 1e-9 and item["predict"]["bids"][0] == [0.55, 50.0]
     assert {e["label"] for e in item["predict"]["edges"]} == {"挂900", "挂700", "吃900", "吃700"}, item["predict"]["edges"]
@@ -144,7 +144,7 @@ async def run():
     assert bot.predict.info[BNB.slug] == {"outcomes": ["$700", "$900"],
                                              "created_ms": int(dt.datetime(2026, 9, 20, 8, tzinfo=dt.timezone.utc).timestamp() * 1000)}
     btc = bot.touch_payload(bot.touches["BTC"], NOW)
-    assert btc["name"] == "BTC 先触 $70k / $90k" and btc["labels"] == ["$90k", "$70k"] and btc["close_ms"] == BTC.deadline_ms, btc
+    assert btc["name"] == "BTC 先触 70k/90k" and btc["labels"] == ["$90k", "$70k"] and btc["close_ms"] == BTC.deadline_ms, btc
     # the rules' window start wins over Predict's creation time
     bot.predict.info[BTC.slug] = {"outcomes": ["$70,000", "$90,000"], "created_ms": BTC.created_ms - 86_400_000}
     for t in bot.touches.values():
@@ -157,7 +157,7 @@ async def run():
     early.price, early.sigma = D("80000"), 0.5
     assert early.odds(BTC.created_ms - 30 * 86_400_000) == early.odds(BTC.created_ms)
     sol = bot.touch_payload(bot.touches["SOL"], NOW)
-    assert sol["name"] == "SOL 先触 $60 / $140" and sol["labels"] == ["$140", "$60"] and sol["missing"].startswith("等待币安行情"), sol
+    assert sol["name"] == "SOL 先触 60/140" and sol["labels"] == ["$140", "$60"] and sol["missing"].startswith("等待币安行情"), sol
     assert not m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BNB_TOUCH": "off"}), m.Store(":memory:"), FakeMarket(), None).predict_targets(NOW).get("BNB")
 
 asyncio.run(run())
