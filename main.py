@@ -3547,14 +3547,20 @@ def hit_probability(spot: float, level: float, sigma: float, years: float) -> fl
     return min(1.0, norm_cdf((-h - s * s / 2) / s) + spot / level * norm_cdf((-h + s * s / 2) / s))
 
 
-def sampled_sigma(samples: list) -> tuple[float, float] | None:
-    """(annualised σ, hours covered) from [[epoch s, price], ...]; gaps over an hour are skipped; None under 12 h."""
+def sampled_coverage(samples: list) -> tuple[float, float]:
+    """(Σ squared log returns, seconds covered) from [[epoch s, price], ...]; gaps over an hour are skipped."""
     pts = sorted((int(t), float(p)) for t, p in samples if float(p) > 0)
     squares = seconds = 0.0
     for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
         if 0 < t1 - t0 <= 3600:
             squares += math.log(p1 / p0) ** 2
             seconds += t1 - t0
+    return squares, seconds
+
+
+def sampled_sigma(samples: list) -> tuple[float, float] | None:
+    """(annualised σ, hours covered) from [[epoch s, price], ...]; gaps over an hour are skipped; None under 12 h."""
+    squares, seconds = sampled_coverage(samples)
     if seconds < 12 * 3600:
         return None
     return math.sqrt(squares / (seconds / (365 * 86400))), seconds / 3600
@@ -3719,13 +3725,15 @@ class CapMarket:
                 self.sigma, self.sigma_kind = float(saved[0]), "saved"
                 self.sigma_note = f"{saved[1]}，{stamp(int(saved[2]), seconds=False)} 保存"
                 return
-        measured = sampled_sigma(self.store.get(f"capsamples:{self.spec.slug}", []))
+        samples = self.store.get(f"capsamples:{self.spec.slug}", [])
+        measured = sampled_sigma(samples)
         if measured:
             self.sigma, self.sigma_kind = measured[0], "samples"
             self.sigma_note = f"机器人自采 5 分钟价，{measured[1]:.0f} 小时"
             return
         self.sigma, self.sigma_kind = self.spec.prior_sigma, "prior"
-        self.sigma_note = "先验"
+        hours = sampled_coverage(samples)[1] / 3600
+        self.sigma_note = f"先验；自采价格 {hours:.1f} / 12 小时"
 
     def sample(self, now_ms: int) -> None:
         """Every 5 minutes, keep the live price (30 days) so σ can be measured where no bars are served."""
@@ -3981,7 +3989,8 @@ function ladder(c,it){
   const st=$("div","lstat");  // status lines (missing / errors / prior σ / reached): a fixed band so tables line up
   if(it.missing)st.append($("p","","概率暂缺："+it.missing));else if(L.error)st.append($("div","warn small","⚠️ "+L.error));
   const prior=L.sigma_kind==="prior";
-  if(prior&&!it.missing){const w=$("div","warn small","⚠️ σ 暂用先验 "+(L.sigma*100).toFixed(0)+"%，优势仅供参考");
+  if(prior&&!it.missing){const prog=(L.sigma_note||"").match(/自采价格 ([0-9.]+)/);
+    const w=$("div","warn small","⚠️ σ 暂用先验 "+(L.sigma*100).toFixed(0)+"%"+(prog?"（自采 "+prog[1]+"/12 小时）":"")+"，优势仅供参考");
     w.title=(L.bars?"K 线暂不可用"+(L.vol_error?"（"+L.vol_error+"）":""):"这条链没有 K 线来源")+"；机器人自采价格满 12 小时后自动改用实测 σ";st.append(w)}
   const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
   if(done.length){const t=$("div","touched");t.append($("span","k","✓ 已触及"));

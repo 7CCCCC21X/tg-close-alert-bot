@@ -227,6 +227,9 @@ async def run():
     await pons.refresh(NOW)
     assert pons.error == "" and pons.supply == D("985000000") and pons.cap == D("0.52") * D("985000000"), (pons.error, pons.supply)
     assert pons.sigma == PONS.prior_sigma and "先验" in pons.sigma_note and all("geckoterminal" not in u for u in pons_calls)
+    assert "自采价格 0.0 / 12 小时" in pons.sigma_note, pons.sigma_note  # the progress towards a measured σ
+    t0 = NOW // 1000
+    assert m.sampled_coverage([[t0, 1.0], [t0 + 300, 1.01], [t0 + 7200, 1.0]])[1] == 300  # the 2-hour gap is skipped
     price["v"] = "0.61"; pons.times["price"] = -1e9
     await pons.refresh(NOW + 60_000)
     price["v"] = "0.55"; pons.times["price"] = -1e9
