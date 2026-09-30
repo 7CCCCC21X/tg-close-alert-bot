@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.13.7"
+VERSION = "1.13.8"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -3918,9 +3918,10 @@ h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px 8px;display:flex;flex-direction:column;gap:6px;min-width:0}
 .card.hot{border:2px solid var(--hot);box-shadow:0 0 0 3px var(--hot-bg);padding:9px 11px 7px}
 .card.rolled{border-color:var(--best);box-shadow:0 0 0 1px var(--best)}
-.head{display:flex;align-items:center;gap:5px}
+.head{display:flex;align-items:center;flex-wrap:wrap;gap:4px 5px}
+.tags{display:flex;align-items:center;gap:5px;margin-left:auto;flex:none}
 .star{flex:none;border:0;background:none;padding:0;margin:0 -2px 0 -1px;font-size:14px;line-height:1;cursor:pointer;color:var(--faint)}.star.on{color:#f5b301}.star:hover{color:#f5b301}
-.name{font-weight:650;font-size:14.5px;min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.name{font-weight:650;font-size:14.5px;min-width:0;max-width:calc(100% - 20px);flex:1 0 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tag{border-radius:6px;padding:1px 5px;font-size:12px;font-weight:600;background:var(--chip);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
 .tag.next{background:var(--best-bg);color:var(--best)}.tag.auc{background:var(--warn);color:#fff}.tag.open{background:var(--best-bg);color:var(--best)}.tag.new{background:var(--best);color:#fff}.tag.hotk{background:var(--hot);color:#fff}
 .cd{font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;background:var(--chip);border-radius:999px;padding:1px 7px}
@@ -4052,15 +4053,15 @@ function card(it){
   const c=$("div","card"+(it.missing?" missing":"")),head=$("div","head"),nm=$("div","name",it.name);
   nm.title=it.symbol||it.name;const fk=favKey(it),on=favs.includes(fk),st=$("button","star"+(on?" on":""),on?"★":"☆");
   st.type="button";st.title=on?"取消收藏":"收藏（排到最前）";st.setAttribute("aria-label",st.title);st.addEventListener("click",e=>{e.preventDefault();toggleFav(fk)});
-  head.append(st,nm);
-  if(it.day){const t=$("span","tag"+(it.day_ahead>0?" next":""),(it.day_tag?it.day_label.split(" ")[0]+" "+it.day_tag:it.day_label));t.title="交易日 "+it.day_label;head.append(t);
+  const tg=$("div","tags");head.append(st,nm,tg);  // tags wrap under the full name when the card is narrow
+  if(it.day){const t=$("span","tag"+(it.day_ahead>0?" next":""),(!it.day_tag?it.day_label:it.day_tag==="今天"&&(it.trading||it.auction)?it.day_label.split(" ")[0]:it.day_label.split(" ")[0]+" "+it.day_tag));t.title="交易日 "+it.day_label;tg.append(t);
     const k=it.name+"|"+(it.symbol||"");if(seen[k]&&seen[k]<it.day)rolled[k]=Date.now();seen[k]=it.day;
     if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");t.className="tag new";t.textContent+=" 新"}}
-  if(it.auction){const a=$("span","tag auc","集合竞价");a.title=it.auction+"：此时价格基本就是收盘价";head.append(a)}
+  if(it.auction){const a=$("span","tag auc","集合竞价");a.title=it.auction+"：此时价格基本就是收盘价";tg.append(a)}
   else if(it.trading){const a=$("span","tag "+(it.trading==="开盘中"?"open":"lunch"),it.trading);
     a.title={"开盘中":"交易所连续交易中：直接用现货相对昨收","午休":"午间休市","未开盘":"今日尚未开盘：按代理估算",
-      "已收盘":"今日已收盘","休市":"今天不是交易日"}[it.trading]||"";head.append(a)}
-  if(it.close_ms){const cd=$("span","cd");cd.dataset.close=it.close_ms;cd.title="目标 "+it.close_label;head.append(cd)}
+      "已收盘":"今日已收盘","休市":"今天不是交易日"}[it.trading]||"";tg.append(a)}
+  if(it.close_ms){const cd=$("span","cd");cd.dataset.close=it.close_ms;cd.title="目标 "+it.close_label;tg.append(cd)}
   c.append(head);
   if(it.kind==="ladder")return ladder(c,it);
   const best=it.predict&&it.predict.edges&&it.predict.edges.find(e=>e.best);
