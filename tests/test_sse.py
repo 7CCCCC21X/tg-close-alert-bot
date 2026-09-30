@@ -121,6 +121,15 @@ async def run():
     assert isinstance(o, m.CloseOdds) and o.target == dt.date(2026, 10, 8) and o.remaining == 3.5, o
     assert abs(float(o.effective) - 3850.12 * math.exp(0.8 * move)) < 1e-6 and o.fair_up < 0.5, o
     assert "A50 14,020 / 15:00 14,160 → -0.989% × β 0.8" in o.proxy_note
+    assert "（暂定，未校准）" in o.proxy_note
+    # the A50 contract-roll evening: the 15:00 anchor is the expiring month, the night quote the next -> no estimate
+    assert m.a50_expiry(dt.date(2026, 9, 29)) and m.a50_expiry(dt.date(2026, 11, 27)) and not m.a50_expiry(dt.date(2026, 9, 30))
+    real = m.a50_expiry; m.a50_expiry = lambda d: d == dt.date(2026, 9, 30)
+    try:
+        roll = bot.sse_odds(bot.market.now_ms())
+        assert isinstance(roll, str) and "到期换月" in roll, roll
+    finally:
+        m.a50_expiry = real
     # restart: anchor restored from the store without refetching
     bot2 = m.Bot(cfg, store, FakeMarket(cfg), tg); bot2.cn.quote = bot.cn.quote; bot2.cn.a50 = bot.cn.a50; bot2.cn.close = bot.cn.close
     n = len(calls); await bot2.refresh_odds_inputs(bot2.market.now_ms())

@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.13.8"
+VERSION = "1.13.9"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -1869,6 +1869,18 @@ def a50_session(now_ms: int) -> str:
     if dt.time(9, 0) <= local <= dt.time(16, 30):
         return "日盘"
     return "休市"
+
+
+def a50_expiry(day: dt.date) -> bool:
+    """SGX FTSE China A50 futures expire on the second-last business day of the month (weekdays; SGX holidays
+    aside): that evening the continuous series (CN00Y, Sina's CFD) moves to the next month's contract."""
+    last = dt.date(day.year + day.month // 12, day.month % 12 + 1, 1) - dt.timedelta(days=1)
+    while last.weekday() >= 5:
+        last -= dt.timedelta(days=1)
+    second = last - dt.timedelta(days=1)
+    while second.weekday() >= 5:
+        second -= dt.timedelta(days=1)
+    return day == second
 
 
 def a50_next_open(now_ms: int) -> int | None:
@@ -5276,6 +5288,12 @@ class Bot:
                     f"{dt.datetime.fromtimestamp(a50.quoted_ms / 1000, BEIJING):%H:%M} 报价估算")
         if a50.quoted_ms < close_ms:
             return f"A50 报价早于 {close_date.strftime('%m-%d')} 15:00 收盘，等待新报价"
+        rolled = int(dt.datetime.combine(close_date, dt.time(16, 35), BEIJING).timestamp() * 1000)
+        if a50_expiry(close_date) and a50.quoted_ms >= rolled:
+            # the 15:00 anchor is the expiring contract, the night quote already the next month: their spread
+            # would be read as a move. No same-contract anchor exists, so no estimate until the cash market reopens.
+            return (f"A50 {close_date.month} 月合约 {close_date.strftime('%m-%d')} 到期换月：15:00 锚点是旧合约、"
+                    "夜盘报价已是新合约，价差会被当成涨跌；暂不输出概率，上证开盘后恢复")
         if anchor and anchor[0] == close_ms:
             if a50_family(self.a50_anchor_source) != a50_family(a50.source):
                 if self.a50_anchor_source == "未知":
@@ -5294,7 +5312,8 @@ class Bot:
         effective = close.value * D(str(math.exp(beta * move)))
         odds = close_odds("上证指数", close.value, effective, sigma, remaining, target, D("0.01"),
                           f"{ref_note}·{close.source}",
-                          f"A50 {fmt(a50.last)} / {base_note} {fmt(base)} → {percent(a50.last, base):+.3f}% × β {beta:g}", sigma_note,
+                          f"A50 {fmt(a50.last)} / {base_note} {fmt(base)} → {percent(a50.last, base):+.3f}% × β {beta:g}"
+                          + ("（暂定，未校准）" if beta == 0.8 else ""), sigma_note,
                           beta=beta, mode="盘后")
         return dataclasses.replace(odds, warn=warn) if warn else odds
 
@@ -5539,7 +5558,7 @@ class Bot:
             items.append({
                 **base, **day_fields(odds.target, now_ms), "ref_day": ref_day.group(0) if ref_day else "",
                 "ref_rel": ref_relative(ref_day.group(0) if ref_day else "", odds.target, now_ms),
-                "eff_label": "今日" if odds.direct else "估算",
+                "eff_label": "今日" if odds.direct else "隐含" if name == "上证指数" else "估算",  # A50-implied, not an SSE print
                 "target": odds.target.strftime("%m-%d"), "unit": odds.unit or self.card_currency(symbol),
                 "close_ms": close_ms, "close_label": close_label,
                 "ref": fmt(odds.ref), "ref_note": odds.ref_note, "effective": fmt(odds.effective.quantize(D("0.0001"))),
