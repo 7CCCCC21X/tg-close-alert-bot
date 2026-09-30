@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.13.5"
+VERSION = "1.13.6"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -2928,6 +2928,22 @@ def auction_running(market: str, now_ms: int, holidays: frozenset = frozenset())
     return day.weekday() < 5 and day not in holidays and window[0] <= local.time() < window[1]
 
 
+def session_state(market: str, now_ms: int, holidays: frozenset = frozenset()) -> str:
+    """"开盘中" during ``market``'s continuous trading, "午休" in its lunch break, else ""."""
+    sessions, info = SESSIONS.get(market), STOCK_MARKETS.get(market)
+    if not sessions or not info:
+        return ""
+    local = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset)))
+    if local.weekday() >= 5 or local.date() in holidays:
+        return ""
+    t = local.time()
+    if any(start <= t < end for start, end in sessions):
+        return "开盘中"
+    if len(sessions) > 1 and sessions[0][1] <= t < sessions[1][0]:
+        return "午休"
+    return ""
+
+
 def ref_relative(ref_day: str, target: dt.date, now_ms: int) -> str:
     """'09-28' -> 昨收 (a close before today, Beijing) / 今收 (today's own close, after the session) / 参考."""
     if not ref_day:
@@ -3904,7 +3920,7 @@ h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin
 .star{flex:none;border:0;background:none;padding:0;margin:0 -2px 0 -1px;font-size:14px;line-height:1;cursor:pointer;color:var(--faint)}.star.on{color:#f5b301}.star:hover{color:#f5b301}
 .name{font-weight:650;font-size:14.5px;min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tag{border-radius:6px;padding:1px 5px;font-size:12px;font-weight:600;background:var(--chip);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
-.tag.next{background:var(--best-bg);color:var(--best)}.tag.auc{background:var(--warn);color:#fff}.tag.new{background:var(--best);color:#fff}.tag.hotk{background:var(--hot);color:#fff}
+.tag.next{background:var(--best-bg);color:var(--best)}.tag.auc{background:var(--warn);color:#fff}.tag.open{background:var(--best-bg);color:var(--best)}.tag.new{background:var(--best);color:#fff}.tag.hotk{background:var(--hot);color:#fff}
 .cd{font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;background:var(--chip);border-radius:999px;padding:1px 7px}
 .cd.done{color:var(--muted)}.cd.soon{color:var(--warn);font-weight:600}
 .odds{display:flex;align-items:center;gap:8px;font-variant-numeric:tabular-nums}
@@ -4039,6 +4055,8 @@ function card(it){
     const k=it.name+"|"+(it.symbol||"");if(seen[k]&&seen[k]<it.day)rolled[k]=Date.now();seen[k]=it.day;
     if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");t.className="tag new";t.textContent+=" 新"}}
   if(it.auction){const a=$("span","tag auc","集合竞价");a.title=it.auction+"：此时价格基本就是收盘价";head.append(a)}
+  else if(it.trading){const a=$("span","tag "+(it.trading==="开盘中"?"open":"lunch"),it.trading);
+    a.title=it.trading==="开盘中"?"交易所连续交易中：直接用现货相对昨收":"午间休市";head.append(a)}
   if(it.close_ms){const cd=$("span","cd");cd.dataset.close=it.close_ms;cd.title="目标 "+it.close_label;head.append(cd)}
   c.append(head);
   if(it.kind==="ladder")return ladder(c,it);
@@ -5382,7 +5400,11 @@ class Bot:
                               f"恒指现货 {fmt(q.spot)}（盘中直接用现货）", sigma_note)
         close_date = self.hk_cash_close_date(now_ms, holidays)
         anchor, anchor_note = None, "收市时"
-        if q.session_name(holidays) != "夜市":
+        quoted_day = dt.datetime.fromtimestamp(q.quoted_ms / 1000, BEIJING).date()
+        if q.session_name(holidays) != "夜市" and quoted_day > close_date and q.prev_settle:
+            # the next day session (09:15–09:30, before the cash open): measure from the futures' previous day close
+            anchor, anchor_note = q.prev_settle, "日市收市"
+        elif q.session_name(holidays) != "夜市":
             anchor, anchor_note = q.last, "日市收市"  # No night trading yet: the close itself is the best estimate.
         elif q.source == "etnet" and q.prev_settle:
             # The night block's 前收市 is the day session it followed. Only valid when that day is the
@@ -5497,14 +5519,18 @@ class Bot:
             book = self.predict_payload(title, odds, now_ms)
             if book:
                 base["predict"] = book
+            market = self.item_market(title)
+            if market:
+                holidays = self.config.holidays.get(market, frozenset())
+                if auction_running(market, now_ms, holidays):
+                    base["auction"] = AUCTIONS[market][2]
+                elif state := session_state(market, now_ms, holidays):
+                    base["trading"] = state
             if isinstance(odds, str):
                 target = self.predict_day(title, now_ms)
                 items.append({**base, "missing": odds, **(day_fields(target, now_ms) if target else {})})
                 continue
             close_ms, close_label = self.target_close(title, odds.target)
-            market = self.item_market(title)
-            if market and auction_running(market, now_ms, self.config.holidays.get(market, frozenset())):
-                base["auction"] = AUCTIONS[market][2]
             ref_day = re.search(r"\b\d\d-\d\d\b", odds.ref_note)
             items.append({
                 **base, **day_fields(odds.target, now_ms), "ref_day": ref_day.group(0) if ref_day else "",
