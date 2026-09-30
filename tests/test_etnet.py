@@ -106,3 +106,21 @@ bot.hsi.quote = m.parse_etnet_futures(ROLL.replace("NIGHT", "10/2026").encode("u
 o = bot.hsi_odds(wed)
 assert isinstance(o, m.CloseOdds) and abs(float(o.effective) - 24523.57 * 24354 / 24449) < 1e-6, o  # not the 0.00% of 24,534/24,534
 print("ETNET_ROLL_OK")
+
+# 09:20, futures day session open, cash not yet (09:30): measured from the previous day close, not ±0
+pre = m.FuturesQuote("恒指期货(10/2026)日市", D("24380"), D("24449"), None, None, None, ms(30, 9, 20), "etnet", D("24523.57"),
+                     "etnet", D("24642.51"), session="日市")
+bot.hsi.quote = pre
+o = bot.hsi_odds(ms(30, 9, 20))
+assert isinstance(o, m.CloseOdds) and abs(float(o.effective) - 24523.57 * 24380 / 24449) < 1e-6, o
+# after 16:10 the same day, before the night opens: the day close itself (±0) is still the estimate
+post = m.dataclasses.replace(pre, quoted_ms=ms(30, 16, 20), last=D("24400"), prev_settle=D("24449"))
+bot.hsi.quote = post
+o = bot.hsi_odds(ms(30, 16, 20))
+assert isinstance(o, m.CloseOdds) and o.effective == o.ref, o
+
+# the web card tags a market in continuous trading
+assert m.session_state("hk", ms(30, 10, 0)) == "开盘中" and m.session_state("hk", ms(30, 12, 30)) == "午休"
+assert m.session_state("hk", ms(30, 9, 20)) == "" and m.session_state("kr", ms(30, 8, 30)) == "开盘中"  # 09:30 KST
+assert m.session_state("hk", ms(30, 10, 0), frozenset({dt.date(2026, 9, 30)})) == ""
+print("ETNET_PREOPEN_OK")
