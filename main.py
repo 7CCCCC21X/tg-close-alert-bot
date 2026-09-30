@@ -39,7 +39,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.13.6"
+VERSION = "1.13.7"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -2929,19 +2929,21 @@ def auction_running(market: str, now_ms: int, holidays: frozenset = frozenset())
 
 
 def session_state(market: str, now_ms: int, holidays: frozenset = frozenset()) -> str:
-    """"开盘中" during ``market``'s continuous trading, "午休" in its lunch break, else ""."""
+    """Where ``market`` stands now (its local time): 未开盘 / 开盘中 / 午休 / 已收盘, or 休市 on a weekend or holiday."""
     sessions, info = SESSIONS.get(market), STOCK_MARKETS.get(market)
     if not sessions or not info:
         return ""
     local = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset)))
     if local.weekday() >= 5 or local.date() in holidays:
-        return ""
+        return "休市"
     t = local.time()
+    if t < sessions[0][0]:
+        return "未开盘"
     if any(start <= t < end for start, end in sessions):
         return "开盘中"
     if len(sessions) > 1 and sessions[0][1] <= t < sessions[1][0]:
         return "午休"
-    return ""
+    return "已收盘"
 
 
 def ref_relative(ref_day: str, target: dt.date, now_ms: int) -> str:
@@ -4056,7 +4058,8 @@ function card(it){
     if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");t.className="tag new";t.textContent+=" 新"}}
   if(it.auction){const a=$("span","tag auc","集合竞价");a.title=it.auction+"：此时价格基本就是收盘价";head.append(a)}
   else if(it.trading){const a=$("span","tag "+(it.trading==="开盘中"?"open":"lunch"),it.trading);
-    a.title=it.trading==="开盘中"?"交易所连续交易中：直接用现货相对昨收":"午间休市";head.append(a)}
+    a.title={"开盘中":"交易所连续交易中：直接用现货相对昨收","午休":"午间休市","未开盘":"今日尚未开盘：按代理估算",
+      "已收盘":"今日已收盘","休市":"今天不是交易日"}[it.trading]||"";head.append(a)}
   if(it.close_ms){const cd=$("span","cd");cd.dataset.close=it.close_ms;cd.title="目标 "+it.close_label;head.append(cd)}
   c.append(head);
   if(it.kind==="ladder")return ladder(c,it);
