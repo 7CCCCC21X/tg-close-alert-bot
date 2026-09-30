@@ -1442,12 +1442,20 @@ def parse_etnet_futures(raw: bytes, now_ms: int, holidays: frozenset = frozenset
     day = next((q for q in candidates if q.session == "日市"), None)
     night = next((q for q in candidates if q.session == "夜市"), None)
     if day and night:
-        if night.prev_settle == day.last and night.prev_settle != day.prev_settle:
+        month = lambda q: tuple(reversed([int(x) for x in re.findall(r"\((\d{2})/(\d{4})\)", q.name)[0]]))
+        if month(day) != month(night):
+            # expiry day: the day block is the expiring contract, the night block already the next month
+            chosen = night if month(night) > month(day) else day
+        elif night.prev_settle == day.last and night.prev_settle != day.prev_settle:
             chosen = night   # tonight's (or last night's, after 03:00) session followed this day block
         elif night.prev_settle == day.prev_settle and night.prev_settle != day.last:
             chosen = day     # the night block is the one before this day session
         else:
-            chosen = night if hk_futures_session(now_ms, holidays) == "夜市" else day
+            # can't tell from the prices (e.g. a contract roll): the session running now, else the one that ended last
+            session = hk_futures_session(now_ms, holidays)
+            if session not in ("日市", "夜市"):
+                session = "夜市" if hk_session_end("夜市", now_ms, holidays) > hk_session_end("日市", now_ms, holidays) else "日市"
+            chosen = night if session == "夜市" else day
     else:
         chosen = day or night
     if not chosen.quoted_ms:  # time unknown: now while its session runs, else when that session last ended
