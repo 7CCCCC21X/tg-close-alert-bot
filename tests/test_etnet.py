@@ -91,3 +91,18 @@ async def run():
     assert x.quote.source == "etnet" and x.quote.spot == D("24834.12") and len(calls) == 1 and not x.error, (calls, x.error)
     print("ETNET_OK")
 asyncio.run(run())
+
+# --- expiry day 09-29: the day block is the expiring 09 contract, the night the 10 contract ------------------------
+ROLL = ("""<div><h3>恒生指數期貨(09/2026)</h3><span>日市</span><div>&#9660;24,534 -178 (-0.72%) 高水10</div>
+<div>最高: 24,728 最低: 24,485 前收市: 24,712 開市: 24,696</div></div>
+<div><h3>恒生指數期貨(NIGHT)</h3><span>夜市</span><div>&#9660;24,354 -95 (-0.39%) 低水170</div>
+<div>最高: 24,547 最低: 24,261 前收市: 24,449 開市: 24,453</div></div>
+<div>恒生指數現貨 &#9660;24,523.57 -118.94 (-0.48%) 最高: 24,648.64 最低: 24,444.15 前收市: 24,642.51 開市: 24,648.64</div>""")
+wed = ms(30, 8, 57)   # 09-30 08:57: the night ended at 03:00, the day session not open yet
+for label in ("10/2026", "09/2026"):   # labelled with the new month, or (unknown layout) with the old one
+    qr = m.parse_etnet_futures(ROLL.replace("NIGHT", label).encode("utf-8"), wed, hk)
+    assert qr.session == "夜市" and qr.last == D("24354") and qr.prev_settle == D("24449"), (label, qr)
+bot.hsi.quote = m.parse_etnet_futures(ROLL.replace("NIGHT", "10/2026").encode("utf-8"), wed, hk)
+o = bot.hsi_odds(wed)
+assert isinstance(o, m.CloseOdds) and abs(float(o.effective) - 24523.57 * 24354 / 24449) < 1e-6, o  # not the 0.00% of 24,534/24,534
+print("ETNET_ROLL_OK")
