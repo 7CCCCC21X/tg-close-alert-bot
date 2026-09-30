@@ -64,8 +64,12 @@ async def run():
     now["ms"] = bj(9, 29, 14, 58)
     items = {i["name"]: i for i in bot.odds_payload()["items"]}
     assert "沪深收盘集合竞价" in items["上证指数"].get("auction", "") and "auction" not in items["SK 海力士"], items
+    assert "trading" not in items["上证指数"] and items["SK 海力士"]["trading"] == "已收盘", items  # the auction tag instead
     now["ms"] = bj(9, 29, 15, 1)
-    assert "auction" not in {i["name"]: i for i in bot.odds_payload()["items"]}["上证指数"]
+    after = {i["name"]: i for i in bot.odds_payload()["items"]}
+    assert "auction" not in after["上证指数"] and after["上证指数"]["trading"] == "已收盘", after["上证指数"]
+    now["ms"] = bj(9, 29, 8, 30)
+    assert {i["name"]: i for i in bot.odds_payload()["items"]}["上证指数"]["trading"] == "未开盘"
 
     # AUCTION_ALERT=off
     off = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "AUCTION_ALERT": "off"}), m.Store(":memory:"), FakeMarket(), FakeTelegram())

@@ -121,6 +121,7 @@ assert isinstance(o, m.CloseOdds) and o.effective == o.ref, o
 
 # the web card tags a market in continuous trading
 assert m.session_state("hk", ms(30, 10, 0)) == "开盘中" and m.session_state("hk", ms(30, 12, 30)) == "午休"
-assert m.session_state("hk", ms(30, 9, 20)) == "" and m.session_state("kr", ms(30, 8, 30)) == "开盘中"  # 09:30 KST
-assert m.session_state("hk", ms(30, 10, 0), frozenset({dt.date(2026, 9, 30)})) == ""
+assert m.session_state("hk", ms(30, 9, 20)) == "未开盘" and m.session_state("kr", ms(30, 8, 30)) == "开盘中"  # 09:30 KST
+assert m.session_state("hk", ms(30, 16, 20)) == "已收盘" and m.session_state("kr", ms(30, 14, 30)) == "已收盘"
+assert m.session_state("hk", ms(30, 10, 0), frozenset({dt.date(2026, 9, 30)})) == "休市" and m.session_state("sh", ms(26, 10, 0)) == "休市"
 print("ETNET_PREOPEN_OK")
