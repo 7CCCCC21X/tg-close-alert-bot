@@ -1,4 +1,4 @@
-import asyncio, sys, math, time, datetime as dt
+import asyncio, os, sys, math, time, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
@@ -208,6 +208,28 @@ async def run():
     bot.predict.ladders["NIULAI"] = gone
     assert bot.cap_payload(cap, NOW)["ladder"]["rows"][0]["touched"] is True
     assert r300["bid"] == 0.86 and {e["label"] for e in r300["edges"]} == {"挂Yes", "挂No", "吃Yes", "吃No"}
+    assert r["miss"] is None and r["need"] >= r["swing"] >= 0  # this row has a best direction: no "miss" beside it
+    # a book within the model's error of the fair price: nothing is recommended, the closest direction is kept for the
+    # card (grey, with the bar it missed); ranked like best_edge (a maker wins a tie)
+    near = bot.predict.ladders["NIULAI"][:]
+    fair300 = r300["fair"]
+    assert 0.006 < fair300 < 0.5, fair300
+    # Yes 买1 half a cent under the fair price, 卖1 1.5¢ over it: 挂Yes +0.5¢, 挂No +1.5¢, both under the 2¢ minimum
+    # (the market lists "No" first, so its own book is No's: No bid = 1 − Yes ask, No ask = 1 − Yes bid)
+    yes_bid, yes_ask = round(fair300 - 0.005, 6), round(fair300 + 0.015, 6)
+    near[1] = m.dataclasses.replace(near[1], book=m.dataclasses.replace(
+        near[1].book, bids=((D(str(1 - yes_ask)), D("40")),), asks=((D(str(1 - yes_bid)), D("40")),)))
+    bot.predict.ladders["NIULAI"] = near
+    q = bot.cap_payload(cap, NOW)["ladder"]["rows"][1]
+    assert abs(q["bid"] - yes_bid) < 1e-9 and abs(q["ask"] - yes_ask) < 1e-9, q
+    assert not any(e["best"] for e in q["edges"]) and q["need"] >= m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).predict_min_edge
+    top = max(q["edges"], key=lambda e: (round(e["edge"], 4), e["maker"]))
+    assert q["miss"] == {**top, "best": False} and q["miss"]["label"] == "挂No" and abs(q["miss"]["edge"] - 0.015) < 1e-6, q
+    assert q["swing"] == cap.model_swing(D("3e8"), NOW, fair300)
+    # a stale book: no suggestion and no "closest" either (the card says 过期)
+    near[1] = m.dataclasses.replace(near[1], book=m.dataclasses.replace(near[1].book, fetched_ms=NOW - m.PREDICT_STALE_MS - 1))
+    q = bot.cap_payload(cap, NOW)["ladder"]["rows"][1]
+    assert q["stale"] and q["miss"] is None and not any(e["best"] for e in q["edges"])
     assert "方向未确认" in r500["error"] and "edges" not in r500 and 0 < r500["fair"] < 1
     assert "404" in r1b["error"] and "bid" not in r1b
     # before any data: the default thresholds, and the card says what it waits for
@@ -315,5 +337,61 @@ async def run():
     await mix.scan(NOW)
     assert mix.history["high"] == 0.5 and mix.history["through"] == NOW_S - NOW_S % H, mix.history
 
+
+
+async def browser_check():
+    """The 最优 cell: a passing direction in colour; otherwise the closest one in grey (the bar itself is not shown, only
+    in the hover text); 过期 / ⚠️ as before."""
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        async_playwright = None
+    chrome = next((p for p in [os.environ.get("CHROMIUM_PATH", ""), "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"]
+                   if p and os.path.exists(p)), "")
+    if async_playwright is None or not (chrome or os.environ.get("PLAYWRIGHT_BROWSERS_PATH")):
+        print("browser check skipped (no Playwright/Chromium)")
+        return
+    now = int(dt.datetime(2026, 10, 2, 1, 16, tzinfo=m.BEIJING).timestamp() * 1000)
+
+    class FakeMarket:
+        def __init__(self): self.config = None
+        def now_ms(self): return now
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
+    bot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(), None)
+    cap = bot.caps["NIULAI"]
+    cap.price, cap.priced_ms, cap.supply, cap.sigma, cap.sigma_kind = D("0.0996"), now, D("985000000"), 3.31, "bars"
+    edge = lambda label, maker, price, value, best=False: {"label": label, "maker": maker, "price": price, "edge": value, "size": 100.0,
+                                                          "gross": value, "fee": 0.0, "slip": 0.0, "short": False, "best": best}
+    def row(label, fair, bid, ask, edges, need, miss=None, **extra):
+        return {"label": label, "fair": fair, "error": "", "dist": 1.0, "bid": bid, "ask": ask, "stale": False, "edges": edges,
+                "need": need, "swing": need, "miss": miss, "touched": False, **extra}
+    e200 = [edge("挂Yes", True, 0.352, -0.048), edge("挂No", True, 0.638, 0.058), edge("吃Yes", False, 0.362, -0.065), edge("吃No", False, 0.648, 0.041)]
+    e500 = [edge("挂Yes", True, 0.06, -0.024), edge("挂No", True, 0.932, 0.0318), edge("吃Yes", False, 0.068, -0.033), edge("吃No", False, 0.94, 0.023)]
+    e1b = [edge("挂Yes", True, 0.025, -0.021), edge("挂No", True, 0.974, 0.022, True), edge("吃Yes", False, 0.026, -0.022), edge("吃No", False, 0.975, 0.020)]
+    item = bot.cap_payload(cap, now)
+    item["ladder"]["rows"] = [row("$200M", 0.304, 0.352, 0.362, e200, 0.067, e200[1]),
+                              row("$500M", 0.036, 0.06, 0.068, e500, 0.0324, e500[1]),
+                              row("$1B", 0.004, 0.025, 0.026, e1b, 0.02),
+                              row("$2B", 0.001, 0.01, 0.02, e1b[:1], 0.02, stale=True)]
+    payload = bot.odds_payload()
+    payload["items"] = [item]
+    bot.odds_payload = lambda: payload
+    web = m.WebServer(bot, 0, "t" * 20); port = await web.start()
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
+        page = await browser.new_page(viewport={"width": 390, "height": 900})
+        await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
+        await page.wait_for_selector("#g-ladder .lg")
+        cells = await page.eval_on_selector_all("#g-ladder .lg .lb:not(.lk)", "els => els.map(e => [e.className, e.innerText])")
+        assert cells == [["lb miss", "挂No 63.8 +5.8¢"], ["lb miss", "挂No 93.2 +3.2¢"], ["lb pos", "挂No 97.4 +2.2¢"], ["lb", "过期"]], cells
+        tip = await page.get_attribute("#g-ladder .lg .lb.miss", "title")
+        assert tip == "挂No @ 63.8¢ 净优势 +5.8¢，不够大，不建议（这一档至少要 6.7¢：σ 估错 25% 时公平价就会变这么多）", tip
+        assert "门槛" not in await page.inner_text("#g-ladder")
+        assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "no sideways scroll"
+        await browser.close()
+    await web.stop()
+
+
 asyncio.run(run())
+asyncio.run(browser_check())
 print("CAP_OK")

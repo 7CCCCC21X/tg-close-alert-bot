@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.15.0"
+VERSION = "1.15.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4822,6 +4822,11 @@ function ladder(c,it){
       if(best){b.append(best.label+" "+(best.price*100).toFixed(1)+" ",$("b","","+"+cent(best.edge)));b.title=best.maker?"挂单排队，成交不保证":"立即成交，量 "+qty(best.size);
         if(prior)b.title="σ 是先验值，这个优势只作参考、不提醒";
         else if(best.edge>=HOT&&(!hot||best.edge>hot.edge))hot={...best,row:r.label}}
+      else if(r.miss&&!r.error&&!r.stale){const m=r.miss,e=(m.edge>=0?"+":"")+cent(m.edge);b.classList.add("miss");
+        // nothing is big enough to suggest: the closest direction, grey (the hover says by how much it fell short)
+        b.append(m.label+" "+(m.price*100).toFixed(1)+" ",$("b","",e));
+        b.title=m.label+" @ "+cent(m.price)+" 净优势 "+e+"，不够大，不建议（这一档至少要 "+cent(need)+
+          (r.swing>=need-1e-9?"：σ 估错 25% 时公平价就会变这么多）":"）")}
       else b.textContent=r.error?"⚠️":r.stale?"过期":"—";
       if(r.error)b.title=r.error;
       const tk=r.edges&&r.edges.filter(e=>!e.maker).sort((x,y)=>y.edge-x.edge)[0],t=$("span","lb lk"+(tk&&tk.edge>need&&!prior&&!r.stale?" pos":""));
@@ -6674,10 +6679,14 @@ class Bot:
                     out["error"] = "数据显示已触及，但盘口仍低于 90¢；以 Flap.sh 为准，请核实"
                 elif fair is not None:
                     edges = book_edges(fair, book, self.edge_costs())
-                    need = self.edge_need(cap.model_swing(row.target, now_ms, fair))
+                    swing = cap.model_swing(row.target, now_ms, fair)
+                    need = self.edge_need(swing)
                     best = None if book.stale(now_ms) else best_edge(edges, need)
-                    out.update(edges=[edge_json(e, best, e.label.replace("涨", "Yes").replace("跌", "No")) for e in edges],
-                               need=need)
+                    # nothing clears the bar: the direction that came closest (ranked as best_edge ranks), shown grey
+                    miss = None if best or book.stale(now_ms) or not edges else max(edges, key=lambda e: (round(e.edge, 4), e.maker))
+                    yes_no = lambda e: e.label.replace("涨", "Yes").replace("跌", "No")
+                    out.update(edges=[edge_json(e, best, yes_no(e)) for e in edges], need=need, swing=swing,
+                               miss=edge_json(miss, None, yes_no(miss)) if miss else None)
             # reached, and the book agrees (settled, gone, or ≥ 90¢): folded into one "已触及" line on the card
             out["touched"] = fair == 1.0 and "请核实" not in out["error"]
             rows.append(out)
