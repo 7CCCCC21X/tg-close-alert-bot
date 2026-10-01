@@ -58,9 +58,9 @@ async def run():
         def __init__(self): self.sent = []
         async def call(self, *a, **k): return True
         async def send(self, chat, thread, text, reply_markup=None, parse_mode=None): self.sent.append(text)
-    class FakeMarket:
+    class FakeMarket:  # the fixtures' clock: Friday 09-18 22:01, the night session (a stale quote is no longer passed on)
         def __init__(self, c): self.config = c
-        def now_ms(self): return int(time.time() * 1000)
+        def now_ms(self): return now
         async def sync_clock(self): pass
         async def prices(self): return {s: {"symbol": s, "price": "100", "time": self.now_ms()} for s in self.config.symbols}
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "42", "SYMBOLS": "HK0625USDT,UNITREEUSDT", "BASELINE_MODE": "manual",
@@ -68,7 +68,7 @@ async def run():
     assert cfg.hsi_futures and not m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "HSI_FUTURES": "off"}).hsi_futures
     store = m.Store(":memory:"); tg = FakeTelegram(); bot = m.Bot(cfg, store, FakeMarket(cfg), tg)
     bot.stocks.enabled = False; bot.config.tickers  # stock fetch would call fake_get with unknown urls -> AssertionError caught per symbol
-    today = m.beijing_day()
+    today = m.beijing_day(now / 1000)
     for s in cfg.symbols: store.put(f"manual:{s}:{today}", {"value": "98", "valid_date": today})
     store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
     await bot.one_cycle()

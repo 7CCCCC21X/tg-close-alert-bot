@@ -95,7 +95,9 @@ async def run():
             return {"data": {"bids": [], "asks": [["0.4", "50"]]}}
         raise AssertionError(url)
     bot.predict.fetch = fetch
-    assert await bot.predict.refresh(targets) is True
+    outcome = await bot.predict.refresh(targets)
+    # HSI's network failure makes the round partial; markets not listed yet are answers, not failures
+    assert isinstance(outcome, m.Refreshed) and outcome.status == "partial" and outcome.error.startswith("HSI：网络错误"), outcome
     assert await bot.predict.refresh(targets) is False  # not due yet
     books, errors = bot.predict.books, bot.predict.errors
     assert books["SSE"].bid == (D("0.81"), D("400"))
@@ -227,6 +229,22 @@ async def run():
         await page.click("#showbook"); assert await page.is_visible("#g-index a.pb")
         wide = await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         assert wide, "no horizontal scroll at phone width"
+        # ✎ 自定义 moves the red-frame bar (default 10¢): 30¢ clears this +24.9¢ card, 20¢ brings it back
+        assert "红框 = 净优势 ≥10¢" in await page.inner_text("#legend")
+        await page.click("#edit"); assert await page.input_value("#hotin") == "10"
+        await page.fill("#hotin", "30"); await page.press("#hotin", "Tab")
+        assert await page.locator(".card.hot").count() == 0 and await page.locator(".edge.hot").count() == 0
+        assert "红框 = 净优势 ≥30¢" in await page.inner_text("#legend") and await page.evaluate("localStorage.getItem('hot')") == "30"
+        await page.reload(); await page.wait_for_selector(".pb .edges")
+        assert await page.locator(".card.hot").count() == 0
+        await page.click("#edit"); assert await page.input_value("#hotin") == "30"
+        await page.fill("#hotin", ""); await page.press("#hotin", "Tab")  # an emptied box keeps the bar it had
+        assert await page.input_value("#hotin") == "30"
+        await page.fill("#hotin", "99"); await page.press("#hotin", "Tab")  # kept within 1–50¢
+        assert await page.input_value("#hotin") == "50"
+        await page.fill("#hotin", "20"); await page.press("#hotin", "Tab"); await page.click("#done")
+        assert await page.locator("#g-index .card.hot .edge.best.hot").count() == 1
+        assert (await page.get_attribute("#g-index .card.hot", "title")).startswith("净优势 ≥20¢：")
         if os.environ.get("WEB_SCREENSHOT"):
             await page.screenshot(path=os.environ["WEB_SCREENSHOT"], full_page=True)
         await browser.close()

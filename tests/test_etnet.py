@@ -61,14 +61,15 @@ assert "｜09-26 03:00 etnet" in hx.line(sat, "cn")
 # during the day session (Monday 10:00) last night's block shares the day block's 前收市 -> day block is newer
 MON = LIVE.replace("24,522 -169 (-0.68%) 高水12", "24,600 +78 (+0.32%) 高水5").replace("前收市: 24,691", "前收市: 24,522")
 qd = m.parse_etnet_futures(MON.encode("utf-8"), ms(28, 10, 0), hk)
-assert qd.session == "日市" and qd.last == D("24600") and qd.quoted_ms == ms(28, 10, 0), qd
+# the running session's block prints no time: unknown (0), never "now"; IndexFutures dates it by when its values changed
+assert qd.session == "日市" and qd.last == D("24600") and qd.quoted_ms == 0 and qd.fetched_ms == ms(28, 10, 0), qd
 # Friday 17:05, before the night opens: the night block is still Thursday's (前收市 = 09-24 close 24,691)
 FRI = LIVE.replace("前收市: 24,522 開市: 24,528", "前收市: 24,691 開市: 24,700")
 qf2 = m.parse_etnet_futures(FRI.encode("utf-8"), ms(25, 17, 5), hk)
 assert qf2.session == "日市" and qf2.last == D("24522") and qf2.quoted_ms == ms(25, 16, 30), (qf2, m.stamp(qf2.quoted_ms))
 # Friday 20:00 during the night: the night block (前收市 = today's day close) is live
 qn2 = m.parse_etnet_futures(LIVE.encode("utf-8"), ms(25, 20, 0), hk)
-assert qn2.session == "夜市" and qn2.quoted_ms == ms(25, 20, 0)
+assert qn2.session == "夜市" and qn2.quoted_ms == 0 and qn2.fetched_ms == ms(25, 20, 0)
 # the probability no longer double-counts the day move: anchor = day close 24,522, not the 09-24 close 24,691
 class _M:
     def now_ms(self): return sat
@@ -77,7 +78,8 @@ bot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "HK0625US
 bot.hsi.quote = ql
 o = bot.hsi_odds(sat)
 assert isinstance(o, m.CloseOdds) and o.ref == D("24510.09") and o.target == dt.date(2026, 9, 28), o
-assert abs(float(o.effective) - 24510.09 * 24501 / 24522) < 1e-6 and "恒指期货 24,501 / 日市收市 24,522 → -0.086%" in o.proxy_note, o
+assert abs(float(o.effective) - 24510.09 * 24501 / 24522) < 1e-6 and "恒指期货 24,501 / 日市 16:30 收市（近似" in o.proxy_note, o
+assert "→ -0.086%" in o.proxy_note and o.warn, o  # no 16:10 print was recorded (restart): labelled approximate, no advice
 assert 0.45 < o.fair_up < 0.5, o.fair_up  # a -0.09% move is close to a coin flip, not 23.5¢
 
 async def run():
@@ -113,11 +115,29 @@ pre = m.FuturesQuote("恒指期货(10/2026)日市", D("24380"), D("24449"), None
 bot.hsi.quote = pre
 o = bot.hsi_odds(ms(30, 9, 20))
 assert isinstance(o, m.CloseOdds) and abs(float(o.effective) - 24523.57 * 24380 / 24449) < 1e-6, o
-# after 16:10 the same day, before the night opens: the day close itself (±0) is still the estimate
+# the review's case: futures +1% between the 16:10 cash close and 16:20 must not read as 0% (current / current)
+bot.store.delete_prefix("anchor:HSI")
 post = m.dataclasses.replace(pre, quoted_ms=ms(30, 16, 20), last=D("24400"), prev_settle=D("24449"))
 bot.hsi.quote = post
 o = bot.hsi_odds(ms(30, 16, 20))
-assert isinstance(o, m.CloseOdds) and o.effective == o.ref, o
+assert isinstance(o, str) and "缺少恒指期货在 09-30 16:10 现货收市时的价格" in o, o  # no print at 16:10: no guess
+at_close = m.dataclasses.replace(pre, quoted_ms=ms(30, 16, 10), fetched_ms=ms(30, 16, 10) + 5_000, last=D("24158.4"))
+bot.note_hsi_close_print(at_close)                  # recorded as it happened (persisted) ...
+bot.note_hsi_close_print(m.dataclasses.replace(at_close, last=D("1"), fetched_ms=ms(30, 16, 11)))  # ... only the first
+assert bot.store.get("anchor:HSI") == [ms(30, 16, 10), "24158.4", "16:10 现货收市时", "10/2026", ms(30, 16, 10) + 5_000]
+o = bot.hsi_odds(ms(30, 16, 20))
+assert isinstance(o, m.CloseOdds) and abs(float(o.effective / o.ref) - 24400 / 24158.4) < 1e-12 and not o.warn, o
+assert abs(float(o.effective / o.ref) - 1.01) < 1e-4 and "/ 16:10 现货收市时 24,158.4 → +1.000%" in o.proxy_note, o.proxy_note
+# the night session that follows maps onto the same anchor (same contract), not onto its 16:30 前收市
+night = m.FuturesQuote("恒指期货(10/2026)夜市", D("24500"), D("24420"), None, None, None, ms(30, 20, 0), "etnet", D("24400"),
+                       "etnet", D("24642.51"), session="夜市")
+bot.hsi.quote = night
+o = bot.hsi_odds(ms(30, 20, 0))
+assert isinstance(o, m.CloseOdds) and abs(float(o.effective / o.ref) - 24500 / 24158.4) < 1e-12 and not o.warn, o
+# a contract roll: the anchor is the old month, the night already the new one -> the new contract's 16:30 close, approximate
+bot.hsi.quote = m.dataclasses.replace(night, name="恒指期货(11/2026)夜市")
+o = bot.hsi_odds(ms(30, 20, 0))
+assert isinstance(o, m.CloseOdds) and abs(float(o.effective / o.ref) - 24500 / 24420) < 1e-12 and "近似" in o.proxy_note and o.warn, o
 
 # the web card tags a market in continuous trading
 assert m.session_state("hk", ms(30, 10, 0)) == "开盘中" and m.session_state("hk", ms(30, 12, 30)) == "午休"

@@ -154,7 +154,7 @@ async def run():
     # before the window opens there is nothing to scan; the horizon counts from the opening
     early = m.TouchMarket(m.Store(":memory:"), BTC); early.get = get
     await early.scan(BTC.created_ms - H); assert early.history == {}
-    early.price, early.sigma = D("80000"), 0.5
+    early.price, early.sigma, early.priced_ms = D("80000"), 0.5, BTC.created_ms
     assert early.odds(BTC.created_ms - 30 * 86_400_000) == early.odds(BTC.created_ms)
     sol = bot.touch_payload(bot.touches["SOL"], NOW)
     assert sol["name"] == "SOL 先触 60/140" and sol["labels"] == ["$140", "$60"] and sol["missing"].startswith("等待币安行情"), sol

@@ -60,6 +60,7 @@ async def run():
     started = time.monotonic()
     await bot.one_cycle()
     assert time.monotonic() - started < 1.0, "the alert loop must not wait for reference feeds"
+    await bot.drain_deliveries()  # with background tasks running, Telegram sends go out in the background too
     alert = [t for t in tg.sent if "上涨超过" in t]
     assert alert and "基准 72" in alert[0], tg.sent
     await asyncio.sleep(1.0)
@@ -148,7 +149,7 @@ async def run():
     assert bot.snapshots["UNITREEUSDT"] == {"error": "等待首次获取上交所688836收盘价（后台刷新中）", "pending": True}, bot.snapshots
     assert not tg.sent, tg.sent
     bot.stocks.errors["UNITREEUSDT"] = "东方财富: 网络错误"  # the first fetch failed -> now it is a real fault
-    await bot.one_cycle()
+    await bot.one_cycle(); await bot.drain_deliveries()
     assert "尚未由带日期的日 K 确认" in bot.snapshots["UNITREEUSDT"]["error"] and any("行情监控异常" in t for t in tg.sent), tg.sent
 
     # --- the real run(): reference tasks start with the monitor, alerts flow, everything stops cleanly -----

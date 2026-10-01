@@ -61,6 +61,26 @@ async def run():
     store.put("outcome:KOSPI:2026-09-28", 7100.0)
     text = bot.calibration_text()
     assert text.startswith("📐 概率模型回测（只评估，不会自动改参数）") and "已有结果 3 条 / 1 日" in text, text
+
+    # the review's case: the page showed 涨 ~42% against Predict's target price, the snapshot must not say ~57%
+    kcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT", "HSI_FUTURES": "off", "SSE_INDEX": "off"})
+    kbot = m.Bot(kcfg, m.Store(":memory:"), m.Binance(kcfg), None)
+    live = m.close_odds("KOSPI", D("6889.74"), D("6899.514"), 0.012, 0.5, dt.date(2026, 9, 29), D("0.01"), "09-28 收盘",
+                        "KOSPI 现货 6,899.514（盘中直接用现货）", "σ")
+    kbot.kospi_odds = lambda now: live
+    kbot.sse_odds = kbot.hsi_odds = lambda now: None
+    slug = "kospi-composite-index-up-or-down-on-september-29-2026"
+    kbot.predict.strikes[slug] = (D("6910.89"), __import__("time").monotonic())
+    kbot.record_predictions(t0)
+    snap = [v for _, v in kbot.store.items("pred:KOSPI")][0]
+    page = next(i for i in kbot.odds_payload()["items"] if i["name"] == "KOSPI")
+    assert abs(snap["up"] - page["fair_up"]) < 1e-12 and snap["up"] < 0.45 and snap["up_raw"] > 0.55, (snap, page["fair_up"])
+    assert snap["ref"] == 6910.89 and snap["strike"] == 6910.89 and snap["ref_raw"] == 6889.74, snap
+    assert snap["slug"] == slug and snap["url"] == m.PREDICT_SITE + slug + "?ref=B00EA", snap
+    # scored as displayed: a 6,905 close is "down" against the 6,910.89 target the card priced
+    kbot.store.put(f"outcome:KOSPI:2026-09-29", 6905.0)
+    report = kbot.calibration_text()
+    assert "其中 1 条按 Predict 目标价评估" in report and "实际 0%" in report, report
     print("CALIB_OK")
 
 

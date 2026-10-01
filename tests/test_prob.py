@@ -87,7 +87,19 @@ async def run():
         return [{"universe": [{"name": "xyz:KR200"}, {"name": "xyz:SKHX"}]}, [{"markPx": "1107.15", "prevDayPx": "1120"}, {"markPx": "1340", "prevDayPx": "1350"}]]
     kospi_json = json.dumps({"datas": [{"closePrice": "7,080.92", "compareToPreviousClosePrice": "63.01", "compareToPreviousPrice": {"code": "2"},
                                          "fluctuationsRatio": "0.90", "localTradedAt": "2026-09-23T15:30:00+09:00", "marketStatus": "CLOSE"}]}).encode()
+    # SK hynix's own KRX sessions (Yahoo 000660.KS): 31 finished days alternating ±1.5%, opens halfway
+    days, d = [], dt.date(2026, 9, 23)
+    while len(days) < 31:
+        if d.weekday() < 5: days.append(d)
+        d -= dt.timedelta(days=1)
+    days.reverse()
+    yclose = [1300000 * (1.03 if i % 2 else 1.0) for i in range(31)]
+    yopen = [yclose[0]] + [math.sqrt(a * b) for a, b in zip(yclose, yclose[1:])]
+    ystamps = [int(dt.datetime(x.year, x.month, x.day, 9, tzinfo=kst).timestamp()) for x in days]
+    yahoo = json.dumps({"chart": {"result": [{"meta": {"gmtoffset": 32400}, "timestamp": ystamps,
+                                              "indicators": {"quote": [{"open": yopen, "close": yclose}]}}]}}).encode()
     async def fake_get(url, timeout=15, headers=None):
+        if "000660.KS" in url and "range=3mo" in url: return yahoo
         if "index/KOSPI" in url: return kospi_json
         if "index/KPI200" in url: return kospi_json.replace(b"7,080.92", b"1,126.12")
         raise m.RemoteError("skip")
@@ -105,7 +117,8 @@ async def run():
     close_ms = kr(2026, 9, 23, 15, 30)
     assert bot.anchors["SKHYNIXUSDT"] == (close_ms, D("1350")), bot.anchors
     assert bot.anchors["KOSPI"] == (close_ms, D("1126.60")) and "candleSnapshot" in hl_calls, bot.anchors
-    assert "SKHYNIXUSDT" in bot.vols.estimates and bot.vols.estimates["SKHYNIXUSDT"][1] == 30
+    assert "SKHYNIXUSDT" in bot.vols.estimates and bot.vols.estimates["SKHYNIXUSDT"][1:] == (30, "Yahoo日K"), bot.vols.estimates
+    assert abs(bot.vols.shares["SKHYNIXUSDT"][0] - 0.5) < 1e-6  # gap and session split like the indices
     assert store.get("anchor:KOSPI") == [close_ms, "1126.60", "15:30 一分钟K"]  # persisted for restarts
     now = bot.market.now_ms()
     bot.hl.quotes["KR200"] = dataclasses.replace(bot.hl.quotes["KR200"], fetched_ms=now - 30_000)  # pin to the fake clock
@@ -124,7 +137,7 @@ async def run():
     pr = tg.sent[-1]
     assert "<b>📍 KOSPI</b>" in pr and "参考收盘 <b>7,080.92</b>（09-23 收盘）→ 目标 09-28 收盘" in pr and "σ 日 3.02%（PROB_VOL 手动设定）× √1.000 = 3.02%｜z -0.576" in pr, pr
     assert "HL KR200 标记价 1,107.15 / 收盘时刻 1,126.6 → -1.726%（KOSPI200 代理）" in pr and "公平价 涨 <b>28.2¢</b> / 跌 <b>71.8¢</b>" in pr, pr
-    assert "<b>📍 SK 海力士｜SKHYNIXUSDT</b>" in pr and "参考收盘 <b>1,857,000 KRW</b>（09-23 14:30·Naver）" in pr and "币安日K 30 日" in pr, pr
+    assert "<b>📍 SK 海力士｜SKHYNIXUSDT</b>" in pr and "参考收盘 <b>1,857,000 KRW</b>（09-23 14:30·Naver）" in pr and "Yahoo日K 30 日" in pr, pr
     assert "📍 恒生指数" not in pr  # HSI disabled
     # --- KR200 anchor: restart, 5-minute fallback, recorded mark, never the KOSPI200 cash level ---------
     k, hl = bot.kospi.quote, bot.hl.quotes["KR200"]
@@ -183,10 +196,17 @@ async def hsi():
     now = bj(2026, 9, 25, 21, 0)
     bot.hsi.quote = m.FuturesQuote("恒指期货(09/2026)夜市", D("24501"), D("24504"), None, None, None, bj(2026, 9, 25, 20, 59), "etnet", D("24510.09"), "etnet", D("24760"))
     o = bot.hsi_odds(now)
-    assert isinstance(o, m.CloseOdds) and f"{o.fair_up * 100:.1f}" == "49.5" and o.target == dt.date(2026, 9, 28) and "日市收市 24,504" in o.proxy_note, o
-    # between the day close and the night open: effective = the close → 50/50
+    # no print was recorded at the 16:10 cash close (e.g. a restart): the night's 前收市 (16:30 day close) stands in, labelled
+    assert isinstance(o, m.CloseOdds) and f"{o.fair_up * 100:.1f}" == "49.5" and o.target == dt.date(2026, 9, 28) and "日市 16:30 收市（近似" in o.proxy_note, o
+    assert o.warn and "24,504" in o.proxy_note, o
+    # between the day close and the night open, still without a 16:10 print: the 16:30 close, approximate → 50/50, no advice
     bot.hsi.quote = m.FuturesQuote("恒指期货(09/2026)日市", D("24527"), D("24691"), None, None, None, bj(2026, 9, 25, 16, 29), "etnet", D("24510.09"), "etnet", D("24760"))
-    o = bot.hsi_odds(bj(2026, 9, 25, 17, 0)); assert abs(o.fair_up - 0.5) < 1e-9 and o.effective == D("24510.09"), o
+    o = bot.hsi_odds(bj(2026, 9, 25, 17, 0)); assert abs(o.fair_up - 0.5) < 1e-9 and o.effective == D("24510.09") and o.warn, o
+    # with the 16:10 print recorded, the 16:10–16:30 move counts: 24,527 vs 24,410 at the cash close
+    bot.store.put("anchor:HSI", [bj(2026, 9, 25, 16, 10), "24410", "16:10 现货收市时", "09/2026", bj(2026, 9, 25, 16, 10)])
+    o = bot.hsi_odds(bj(2026, 9, 25, 17, 0))
+    assert abs(float(o.effective) - 24510.09 * 24527 / 24410) < 1e-6 and 0.65 < o.fair_up < 0.72 and not o.warn, o
+    bot.store.delete_prefix("anchor:HSI")
     # cash session: live index against yesterday's close, remaining time shrinks
     bot.hsi.quote = m.FuturesQuote("x", D("24600"), D("24691"), None, None, None, bj(2026, 9, 28, 10, 0), "etnet", D("24600"), "etnet", D("24510.09"))
     o = bot.hsi_odds(bj(2026, 9, 28, 10, 0))
