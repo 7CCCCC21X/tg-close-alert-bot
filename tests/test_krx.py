@@ -218,24 +218,29 @@ async def hsi():
 
     # the cash index: a failed spot round keeps the last value for a few minutes instead of blanking the card
     hf = m.IndexFutures()
-    etnet_like = m.FuturesQuote("恒指期货", D("24600"), D("24500"), None, None, None, bj2(30, 11, 0), "东方财富")
-    spot = {"v": (D("24529.24"), D("24400"))}
-    async def first(sources, parse):
-        if sources is hf.FUTURES_SOURCES: return etnet_like
-        if isinstance(spot["v"], Exception): raise spot["v"]
-        return spot["v"]
-    hf._first = first
-    await hf.refresh(bj2(30, 11, 0), force=True); assert hf.quote.spot == D("24529.24")
-    spot["v"] = ValueError("腾讯: 超时")
-    await hf.refresh(bj2(30, 11, 1), force=True)
-    assert hf.quote.spot == D("24529.24") and hf.quote.spot_prev == D("24400") and "超时" in hf.spot_error, hf.quote
+    clock, spot_ok = {"ms": bj2(30, 11, 0)}, {"v": True}
+    async def feeds(url, timeout=15, headers=None):
+        if "134.HSI_M" in url:  # the futures (Eastmoney: no cash index with it)
+            return json.dumps({"data": {"f43": 24600, "f60": 24500, "f86": clock["ms"] // 1000}}).encode()
+        if "100.HSI" in url and spot_ok["v"]:
+            return json.dumps({"data": {"f43": 24529.24, "f60": 24400, "f86": clock["ms"] // 1000}}).encode()
+        raise m.RemoteError("网络错误 (TimeoutError)")
+    m.http_get = feeds; m.SOURCE_HEALTH.hosts.clear()
+    await hf.refresh(clock["ms"], force=True)
+    assert hf.quote.source == "东方财富" and hf.quote.spot == D("24529.24") and hf.quote.spot_ms == clock["ms"], hf.quote
+    spot_ok["v"] = False; clock["ms"] = bj2(30, 11, 1)
+    await hf.refresh(clock["ms"], force=True)
+    assert hf.quote.spot == D("24529.24") and hf.quote.spot_prev == D("24400") and "TimeoutError" in hf.spot_error, hf.quote
+    assert hf.quote.spot_ms == bj2(30, 11, 0)  # kept with its own time, so it ages
     hf.spot_at -= hf.SPOT_KEEP_SECONDS + 1
-    await hf.refresh(bj2(30, 11, 7), force=True); assert hf.quote.spot is None  # too old: not passed off as current
+    clock["ms"] = bj2(30, 11, 7)
+    await hf.refresh(clock["ms"], force=True); assert hf.quote.spot is None  # too old: not passed off as current
+    m.http_get = fake_get; m.SOURCE_HEALTH.hosts.clear()
 
     # anchors are per contract family: a Sina CFD night print is never divided by an HKEX-contract anchor
     cfd = m.FuturesQuote("恒指CFD", D("24650.5"), None, None, None, None, bj2(30, 22, 0), "新浪CFD", D("24600"),
                          exchange_contract=False, session="夜市")
-    assert m.hsi_anchor_key(cfd) == "HSI:cfd" and m.hsi_anchor_key(etnet_like) == "HSI"
+    assert m.hsi_anchor_key(cfd) == "HSI:cfd" and m.hsi_anchor_key(hf.quote) == "HSI"
 
 asyncio.run(hsi())
 print("HSI_OK")

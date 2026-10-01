@@ -95,7 +95,9 @@ async def run():
             return {"data": {"bids": [], "asks": [["0.4", "50"]]}}
         raise AssertionError(url)
     bot.predict.fetch = fetch
-    assert await bot.predict.refresh(targets) is True
+    outcome = await bot.predict.refresh(targets)
+    # HSI's network failure makes the round partial; markets not listed yet are answers, not failures
+    assert isinstance(outcome, m.Refreshed) and outcome.status == "partial" and outcome.error.startswith("HSI：网络错误"), outcome
     assert await bot.predict.refresh(targets) is False  # not due yet
     books, errors = bot.predict.books, bot.predict.errors
     assert books["SSE"].bid == (D("0.81"), D("400"))
