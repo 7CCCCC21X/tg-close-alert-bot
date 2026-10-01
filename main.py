@@ -4670,7 +4670,7 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 .lg .lt{font-weight:650;white-space:nowrap}.lg .lq{color:var(--muted);white-space:nowrap}
 .touched{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font-size:12px}.touched .k{color:var(--down);font-weight:600}
 .tchip{border-radius:6px;padding:0 6px;background:var(--chip);color:var(--muted);font-variant-numeric:tabular-nums}
-.lg .lb{color:var(--faint);white-space:nowrap}.lg .lnd{display:block;font-size:10.5px;line-height:1.25;color:var(--faint)}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}.lg .lk b{color:var(--faint)}.lg .lk.pos b{color:var(--best)}.lg .lz{color:var(--faint);font-size:11px;margin-left:3px}
+.lg .lb{color:var(--faint);white-space:nowrap}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}.lg .lk b{color:var(--faint)}.lg .lk.pos b{color:var(--best)}.lg .lz{color:var(--faint);font-size:11px;margin-left:3px}
 @media (max-width:560px){.lg{gap:3px 7px;font-size:12px}.lg .ld,.lg .lz,.lg .lp{display:none}.lg{grid-template-columns:auto auto auto auto 1fr}}
 .small{font-size:12px;margin-top:3px}.mut{color:var(--faint)}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
 [hidden]{display:none!important}
@@ -4822,12 +4822,11 @@ function ladder(c,it){
       if(best){b.append(best.label+" "+(best.price*100).toFixed(1)+" ",$("b","","+"+cent(best.edge)));b.title=best.maker?"挂单排队，成交不保证":"立即成交，量 "+qty(best.size);
         if(prior)b.title="σ 是先验值，这个优势只作参考、不提醒";
         else if(best.edge>=HOT&&(!hot||best.edge>hot.edge))hot={...best,row:r.label}}
-      else if(r.miss&&!r.error&&!r.stale){const m=r.miss;b.classList.add("miss");  // nothing clears the bar: closest, grey
-        // one more decimal when both round alike, so "+3.2¢ / 门槛 3.2¢" never reads as a pass
-        const d=cent(m.edge)===cent(need)?2:1,c=x=>(x*100).toFixed(d)+"¢",e=(m.edge>=0?"+":"")+c(m.edge);
-        b.append(m.label+" "+(m.price*100).toFixed(1)+" ",$("b","",e),$("span","lnd","门槛 "+c(need)));
-        b.title=m.label+" @ "+cent(m.price)+" 净优势 "+e+"，没超过这一档的门槛 "+c(need)+
-          (r.swing>=need-1e-9?"（模型误差：σ ×/÷ 1.25 时这档 Yes 公平价变动 "+cent(r.swing)+"）":"（最低净优势）")+"，不建议"}
+      else if(r.miss&&!r.error&&!r.stale){const m=r.miss,e=(m.edge>=0?"+":"")+cent(m.edge);b.classList.add("miss");
+        // nothing is big enough to suggest: the closest direction, grey (the hover says by how much it fell short)
+        b.append(m.label+" "+(m.price*100).toFixed(1)+" ",$("b","",e));
+        b.title=m.label+" @ "+cent(m.price)+" 净优势 "+e+"，不够大，不建议（这一档至少要 "+cent(need)+
+          (r.swing>=need-1e-9?"：σ 估错 25% 时公平价就会变这么多）":"）")}
       else b.textContent=r.error?"⚠️":r.stale?"过期":"—";
       if(r.error)b.title=r.error;
       const tk=r.edges&&r.edges.filter(e=>!e.maker).sort((x,y)=>y.edge-x.edge)[0],t=$("span","lb lk"+(tk&&tk.edge>need&&!prior&&!r.stale?" pos":""));
@@ -6684,7 +6683,6 @@ class Bot:
                     need = self.edge_need(swing)
                     best = None if book.stale(now_ms) else best_edge(edges, need)
                     # nothing clears the bar: the direction that came closest (ranked as best_edge ranks), shown grey
-                    # on the card with the bar it missed, so a phone (no hover) can see how far off it is
                     miss = None if best or book.stale(now_ms) or not edges else max(edges, key=lambda e: (round(e.edge, 4), e.maker))
                     yes_no = lambda e: e.label.replace("涨", "Yes").replace("跌", "No")
                     out.update(edges=[edge_json(e, best, yes_no(e)) for e in edges], need=need, swing=swing,
