@@ -394,7 +394,8 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-september-28-2026
 - 超过 90 秒没刷新成功的盘口只显示、不给建议；目标日切换时旧盘口立即丢弃。
 - 市场页面上的“目标价”（结算基准，如 KOSPI 按 Yahoo ^KS11 / KRX 官方收盘）能从 Predict GraphQL（`marketData.startPrice`）读到时，概率改以它为参考线：盘后代理估算按同一比例平移到目标价，盘中现货价不变；本地参考收盘保留在说明里。与本地参考相差 ≥5% 时视为单位不符，不采用。
 - 集合竞价提醒（`AUCTION_ALERT=off` 关闭）：韩交所 14:20–14:30、港交所 16:00–16:10、沪深 14:57–15:00（北京时间，交易日）收盘集合竞价开始时，给已订阅的聊天发一条提醒：该市场每张卡的昨收 → 现价、涨跌幅、模型涨/跌公平价和 Predict 最优方向（净优势、过门槛才写）。竞价最后几分钟的价格基本就是收盘价。每个市场每天对每个订阅只发一次：哪个订阅发送成功才给哪个订阅登记，发送失败的在竞价开始后 2 分钟内每轮重试；排队超过 60 秒还没发出去的提醒作废、按当时数据重新生成。开始 2 分钟后才启动的不再补发。网页上这些卡片在竞价期间显示橙色“集合竞价”标签。
-- 网页每张卡左上角有 ☆：点一下收藏，卡片移到最上面的“⭐ 收藏”栏（按收藏先后排列），再点一下放回原栏。收藏记在当前浏览器里，刷新、重启服务都保留；换设备或清浏览器数据要重新收藏。
+- 网页每张卡左上角有 ☆：点一下收藏，卡片移到最上面的“⭐ 收藏”栏，再点一下放回原栏。收藏栏的卡片左边有 ⠿，按住拖动即可调整顺序（鼠标、手指都行，手机上只有按住 ⠿ 才拖动，卡片其他地方照常滑动页面；拖到屏幕上下边缘会自动滚动）。收藏和顺序记在当前浏览器里，刷新、重启服务都保留；换设备或清浏览器数据要重新设置。
+- 网页右上角“✎ 自定义”：每张卡上方出现 ⠿ ◀ ▶ 和“隐藏”，任何栏目里的卡片都能拖动或点 ◀ ▶ 调整顺序；栏目标题旁的 ↑ ↓ 调整栏目先后（收藏栏固定在最上面）；“隐藏”收起不看的卡片（自定义时变淡显示，点“显示”或“全部显示”恢复）；勾掉栏目名可整栏隐藏；“红框门槛”改净优势达到多少¢标红框（默认 10¢，1–50¢）；“恢复默认布局”（4 秒内连点两次）还原卡片和栏目顺序、隐藏和门槛，收藏保留。这些设置同样只存在当前浏览器，网页本身仍是只读的，不影响机器人和别人看到的页面。新增的卡片排在该栏最后。
 - “市值阶梯”栏另有两张 FDV 卡，窗口都到 2026-10-31 23:59 ET：$ANSEM（[what-fdv-will-ansem-hit-before-nov-2026](https://predict.fun/zh-cn/market/what-fdv-will-ansem-hit-before-nov-2026)，Solana pump.fun 币，窗口 08-17 13:00 ET 起，FDV = 价格 × 总量，σ 和窗口最高用 GeckoTerminal solana 小时 K）；$PONS（[what-fdv-will-pons-hit-before-nov-2026](https://predict.fun/zh-cn/market/what-fdv-will-pons-hit-before-nov-2026)，Robinhood 链，窗口 08-31 06:00 ET 起，结算来源就是 DexScreener 上的指定交易对，直接用它的 FDV）。PONS 这条链没有 K 线来源：σ 用先验 300%，窗口最高只含机器人运行以来看到的价格，优势灰色显示、不标红。Predict 上已经提前结算的档位一律算已触及。
 - 网页最下面的“市值阶梯”栏：$牛来 在 2026 年 11 月前市值会达到多少（[what-marketcap-will-niu-lai-hit-before-nov-2026](https://predict.fun/zh-cn/market/what-marketcap-will-niu-lai-hit-before-nov-2026)）。$200M / $300M / $500M / $1B 各是一个 Yes/No 市场，窗口 2026-08-16 23:30 ET 至 10-31 23:59 ET（夏令时），任一 1 分钟 K 线市值 ≥ 档位即 Yes；结算来源是 Flap.sh，市值 =（总量 − 销毁）× 价格。机器人用 DexScreener 取价格（每 30 秒）、BSC 节点读总量和黑洞地址余额（每 10 分钟）、GeckoTerminal 小时 K 算 30 日 σ 并记录开窗以来的最高市值（开窗那半小时用 1 分钟 K），单边触及模型（零漂移）给出每档 Yes 的公平价，并和 Predict 各档盘口比较。按小时 K 已触及、但盘口仍低于 90¢ 的档位会标“请核实”而不给建议（数据源与 Flap.sh 可能不一致）。已触及且盘口认可（已结算、无盘口或 ≥ 90¢）的档位收成一行“✓ 已触及”，其余每档一行：目标、距离（市值还要涨多少）、模型 Yes 价、Yes 盘口、最优方向。
 - 网页“加密”栏：先触哪个价的市场，都没碰到按 50/50；BNB、SOL 截止 2026-12-31 23:59 ET，BTC 先触 $70k 还是 $90k（[will-btc-hit-70000-or-90000-first](https://predict.fun/zh-cn/market/will-btc-hit-70000-or-90000-first)）按规则只看 2026-08-25 10:00 ET 至 10-25 23:59 ET（均为夏令时 UTC−4），窗口起点以规则为准、不用 Predict 的创建时间。ETH 先触 $1k 还是 $3k（[will-ethereum-hit-1k-or-3k-first](https://predict.fun/zh-cn/market/will-ethereum-hit-1k-or-3k-first)，截止 2026-12-31 23:59 ET，窗口从 Predict 给出的市场创建时间起算）。BNB 先触 $700 还是 $900（[will-bnb-hit-700-or-900](https://predict.fun/zh-cn/market/will-bnb-hit-700-or-900)）；SOL 先触 $60 还是 $140（[will-solana-hit-60-or-140-first](https://predict.fun/zh-cn/market/will-solana-hit-60-or-140-first)，按规则创建于 2026-03-12 13:27:08 UTC，Predict 没给创建时间时用它）。新增市场只需在 `TOUCH_MARKETS` 加一行。每个都用币安现货（BNBUSDT / SOLUSDT）每 30 秒取价，30 日小时收盘算年化 σ，双边界首达模型（零漂移）给出两边公平价；从 Predict 市场创建时间起按小时 K 线核验是否已触线，命中的那一小时再用 1 分钟 K 线定到分钟，已触线则按 100/0 显示，同一分钟两边都碰到则提示人工核对。Predict 盘口按市场结果名称（$700 / $900）自动换算成“先 $900”一侧；名称认不出时只显示盘口、不比较。`BNB_TOUCH=off` 关闭整个“加密”栏。
@@ -583,7 +584,7 @@ heartbeat: valid_quotes=4/4 active_subscriptions=1 mode=binance_daily
 Python 3.12 环境下运行离线测试，无须 Token，无须联网：
 
 ```bash
-python tests/run_all.py            # 全部 23 组
+python tests/run_all.py            # 全部 34 组
 python tests/run_all.py sse exmode # 只跑指定几组
 ```
 
