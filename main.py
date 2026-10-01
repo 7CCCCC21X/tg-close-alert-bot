@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.14.1"
+VERSION = "1.15.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -3749,6 +3749,18 @@ TOUCH_SPOT = ("https://data-api.binance.vision", "https://api.binance.com", "htt
 YEAR_MS = 365 * 24 * 3600 * 1000
 
 
+async def binance_spot(path: str, **params: Any) -> Any:
+    """GET /api/v3/<path> from Binance spot (the crypto markets' resolution source), each public host in turn."""
+    query = urllib.parse.urlencode(params)
+    failures = []
+    for base in TOUCH_SPOT:
+        try:
+            return json.loads(await fetch_source(f"{base}/api/v3/{path}?{query}"))
+        except Exception as error:
+            failures.append(f"{urllib.parse.urlsplit(base).hostname}: {clean_error(error)}")
+    raise RemoteError("；".join(failures))
+
+
 def _log_erfc_pos(z: float) -> float:
     """log(erfc(z)) for z ≥ 0 without underflow (Numerical Recipes' erfcc, |rel err| < 1.2e-7)."""
     if z == 0:
@@ -3895,14 +3907,7 @@ class TouchMarket:
         self.start_ms = spec.created_ms  # market creation (Predict, else the rules), 0 = unknown
 
     async def get(self, path: str, **params: Any) -> Any:
-        query = urllib.parse.urlencode(params)
-        failures = []
-        for base in TOUCH_SPOT:
-            try:
-                return json.loads(await fetch_source(f"{base}/api/v3/{path}?{query}"))
-            except Exception as error:
-                failures.append(f"{urllib.parse.urlsplit(base).hostname}: {clean_error(error)}")
-        raise RemoteError("；".join(failures))
+        return await binance_spot(path, **params)
 
     @property
     def history(self) -> dict:
@@ -4022,6 +4027,189 @@ class TouchMarket:
         if kind == "clear":
             return f"开盘以来未触线（核至 {stamp(hist['through'], seconds=False)}）"
         return "开盘以来是否触线：待核验" if self.start_ms else "开盘时间未知：按此前未触线计算"
+
+
+# --- period up/down market (does the pair end the month above the close of its first minute?) -------------------
+def us_eastern_offset(ms: int) -> int:
+    """US Eastern UTC offset at an instant: −4 (EDT) from the second Sunday of March 02:00 EST to the first Sunday of
+    November 02:00 EDT, else −5 (EST). No tz database needed (slim images often lack one)."""
+    utc = dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc)
+    sunday = lambda day: day + dt.timedelta(days=(6 - day.weekday()) % 7)  # the first Sunday on or after day
+    starts = dt.datetime.combine(sunday(dt.date(utc.year, 3, 8)), dt.time(7), dt.timezone.utc)    # 02:00 EST
+    ends = dt.datetime.combine(sunday(dt.date(utc.year, 11, 1)), dt.time(6), dt.timezone.utc)     # 02:00 EDT
+    return -4 if starts <= utc < ends else -5
+
+
+@dataclass(frozen=True)
+class UpDownSpec:
+    """A "BTC Up/Down <month>" market: Up when the Binance 1-minute candle named for the period's end closes above the
+    one named for its start, Down when below, 50-50 when equal. Candles are named by their open time in US Eastern."""
+    key: str        # item / book key, also the card's favourite key (not the bare pair: a 先触 card has that one)
+    slug: str
+    symbol: str     # Binance spot pair (the resolution source)
+    name: str       # card title
+    start_ms: int   # open time of the starting 1-minute candle: its close is the line to beat
+    end_ms: int     # open time of the final 1-minute candle: its close settles the market
+
+    def label(self, open_ms: int, plain: bool = False) -> str:
+        """'09-30 23:59 ET（北京 10-01 11:59）' for the candle opening at open_ms; plain: '09-30 23:59 ET，北京 10-01 11:59'."""
+        et = dt.datetime.fromtimestamp(open_ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(open_ms))))
+        bj = stamp(open_ms, seconds=False)
+        return f"{et:%m-%d %H:%M} ET，北京 {bj}" if plain else f"{et:%m-%d %H:%M} ET（北京 {bj}）"
+
+
+UPDOWN_MARKETS = (
+    # "the Binance 1 minute candle for BTC/USDT Sep 30 '26 11:59 PM in the ET timezone" against the one for
+    # "Oct 31 '26 11:59 PM ET" (both EDT: daylight time ends on Nov 1)
+    UpDownSpec("BTC-2026-10", "btc-up-down-october-2026", "BTCUSDT", "BTC 10月涨跌",
+               et_ms(2026, 9, 30, 23, 59, -4), et_ms(2026, 10, 31, 23, 59, -4)),
+)
+
+
+def updown_odds(price: float, line: float, sigma: float, years: float, drift: float = -0.5,
+                tick: float = 0.01) -> tuple[float, float, float, float]:
+    """(up, flat, down, z) for a close `years` from now against `line`: log-normal with annual σ, its log mean moved by
+    drift·σ²τ (−½: no drift in the price itself, so the median sits σ²τ/2 below today's price; 0: median = today's
+    price). Prices are whole ticks; a close equal to the line is `flat` and settles 50-50."""
+    s = sigma * math.sqrt(max(years, 0.0))
+    if not s > 0:
+        return (1.0, 0.0, 0.0, math.inf) if price > line else (0.0, 0.0, 1.0, -math.inf) if price < line else (0.0, 1.0, 0.0, 0.0)
+    mean = math.log(price) + drift * s * s
+    up = 1 - norm_cdf((math.log(line + tick / 2) - mean) / s)
+    down = norm_cdf((math.log(line - tick / 2) - mean) / s) if line > tick / 2 else 0.0
+    return up, max(0.0, 1 - up - down), down, (mean - math.log(line)) / s
+
+
+@dataclass(frozen=True)
+class UpDownOdds:
+    up: float
+    flat: float      # the final close equals the line (settles 50-50)
+    down: float
+    z: float
+    line: D          # the starting candle's close
+    price: D         # what it is measured from: the live price, or the final close once settled
+    years: float     # time left until the final candle closes (0 once settled)
+    settled: bool = False
+
+    @property
+    def fair_up(self) -> float:
+        return self.up + self.flat / 2
+
+    @property
+    def fair_down(self) -> float:
+        return self.down + self.flat / 2
+
+
+class UpDownMarket:
+    """A Binance spot pair against the close of its period's first 1-minute candle: live price, 30-day σ, and the two
+    candle closes that set and settle the market, each read once its minute is over (strictly that minute) and kept."""
+    PRICE_SECONDS = 30
+    VOL_SECONDS = 3600
+    CANDLE_SECONDS = 30            # a candle still missing is asked for again this often
+    CANDLE_GRACE_MS = 2_000        # and only this long after its minute ended
+    PRICE_STALE_MS = TouchMarket.PRICE_STALE_MS
+    SIGMA_STALE_MS = TouchMarket.SIGMA_STALE_MS
+
+    def __init__(self, store: "Store", spec: UpDownSpec):
+        self.store, self.spec = store, spec
+        self.price: D | None = None
+        self.priced_ms = 0
+        self.sigma: float | None = None
+        self.sigma_ms = 0
+        self.error = ""
+        self.times = {"price": -1e9, "vol": -1e9, "candle": -1e9}
+
+    async def get(self, path: str, **params: Any) -> Any:
+        return await binance_spot(path, **params)
+
+    def close_of(self, which: str) -> D | None:
+        """The kept close of the "start" or "end" candle, None until it has been read."""
+        open_ms = self.spec.start_ms if which == "start" else self.spec.end_ms
+        saved = self.store.get(f"updown:{self.spec.slug}:{which}")
+        with contextlib.suppress(TypeError, KeyError, ValueError, decimal.InvalidOperation):
+            if int(saved["open"]) == open_ms:
+                value = D(str(saved["close"]))
+                return value if value > 0 else None
+        return None
+
+    async def read_candle(self, open_ms: int) -> D:
+        """The close of exactly the 1-minute candle that opens at open_ms (Binance answers with the next minute when
+        that one is missing: a neighbouring minute is never taken for it)."""
+        rows = await self.get("klines", symbol=self.spec.symbol, interval="1m", startTime=open_ms,
+                              endTime=open_ms + 59_999, limit=1)
+        row = next((r for r in rows or [] if isinstance(r, list) and len(r) > 6 and int(r[0]) == open_ms), None)
+        if row is None or int(row[6]) != open_ms + 59_999:
+            raise ValueError(f"币安没有返回 {self.spec.label(open_ms)}这根 1 分钟 K 线")
+        return number(row[4], f"{self.spec.symbol} 1 分钟 K 收盘价")
+
+    async def refresh(self, now_ms: int) -> None:
+        mono = time.monotonic()
+        errors = []
+        if mono - self.times["candle"] >= self.CANDLE_SECONDS:
+            self.times["candle"] = mono
+            for which, open_ms in (("start", self.spec.start_ms), ("end", self.spec.end_ms)):
+                if self.close_of(which) is None and now_ms >= open_ms + 60_000 + self.CANDLE_GRACE_MS:
+                    try:
+                        close = await self.read_candle(open_ms)
+                        self.store.put(f"updown:{self.spec.slug}:{which}", {"open": open_ms, "close": str(close), "read_ms": now_ms})
+                    except Exception as error:
+                        errors.append(clean_error(error) or type(error).__name__)
+        if self.close_of("end") is None:  # settled: nothing is left to price
+            try:
+                if mono - self.times["price"] >= self.PRICE_SECONDS:
+                    self.times["price"] = mono
+                    data = await self.get("ticker/price", symbol=self.spec.symbol)
+                    self.price, self.priced_ms = number(data["price"], self.spec.symbol), now_ms
+                if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
+                    self.times["vol"] = mono
+                    self.sigma = realized_vol(await self.get("klines", symbol=self.spec.symbol, interval="1h", limit=722), now_ms)
+                    self.sigma_ms = now_ms
+            except Exception as error:
+                errors.append(clean_error(error) or type(error).__name__)
+        self.error = "；".join(errors)
+
+    def odds(self, now_ms: int) -> UpDownOdds | str:
+        spec = self.spec
+        line, final = self.close_of("start"), self.close_of("end")
+        if line is not None and final is not None:
+            up, down = float(final > line), float(final < line)
+            return UpDownOdds(up, 1.0 - up - down, down, 0.0, line, final, 0.0, True)
+        why = f"（{brief_error(self.error, 60)}）" if self.error else ""
+        if line is None:
+            if now_ms < spec.start_ms + 60_000:
+                return f"起点价要等 {spec.label(spec.start_ms)}这根 1 分钟 K 收盘后确定"
+            return f"等待币安 {spec.label(spec.start_ms)}这根 1 分钟 K 的收盘价{why}"
+        if now_ms >= spec.end_ms + 60_000:
+            return f"已到结算时刻，等待币安 {spec.label(spec.end_ms)}这根 1 分钟 K 的收盘价{why}"
+        if self.price is None or self.sigma is None:
+            return f"等待币安行情{why}"
+        if now_ms - self.priced_ms > self.PRICE_STALE_MS:
+            return (f"币安价格停在 {stamp(self.priced_ms, seconds=False)}（{(now_ms - self.priced_ms) // 60_000} 分钟未更新"
+                    f"{'：' + brief_error(self.error, 60) if self.error else ''}），暂停概率")
+        if not self.sigma > 0:
+            return "波动率无效，暂停概率"
+        years = (spec.end_ms + 60_000 - now_ms) / YEAR_MS
+        up, flat, down, z = updown_odds(float(self.price), float(line), self.sigma, years)
+        return UpDownOdds(up, flat, down, z, line, self.price, years)
+
+    def model_swing(self, odds: UpDownOdds) -> float:
+        """How far the fair Up price moves with σ ×/÷ 1.25, or with the median at today's price instead of σ²τ/2 below
+        it (each varied alone): over a month that alone is a few cents at the line."""
+        if odds.settled or not self.sigma:
+            return 0.0
+        def fair(sigma: float, drift: float) -> float:
+            up, flat, _, _ = updown_odds(float(odds.price), float(odds.line), sigma, odds.years, drift)
+            return up + flat / 2
+        return max(abs(fair(sigma, drift) - odds.fair_up) for sigma, drift in
+                   ((self.sigma * MODEL_SIGMA_ERROR, -0.5), (self.sigma / MODEL_SIGMA_ERROR, -0.5), (self.sigma, 0.0)))
+
+    def advice_problem(self, odds: UpDownOdds, now_ms: int) -> str:
+        """Why no trade is suggested from these odds ("" when one may be)."""
+        if odds.settled:
+            return "已出结果，以 Predict 结算为准；不再给建议"
+        if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
+            return "波动率超过一天未更新；暂不给建议"
+        return ""
 
 
 # --- market-cap ladder (will a token's market cap reach each threshold?) ----------------------------
@@ -5275,9 +5463,10 @@ class Bot:
             ("yahoo", yahoo_url("^HSI"))))
         self.hsi.dated_close = lambda day: self.hsi_daily.daily.get(day)  # checks the cash index belongs to the right day
         self.touches = {spec.key: TouchMarket(store, spec) for spec in TOUCH_MARKETS}
+        self.updowns = {spec.key: UpDownMarket(store, spec) for spec in UPDOWN_MARKETS}
         self.caps = {spec.key: CapMarket(store, spec) for spec in CAP_MARKETS}
         if config.touch:
-            self.predict.want_info.update(spec.slug for spec in TOUCH_MARKETS)
+            self.predict.want_info.update(spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS))
             self.predict.ladder_keys.update(self.caps)
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
@@ -6339,6 +6528,7 @@ class Bot:
             })
         if self.config.touch:
             items.extend(self.touch_payload(t, now_ms) for t in self.touches.values())
+            items.extend(self.updown_payload(u, now_ms) for u in self.updowns.values())
             items.extend(self.cap_payload(c, now_ms) for c in self.caps.values())
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION, "server_ms": now_ms,
@@ -6397,6 +6587,67 @@ class Bot:
                     "sigma": touch.sigma or 0.0, "years": years, "status": touch.status(),
                     "p_low": odds.lower, "p_high": odds.upper, "p_none": odds.none,
                     "error": touch.error, "hold": touch.advice_problem(now_ms)}}
+
+    def updown_book(self, spec: UpDownSpec) -> tuple[PredictBook | None, str]:
+        """The book priced as "Up" (the card's 涨 side), whatever the market's outcome order."""
+        book = self.predict.books.get(spec.key)
+        if book is None:
+            return None, ""
+        names = (self.predict.info.get(spec.slug) or {}).get("outcomes") or []
+        first = names[0].strip().lower() if names else ""
+        if first in {"up", "涨", "上涨"}:
+            return book, ""
+        if first in {"down", "跌", "下跌"}:  # the book prices "Down": its complement is "Up"
+            return flip_book(book), ""
+        return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}），暂不比较"
+
+    def updown_payload(self, mkt: "UpDownMarket", now_ms: int) -> dict:
+        """Web card for a period up/down market: the usual 涨/跌 card, measured from the starting candle's close."""
+        spec = mkt.spec
+        base = {"name": spec.name, "symbol": spec.key, "group": "crypto", "close_ms": spec.end_ms + 60_000,
+                "close_label": f"{spec.label(spec.end_ms)}这根 1 分钟 K 的收盘价；高于起点为涨、低于为跌、相同按 50/50 结算"}
+        odds = mkt.odds(now_ms)
+        hold = mkt.advice_problem(odds, now_ms) if isinstance(odds, UpDownOdds) else ""
+        # Predict's own target price (when its category shows one) must be the same opening close we read from Binance
+        strike = (self.predict.strikes.get(spec.slug) or (None,))[0]
+        agree = ""
+        if strike is not None and isinstance(odds, UpDownOdds):
+            if abs(percent(strike, odds.line)) > D("0.005"):
+                hold = hold or f"Predict 目标价 {strike:,.2f} 与币安起点 {odds.line:,.2f} 不一致，请核实；暂不给建议"
+            else:
+                agree = "；与 Predict 目标价一致"
+        out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
+        book, why = self.updown_book(spec)
+        if book is not None:
+            out.update(bids=[[float(p), float(q)] for p, q in book.bids], asks=[[float(p), float(q)] for p, q in book.asks],
+                       age=max(0, (now_ms - book.fetched_ms) // 1000), stale=book.stale(now_ms))
+            if isinstance(odds, UpDownOdds):
+                edges = book_edges(odds.fair_up, book, self.edge_costs())
+                swing = mkt.model_swing(odds)
+                need = self.edge_need(swing)
+                best = None if book.stale(now_ms) or hold else best_edge(edges, need)
+                out.update(edges=[edge_json(e, best) for e in edges], need=need, swing=swing,
+                           notional=self.config.predict_trade_usd)
+        elif why and spec.key in self.predict.books:
+            out["error"] = why
+        if self.config.predict:
+            base["predict"] = out
+        if isinstance(odds, str):
+            return {**base, "missing": odds}
+        sigma = mkt.sigma or 0.0
+        verdict = "涨" if odds.up else "跌" if odds.down else "持平，按 50/50"
+        return {**base, "ref": f"{odds.line:,.2f}", "ref_rel": "起点", "unit": "USDT",
+                "ref_note": f"币安 {spec.symbol} 1 分钟 K 收盘：{spec.label(spec.start_ms, plain=True)}{agree}",
+                "eff_label": "终点" if odds.settled else "现价", "effective": f"{odds.price:,.2f}",
+                "move": float(percent(odds.price, odds.line)),
+                "proxy_note": (f"已结算：终点 {odds.price:,.2f}（{spec.label(spec.end_ms, plain=True)}）对起点 {odds.line:,.2f} → {verdict}"
+                               if odds.settled else f"不用代理：币安 {spec.symbol} 现价就是结算源"),
+                "warn": hold, "sigma_daily": sigma / math.sqrt(365), "remaining": odds.years * 365,
+                "sigma": sigma * math.sqrt(odds.years),
+                "sigma_note": (f"币安 {spec.symbol} 30 日小时收盘年化 {sigma * 100:.1f}%；价格零漂移，中位数比现价低 σ²τ/2"
+                               if not odds.settled else "已结算"),
+                "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
+                "fair_up": odds.fair_up, "fair_down": odds.fair_down}
 
     def cap_payload(self, cap: "CapMarket", now_ms: int) -> dict:
         """Web card for a market-cap ladder: per threshold the model's P(Yes), the Yes book and its best edge."""
@@ -6553,8 +6804,7 @@ class Bot:
                    else session_remaining(market, now_ms, None, self.config.holidays.get(market, frozenset()))[1])
             targets[key] = predict_slug(stem, day)
         if self.config.touch:
-            targets.update({spec.key: spec.slug for spec in TOUCH_MARKETS})
-            targets.update({spec.key: spec.slug for spec in CAP_MARKETS})
+            targets.update({spec.key: spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *CAP_MARKETS)})
         return targets
 
     def edge_costs(self) -> EdgeCosts:
@@ -7185,6 +7435,7 @@ class Bot:
             jobs.append(("Predict 盘口", lambda: self.predict.refresh(self.predict_targets(now()))))
         if self.config.touch:
             jobs.append(("先触市场", lambda: self.refresh_touch(now())))
+            jobs.append(("涨跌市场", lambda: self.refresh_updown(now())))
             jobs.append(("市值阶梯", lambda: self.refresh_caps(now())))
         return jobs
 
@@ -7201,6 +7452,12 @@ class Bot:
             await cap.refresh(now_ms)
         failed = [f"{key}：{cap.error}" for key, cap in self.caps.items() if cap.error]
         return refreshed(failed, len(self.caps) - len(failed))
+
+    async def refresh_updown(self, now_ms: int) -> Refreshed:
+        for mkt in self.updowns.values():
+            await mkt.refresh(now_ms)
+        failed = [f"{key}：{mkt.error}" for key, mkt in self.updowns.items() if mkt.error]
+        return refreshed(failed, len(self.updowns) - len(failed))
 
     async def refresh_touch(self, now_ms: int) -> Refreshed:
         for touch in self.touches.values():
