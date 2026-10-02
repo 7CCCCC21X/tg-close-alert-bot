@@ -56,7 +56,7 @@ async def run():
     bot.start_reference_tasks()
     assert [t.get_name() for t in bot.reference_tasks] == ["reference:交易所收盘", "reference:股票实时", "reference:汇率", "reference:恒指期货",
                                                             "reference:Hyperliquid", "reference:KOSPI", "reference:上证/A50", "reference:概率输入",
-                                                            "reference:Predict 盘口", "reference:先触市场", "reference:涨跌市场", "reference:市值阶梯",
+                                                            "reference:Predict 盘口", "reference:先触市场", "reference:涨跌市场", "reference:反超市场", "reference:市值阶梯",
                                                             "reference:模拟交易"]
     started = time.monotonic()
     await bot.one_cycle()
@@ -167,7 +167,7 @@ async def run():
         await asyncio.sleep(0.1)
         if [t for t in tg.sent if "上涨超过" in t]: break
     assert [t for t in tg.sent if "上涨超过" in t], tg.sent
-    assert len(bot.reference_tasks) == 13 and all(not t.done() for t in bot.reference_tasks)
+    assert len(bot.reference_tasks) == 14 and all(not t.done() for t in bot.reference_tasks)
     bot.stopping.set()
     await asyncio.wait_for(runner, 3)
     assert all(t.done() for t in bot.reference_tasks) and bot.reference_pool._shutdown

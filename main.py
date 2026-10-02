@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.16.0"
+VERSION = "1.17.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4218,6 +4218,224 @@ class UpDownMarket:
         return ""
 
 
+# --- flip market (does one coin trade above another on Hyperliquid within the window?) -------------------------------
+HOUR_MS = 3_600_000
+
+
+@dataclass(frozen=True)
+class FlipSpec:
+    """A "will A flip B" market: Yes once any 1-minute candle in the window closes with A above B at the same timestamp.
+    Hyperliquid's USDC perps; the rules leave spot markets out."""
+    key: str         # item / book key, also the card's favourite key
+    slug: str
+    name: str        # card title
+    coin: str        # the one that has to climb (HYPE)
+    other: str       # the one it has to pass (SOL)
+    start_ms: int    # open time of the first 1-minute candle that counts
+    end_ms: int      # open time of the last one
+
+    def window(self) -> str:
+        et = lambda ms: dt.datetime.fromtimestamp(ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(ms)))).strftime("%m-%d %H:%M")
+        return (f"{et(self.start_ms)} – {et(self.end_ms)} ET（北京 {stamp(self.start_ms, seconds=False)} – "
+                f"{stamp(self.end_ms, seconds=False)}）")
+
+
+FLIP_MARKETS = (
+    # "at any point between October 2, 2026, 04:00 AM ET and October 31, 2026, 11:59 PM ET" (both EDT): the HYPE/USDC
+    # and SOL/USDC 1-minute closes with the same timestamp on Hyperliquid
+    FlipSpec("HYPE-SOL", "will-hype-flip-sol-by-nov-26", "HYPE 反超 SOL", "HYPE", "SOL",
+             et_ms(2026, 10, 2, 4, 0, -4), et_ms(2026, 10, 31, 23, 59, -4)),
+)
+
+
+def ratio_vol(a_rows: list, b_rows: list, now_ms: int) -> float:
+    """Annualised σ of ln(A/B) from the last 721 finished hours both coins have (Hyperliquid 1h candles)."""
+    closes = lambda rows: {int(r["t"]): float(r["c"]) for r in rows if int(r["t"]) + HOUR_MS <= now_ms and float(r["c"]) > 0}
+    a, b = closes(a_rows), closes(b_rows)
+    hours = sorted(set(a) & set(b))[-721:]
+    if len(hours) < 721:
+        raise ValueError("30 日小时 K 线不足")
+    logs = [math.log(a[t] / b[t]) for t in hours]
+    rets = [y - x for x, y in zip(logs, logs[1:])]
+    mean = sum(rets) / len(rets)
+    return math.sqrt(sum((r - mean) ** 2 for r in rets) / (len(rets) - 1) * 365 * 24)
+
+
+class FlipMarket:
+    """Two Hyperliquid perps against each other: live mids, the 30-day σ of their price ratio, and the path since the
+    window opened. The path check reads hourly bars and opens an hour's 1-minute candles only when a flip was possible
+    in it (A's high reached B's low), so it costs next to nothing while the two are far apart."""
+    PRICE_SECONDS = 30
+    VOL_SECONDS = 3600
+    SCAN_SECONDS = 300
+    PRICE_STALE_MS = 5 * 60_000     # mids older than this price nothing
+    SIGMA_STALE_MS = 24 * 3600_000  # σ not re-measured for a day: shown, not advised on
+    SCAN_STALE_MS = 3 * 3600_000    # the path check must reach this close to now before advice is given
+
+    def __init__(self, store: "Store", spec: FlipSpec):
+        self.store, self.spec = store, spec
+        self.prices: dict[str, D] = {}
+        self.priced_ms = 0
+        self.sigma: float | None = None
+        self.sigma_ms = 0
+        self.error = ""
+        self.times = {"price": -1e9, "vol": -1e9, "scan": -1e9}
+
+    async def info(self, payload: dict) -> Any:
+        return await http_json(Hyperliquid.URL, payload)
+
+    async def candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list[dict]:
+        rows = await self.info({"type": "candleSnapshot", "req": {"coin": coin, "interval": interval,
+                                                                  "startTime": start_ms, "endTime": end_ms}})
+        if not isinstance(rows, list):
+            raise ValueError("Hyperliquid K 线格式异常")
+        return [r for r in rows if isinstance(r, dict) and str(r.get("t", "")).isdigit()]
+
+    @property
+    def ratio(self) -> float | None:
+        a, b = self.prices.get(self.spec.coin), self.prices.get(self.spec.other)
+        return float(a / b) if a and b else None
+
+    @property
+    def history(self) -> dict:
+        """{'kind': 'clear'|'flip', 'through': ms (next hour to check), 'top'/'top_at': highest hourly-close ratio,
+        'time'/'a'/'b': the flip minute and both closes, 'start': the window} or {}."""
+        saved = self.store.get(f"flip:{self.spec.slug}", {})
+        return saved if isinstance(saved, dict) and saved.get("start") == self.spec.start_ms else {}
+
+    async def refresh(self, now_ms: int) -> None:
+        mono, errors = time.monotonic(), []
+        if mono - self.times["price"] >= self.PRICE_SECONDS:
+            self.times["price"] = mono
+            try:
+                mids = await self.info({"type": "allMids"})
+                prices = {}
+                for coin in (self.spec.coin, self.spec.other):
+                    if not isinstance(mids, dict) or coin not in mids:
+                        raise ValueError(f"Hyperliquid 没有 {coin} 的报价")
+                    prices[coin] = number(mids[coin], f"{coin} 价格")
+                self.prices, self.priced_ms = prices, now_ms
+            except Exception as error:
+                errors.append(clean_error(error) or type(error).__name__)
+        if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
+            self.times["vol"] = mono
+            try:
+                first = now_ms - 32 * 24 * HOUR_MS
+                a = await self.candles(self.spec.coin, "1h", first, now_ms)
+                b = await self.candles(self.spec.other, "1h", first, now_ms)
+                self.sigma, self.sigma_ms = ratio_vol(a, b, now_ms), now_ms
+            except Exception as error:
+                errors.append(f"波动率：{clean_error(error) or type(error).__name__}")
+        if mono - self.times["scan"] >= self.SCAN_SECONDS:
+            self.times["scan"] = mono
+            try:
+                await self.scan(now_ms)
+            except Exception as error:
+                errors.append(f"反超核验：{clean_error(error) or type(error).__name__}")
+        self.error = "；".join(errors)
+
+    async def scan(self, now_ms: int) -> None:
+        """Extend the flip check from where it stopped (kept) up to the last closed minute of the window."""
+        spec, hist = self.spec, self.history
+        if hist.get("kind") == "flip":
+            return
+        end = min(now_ms - now_ms % 60_000, spec.end_ms + 60_000)  # minutes opening before this have closed
+        if end <= spec.start_ms:
+            return  # the window has not opened yet: nothing to check
+        cursor = int(hist.get("through") or spec.start_ms)
+        if cursor >= end:
+            return  # checked to the end of the window (or to this very minute)
+        top, top_at = float(hist.get("top") or 0), int(hist.get("top_at") or 0)
+        first = cursor - cursor % HOUR_MS
+        a_rows = await self.candles(spec.coin, "1h", first, end)
+        b_by_hour = {int(r["t"]): r for r in await self.candles(spec.other, "1h", first, end)}
+        for row in sorted(a_rows, key=lambda r: int(r["t"])):
+            t, other = int(row["t"]), b_by_hour.get(int(row["t"]))
+            if t + HOUR_MS <= cursor or t >= end:
+                continue
+            if other is None:
+                break  # an hour one coin lacks cannot be vouched for: try again next time
+            if float(row["h"]) >= float(other["l"]):  # only then can a minute close with A above B
+                hit = await self.scan_minutes(max(t, cursor, spec.start_ms), min(t + HOUR_MS, end))
+                if hit:
+                    self.store.put(f"flip:{spec.slug}", {**hit, "start": spec.start_ms, "top": max(top, hit["a"] / hit["b"]), "top_at": hit["time"]})
+                    return
+            ratio = float(row["c"]) / float(other["c"])
+            if ratio > top:
+                top, top_at = ratio, t
+            if t + HOUR_MS > end:
+                break  # the running hour: its closed minutes were checked; the hour itself is not done yet
+            cursor = t + HOUR_MS
+        self.store.put(f"flip:{spec.slug}", {"kind": "clear", "through": cursor, "start": spec.start_ms, "top": top, "top_at": top_at})
+
+    async def scan_minutes(self, start_ms: int, end_ms: int) -> dict | None:
+        """The first closed minute in [start_ms, end_ms) whose A close is above B's (same timestamp), or None."""
+        if end_ms <= start_ms:
+            return None
+        a = {int(r["t"]): float(r["c"]) for r in await self.candles(self.spec.coin, "1m", start_ms, end_ms - 1)}
+        b = {int(r["t"]): float(r["c"]) for r in await self.candles(self.spec.other, "1m", start_ms, end_ms - 1)}
+        if not a or not b:
+            raise ValueError(f"Hyperliquid 没有 {stamp(start_ms, seconds=False)} 起的 1 分钟 K 线，无法核验")  # kept ~3.5 days
+        for t in sorted(set(a) & set(b)):
+            if start_ms <= t < end_ms and t <= self.spec.end_ms and a[t] > b[t]:
+                return {"kind": "flip", "time": t, "a": a[t], "b": b[t]}
+        return None
+
+    def odds(self, now_ms: int) -> float | str:
+        """P(Yes), or why there is none: 1 once a minute closed with A above B; otherwise the chance the ratio's running
+        maximum reaches 1 before the window ends (zero drift, fixed σ, the window's remaining time)."""
+        spec, hist = self.spec, self.history
+        if hist.get("kind") == "flip":
+            return 1.0
+        why = f"（{brief_error(self.error, 60)}）" if self.error else ""
+        if now_ms >= spec.end_ms + 60_000:
+            if hist.get("kind") == "clear" and int(hist.get("through") or 0) >= spec.end_ms + 60_000:
+                return 0.0
+            return f"窗口已结束，等待核验最后几小时{why}"
+        if self.ratio is None or self.sigma is None:
+            return f"等待 Hyperliquid 行情{why}"
+        if now_ms - self.priced_ms > self.PRICE_STALE_MS:
+            return (f"Hyperliquid 价格停在 {stamp(self.priced_ms, seconds=False)}（{(now_ms - self.priced_ms) // 60_000} 分钟未更新"
+                    f"{'：' + brief_error(self.error, 60) if self.error else ''}），暂停概率")
+        years = (spec.end_ms + 60_000 - max(now_ms, spec.start_ms)) / YEAR_MS
+        return hit_probability(self.ratio, 1.0, self.sigma, years)
+
+    def model_swing(self, now_ms: int) -> float:
+        """How far P(Yes) moves with σ ×/÷ 1.25 (σ is a 30-day estimate)."""
+        odds = self.odds(now_ms)
+        if not isinstance(odds, float) or odds >= 1.0 or not self.sigma or self.ratio is None:
+            return 0.0
+        years = max(0.0, (self.spec.end_ms + 60_000 - max(now_ms, self.spec.start_ms)) / YEAR_MS)
+        return max(abs(hit_probability(self.ratio, 1.0, self.sigma * k, years) - odds) for k in (MODEL_SIGMA_ERROR, 1 / MODEL_SIGMA_ERROR))
+
+    def advice_problem(self, now_ms: int) -> str:
+        """Why the model's edge must not be suggested now ("" when it may): the window's path must be checked up to
+        nearly now, and σ must be current."""
+        hist, kind = self.history, self.history.get("kind")
+        if kind == "flip":
+            return ""
+        if now_ms > self.spec.start_ms + self.SCAN_STALE_MS:
+            if kind != "clear":
+                return "窗口开始以来是否反超尚未核验；暂不给建议"
+            through = int(hist.get("through") or 0)
+            if through < self.spec.end_ms + 60_000 and now_ms - through > self.SCAN_STALE_MS:
+                return f"反超核验停在 {stamp(through, seconds=False)}；暂不给建议"
+        if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
+            return "波动率超过一天未更新；暂不给建议"
+        return ""
+
+    def status(self, now_ms: int) -> str:
+        spec, hist = self.spec, self.history
+        if hist.get("kind") == "flip":
+            return (f"已于 {stamp(hist['time'], seconds=False)} 这一分钟反超：{spec.coin} {hist['a']:g} > {spec.other} {hist['b']:g}")
+        if now_ms < spec.start_ms:
+            return f"窗口北京 {stamp(spec.start_ms, seconds=False)} 开始"
+        if hist.get("kind") == "clear":
+            top = f"；窗口内最高比值 {hist['top']:.4f}（{stamp(hist['top_at'], seconds=False)} 那一小时收盘）" if hist.get("top") else ""
+            return f"窗口开始以来未反超（核至 {stamp(hist['through'], seconds=False)}）{top}"
+        return "窗口开始以来是否反超：待核验"
+
+
 # --- market-cap ladder (will a token's market cap reach each threshold?) ----------------------------
 @dataclass(frozen=True)
 class CapSpec:
@@ -4635,7 +4853,7 @@ class SimMarket:
     settle: dict             # what deciding the result needs
 
 
-SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": "月度涨跌", "ladder": "市值阶梯"}
+SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": "月度涨跌", "flip": "反超", "ladder": "市值阶梯"}
 
 
 def side_levels(book: PredictBook, side: str) -> list[tuple[float, float]]:
@@ -4979,6 +5197,18 @@ function card(it,g){
     det.append(dl);c.append(det);if(t.error)c.append($("div","warn small","⚠️ 币安刷新失败："+t.error));
     if(t.status.startsWith("需人工核对"))c.append($("div","warn small","⚠️ "+t.status));
     else if(t.hold)c.append($("div","warn small","⚠️ "+t.hold));
+    if(it.predict)c.append(book(it.predict));return c}
+  if(it.flip){const f=it.flip,det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
+    // a flip market: A has to close a minute above B; the ratio and how far it still has to climb
+    const sm=$("summary");sm.title="点开看计算明细";
+    sm.append($("span","rd",f.coin),$("span","v",f.a),$("span","rd",f.other),$("span","v",f.b),$("span","rd","比"),$("span","v",f.ratio==null?"—":f.ratio.toFixed(4)));
+    if(f.gap!=null&&f.gap>0){const ch=$("span","chip","差 +"+(f.gap*100).toFixed(1)+"%");ch.title=f.coin+" 相对 "+f.other+" 还要涨这么多才反超";sm.append(ch)}
+    det.append(sm);const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
+    row("窗口",f.window);row("规则","Hyperliquid 永续，同一分钟的 1 分钟 K 收盘 "+f.coin+" > "+f.other+" 即 Yes；只看每个币的单价");
+    row("σ","30 日小时收盘的 ln("+f.coin+"/"+f.other+") 年化 "+(f.sigma*100).toFixed(1)+"%｜剩 "+(f.years*365).toFixed(1)+" 天");
+    row("窗口以来",f.status);row("模型","比值单边触及 1：零漂移、固定波动率，Φ((−h−s²/2)/s) + R·Φ((−h+s²/2)/s)，h = ln(1/R)，s = σ√T");
+    det.append(dl);c.append(det);if(f.error)c.append($("div","warn small","⚠️ Hyperliquid 刷新失败："+f.error));
+    if(f.hold)c.append($("div","warn small","⚠️ "+f.hold));
     if(it.predict)c.append(book(it.predict));return c}
   const det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   const sm=$("summary");sm.title=(it.ref_day?it.ref_day+" 收盘 → 有效价":"参考 → 有效价")+"；点开看计算明细";
@@ -5571,9 +5801,10 @@ class Bot:
         self.hsi.dated_close = lambda day: self.hsi_daily.daily.get(day)  # checks the cash index belongs to the right day
         self.touches = {spec.key: TouchMarket(store, spec) for spec in TOUCH_MARKETS}
         self.updowns = {spec.key: UpDownMarket(store, spec) for spec in UPDOWN_MARKETS}
+        self.flips = {spec.key: FlipMarket(store, spec) for spec in FLIP_MARKETS}
         self.caps = {spec.key: CapMarket(store, spec) for spec in CAP_MARKETS}
         if config.touch:
-            self.predict.want_info.update(spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS))
+            self.predict.want_info.update(spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *FLIP_MARKETS))
             self.predict.ladder_keys.update(self.caps)
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
@@ -6637,6 +6868,7 @@ class Bot:
         if self.config.touch:
             items.extend(self.touch_payload(t, now_ms) for t in self.touches.values())
             items.extend(self.updown_payload(u, now_ms) for u in self.updowns.values())
+            items.extend(self.flip_payload(f, now_ms) for f in self.flips.values())
             items.extend(self.cap_payload(c, now_ms) for c in self.caps.values())
         if self.config.sim and self.config.predict:
             items.append({"name": "模拟交易", "symbol": "SIM", "group": "sim", "kind": "sim", "sim": self.sim_report()})
@@ -6710,6 +6942,60 @@ class Bot:
         if first in {"down", "跌", "下跌"}:  # the book prices "Down": its complement is "Up"
             return flip_book(book), ""
         return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}），暂不比较"
+
+    def flip_yes_book(self, spec: FlipSpec) -> tuple[PredictBook | None, str]:
+        """The book priced as "Yes" (the card's left side), whatever the market's outcome order."""
+        book = self.predict.books.get(spec.key)
+        if book is None:
+            return None, ""
+        names = (self.predict.info.get(spec.slug) or {}).get("outcomes") or []
+        first = names[0].strip().lower() if names else ""
+        if first == "yes":
+            return book, ""
+        if first == "no":
+            return flip_book(book), ""
+        return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}），暂不比较"
+
+    def flip_hold(self, fm: "FlipMarket", odds: float, book: PredictBook | None, now_ms: int) -> str:
+        """Why no trade is suggested: the market's own reasons, or our data says it flipped while the book disagrees."""
+        hold = fm.advice_problem(now_ms)
+        if book is not None and odds >= 1.0 and fm.history.get("kind") == "flip":
+            top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0)
+            if top < 0.9:
+                hold = hold or "数据显示已反超，但盘口仍低于 90¢；以 Hyperliquid 1 分钟 K 为准，请核实"
+        return hold
+
+    def flip_payload(self, fm: "FlipMarket", now_ms: int) -> dict:
+        """Web card for a flip market: Yes = A closes a minute above B inside the window."""
+        spec = fm.spec
+        base = {"name": spec.name, "symbol": spec.key, "group": "crypto", "labels": ["Yes", "No"], "close_ms": spec.end_ms + 60_000,
+                "close_label": f"{spec.window()}，任一 1 分钟 K 收盘 {spec.coin} > {spec.other} 即 Yes"}
+        odds = fm.odds(now_ms)
+        book, why = self.flip_yes_book(spec)
+        hold = self.flip_hold(fm, odds, book, now_ms) if isinstance(odds, float) else ""
+        out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
+        if book is not None:
+            out.update(bids=[[float(p), float(q)] for p, q in book.bids], asks=[[float(p), float(q)] for p, q in book.asks],
+                       age=max(0, (now_ms - book.fetched_ms) // 1000), stale=book.stale(now_ms))
+            if isinstance(odds, float):
+                edges = book_edges(odds, book, self.edge_costs())
+                swing = fm.model_swing(now_ms)
+                need = self.edge_need(swing)
+                best = None if book.stale(now_ms) or hold else best_edge(edges, need)
+                out.update(edges=[edge_json(e, best, e.label.replace("涨", "Yes").replace("跌", "No")) for e in edges],
+                           need=need, swing=swing, notional=self.config.predict_trade_usd)
+        elif why and spec.key in self.predict.books:
+            out["error"] = why
+        if self.config.predict:
+            base["predict"] = out
+        if isinstance(odds, str):
+            return {**base, "missing": odds}
+        a, b, ratio = fm.prices.get(spec.coin), fm.prices.get(spec.other), fm.ratio
+        return {**base, "fair_up": odds, "fair_down": 1 - odds, "up": odds, "flat": 0.0, "down": 1 - odds, "flip": {
+            "coin": spec.coin, "other": spec.other, "a": fmt(a) if a else "—", "b": fmt(b) if b else "—", "ratio": ratio,
+            "gap": (1 / ratio - 1) if ratio else None, "sigma": fm.sigma or 0.0, "window": spec.window(),
+            "years": max(0.0, (spec.end_ms + 60_000 - max(now_ms, spec.start_ms)) / YEAR_MS),
+            "status": fm.status(now_ms), "error": fm.error, "hold": hold}}
 
     def updown_hold(self, mkt: "UpDownMarket", odds: UpDownOdds, now_ms: int) -> tuple[str, str]:
         """(why no trade is suggested, a note on the line): the market's own reasons, and Predict's target price (when its
@@ -6807,6 +7093,12 @@ class Bot:
             if isinstance(odds, UpDownOdds) and book is not None:
                 out.append(SimMarket(mkt.spec.slug, mkt.spec.name, "updown", mkt.spec.key, odds.fair_up, book,
                                      self.edge_need(mkt.model_swing(odds)), self.updown_hold(mkt, odds, now_ms)[0], ("涨", "跌"), {}))
+        for fm in self.flips.values():
+            odds = fm.odds(now_ms)
+            book, _ = self.flip_yes_book(fm.spec)
+            if isinstance(odds, float) and book is not None:
+                out.append(SimMarket(fm.spec.slug, fm.spec.name, "flip", fm.spec.key, odds, book, self.edge_need(fm.model_swing(now_ms)),
+                                     self.flip_hold(fm, odds, book, now_ms), ("Yes", "No"), {"end": fm.spec.end_ms}))
         for cap in self.caps.values():
             for row in self.predict.ladders.get(cap.spec.key) or []:
                 fair = self.ladder_fair(cap, row, now_ms)
@@ -6875,6 +7167,15 @@ class Bot:
             odds = mkt.odds(now_ms) if mkt else None
             if isinstance(odds, UpDownOdds) and odds.settled:
                 return odds.fair_up, f"终点 {odds.price:,.2f}，起点 {odds.line:,.2f}"
+            return None
+        if kind == "flip":
+            fm = self.flips.get(trade["key"])
+            hist = fm.history if fm else {}
+            if hist.get("kind") == "flip":
+                return 1.0, fm.status(now_ms)
+            end = int(s.get("end") or 0)
+            if hist.get("kind") == "clear" and int(hist.get("through") or 0) >= end + 60_000 and now_ms > end + self.SIM_SETTLE_MS:
+                return 0.0, "窗口内没有反超"
             return None
         if kind == "ladder":
             cap = self.caps.get(trade["key"])
@@ -7142,7 +7443,7 @@ class Bot:
                    else session_remaining(market, now_ms, None, self.config.holidays.get(market, frozenset()))[1])
             targets[key] = predict_slug(stem, day)
         if self.config.touch:
-            targets.update({spec.key: spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *CAP_MARKETS)})
+            targets.update({spec.key: spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *FLIP_MARKETS, *CAP_MARKETS)})
         return targets
 
     def edge_costs(self) -> EdgeCosts:
@@ -7774,6 +8075,7 @@ class Bot:
         if self.config.touch:
             jobs.append(("先触市场", lambda: self.refresh_touch(now())))
             jobs.append(("涨跌市场", lambda: self.refresh_updown(now())))
+            jobs.append(("反超市场", lambda: self.refresh_flip(now())))
             jobs.append(("市值阶梯", lambda: self.refresh_caps(now())))
         if self.config.sim and self.config.predict:
             jobs.append(("模拟交易", lambda: self.sim_step(now())))
@@ -7792,6 +8094,12 @@ class Bot:
             await cap.refresh(now_ms)
         failed = [f"{key}：{cap.error}" for key, cap in self.caps.items() if cap.error]
         return refreshed(failed, len(self.caps) - len(failed))
+
+    async def refresh_flip(self, now_ms: int) -> Refreshed:
+        for fm in self.flips.values():
+            await fm.refresh(now_ms)
+        failed = [f"{key}：{fm.error}" for key, fm in self.flips.items() if fm.error]
+        return refreshed(failed, len(self.flips) - len(failed))
 
     async def refresh_updown(self, now_ms: int) -> Refreshed:
         for mkt in self.updowns.values():
