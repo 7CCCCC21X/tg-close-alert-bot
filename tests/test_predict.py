@@ -211,26 +211,38 @@ async def run():
         # a best edge of 10¢ or more puts a red frame round the card
         assert await page.locator("#g-index .card.hot .edge.best.hot").count() == 1
         assert await page.locator(".edge.best").count() == 1
-        # the whole block is one link: quote line, edge chips and tip all sit inside it
+        # the market opens from its own Predict ↗ button, in a new tab; the four chips are buttons that open their details
         href = m.PREDICT_SITE + want["SSE"] + "?ref=B00EA"
-        assert await page.get_attribute("#g-index a.pb", "href") == href and await page.get_attribute("#g-index a.pb", "target") == "_blank"
-        assert await page.locator("#g-index a.pb .edges .edge.best").count() == 1 and await page.locator("#g-index a.pb .edges .edge").count() == 4
-        # framed = suggested, grey = not big enough: no threshold line under the chips (the hover says why a chip is grey)
+        link = page.locator("#g-index .pb a.open")
+        assert await link.get_attribute("href") == href and await link.get_attribute("target") == "_blank"
+        assert await page.locator("#g-index .pb .edges button.edge.best").count() == 1 and await page.locator("#g-index .pb .edges button.edge").count() == 4
+        # framed = suggested, grey = not big enough: no threshold on the card itself, only in a tapped chip's details
         assert "门槛" not in await page.inner_text("#g-index .card")
+        p = next(i for i in bot.odds_payload()["items"] if i["name"] == "上证指数")["predict"]
+        best = next(e for e in p["edges"] if e["best"])
+        await page.click("#g-index .edge.best")
+        det = await page.inner_text("#g-index .edet")
+        assert f"{best['label']} @ {m.cents(best['price'])}：挂单排队" in det and f"毛优势 {m.cents(best['gross'], True)}" in det, det
+        assert f"净优势 {m.cents(best['edge'], True)} · 建议门槛 {m.cents(p['need'])}" in det and "→ 满足" in det and "高亮门槛 10¢ → 标红框" in det, det
+        assert len(page.context.pages) == 1 and await page.get_attribute("#g-index .edge.best", "aria-expanded") == "true"
         grey = page.locator("#g-index .edge:not(.pos)")
-        assert await grey.count() >= 1 and (await grey.first.get_attribute("title")).endswith("；不够大，不建议")
+        assert await grey.count() >= 1
+        await grey.first.click()  # another chip swaps the details; a grey one says why it is not suggested
+        det = await page.inner_text("#g-index .edet")
+        assert "→ 不满足" in det and "高亮门槛" not in det and await page.locator("#g-index .edet").count() == 1, det
+        await grey.first.click(); assert await page.locator("#g-index .edet").count() == 0  # tapped again: closed
         await page.context.route("https://predict.fun/**", lambda route: route.fulfill(body="predict", content_type="text/html"))
         async with page.context.expect_page() as popup:
-            await page.click("#g-index a.pb .edge.best")  # a click on an edge chip opens the market too
+            await link.click()
         tab = await popup.value; await tab.wait_for_load_state()
         assert tab.url == href, tab.url
         await tab.close()
         assert "还没有这个市场" in await page.inner_text("#g-contract")
         # the header toggle hides every Predict block, and the choice survives a reload
-        await page.click("#showbook"); assert not await page.is_visible("#g-index a.pb")
+        await page.click("#showbook"); assert not await page.is_visible("#g-index .pb")
         await page.reload(); await page.wait_for_selector(".card .odds")
-        assert not await page.is_checked("#showbook") and not await page.is_visible("#g-index a.pb")
-        await page.click("#showbook"); assert await page.is_visible("#g-index a.pb")
+        assert not await page.is_checked("#showbook") and not await page.is_visible("#g-index .pb")
+        await page.click("#showbook"); assert await page.is_visible("#g-index .pb")
         wide = await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         assert wide, "no horizontal scroll at phone width"
         # ✎ 自定义 moves the red-frame bar (default 10¢): 30¢ clears this +24.9¢ card, 20¢ brings it back
