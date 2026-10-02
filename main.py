@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.15.2"
+VERSION = "1.16.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -415,6 +415,9 @@ class Config:
     predict_fee_bps: int = 200   # taker fee rate when a market states none (Predict: 2% × min(p, 1 − p); makers 0)
     predict_trade_usd: float = 100.0  # trade size a taker edge is priced for (walks the book's depth)
     predict_min_edge: float = 0.02    # net edge (per $1 share) a suggestion needs at least, on top of the model error
+    sim: bool = True         # paper trading: a simulated buy whenever a suggestion's net edge reaches sim_edge
+    sim_edge: float = 0.10   # net edge (per $1 share) that triggers a simulated buy
+    sim_shares: float = 100.0  # shares per simulated buy
     touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
     auction_alert: bool = True  # Telegram reminder when a market's closing auction starts
 
@@ -469,6 +472,9 @@ class Config:
             predict_fee_bps=bounded_int(e, "PREDICT_FEE_BPS", 200, 0, 1000),
             predict_trade_usd=parse_bounded(e, "PREDICT_TRADE_USD", "100", 1, 1_000_000),
             predict_min_edge=parse_bounded(e, "PREDICT_MIN_EDGE_CENTS", "2", 0, 50) / 100,
+            sim=e.get("SIM", "on").strip().lower() not in {"off", "0", "false", "no"},
+            sim_edge=parse_bounded(e, "SIM_EDGE_CENTS", "10", 0.5, 50) / 100,
+            sim_shares=parse_bounded(e, "SIM_SHARES", "100", 1, 1_000_000),
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
             auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
             probability=e.get("PROBABILITY", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -4612,6 +4618,74 @@ class CapMarket:
         return hit_probability(float(cap), float(target), self.sigma, years)
 
 
+# --- paper trading (does buying every 10¢ edge make money in the long run?) ------------------------------------------
+@dataclass(frozen=True)
+class SimMarket:
+    """One Predict market as the paper trader sees it, exactly as its card does: the model's fair price for the 涨 / Yes
+    side, the book oriented to that side, the bar a suggestion must clear, and what deciding the result needs."""
+    market: str              # unique: the slug, plus "#<market id>" for one level of a ladder
+    item: str                # the card's name for it (恒生指数 / BTC 10月涨跌 / $牛来 市值 $200M)
+    kind: str                # close | touch | updown | ladder
+    key: str                 # the card's book key (HSI / UNITREEUSDT / BNB / BTC-2026-10 / NIULAI)
+    fair_up: float
+    book: PredictBook        # bids / asks price the 涨 / Yes side
+    need: float
+    hold: str                # why the card suggests nothing now ("" = it may)
+    sides: tuple[str, str]   # the card's names for the two sides: (涨, 跌), (Yes, No), ($3k, $1k)
+    settle: dict             # what deciding the result needs
+
+
+SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": "月度涨跌", "ladder": "市值阶梯"}
+
+
+def side_levels(book: PredictBook, side: str) -> list[tuple[float, float]]:
+    """What buying one side costs, best first: 涨 / Yes = the asks; 跌 / No = 1 − the bids."""
+    if side == "up":
+        return [(float(p), float(q)) for p, q in book.asks]
+    return [(1 - float(p), float(q)) for p, q in book.bids]
+
+
+def fill_shares(levels: list[tuple[float, float]], shares: float) -> tuple[float, float]:
+    """(average price, shares bought) taking up to ``shares`` from ``levels`` [(price, size)], best first."""
+    got = cost = 0.0
+    for price, size in levels:
+        take = min(size, shares - got)
+        if take <= 0:
+            break
+        got, cost = got + take, cost + take * price
+    return (cost / got if got else 0.0), got
+
+
+def sim_payout(side: str, up_result: float) -> float:
+    """What one share of ``side`` pays when the 涨 / Yes side settles at up_result (1, 0, or ½ for a tie)."""
+    return up_result if side == "up" else 1 - up_result
+
+
+def sim_stats(trades: list[dict]) -> dict:
+    """Totals for a set of paper trades: settled count and result split, money in and out, the model's own expectation
+    for those positions (the net edge at entry × shares), and what is still open."""
+    done = [t for t in trades if t["status"] == "settled"]
+    held = [t for t in trades if t["status"] == "filled"]
+    cost = sum(t["price"] * t["shares"] for t in done)
+    back = sum(t["payout"] * t["shares"] for t in done)
+    return {"trades": len(trades), "settled": len(done), "wins": sum(t["payout"] == 1 for t in done),
+            "losses": sum(t["payout"] == 0 for t in done), "ties": sum(0 < t["payout"] < 1 for t in done),
+            "cost": cost, "payout": back, "pnl": back - cost, "roi": (back - cost) / cost if cost else 0.0,
+            "expected": sum(t["edge"] * t["shares"] for t in done),
+            "open": len(held), "open_cost": sum(t["price"] * t["shares"] for t in held),
+            "resting": sum(t["status"] == "resting" for t in trades), "expired": sum(t["status"] == "expired" for t in trades)}
+
+
+def sim_status(trade: dict) -> str:
+    """'持仓' / '挂单中' / '未成交' / '赢 +$38.00' / '输 −$62.00' / '平局 −$12.00' (a tie pays ½)."""
+    status = trade["status"]
+    if status != "settled":
+        return {"resting": "挂单中", "filled": "持仓", "expired": "未成交"}.get(status, status)
+    pnl = (trade["payout"] - trade["price"]) * trade["shares"]
+    word = "赢" if trade["payout"] == 1 else "输" if trade["payout"] == 0 else "平局"
+    return f"{word} {'+' if pnl >= 0 else '−'}${abs(pnl):,.2f}"
+
+
 # --- read-only probability web page -------------------------------------------------------------
 WEB_PAGE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -4670,7 +4744,13 @@ a.pb:hover,a.pb:active{background:var(--chip)}a.pb:hover .edge,a.pb:active .edge
 .lg .lt{font-weight:650;white-space:nowrap}.lg .lq{color:var(--muted);white-space:nowrap}
 .touched{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font-size:12px}.touched .k{color:var(--down);font-weight:600}
 .tchip{border-radius:6px;padding:0 6px;background:var(--chip);color:var(--muted);font-variant-numeric:tabular-nums}
-.lg .lb{color:var(--faint);white-space:nowrap}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}.lg .lk b{color:var(--faint)}.lg .lk.pos b{color:var(--best)}.lg .lz{color:var(--faint);font-size:11px;margin-left:3px}
+.lg .lb{color:var(--faint);white-space:nowrap}
+.simtop{display:flex;align-items:baseline;gap:8px}.simpnl{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums}
+.simln{display:flex;flex-wrap:wrap;gap:2px 12px;font-size:13px;color:var(--muted)}
+.simg{display:grid;grid-template-columns:auto auto auto 1fr;gap:2px 12px;font-size:12.5px;font-variant-numeric:tabular-nums;margin-top:2px}.simg .lh{color:var(--faint);font-size:11px}.simg .ln{text-align:right}
+.simrows{display:flex;flex-direction:column;gap:3px;margin-top:4px}
+a.simrow{display:grid;grid-template-columns:auto 1fr auto auto;gap:2px 8px;font-size:12.5px;color:inherit;text-decoration:none;font-variant-numeric:tabular-nums;padding:2px 0;border-top:1px dashed var(--line)}
+a.simrow:hover{background:var(--chip)}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}.lg .lk b{color:var(--faint)}.lg .lk.pos b{color:var(--best)}.lg .lz{color:var(--faint);font-size:11px;margin-left:3px}
 @media (max-width:560px){.lg{gap:3px 7px;font-size:12px}.lg .ld,.lg .lz,.lg .lp{display:none}.lg{grid-template-columns:auto auto auto auto 1fr}}
 .small{font-size:12px;margin-top:3px}.mut{color:var(--faint)}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
 [hidden]{display:none!important}
@@ -4701,6 +4781,7 @@ button.tog{font-family:inherit;padding:2px 9px}.tog.on{border-color:var(--best);
 <h2 id="h-contract">合约标的</h2><div class="grid" id="g-contract"></div>
 <h2 id="h-crypto">加密</h2><div class="grid" id="g-crypto"></div>
 <h2 id="h-ladder">市值阶梯</h2><div class="grid wide" id="g-ladder"></div>
+<h2 id="h-sim">模拟交易</h2><div class="grid wide" id="g-sim"></div>
 <footer id="foot">模型参考，非投资建议。</footer>
 </div>
 <script>
@@ -4712,7 +4793,7 @@ if(!Array.isArray(favs))favs=[];
 favs=[...new Set(favs.filter(k=>typeof k==="string").map(k=>k.includes("|")?(k.split("|")[1]||k.split("|")[0]):k))];  // old "name|symbol" keys
 function toggleFav(k){favs=favs.includes(k)?favs.filter(x=>x!==k):[...favs,k];keep("favs",favs);if(last)render(last)}
 // the viewer's layout, also in this browser only: card order per section, hidden cards and sections, the red-frame bar
-const SECTIONS=["index","contract","crypto","ladder"],SEC_NAMES={fav:"⭐ 收藏",index:"指数",contract:"合约标的",crypto:"加密",ladder:"市值阶梯"};
+const SECTIONS=["index","contract","crypto","ladder","sim"],SEC_NAMES={fav:"⭐ 收藏",index:"指数",contract:"合约标的",crypto:"加密",ladder:"市值阶梯",sim:"模拟交易"};
 function keep(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
 function stored(k,d,ok){try{const v=JSON.parse(localStorage.getItem(k));return ok(v)?v:d}catch(e){return d}}
 const strs=v=>Array.isArray(v)&&v.every(x=>typeof x==="string");
@@ -4782,6 +4863,27 @@ function book(p){
     w.append(g);if(p.stale)w.append($("div","warn small","盘口过期，不给建议"))}  // framed = suggested, grey = not big enough
   return w}
 function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
+function simCard(c,it){
+  // paper trading: would buying every suggestion of 10¢ or more have made money? Results only, nothing is ever ordered
+  const s=it.sim,t=s.total,cents=(s.edge*100).toFixed(0),money=x=>(x>=0?"+$":"−$")+Math.abs(x).toFixed(2),usd=x=>"$"+x.toFixed(2);
+  const col=x=>x>0?upColor():x<0?downColor():"var(--muted)";
+  c.append($("div","small mut","净优势 ≥"+cents+"¢ 时按卡片建议买 "+s.shares+" 份，只记账不下单。吃单按盘口深度成交并扣手续费；挂单要等盘口成交到挂价才算成交，出结果时还没成交就作废。"));
+  if(!t.trades){c.append($("p","","还没有触发过：等有卡片的净优势达到 "+cents+"¢ 就开始记录。"));return c}
+  const top=$("div","simtop"),big=$("b","simpnl",money(t.pnl));big.style.color=col(t.pnl);
+  top.append($("span","mut","已结算盈亏"),big);if(t.cost)top.append($("span","mut",(t.roi>=0?"+":"")+(t.roi*100).toFixed(1)+"%"));c.append(top);
+  const line=(...xs)=>{const d=$("div","simln");xs.forEach(x=>d.append(typeof x==="string"?$("span","",x):x));c.append(d)};
+  line("已结算 "+t.settled+" 笔：赢 "+t.wins+" · 输 "+t.losses+(t.ties?" · 平 "+t.ties:""),"成本 "+usd(t.cost)+" → 回款 "+usd(t.payout));
+  const exp=$("span","","模型预期 "+money(t.expected));exp.title="同一批已结算的交易，按下单时的净优势 × 份数加总：实际盈亏长期应接近它，差得多说明模型有偏差";line(exp);
+  line("持仓 "+t.open+" 笔（"+usd(t.open_cost)+"）","挂单中 "+t.resting+" 笔","未成交作废 "+t.expired+" 笔");
+  const groups=[...s.kinds,...(s.modes.length>1?s.modes:[])];
+  if(groups.length>1){const g=$("div","simg");g.append(...["类别","结算","盈亏","预期"].map(x=>$("span","lh",x)));
+    groups.forEach(r=>{const v=$("span","ln",money(r.pnl));v.style.color=col(r.pnl);g.append($("span","",r.name),$("span","ln",r.settled+" 笔"),v,$("span","ln mut",money(r.expected)))});c.append(g)}
+  const det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
+  det.append($("summary","","最近 "+s.rows.length+" 笔"));const list=$("div","simrows");
+  s.rows.forEach(r=>{const a=$("a","simrow");a.href=r.url;a.target="_blank";a.rel="noopener noreferrer";a.title=r.note||"打开 Predict 市场";
+    const st=$("b","",r.text);if(r.pnl!=null)st.style.color=col(r.pnl);
+    a.append($("span","mut",r.opened),$("span","",r.item+" "+r.label+" "+(r.price*100).toFixed(1)+"¢×"+r.shares),$("span","mut",(r.edge>=0?"+":"")+(r.edge*100).toFixed(1)+"¢"),st);list.append(a)});
+  det.append(list);c.append(det);return c}
 function ladder(c,it){
   c.classList.add("lad");
   // a market-cap ladder: one Yes/No market per threshold; reached ones fold into one line, open ones get a row each
@@ -4857,6 +4959,7 @@ function card(it,g){
       "已收盘":"今日已收盘","休市":"今天不是交易日"}[it.trading]||"";tg.append(a)}
   if(it.close_ms){const cd=$("span","cd");cd.dataset.close=it.close_ms;cd.title="目标 "+it.close_label;tg.append(cd)}
   c.append(head);
+  if(it.kind==="sim")return simCard(c,it);
   if(it.kind==="ladder")return ladder(c,it);
   const best=it.predict&&it.predict.edges&&it.predict.edges.find(e=>e.best);
   if(best&&best.edge>=HOT){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge)}
@@ -5276,6 +5379,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("book", "对比 Predict 订单簿和模型公平价，看挂涨还是挂跌优势大"),
     Command("web", "获取概率网页链接（自动刷新）"),
     Command("calib", "用已保存的预测快照和实际收盘给概率模型打分（Brier/校准/逐日向前拟合）"),
+    Command("sim", "模拟交易：净优势 ≥10¢ 时买 100 份，看长期是赚还是亏（只记账，不下单）"),
     Command("diag", "逐个检测数据源（币安/交易所/上证/A50/恒指/KOSPI/HL/汇率），找出哪里出问题"),
     Command("test", "发送测试消息，不代表行情正常"),
     Command("id", "查看你的用户 ID、聊天 ID、话题 ID"),
@@ -5473,6 +5577,7 @@ class Bot:
             self.predict.ladder_keys.update(self.caps)
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
+        self.sim_ran = -1e9  # monotonic time of the paper trader's last look
         self.reference_pool: ThreadPoolExecutor | None = None
         self.reference_state: dict[str, dict] = {}  # per background feed: last success, last error, duration
         self.anchors: dict[str, tuple[int, D]] = {}  # key -> (reference close ms, proxy price then)
@@ -5496,7 +5601,7 @@ class Bot:
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
             "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/calib": self.cmd_calib,
-            "/book": self.cmd_book,
+            "/book": self.cmd_book, "/sim": self.cmd_sim,
         }
 
     def settings(self) -> dict:
@@ -6533,6 +6638,8 @@ class Bot:
             items.extend(self.touch_payload(t, now_ms) for t in self.touches.values())
             items.extend(self.updown_payload(u, now_ms) for u in self.updowns.values())
             items.extend(self.cap_payload(c, now_ms) for c in self.caps.values())
+        if self.config.sim and self.config.predict:
+            items.append({"name": "模拟交易", "symbol": "SIM", "group": "sim", "kind": "sim", "sim": self.sim_report()})
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION, "server_ms": now_ms,
                 "today": f"{today:%m-%d} {WEEKDAYS[today.weekday()]}",
@@ -6604,21 +6711,24 @@ class Bot:
             return flip_book(book), ""
         return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}），暂不比较"
 
+    def updown_hold(self, mkt: "UpDownMarket", odds: UpDownOdds, now_ms: int) -> tuple[str, str]:
+        """(why no trade is suggested, a note on the line): the market's own reasons, and Predict's target price (when its
+        category shows one) must be the same opening close we read from Binance."""
+        hold = mkt.advice_problem(odds, now_ms)
+        strike = (self.predict.strikes.get(mkt.spec.slug) or (None,))[0]
+        if strike is None:
+            return hold, ""
+        if abs(percent(strike, odds.line)) > D("0.005"):
+            return hold or f"Predict 目标价 {strike:,.2f} 与币安起点 {odds.line:,.2f} 不一致，请核实；暂不给建议", ""
+        return hold, "；与 Predict 目标价一致"
+
     def updown_payload(self, mkt: "UpDownMarket", now_ms: int) -> dict:
         """Web card for a period up/down market: the usual 涨/跌 card, measured from the starting candle's close."""
         spec = mkt.spec
         base = {"name": spec.name, "symbol": spec.key, "group": "crypto", "close_ms": spec.end_ms + 60_000,
                 "close_label": f"{spec.label(spec.end_ms)}这根 1 分钟 K 的收盘价；高于起点为涨、低于为跌、相同按 50/50 结算"}
         odds = mkt.odds(now_ms)
-        hold = mkt.advice_problem(odds, now_ms) if isinstance(odds, UpDownOdds) else ""
-        # Predict's own target price (when its category shows one) must be the same opening close we read from Binance
-        strike = (self.predict.strikes.get(spec.slug) or (None,))[0]
-        agree = ""
-        if strike is not None and isinstance(odds, UpDownOdds):
-            if abs(percent(strike, odds.line)) > D("0.005"):
-                hold = hold or f"Predict 目标价 {strike:,.2f} 与币安起点 {odds.line:,.2f} 不一致，请核实；暂不给建议"
-            else:
-                agree = "；与 Predict 目标价一致"
+        hold, agree = self.updown_hold(mkt, odds, now_ms) if isinstance(odds, UpDownOdds) else ("", "")
         out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
         book, why = self.updown_book(spec)
         if book is not None:
@@ -6652,6 +6762,230 @@ class Bot:
                 "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down}
 
+    def ladder_fair(self, cap: "CapMarket", row: "LadderRow", now_ms: int) -> float | None:
+        """A ladder level's Yes fair price as its card shows it (a market Predict settled before the window closed counts
+        as reached: only a touch settles one early)."""
+        fair = cap.probability(row.target, now_ms)
+        meta = (self.predict.market_meta.get(row.market_id) or ({}, 0))[0] if row.market_id else {}
+        if "RESOLVED" in str(meta.get("status", "")).upper() and now_ms < cap.spec.end_ms:
+            fair = 1.0
+        return fair
+
+    SIM_SECONDS = 10                  # the paper trader looks at the books this often (they refresh every 15 s)
+    SIM_SETTLE_MS = 60 * 60_000       # a daily market is settled this long after its close: the official close is in
+
+    def sim_trades(self) -> dict[str, dict]:
+        return {k.removeprefix("sim:"): v for k, v in self.store.items("sim:") if isinstance(v, dict) and "status" in v}
+
+    def sim_markets(self, now_ms: int) -> list[SimMarket]:
+        """Every Predict market a card prices right now, with the bar its suggestion must clear and why it holds back."""
+        out: list[SimMarket] = []
+        if self.config.probability:
+            for title, odds in self.odds_items(now_ms):
+                key = self.predict_key(title)
+                slug, book = self.predict.slugs.get(key), self.predict.books.get(key)
+                if not isinstance(odds, CloseOdds) or not slug or book is None or book.slug != slug:
+                    continue
+                name, _, symbol = title.partition("｜")
+                close_ms, _ = self.target_close(title, odds.target)
+                out.append(SimMarket(slug, name, "close", key, odds.fair_up, book, self.edge_need(model_swing(odds)), odds.warn,
+                                     ("涨", "跌"), {"key": symbol or key, "target": odds.target.isoformat(),
+                                                   "line": float(odds.ref), "close_ms": close_ms}))
+        if not self.config.touch:
+            return out
+        for touch in self.touches.values():
+            spec, odds = touch.spec, touch.odds(now_ms)
+            book, _ = self.touch_book(spec)
+            if isinstance(odds, TouchOdds) and book is not None:
+                low, high = spec.label(spec.low), spec.label(spec.high)
+                out.append(SimMarket(spec.slug, f"{spec.symbol.removesuffix('USDT')} 先触 {low}/{high}", "touch", spec.key,
+                                     odds.fair_upper, book, self.edge_need(touch.model_swing(now_ms)),
+                                     touch.advice_problem(now_ms), (high, low), {"deadline": spec.deadline_ms}))
+        for mkt in self.updowns.values():
+            odds = mkt.odds(now_ms)
+            book, _ = self.updown_book(mkt.spec)
+            if isinstance(odds, UpDownOdds) and book is not None:
+                out.append(SimMarket(mkt.spec.slug, mkt.spec.name, "updown", mkt.spec.key, odds.fair_up, book,
+                                     self.edge_need(mkt.model_swing(odds)), self.updown_hold(mkt, odds, now_ms)[0], ("涨", "跌"), {}))
+        for cap in self.caps.values():
+            for row in self.predict.ladders.get(cap.spec.key) or []:
+                fair = self.ladder_fair(cap, row, now_ms)
+                book, _ = self.predict.yes_book(row) if row.market_id else (None, "")
+                if fair is None or book is None:
+                    continue
+                top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0)
+                hold = ("数据显示已触及，但盘口仍低于 90¢" if fair == 1.0 and top < 0.9
+                        else "σ 是先验值" if cap.sigma_kind == "prior" else "")
+                out.append(SimMarket(f"{cap.spec.slug}#{row.market_id}", f"{cap.spec.name} {usd_short(row.target)}", "ladder",
+                                     cap.spec.key, fair, book, self.edge_need(cap.model_swing(row.target, now_ms, fair)), hold,
+                                     ("Yes", "No"), {"target": str(row.target), "end": cap.spec.end_ms}))
+        return out
+
+    def sim_note_closes(self) -> None:
+        """Each contract's exchange close, kept per day (its feed holds only the latest), to settle the daily market."""
+        for symbol, base in self.stocks.closes.items():
+            ticker = self.config.tickers.get(symbol)
+            if ticker is None or not base.close_ms:
+                continue
+            offset = dt.timezone(dt.timedelta(hours=STOCK_MARKETS[ticker.market].utc_offset))
+            key = f"outcome:{symbol}:{dt.datetime.fromtimestamp(base.close_ms / 1000, offset).date().isoformat()}"
+            if self.store.get(key) != float(base.value):
+                self.store.put(key, float(base.value))
+
+    def sim_open(self, mk: SimMarket, best: BookEdge, side: str, now_ms: int) -> dict | None:
+        """A paper buy of SIM_SHARES on ``side``: a taker fills now across the book's depth and pays the fee; a maker
+        rests at its price and counts as filled only once the book trades through it."""
+        fair = mk.fair_up if side == "up" else 1 - mk.fair_up
+        trade = {"market": mk.market, "slug": mk.book.slug, "item": mk.item, "kind": mk.kind, "key": mk.key, "side": side,
+                 "label": ("挂" if best.maker else "吃") + mk.sides[0 if side == "up" else 1], "maker": best.maker,
+                 "fair": fair, "signal": best.edge, "opened": now_ms, "settle": mk.settle}
+        if best.maker:
+            trade.update(price=best.price, shares=self.config.sim_shares, status="resting", filled=None)
+        else:
+            avg, got = fill_shares(side_levels(mk.book, side), self.config.sim_shares)
+            if got <= 0:
+                return None
+            bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
+            trade.update(price=avg + taker_fee(avg, bps), shares=got, status="filled", filled=now_ms)
+        trade["edge"] = fair - trade["price"]
+        return trade
+
+    def sim_result(self, trade: dict, now_ms: int) -> tuple[float, str] | None:
+        """(the 涨 / Yes side's result: 1, 0 or ½ for a tie, how it was decided) once the market is decided; None before."""
+        s, kind = trade.get("settle") or {}, trade.get("kind")
+        if kind == "close":
+            close = self.store.get(f"outcome:{s.get('key')}:{s.get('target')}")
+            if close is None or now_ms < int(s.get("close_ms") or 0) + self.SIM_SETTLE_MS:
+                return None
+            line = float(s["line"])
+            up = 1.0 if close > line else 0.0 if close < line else 0.5
+            return up, f"{s['target'][5:]} 收盘 {fmt(close)}，对 {fmt(line)}"
+        if kind == "touch":
+            touch = self.touches.get(trade["key"])
+            hist = touch.history if touch else {}
+            if hist.get("kind") in {"low", "high"}:
+                return (1.0 if hist["kind"] == "high" else 0.0), touch.status()
+            deadline = int(s.get("deadline") or 0)
+            # the hourly check stops at the last full hour before the deadline
+            if hist.get("kind") == "clear" and now_ms > deadline + self.SIM_SETTLE_MS and int(hist.get("through") or 0) >= deadline - 3_600_000:
+                return 0.5, "截止前两条线都没碰到，按 50/50"
+            return None
+        if kind == "updown":
+            mkt = self.updowns.get(trade["key"])
+            odds = mkt.odds(now_ms) if mkt else None
+            if isinstance(odds, UpDownOdds) and odds.settled:
+                return odds.fair_up, f"终点 {odds.price:,.2f}，起点 {odds.line:,.2f}"
+            return None
+        if kind == "ladder":
+            cap = self.caps.get(trade["key"])
+            if cap is None:
+                return None
+            target, mid = D(str(s["target"])), trade["market"].partition("#")[2]
+            row = next((r for r in self.predict.ladders.get(cap.spec.key) or [] if r.market_id == mid), None)
+            high, _ = cap.window_high()
+            meta = (self.predict.market_meta.get(mid) or ({}, 0))[0]
+            reached = (high is not None and high >= target) or (
+                "RESOLVED" in str(meta.get("status", "")).upper() and now_ms < int(s["end"]))
+            if reached:
+                book = self.predict.yes_book(row)[0] if row else None
+                top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=1.0) if book else 1.0
+                if top >= 0.9:  # the book agrees, or is gone: reached (an open disagreement waits)
+                    return 1.0, f"{usd_short(target)} 已触及（按机器人数据，以 {cap.spec.settle} 为准）"
+                return None
+            if now_ms > int(s["end"]) + self.SIM_SETTLE_MS:
+                return 0.0, f"窗口结束前没到 {usd_short(target)}（按机器人数据，以 {cap.spec.settle} 为准）"
+        return None
+
+    async def sim_step(self, now_ms: int) -> "Refreshed | bool":
+        """Paper trading: whenever a card suggests a trade whose net edge reaches SIM_EDGE_CENTS, buy SIM_SHARES of it.
+        The best maker (挂) and the best taker (吃) are judged apart, as the suggestions are, and each is taken once per
+        market and side; a resting order counts only when the book trades through it; every position is settled on the
+        market's result. Nothing is ever sent to Predict."""
+        if time.monotonic() - self.sim_ran < self.SIM_SECONDS:
+            return False
+        self.sim_ran = time.monotonic()
+        self.sim_note_closes()
+        markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
+        trades = self.sim_trades()
+        costs = self.edge_costs()
+        for mk in markets.values():
+            if mk.hold or mk.book.stale(now_ms):
+                continue
+            edges = book_edges(mk.fair_up, mk.book, costs)
+            for maker in (True, False):
+                best = best_edge([e for e in edges if e.maker == maker], mk.need)
+                if best is None or best.edge < self.config.sim_edge - 1e-9:
+                    continue
+                side = "up" if best.side == "涨" else "down"
+                tid = f"{mk.market}|{side}|{'挂' if maker else '吃'}"
+                if tid in trades:
+                    continue  # one position per market, side and way of trading, however long the edge lasts
+                trade = self.sim_open(mk, best, side, now_ms)
+                if trade:
+                    trades[tid] = trade
+                    self.store.put(f"sim:{tid}", trade)
+        for tid, trade in trades.items():
+            before = dict(trade)
+            mk = markets.get(trade["market"])
+            if trade["status"] == "resting" and mk is not None and not mk.book.stale(now_ms):
+                levels = side_levels(mk.book, trade["side"])
+                if levels and levels[0][0] <= trade["price"] + 1e-9:  # someone now sells at our price: we were filled
+                    # the model's view when the fill came (fills tend to come as the market moves against the order)
+                    trade.update(status="filled", filled=now_ms, fill_fair=mk.fair_up if trade["side"] == "up" else 1 - mk.fair_up)
+            if trade["status"] in {"resting", "filled"}:
+                result = self.sim_result(trade, now_ms)
+                if result is not None:
+                    up, note = result
+                    if trade["status"] == "filled":
+                        trade.update(status="settled", payout=sim_payout(trade["side"], up), settled=now_ms, note=note)
+                    else:
+                        trade.update(status="expired", settled=now_ms, note="市场已出结果，挂单一直没成交：" + note)
+            if trade != before:
+                self.store.put(f"sim:{tid}", trade)
+        return Refreshed("ok")
+
+    def sim_report(self, recent: int = 30) -> dict:
+        """The paper trader's record for the page: totals, by market kind and by maker / taker, the latest trades."""
+        trades = sorted(self.sim_trades().values(), key=lambda t: t.get("opened", 0))
+        rows = [{"opened": stamp(t["opened"], seconds=False), "item": t["item"], "label": t["label"], "maker": t["maker"],
+                 "price": t["price"], "shares": t["shares"], "edge": t["edge"], "status": t["status"], "text": sim_status(t),
+                 "pnl": (t["payout"] - t["price"]) * t["shares"] if t["status"] == "settled" else None,
+                 "note": t.get("note", ""), "url": predict_url(t.get("slug") or t["market"].partition("#")[0], self.config.predict_ref)}
+                for t in reversed(trades[-recent:])]
+        return {"edge": self.config.sim_edge, "shares": self.config.sim_shares, "total": sim_stats(trades),
+                "kinds": [{"name": name, **sim_stats([t for t in trades if t["kind"] == kind])}
+                          for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in trades)],
+                "modes": [{"name": name, **sim_stats([t for t in trades if t["maker"] == maker])}
+                          for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in trades)],
+                "rows": rows}
+
+    def sim_text(self) -> str:
+        r = self.sim_report(recent=10)
+        t, edge, shares = r["total"], r["edge"] * 100, f"{r['shares']:g}"
+        lines = [f"🧪 {bold('模拟交易')}（净优势 ≥{edge:g}¢ 时按卡片建议买 {shares} 份，只记账不下单）",
+                 "吃单按盘口深度成交并扣手续费；挂单要等盘口成交到挂价才算成交，市场出结果时还没成交就作废。"]
+        if not t["trades"]:
+            lines.append(f"\n还没有触发过：等有卡片的净优势达到 {edge:g}¢ 就开始记录。")
+            return "\n".join(lines)
+        money = lambda x: f"{'+' if x >= 0 else '−'}${abs(x):,.2f}"
+        lines += ["", f"已结算 {t['settled']} 笔：赢 {t['wins']}｜输 {t['losses']}｜平 {t['ties']}",
+                  f"成本 ${t['cost']:,.2f} → 回款 ${t['payout']:,.2f}｜盈亏 {bold(money(t['pnl']))}"
+                  + (f"（{t['roi'] * 100:+.1f}%）" if t["cost"] else ""),
+                  f"同一批按下单时的净优势，模型预期 {money(t['expected'])}",
+                  f"持仓 {t['open']} 笔（成本 ${t['open_cost']:,.2f}）｜挂单中 {t['resting']} 笔｜未成交作废 {t['expired']} 笔"]
+        for group in (r["kinds"], r["modes"]):
+            if len(group) > 1:
+                lines.append("｜".join(f"{g['name']} {g['settled']} 笔 {money(g['pnl'])}" for g in group))
+        lines.append("\n最近：")
+        lines += [f"{x['opened']} {x['item']} {x['label']} {x['price'] * 100:.1f}¢×{x['shares']:g}"
+                  f"（净优势 {x['edge'] * 100:+.1f}¢）→ {x['text']}" for x in r["rows"]]
+        return "\n".join(lines)
+
+    def cmd_sim(self, req: Request) -> "Reply":
+        if not self.config.sim or not self.config.predict:
+            return Reply("模拟交易已关闭（SIM=off 或 PREDICT=off）。")
+        return Reply(self.sim_text(), html=True)
+
     def cap_payload(self, cap: "CapMarket", now_ms: int) -> dict:
         """Web card for a market-cap ladder: per threshold the model's P(Yes), the Yes book and its best edge."""
         spec = cap.spec
@@ -6661,10 +6995,7 @@ class Bot:
         rows_in = self.predict.ladders.get(spec.key) or [LadderRow(t, "", "", None, "") for t in spec.targets]
         rows = []
         for row in rows_in:
-            fair = cap.probability(row.target, now_ms)
-            meta = (self.predict.market_meta.get(row.market_id) or ({}, 0))[0] if row.market_id else {}
-            if "RESOLVED" in str(meta.get("status", "")).upper() and now_ms < spec.end_ms:
-                fair = 1.0  # settled before the window closed: only a touch settles early, so it was Yes
+            fair = self.ladder_fair(cap, row, now_ms)
             book, why = self.predict.yes_book(row) if row.market_id else (None, "")
             out: dict[str, Any] = {"label": usd_short(row.target), "fair": fair, "error": why,
                                    "dist": float(row.target / cap.cap - 1) if cap.cap else None}
@@ -7444,6 +7775,8 @@ class Bot:
             jobs.append(("先触市场", lambda: self.refresh_touch(now())))
             jobs.append(("涨跌市场", lambda: self.refresh_updown(now())))
             jobs.append(("市值阶梯", lambda: self.refresh_caps(now())))
+        if self.config.sim and self.config.predict:
+            jobs.append(("模拟交易", lambda: self.sim_step(now())))
         return jobs
 
     async def refresh_hsi(self, now_ms: int) -> Refreshed | bool:
