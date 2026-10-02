@@ -1,7 +1,7 @@
 """Will HYPE flip SOL by Nov 2026: Yes once any Hyperliquid 1-minute candle between Oct 2 04:00 ET and Oct 31 23:59 ET
 closes with HYPE above SOL at the same timestamp. The path is checked on hourly bars, opening an hour's 1-minute candles
 only when a flip was possible in it; the chance of a flip is the ratio's single-barrier touch probability."""
-import asyncio, sys, math, json, time, datetime as dt
+import asyncio, os, sys, math, json, time, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
@@ -16,6 +16,8 @@ assert SPEC.slug == "will-hype-flip-sol-by-nov-26" and (SPEC.coin, SPEC.other) =
 assert SPEC.start_ms == utc(2026, 10, 2, 8, 0) and SPEC.end_ms == utc(2026, 11, 1, 3, 59)
 assert SPEC.window() == "10-02 04:00 – 10-31 23:59 ET（北京 10-02 16:00 – 11-01 11:59）", SPEC.window()
 assert SPEC.key not in {s.key for s in (*m.TOUCH_MARKETS, *m.UPDOWN_MARKETS, *m.CAP_MARKETS)}
+assert [m.short_price(D(x)) for x in ("90.2515", "121.805", "0.0123456", "3.5")] == ["90.25", "121.80", "0.01235", "3.5"]
+assert m.short_price(None) == "—"
 
 # --- σ of the ratio: HYPE alternating ±0.5% an hour against a flat SOL -> 0.5% × √8760; moving together -> 0 ---------
 NOW = utc(2026, 10, 3, 10, 20)
@@ -142,7 +144,7 @@ async def run():
     want = m.hit_probability(0.9, 1.0, 0.9, (SPEC.end_ms + 60_000 - NOW) / m.YEAR_MS)
     assert card["group"] == "crypto" and card["symbol"] == "HYPE-SOL" and card["labels"] == ["Yes", "No"] and abs(card["fair_up"] - want) < 1e-12
     f = card["flip"]
-    assert f["a"] == "162" and f["b"] == "180" and abs(f["ratio"] - 0.9) < 1e-12 and abs(f["gap"] - (1 / 0.9 - 1)) < 1e-12 and not f["hold"], f
+    assert f["a"] == "162.00" and f["b"] == "180.00" and abs(f["ratio"] - 0.9) < 1e-12 and abs(f["gap"] - (1 / 0.9 - 1)) < 1e-12 and not f["hold"], f
     assert card["close_ms"] == SPEC.end_ms + 60_000 and card["close_label"].endswith("任一 1 分钟 K 收盘 HYPE > SOL 即 Yes")
     bot.predict.books[SPEC.key] = m.PredictBook(SPEC.key, SPEC.slug, "9", "t", ((D("0.40"), D("500")),), ((D("0.44"), D("500")),), NOW)
     bot.predict.info[SPEC.slug] = {"outcomes": ["Yes", "No"], "created_ms": 0}
@@ -176,7 +178,56 @@ async def run():
     off = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BNB_TOUCH": "off"}), m.Store(":memory:"), FM(NOW), None)
     assert SPEC.key not in off.predict_targets(NOW) and "反超市场" not in [name for name, _ in off.reference_jobs()]
     assert not any(i["name"] == "HYPE 反超 SOL" for i in off.odds_payload()["items"])
+    await layout_check()
     print("FLIP_OK")
+
+
+async def layout_check():
+    """The card as it appeared live (HYPE 90.2515, SOL 121.805, an empty book) at phone and desktop widths: nothing sticks
+    out of any card (the summary wraps instead), the prices are shortened, an empty book says so."""
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        async_playwright = None
+    chrome = next((p for p in [os.environ.get("CHROMIUM_PATH", ""), "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"]
+                   if p and os.path.exists(p)), "")
+    if async_playwright is None or not (chrome or os.environ.get("PLAYWRIGHT_BROWSERS_PATH")):
+        print("browser check skipped (no Playwright/Chromium)")
+        return
+    now = utc(2026, 10, 2, 13, 52)
+
+    class FM:
+        def __init__(self): self.config = None
+        def now_ms(self): return now
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
+    store = m.Store(":memory:")
+    bot = m.Bot(cfg, store, FM(), None)
+    fm = bot.flips[SPEC.key]
+    fm.prices, fm.priced_ms, fm.sigma, fm.sigma_ms = {"HYPE": D("90.2515"), "SOL": D("121.805")}, now, 0.52, now
+    bot.predict.books[SPEC.key] = m.PredictBook(SPEC.key, SPEC.slug, "9", "t", (), (), now)
+    bot.predict.info[SPEC.slug] = {"outcomes": ["Yes", "No"], "created_ms": 0}
+    bot.predict.slugs[SPEC.key] = SPEC.slug
+    touch = bot.touches["BNB"]
+    touch.price, touch.priced_ms, touch.sigma, touch.sigma_ms = D("776.55"), now, 0.6, now
+    web = m.WebServer(bot, 0, "t" * 20); port = await web.start()
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
+        for width in (390, 620, 900, 1300):
+            page = await browser.new_page(viewport={"width": width, "height": 900})
+            await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
+            await page.wait_for_selector("#g-crypto .card")
+            out = await page.evaluate("""() => [...document.querySelectorAll('.card')].flatMap(c => {
+                const edge = c.getBoundingClientRect().right;
+                return [...c.querySelectorAll('*')].filter(e => { const b = e.getBoundingClientRect(); return b.width && b.right > edge + 0.5; })
+                  .map(e => (c.querySelector('.name') || {}).textContent + ': ' + e.className); })""")
+            assert not out, (width, out)
+            card = page.locator("#g-crypto .card", has_text="HYPE 反超 SOL")
+            summary = await card.locator("summary").inner_text()
+            assert "90.25" in summary and "121.80" in summary and "90.2515" not in summary and "+35.0%" in summary, summary
+            assert await card.locator(".quote").inner_text() == "Predict ↗\n暂无挂单"
+            await page.close()
+        await browser.close()
+    await web.stop()
 
 
 asyncio.run(run())
