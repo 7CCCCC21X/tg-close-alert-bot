@@ -215,6 +215,10 @@ async def run():
         href = m.PREDICT_SITE + want["SSE"] + "?ref=B00EA"
         assert await page.get_attribute("#g-index a.pb", "href") == href and await page.get_attribute("#g-index a.pb", "target") == "_blank"
         assert await page.locator("#g-index a.pb .edges .edge.best").count() == 1 and await page.locator("#g-index a.pb .edges .edge").count() == 4
+        # framed = suggested, grey = not big enough: no threshold line under the chips (the hover says why a chip is grey)
+        assert "门槛" not in await page.inner_text("#g-index .card")
+        grey = page.locator("#g-index .edge:not(.pos)")
+        assert await grey.count() >= 1 and (await grey.first.get_attribute("title")).endswith("；不够大，不建议")
         await page.context.route("https://predict.fun/**", lambda route: route.fulfill(body="predict", content_type="text/html"))
         async with page.context.expect_page() as popup:
             await page.click("#g-index a.pb .edge.best")  # a click on an edge chip opens the market too

@@ -340,8 +340,8 @@ async def run():
 
 
 async def browser_check():
-    """The 最优 cell: a passing direction in colour; otherwise the closest one in grey (the bar itself is not shown, only
-    in the hover text); 过期 / ⚠️ as before."""
+    """The 最优 cell: a passing direction in colour; otherwise the closest one in grey (the bar itself is never shown);
+    过期 / ⚠️ as before."""
     try:
         from playwright.async_api import async_playwright
     except ImportError:
@@ -385,7 +385,7 @@ async def browser_check():
         cells = await page.eval_on_selector_all("#g-ladder .lg .lb:not(.lk)", "els => els.map(e => [e.className, e.innerText])")
         assert cells == [["lb miss", "挂No 63.8 +5.8¢"], ["lb miss", "挂No 93.2 +3.2¢"], ["lb pos", "挂No 97.4 +2.2¢"], ["lb", "过期"]], cells
         tip = await page.get_attribute("#g-ladder .lg .lb.miss", "title")
-        assert tip == "挂No @ 63.8¢ 净优势 +5.8¢，不够大，不建议（这一档至少要 6.7¢：σ 估错 25% 时公平价就会变这么多）", tip
+        assert tip == "挂No @ 63.8¢ 净优势 +5.8¢，不够大，不建议", tip
         assert "门槛" not in await page.inner_text("#g-ladder")
         assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "no sideways scroll"
         await browser.close()

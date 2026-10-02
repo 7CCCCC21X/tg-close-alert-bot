@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.15.1"
+VERSION = "1.15.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4776,11 +4776,10 @@ function book(p){
       // net edge on the chip; where the costs went in the tooltip
       x.title=e.label+" @ "+cent(e.price)+"："+(e.maker?"挂单排队，成交不保证；免手续费":
         "立即成交"+(p.notional?"，$"+p.notional+(e.short?" 盘口不够，只能买 ":" 约 ")+qty(e.size)+" 份":"，量 "+qty(e.size))+
-        "；毛 "+cent(e.gross)+" − 深度 "+cent(e.slip||0)+" − 手续费 "+cent(e.fee||0))+" = 净 "+cent(e.edge);
+        "；毛 "+cent(e.gross)+" − 深度 "+cent(e.slip||0)+" − 手续费 "+cent(e.fee||0))+" = 净 "+cent(e.edge)+(e.edge>need?"":"；不够大，不建议");
       const el=$("span","el",e.label+" ");el.append($("i","",(e.price*100).toFixed(1)));
       x.append(el,$("b","",(e.edge>=0?"+":"")+cent(e.edge)));g.append(x)});
-    w.append(g);if(p.stale)w.append($("div","warn small","盘口过期，不给建议"));
-    else if(need){const t=$("div","small mut","净优势门槛 "+cent(need)+(p.swing>p.need-1e-9&&p.swing?"（模型误差）":""));t.title="吃单已扣手续费和按 $"+(p.notional||0)+" 吃到的深度；低于门槛的方向不建议（门槛 = max(最低净优势, 模型误差：σ×/÷1.25、代理系数±0.25)）";w.append(t)}}
+    w.append(g);if(p.stale)w.append($("div","warn small","盘口过期，不给建议"))}  // framed = suggested, grey = not big enough
   return w}
 function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
 function ladder(c,it){
@@ -4823,14 +4822,13 @@ function ladder(c,it){
         if(prior)b.title="σ 是先验值，这个优势只作参考、不提醒";
         else if(best.edge>=HOT&&(!hot||best.edge>hot.edge))hot={...best,row:r.label}}
       else if(r.miss&&!r.error&&!r.stale){const m=r.miss,e=(m.edge>=0?"+":"")+cent(m.edge);b.classList.add("miss");
-        // nothing is big enough to suggest: the closest direction, grey (the hover says by how much it fell short)
+        // nothing is big enough to suggest: the closest direction, grey
         b.append(m.label+" "+(m.price*100).toFixed(1)+" ",$("b","",e));
-        b.title=m.label+" @ "+cent(m.price)+" 净优势 "+e+"，不够大，不建议（这一档至少要 "+cent(need)+
-          (r.swing>=need-1e-9?"：σ 估错 25% 时公平价就会变这么多）":"）")}
+        b.title=m.label+" @ "+cent(m.price)+" 净优势 "+e+"，不够大，不建议"}
       else b.textContent=r.error?"⚠️":r.stale?"过期":"—";
       if(r.error)b.title=r.error;
       const tk=r.edges&&r.edges.filter(e=>!e.maker).sort((x,y)=>y.edge-x.edge)[0],t=$("span","lb lk"+(tk&&tk.edge>need&&!prior&&!r.stale?" pos":""));
-      if(tk){t.append(tk.label+" ",$("span","lp",(tk.price*100).toFixed(1)+" "),$("b","",(tk.edge>=0?"+":"")+cent(tk.edge)),$("span","lz","×"+qk(tk.size)));t.title=tk.label+" @ "+cent(tk.price)+"，立即成交 "+qty(tk.size)+" 份；净优势已扣手续费 "+cent(tk.fee||0)+"、深度 "+cent(tk.slip||0)+(need?"；门槛 "+cent(need):"")+(r.stale?"（盘口过期）":"")}
+      if(tk){t.append(tk.label+" ",$("span","lp",(tk.price*100).toFixed(1)+" "),$("b","",(tk.edge>=0?"+":"")+cent(tk.edge)),$("span","lz","×"+qk(tk.size)));t.title=tk.label+" @ "+cent(tk.price)+"，立即成交 "+qty(tk.size)+" 份；净优势已扣手续费 "+cent(tk.fee||0)+"、深度 "+cent(tk.slip||0)+(tk.edge>need?"":"；不够大，不建议")+(r.stale?"（盘口过期）":"")}
       else t.textContent="—";
       g.append($("span","lt",r.label),$("span","ln ld",r.dist==null?"—":"+"+(r.dist*100).toFixed(0)+"%"),$("span","ln",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b,t)});
     w.append(g)}
@@ -4922,7 +4920,7 @@ function render(d){
 function drawLegend(){
   const lg=document.getElementById("legend");const sw=$("span","sw");[["涨",upColor()],["平","var(--flat)"],["跌",downColor()]].forEach(([t,col])=>{const i=$("i");i.style.background=col;sw.append(i,t)});
   const hot=$("span","sw hot");hot.append($("i"),"红框 = 净优势 ≥"+hotCents+"¢");hot.title="可在 ✎ 自定义 里修改";
-  const rule=$("span","","¢ 公平价 · 净优势 = 公平价 − 成交价 − 费用");rule.title="挂涨@买1 · 挂跌@1−卖1 · 吃涨@卖1 · 吃跌@1−买1；吃单另扣手续费和按单笔金额吃到的深度；低于门槛（最低净优势与模型误差取大）不建议；平盘两边各半";
+  const rule=$("span","","¢ 公平价 · 净优势 = 公平价 − 成交价 − 费用");rule.title="挂涨@买1 · 挂跌@1−卖1 · 吃涨@卖1 · 吃跌@1−买1；吃单另扣手续费和按单笔金额吃到的深度；加框的是建议方向，灰色的优势不够大（要超过最低净优势和模型误差中较大的那个），不建议；平盘两边各半";
   lg.replaceChildren(sw,rule,hot)}
 function drawPanel(){
   const secs=document.getElementById("secs");secs.replaceChildren($("span","mut","显示的栏目："));
