@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.17.0"
+VERSION = "1.17.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4248,6 +4248,13 @@ FLIP_MARKETS = (
 )
 
 
+def short_price(value: D | None) -> str:
+    """90.2515 -> '90.25', 0.0123456 -> '0.01235': short enough for a card's one-line summary."""
+    if value is None:
+        return "—"
+    return f"{value:,.2f}" if value >= 10 else f"{value:.4g}"
+
+
 def ratio_vol(a_rows: list, b_rows: list, now_ms: int) -> float:
     """Annualised σ of ln(A/B) from the last 721 finished hours both coins have (Hyperliquid 1h candles)."""
     closes = lambda rows: {int(r["t"]): float(r["c"]) for r in rows if int(r["t"]) + HOUR_MS <= now_ms and float(r["c"]) > 0}
@@ -4936,7 +4943,7 @@ h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin
 .odds b{font-size:22px;font-weight:700;letter-spacing:-.01em;white-space:nowrap}.odds .lbl{color:var(--muted);font-size:12px;font-weight:400;margin:0 3px}
 .u{color:var(--up)}.d{color:var(--down)}
 .bar{flex:1;display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--line)}.bar i{display:block;height:100%}
-details{font-size:12.5px}summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:4px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:0}
+details{font-size:12.5px}summary{cursor:pointer;list-style:none;display:flex;flex-wrap:wrap;align-items:baseline;gap:1px 4px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:0}
 summary>*{flex:none}summary .sep{margin-left:4px}summary .v{color:var(--text)}summary .un{color:var(--faint);font-size:11px}summary .rd{color:var(--faint);font-size:12px}summary .chip{margin-left:auto}
 summary::-webkit-details-marker{display:none}summary:before{content:"▸";color:var(--faint)}details[open] summary:before{content:"▾"}
 summary .v{color:var(--text)}.chip{font-size:12px;border-radius:6px;padding:0 5px;background:var(--chip);font-weight:600}
@@ -5065,7 +5072,8 @@ function book(p){
   const w=$("a","pb");w.href=p.url;w.target="_blank";w.rel="noopener noreferrer";w.title="打开 Predict 市场";
   const q=$("div","quote");q.append($("span","pt","Predict ↗"));w.append(q);
   const has=p.bids||p.asks;
-  if(has){const b=p.bids[0],k=p.asks[0],lv=(t,l)=>{const x=$("span","",t+" ");x.append($("b","",l?cent(l[0]):"无"));if(l)x.append("×"+qk(l[1]));if(l)x.title=qty(l[1])+" 份";return x};
+  if(has&&!(p.bids||[]).length&&!(p.asks||[]).length){q.append($("span","mut","暂无挂单"));if(p.stale)q.append($("span","warn",p.age+" 秒前"))}
+  else if(has){const b=p.bids[0],k=p.asks[0],lv=(t,l)=>{const x=$("span","",t+" ");x.append($("b","",l?cent(l[0]):"无"));if(l)x.append("×"+qk(l[1]));if(l)x.title=qty(l[1])+" 份";return x};
     q.append(lv("买1",b),lv("卖1",k));if(b&&k)q.title="价差 "+cent(k[0]-b[0]);
     if(p.stale)q.append($("span","warn",p.age+" 秒前"))}
   else if(!p.error)q.append($("span","","等待获取"));
@@ -6992,7 +7000,7 @@ class Bot:
             return {**base, "missing": odds}
         a, b, ratio = fm.prices.get(spec.coin), fm.prices.get(spec.other), fm.ratio
         return {**base, "fair_up": odds, "fair_down": 1 - odds, "up": odds, "flat": 0.0, "down": 1 - odds, "flip": {
-            "coin": spec.coin, "other": spec.other, "a": fmt(a) if a else "—", "b": fmt(b) if b else "—", "ratio": ratio,
+            "coin": spec.coin, "other": spec.other, "a": short_price(a), "b": short_price(b), "ratio": ratio,
             "gap": (1 / ratio - 1) if ratio else None, "sigma": fm.sigma or 0.0, "window": spec.window(),
             "years": max(0.0, (spec.end_ms + 60_000 - max(now_ms, spec.start_ms)) / YEAR_MS),
             "status": fm.status(now_ms), "error": fm.error, "hold": hold}}
