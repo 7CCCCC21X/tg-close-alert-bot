@@ -408,6 +408,7 @@ async def browser_check():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         page = await browser.new_page(viewport={"width": 390, "height": 900})
+        await page.add_init_script("if(!localStorage.getItem('ladderDefault')){localStorage.setItem('hideSec','[\"sim\"]');localStorage.setItem('ladderDefault','1')}")  # 市值阶梯 is hidden by default; one-shot so reloads keep the test's state
         await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
         await page.wait_for_selector("#g-ladder .pg")
         # the same four-column table as the price ladders: 目标 / 模型 / 挂单 (the best maker) / 吃单 (the best taker); blue =

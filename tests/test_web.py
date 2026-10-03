@@ -146,6 +146,18 @@ async def layout_check(browser, page):
     await page.click("#g-fav .card .star")
     await page.reload(); await page.wait_for_selector("#g-crypto .card"); await page.click("#edit")
     assert await heads() == ["crypto", "contract", "levels", "index", "ladder", "sim"]
+    # a section title dragged by its ⠿ past the section below moves the whole section (kept, like the ↑ ↓ moves)
+    await page.set_viewport_size({"width": 1300, "height": 2200})
+    await page.evaluate("document.getElementById('h-contract').scrollIntoView({block: 'start'})")
+    x, y, _ = await box("#h-contract .grip")
+    _, _, lv = await box("#g-levels")
+    await page.mouse.move(x, y); await page.mouse.down()
+    await page.mouse.move(x, lv["y"] + lv["height"] - 4, steps=12)
+    assert await heads() == ["crypto", "levels", "contract", "index", "ladder", "sim"], await heads()
+    await page.mouse.up()
+    assert await page.evaluate("drag === null") and await stored("secs") == '["crypto","levels","contract","index","ladder","sim"]'
+    assert await page.eval_on_selector_all("#secs input", "els => els.map(e => e.dataset.sec)") == ["crypto", "levels", "contract", "index", "ladder", "sim"]
+    await page.set_viewport_size({"width": 390, "height": 900})
     # 恢复默认布局 takes a second click within 4 s and leaves the stars alone (folded sections open again too)
     await page.evaluate("keep('folded', ['index'])")
     await page.click("#g-crypto .card:nth-child(4) .star")
@@ -168,8 +180,17 @@ async def layout_check(browser, page):
 async def browser_check(async_playwright, chrome, port, token):
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
+        url = f"http://127.0.0.1:{port}/p/{token}"
+        # a fresh browser hides 市值阶梯 (and 模拟交易); ticking it in 自定义 brings it back
+        fresh = await browser.new_page(viewport={"width": 390, "height": 900})
+        await fresh.goto(url); await fresh.wait_for_selector("#g-crypto .card")
+        assert not await fresh.is_visible("#h-ladder") and await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim","ladder"]'
+        await fresh.click("#edit"); await fresh.check("#secs input[data-sec=ladder]"); await fresh.click("#done")
+        assert await fresh.is_visible("#g-ladder .card") and await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim"]'
+        await fresh.close()
         page = await browser.new_page(viewport={"width": 390, "height": 900})
-        await page.goto(f"http://127.0.0.1:{port}/p/{token}")
+        await page.add_init_script("if(!localStorage.getItem('ladderDefault')){localStorage.setItem('hideSec','[\"sim\"]');localStorage.setItem('ladderDefault','1')}")  # 市值阶梯 on, as below; one-shot so a reload keeps what the test changes
+        await page.goto(url)
         await page.wait_for_selector(".card .odds")
         text = await page.inner_text(".wrap")
         assert "上证指数" in text and "10-08 下周四" in text and "涨35.0¢" in text and "概率暂缺：等待行情" in text, text

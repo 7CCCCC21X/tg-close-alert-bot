@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.21.4"
+VERSION = "1.21.5"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5636,7 +5636,7 @@ body.olddata .paction .pa,body.olddata .paction .pv{color:var(--faint)}body.oldd
 [hidden]{display:none!important}
 .grip{flex:none;border:0;background:none;padding:3px 5px;margin:-3px 0 -3px -6px;font-size:16px;line-height:1;color:var(--muted);cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}.grip:hover{color:var(--text)}
 body.sorting,body.sorting *{cursor:grabbing!important;user-select:none!important}
-.card.dragging{opacity:.55;outline:2px dashed var(--best);outline-offset:2px}
+.card.dragging,h2.dragging{opacity:.55;outline:2px dashed var(--best);outline-offset:2px}h2 .grip{font-size:14px;margin:-4px 2px -4px 0;padding:2px 5px}
 .ctl{display:flex;align-items:center;gap:6px;font-size:12px;padding-bottom:6px;border-bottom:1px dashed var(--line)}.ctl .sp,.panel .sp{flex:1}
 .ctl .grip{font-size:16px;margin:0;padding:1px 6px;border:1px solid var(--line);border-radius:6px;background:var(--chip)}
 .cb{border:1px solid var(--line);background:var(--chip);color:var(--text);border-radius:6px;padding:1px 9px;font:inherit;font-size:12px;line-height:1.6;cursor:pointer}.cb:hover{border-color:var(--best);color:var(--best)}
@@ -5659,10 +5659,10 @@ button.tog{font-family:inherit;padding:2px 9px}.tog.on{border-color:var(--best);
 <div id="stale" hidden><span id="stalemsg"></span><button type="button" class="cb" id="retry">立即重试</button></div>
 <div id="opps" hidden></div>
 <div class="panel" id="custom" hidden>
-<div class="pr"><b>自定义布局</b><span class="mut">拖动 ⠿ 或点 ◀ ▶ 调整卡片顺序（收藏栏平时也能拖），栏目标题旁的 ↑ ↓ 调整栏目顺序；“隐藏”收起不看的卡片。只保存在这个浏览器。</span></div>
+<div class="pr"><b>自定义布局</b><span class="mut">拖动 ⠿ 或点 ◀ ▶ 调整卡片顺序（收藏栏平时也能拖）；拖动栏目标题前的 ⠿ 或点旁边的 ↑ ↓ 调整栏目顺序；“隐藏”收起不看的卡片。只保存在这个浏览器。</span></div>
 <div class="pr" id="secs"></div>
 <div class="pr" id="oppsrc"></div>
-<div class="pr"><span class="mut">“模拟交易”栏默认不显示，勾上就在页面最下面出现；每笔交易的证据和导出在</span><a class="cb" id="journal" href="#">模拟交易复盘 ↗</a></div>
+<div class="pr"><span class="mut">“市值阶梯”和“模拟交易”栏默认不显示，勾上才出现；每笔交易的证据和导出在</span><a class="cb" id="journal" href="#">模拟交易复盘 ↗</a></div>
 <div class="pr"><label>高亮门槛 <input type="number" id="hotin" min="1" max="50" step="1"> ¢</label><span class="mut">净优势达到这个值的卡片标红框（和模型的“建议门槛”不是一回事：没超过建议门槛的方向不会被建议）</span></div>
 <div class="pr"><span class="mut" id="hidn"></span><span class="sp"></span><button type="button" class="cb" id="showall">全部显示</button><button type="button" class="cb" id="reset" title="还原卡片和栏目顺序、隐藏与高亮门槛（收藏保留）">恢复默认布局</button><button type="button" class="cb pri" id="done">完成</button></div>
 </div>
@@ -5690,8 +5690,9 @@ function keep(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
 function stored(k,d,ok){try{const v=JSON.parse(localStorage.getItem(k));return ok(v)?v:d}catch(e){return d}}
 const strs=v=>Array.isArray(v)&&v.every(x=>typeof x==="string");
 let order=stored("order",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Object.values(v).every(strs));
-let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim"],strs);
+let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim","ladder"],strs);
 try{if(!localStorage.getItem("simDefault")){if(!hideSec.includes("sim"))hideSec=[...hideSec,"sim"];keep("hideSec",hideSec);localStorage.setItem("simDefault","1")}}catch(e){}  // 模拟交易 starts hidden (show it in 自定义)
+try{if(!localStorage.getItem("ladderDefault")){if(!hideSec.includes("ladder"))hideSec=[...hideSec,"ladder"];keep("hideSec",hideSec);localStorage.setItem("ladderDefault","1")}}catch(e){}  // 市值阶梯 starts hidden too
 let hotCents=stored("hot",10,v=>typeof v==="number"&&v>=1&&v<=50),HOT=hotCents/100;  // an edge this large gets the red frame
 let oppOff=stored("oppOff",[],strs),oppTaker=stored("oppTaker",false,v=>typeof v==="boolean");  // the strip on top: sections left out, takers only
 let folded=stored("folded",[],strs);  // sections folded away: the title stays, with how many cards it holds and how many are red-framed
@@ -5714,6 +5715,23 @@ function moveSec(g,step){  // past the next section that is on the page (section
   const vis=secOrder.filter(s=>(plan[s]||[]).length),i=vis.indexOf(g),j=i+step;if(i<0||j<0||j>=vis.length)return;
   const rest=secOrder.filter(s=>s!==g);rest.splice(rest.indexOf(vis[j])+(step>0?1:0),0,g);secOrder=rest;keep("secs",secOrder);drawPanel();if(last)render(last)}
 function toggleHidden(k){hidden=hidden.includes(k)?hidden.filter(x=>x!==k):[...hidden,k];keep("hidden",hidden);drawPanel();if(last)render(last)}
+function startSecDrag(e,g){  // 自定义: a section title (its ⠿) dragged past another section moves the whole section, as a card does
+  if(e.button>0||drag)return;e.preventDefault();
+  const id=e.pointerId,h=document.getElementById("h-"+g),foot=document.getElementById("foot");let at=null;drag={sec:g};h.classList.add("dragging");document.body.classList.add("sorting");
+  const place=()=>{
+    const t=(document.elementFromPoint(at.x,at.y)||document.body).closest(".wrap>h2,.wrap>.grid"),tg=t&&t.id.slice(2);
+    if(!tg||tg===g||!SECTIONS.includes(tg))return;  // the starred section stays on top
+    const vis=secOrder.filter(x=>(plan[x]||[]).length),i=vis.indexOf(g),j=vis.indexOf(tg);if(i<0||j<0)return;
+    const mid=(document.getElementById("h-"+tg).getBoundingClientRect().top+document.getElementById("g-"+tg).getBoundingClientRect().bottom)/2;
+    if(!(i<j&&at.y>mid)&&!(i>j&&at.y<mid))return;  // past the other section's middle only, so sections do not flip back and forth
+    const rest=secOrder.filter(x=>x!==g);rest.splice(rest.indexOf(tg)+(i<j?1:0),0,g);secOrder=rest;keep("secs",secOrder);
+    for(const x of secOrder)foot.before(document.getElementById("h-"+x),document.getElementById("g-"+x))};
+  const scroll=setInterval(()=>{if(!at)return;const dy=at.y<56?-14:at.y>innerHeight-56?14:0;if(dy){window.scrollBy(0,dy);place()}},40);
+  const move=ev=>{if(ev.pointerId!==id)return;if(ev.pointerType==="mouse"&&!ev.buttons)return end(ev);at={x:ev.clientX,y:ev.clientY};place()};
+  const end=ev=>{if(ev.type!=="blur"&&ev.pointerId!==id)return;clearInterval(scroll);
+    document.removeEventListener("pointermove",move);document.removeEventListener("pointerup",end);document.removeEventListener("pointercancel",end);removeEventListener("blur",end);
+    h.classList.remove("dragging");document.body.classList.remove("sorting");drag=null;const d=pending||last;pending=null;if(d){drawPanel();render(d)}};
+  document.addEventListener("pointermove",move);document.addEventListener("pointerup",end);document.addEventListener("pointercancel",end);addEventListener("blur",end)}
 function startDrag(e,c,g){
   // pointer events (mouse, pen and touch alike); the card moves in front of or behind the card under the pointer once
   // the pointer is past that card's middle, so cards of different heights do not flip back and forth
@@ -6094,7 +6112,9 @@ function render(d){
     if(!editing){head=$("button","fold");head.type="button";head.setAttribute("aria-expanded",fold?"false":"true");
       head.title=fold?"展开这一栏":"折叠这一栏（标题留着，写明张数和红框机会数）";head.append(name);head.addEventListener("click",()=>toggleFold(g))}
     if(fold){const hot=grid.querySelectorAll(".card.hot").length;sum=$("span","fs",items.length+" 张");if(hot)sum.append(" · ",$("b","","🔥 "+hot))}
-    h.replaceChildren(head,...(sum?[sum]:[]),
+    const sg=editing&&g!=="fav"?$("button","grip","⠿"):null;  // 自定义: drag the title to move the whole section (↑ ↓ do the same)
+    if(sg){sg.type="button";sg.title="按住拖动，调整栏目顺序";sg.setAttribute("aria-label","拖动栏目");sg.addEventListener("pointerdown",e=>startSecDrag(e,g))}
+    h.replaceChildren(...(sg?[sg]:[]),head,...(sum?[sum]:[]),
       ...(editing&&g!=="fav"?[ctlBtn("↑","栏目上移",()=>moveSec(g,-1),i<=0),ctlBtn("↓","栏目下移",()=>moveSec(g,1),i<0||i>=vis.length-1)]:[]))}
   const now=[...document.querySelectorAll(".wrap>.grid")].map(e=>e.id.slice(2)).filter(g=>g!=="fav");
   if(now.join()!==secOrder.join())for(const g of secOrder)foot.before(document.getElementById("h-"+g),document.getElementById("g-"+g));
@@ -6133,7 +6153,7 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppTaker=false;folded=[];
+  order={};hidden=[];hideSec=["sim","ladder"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppTaker=false;folded=[];
   ["order","hidden","secs","hot","oppOff","oppTaker","folded"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 async function load(){
