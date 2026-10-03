@@ -497,6 +497,8 @@ async def browser_check(bot):
     jia = {"name": "甲", "symbol": "JIA", "group": "index", "missing": "等待行情", "predict": {"url": "https://predict.fun/zh-cn/market/x", "error": ""}}
     book = m.PredictBook("JIA", "x", "1", "x", ((D("0.30"), D("500")),), ((D("0.95"), D("500")),), NOW, 200)
     bot.book_block(jia["predict"], book, 0.5, bot.edge_need(0.0), 0.0, "", ("涨", "跌"), NOW)  # 挂跌 @ 5¢ +45¢, 挂涨 @ 30¢ +20¢; no taker edge
+    assert jia["predict"]["points_active"] is None and jia["predict"]["points_note"] == "积分状态暂缺"  # every block carries its points
+    jia["predict"].update(points_active=True, points_rate=120, points_note="积分已激活")
     payload["items"] = [jia, *(i for i in payload["items"] if i["group"] == "levels")]
     btc = next(i for i in payload["items"] if i["name"] == "BTC 10月价格")
     tk = next(e for e in next(r for r in btc["ladder"]["rows"] if r["label"] == "↑ $120k")["edges"] if e["best"])
@@ -519,11 +521,15 @@ async def browser_check(bot):
         # the price's own line sits between the ↑ levels and the ↓ levels
         assert await card.locator(".pg .lt, .pg .lspot").all_inner_texts() == ["↑ $160k", "↑ $125k", "↑ $120k", "现价 $112,050", "↓ $108.5k",
                                                                                "↓ $105k", "↓ $100k"]
-        # Distances and points state stay with each target, including on a phone.
+        # Distances stay with each target, including on a phone; points unknown here (no rewards in the fixture): no pill
         dists = await card.locator(".pg .pdist").all_inner_texts()
         assert dists == ["+43%", "+12%", "+7.1%", "−3.2%", "−6.3%", "−11%"], dists
-        assert await card.locator(".pg .ppoints").count() == 6
-        assert await card.locator(".pg .lh").all_inner_texts() == ["目标 / 积分", "模型 Yes", "挂单", "吃单"]
+        assert await card.locator(".pg .ppoints").count() == 0
+        assert await card.locator(".pg .lh").all_inner_texts() == ["目标", "模型", "挂单", "吃单"]
+        # 甲 (an index card) carries its points on its Predict line: ● with the hourly rate
+        pill = await page.locator("#g-index .quote .ppoints.active").inner_text()
+        assert pill == "● 120 PP/h", repr(pill)
+        assert "每小时发 120 PP" in await page.locator("#g-index .quote .ppoints.active").get_attribute("title")
         assert not await card.locator(".touched").evaluate("e => e.open")
         await card.locator(".touched summary").click()
         assert await card.locator(".touched .tchip").all_inner_texts() == ["↑ $118k", "↑ $110k"]
@@ -535,8 +541,8 @@ async def browser_check(bot):
         assert "pos" not in cells[11][0] and "hot" not in cells[11][0], cells
         assert "hot" in cells[5][0] and "pos" not in cells[3][0], cells  # ↑ $120k's taker at 24¢; ↑ $125k disputed
         # An unqualified maker does not fill the overview with a hypothetical 99¢ advantage.
-        assert "disabled" in cells[0][0] and "99." not in cells[0][2], cells[0]
-        assert "Yes" in cells[1][2] and "99.8¢" in cells[1][2] and "未过建议门槛" in cells[1][1], cells[1]
+        assert "disabled" in cells[0][0] and cells[0][2] == "—" and "积分状态暂缺" in cells[0][1], cells[0]
+        assert "Yes" in cells[1][2] and "99.8¢" in cells[1][2] and "未过建议门槛" in cells[1][1] and "未过门槛" not in cells[1][2], cells[1]
         await card.locator(".pg .lt:text-is('↑ $160k')").click()
         chips = card.locator(".lrow .edge")
         assert await chips.count() == 2 and await card.locator(".lrow .edge.best, .lrow .edge.pos").count() == 0
@@ -626,7 +632,7 @@ async def browser_check(bot):
         assert "↑ $200k" in visible and "↑ $114k" in visible and "↑ $190k" not in visible, visible
         assert "挂Yes 50.0" in await page.inner_text("#opps")
         active = card.locator(".ptarget:has(.lt:text-is('↑ $200k'))")
-        assert await active.locator(".ppoints.active").inner_text() == "● 积分激活"
+        assert await active.locator(".ppoints.active").inner_text() == "● 200 PP/h"  # colour says active, the number the rate
         await active.click()
         await card.locator(".lrow .edge.best").click()
         assert "→ 满足" in await card.locator(".lrow .edet").inner_text()
@@ -640,7 +646,10 @@ async def browser_check(bot):
         await card.locator(".lrow .edge").first.click()
         assert "积分未激活：不给挂单建议" in await card.locator(".lrow .edet").inner_text()
         await card.locator(".ptarget:has(.lt:text-is('↑ $190k'))").click()
-        assert "待确认" in await card.locator(".ptarget:has(.lt:text-is('↑ $180k')) + .pmodel + .paction").inner_text()
+        assert await card.locator(".ptarget:has(.lt:text-is('↑ $190k')) .ppoints.off").get_attribute("title") == "积分未激活"  # a faint ○, no text
+        assert await card.locator(".ptarget:has(.lt:text-is('↑ $180k')) .ppoints").count() == 0  # unknown: nothing
+        unknown = card.locator(".ptarget:has(.lt:text-is('↑ $180k')) + .pmodel + .paction")
+        assert await unknown.inner_text() == "—" and "积分状态暂缺" in await unknown.get_attribute("title")
         await page.click("#fchips button:text-is('仅挂单')")
         assert await page.locator("#g-flat .card.price-lad").count() == 1
         assert "↑ $200k" in await page.locator("#g-flat .pg").inner_text()

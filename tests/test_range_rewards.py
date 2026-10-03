@@ -112,6 +112,26 @@ async def step(bot, at):
 
 async def run():
     bot, rm, row = fixture()
+    # Every market's points reach its card: read with the fee (market details), trusted for PREDICT_POINTS_STALE_SECONDS
+    other = m.PredictBook("SSE", "sse-up", "sse-1", "t", ((D("0.40"), D("100")),), ((D("0.45"), D("100")),), NOW, 200)
+    async def details(url, payload=None):
+        assert url.endswith("/markets/sse-1"), url
+        return {"data": {"id": "sse-1", "feeRateBps": 150, "status": "OPEN", "outcomes": [{"name": "Up", "indexSet": 1}, {"name": "Down", "indexSet": 2}],
+                         "rewards": {"current": {"hourlyRate": 55, "startsAt": iso(NOW - MIN), "endsAt": iso(NOW + m.DAY_MS)}}}}
+    bot.predict.fetch = details
+    assert await bot.predict.market_fee("sse-1") == 150 and bot.predict.market_meta["sse-1"][0]["rewards"]["current"]["hourlyRate"] == 55
+    block = {}
+    bot.book_block(block, other, 0.5, 0.02, 0.0, "", ("涨", "跌"), NOW)
+    assert block["points_active"] is True and block["points_rate"] == 55 and block["points_note"] == "积分已激活", block
+    bot.predict.market_meta["sse-1"] = (bot.predict.market_meta["sse-1"][0], time.monotonic() - m.PREDICT_POINTS_STALE_SECONDS - 1)
+    block = {}; bot.book_block(block, other, 0.5, 0.02, 0.0, "", ("涨", "跌"), NOW)
+    assert block["points_active"] is None and block["points_note"] == "积分状态已过期"
+    bot.predict.market_meta["sse-1"] = (meta(), time.monotonic())
+    block = {}; bot.book_block(block, other, 0.5, 0.02, 0.0, "", ("涨", "跌"), NOW)
+    assert block["points_active"] is False and block["points_note"] == "积分未激活" and block["points_rate"] is None
+    del bot.predict.market_meta["sse-1"]
+    block = {}; bot.book_block(block, other, None, 0.02, 0.0, "", ("涨", "跌"), NOW)  # also without a fair price
+    assert block["points_active"] is None and block["points_note"] == "积分状态暂缺" and "edges" not in block
     status = bot.range_maker_status(row, row.book, NOW)
     assert status["points_active"] is True and status["makers"] and status["maker_note"] == ""
     payload = bot.range_payload(rm, NOW)["ladder"]["rows"][0]

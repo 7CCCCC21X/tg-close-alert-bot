@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.21.0"
+VERSION = "1.21.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -3173,6 +3173,7 @@ PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and n
 PREDICT_META_SECONDS = 600     # outcome names / status of a ladder market are re-read this often
 PREDICT_REWARD_SECONDS = 60    # price-ladder reward metadata is refreshed every minute
 PREDICT_REWARD_STALE_SECONDS = 120  # allows the normal refresh to finish across a 60-second alert confirmation
+PREDICT_POINTS_STALE_SECONDS = 3 * PREDICT_META_SECONDS  # other markets' points (read with the fee) are shown this long
 PREDICT_STRIKE_SECONDS = 300   # a known target price is re-read this often (the site may correct it)
 PREDICT_MISS_SECONDS = 60      # an unknown slug is looked up again after this long (new markets show up within a minute)
 PREDICT_DEPTH = 5
@@ -3652,7 +3653,9 @@ class PredictFeed:
             return cached[0]
         fee = cached[0] if cached else None
         with contextlib.suppress(Exception):  # best effort: never blocks the orderbook
-            fee = (await self.market_details(market_id))["fee_bps"]
+            details = await self.market_details(market_id)
+            self.market_meta[market_id] = (details, time.monotonic())  # its points (rewards) are read from here too
+            fee = details["fee_bps"]
         self.fees[market_id] = (fee, time.monotonic())
         return fee
 
@@ -5628,16 +5631,17 @@ a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);t
 .card.price-lad .lstat{min-height:0;gap:4px}.price-model summary{font-size:12px}.price-model dl{line-height:1.5}.price-model{padding-bottom:2px}
 .price-lad .touched{gap:4px}.price-lad .touched summary{font-size:12px;color:var(--down)}.price-lad .touched .tchips{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
 .price-tools{display:flex;flex-wrap:wrap;align-items:center;gap:5px 8px;margin-top:8px;font-size:11px;color:var(--muted)}.price-tools .cb{font-size:11px;margin-left:auto}.price-tools .hint{flex:1;min-width:0}
-.pg{display:grid;grid-template-columns:minmax(96px,1.15fr) minmax(48px,.55fr) minmax(88px,1fr) minmax(88px,1fr);column-gap:8px;row-gap:0;align-items:stretch;margin-top:7px;font-size:12px;font-variant-numeric:tabular-nums}
-.pg .lh{padding:0 0 6px;font-size:11px;color:var(--muted);white-space:nowrap}.pg .lr{text-align:right}.pg .pcell{border-top:1px solid var(--line);padding:8px 0;min-width:0}.pg .pmodel{text-align:right;align-content:center;color:var(--muted)}
-.ptarget{font:inherit;color:var(--text);border:0;background:none;text-align:left;cursor:pointer;min-width:0}.ptarget .lt{display:block;font-weight:650;white-space:nowrap}.ptarget .pdist{display:block;font-size:10.5px;color:var(--faint);margin-top:1px}
-.ppoints{display:inline-block;font-size:10px;line-height:1.5;color:var(--muted);margin-top:3px}.ppoints.active{color:var(--best)}
-.paction{font:inherit;border:0;background:none;color:var(--faint);text-align:left;cursor:pointer;line-height:1.35;min-width:0}.paction .pa{display:flex;flex-wrap:wrap;gap:2px 4px;align-items:baseline}.paction .pa b{font-weight:550}.paction .pv{display:block;margin-top:3px;font-weight:600}.paction.pos .pa{color:var(--text)}.paction.pos .pv{color:var(--best)}.paction.hot .pv{color:var(--hot)}.paction .pwhy{display:block;font-size:10px;line-height:1.35;color:var(--faint);margin-top:2px}.paction.disabled{cursor:pointer}
+.pg{display:grid;grid-template-columns:minmax(78px,auto) minmax(40px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:10px;row-gap:0;align-items:stretch;margin-top:7px;font-size:12px;font-variant-numeric:tabular-nums}
+.pg .lh{padding:0 0 5px;font-size:11px;color:var(--muted);white-space:nowrap}.pg .lr{text-align:right}.pg .pcell{border-top:1px solid var(--line);padding:6px 0;min-width:0;align-content:center}.pg .pmodel{text-align:right;color:var(--muted)}
+.ptarget{font:inherit;color:var(--text);border:0;background:none;text-align:left;cursor:pointer;min-width:0;padding-right:0}.ptarget .ltl{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 5px}.ptarget .lt{font-weight:650;white-space:nowrap}.ptarget .pdist{font-size:10.5px;color:var(--faint)}
+.ppoints{display:inline-block;font-size:10.5px;line-height:1.6;border-radius:999px;padding:0 6px;background:var(--chip);color:var(--muted);white-space:nowrap;font-weight:600;vertical-align:1px}
+.ppoints.active{background:var(--best-bg);color:var(--best)}.ppoints.off{padding:0 4px;color:var(--faint);font-weight:400}.ptarget .ppoints{margin-top:3px}.quote .ppoints{align-self:center}.lg .ltw{white-space:nowrap}.lg .ltw .ppoints{margin-left:4px}
+.paction{font:inherit;border:0;background:none;color:var(--faint);text-align:left;cursor:pointer;line-height:1.35;min-width:0}.paction .pa{display:flex;flex-wrap:wrap;gap:1px 5px;align-items:baseline}.paction .pa b{font-weight:550}.paction .pv{font-weight:650}.paction.pos .pa{color:var(--text)}.paction.pos .pv{color:var(--best)}.paction.hot .pv{color:var(--hot)}.paction .pwhy{display:block;font-size:10px;line-height:1.35;color:var(--faint);margin-top:1px}.paction.disabled{cursor:pointer}
 body.olddata .paction .pa,body.olddata .paction .pv{color:var(--faint)}body.olddata .price-top{opacity:.55}
 .pg .lrow{grid-column:1/-1;margin:0 0 7px;padding:7px 8px;border-radius:8px;background:var(--chip)}.pg .lnote{font-size:12px;line-height:1.5;color:var(--muted)}.pg .lnote .warn{display:block}.pg .lnote b{color:var(--text)}.pg .lspot{grid-column:1/-1;color:var(--muted);font-size:11px;display:flex;align-items:center;gap:8px;padding:5px 0}.pg .lspot:before,.pg .lspot:after{content:"";flex:1;border-top:1px dashed var(--line)}
 .price-lad .pb{padding-top:8px}.price-lad .quote{gap:5px 8px}.price-lad .price-empty{font-size:12px;color:var(--muted);padding-top:8px}
-@media(max-width:560px){.pg{grid-template-columns:minmax(78px,.95fr) minmax(42px,.5fr) minmax(72px,1fr) minmax(72px,1fr);column-gap:5px;font-size:11.5px}.pg .pcell{padding:7px 0}.ptarget .pdist,.ppoints,.paction .pwhy{font-size:10px}.price-top b{font-size:23px}.price-range{gap:3px 10px}.price-lad .edges{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:360px){.pg{grid-template-columns:minmax(74px,.95fr) minmax(32px,.5fr) minmax(62px,1fr) minmax(62px,1fr);column-gap:4px;font-size:11px}.pg .lh{font-size:10px}}
+@media(max-width:560px){.lg .ltw .ppoints .pu{display:none}.pg{grid-template-columns:minmax(70px,auto) minmax(36px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:6px;font-size:11.5px}.pg .pcell{padding:6px 0}.ptarget .pdist,.ppoints,.paction .pwhy{font-size:10px}.price-top b{font-size:23px}.price-range{gap:3px 10px}.price-lad .edges{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:360px){.pg{grid-template-columns:minmax(64px,auto) minmax(30px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:4px;font-size:11px}.pg .lh{font-size:10px}}
 [hidden]{display:none!important}
 .grip{flex:none;border:0;background:none;padding:3px 5px;margin:-3px 0 -3px -6px;font-size:16px;line-height:1;color:var(--muted);cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}.grip:hover{color:var(--text)}
 body.sorting,body.sorting *{cursor:grabbing!important;user-select:none!important}
@@ -5818,6 +5822,11 @@ function matches(it){  // the filter bar: every chip that is on must hold for on
   return pool.length?Math.max(...pool.map(e=>e.edge)):-1}  // the sort key: its largest matching net edge
 function openLink(url){  // the market opens from this one button (in a new tab); the chips open their details instead
   const a=$("a","pt open","Predict ↗");a.href=url;a.target="_blank";a.rel="noopener noreferrer";a.title="在新标签页打开 Predict 市场";return a}
+function pointsPill(p){  // LP points on this market: a coloured ● with the hourly rate while active, a faint ○ when not; nothing while unknown
+  if(p.points_active===true){const x=$("span","ppoints active","● "+(p.points_rate!=null?qty(p.points_rate):"积分"));if(p.points_rate!=null)x.append(" ",$("span","pu","PP/h"));
+    x.title=(p.points_note||"积分已激活")+(p.points_rate!=null?"：这个市场的挂单每小时发 "+qty(p.points_rate)+" PP":"");return x}
+  if(p.points_active===false){const x=$("span","ppoints off","○");x.title=p.points_note||"积分未激活";x.setAttribute("aria-label",x.title);return x}
+  return null}
 function book(p,key){
   const w=$("div","pb"),q=$("div","quote");q.append(openLink(p.url));w.append(q);
   const has=p.bids||p.asks;
@@ -5826,6 +5835,7 @@ function book(p,key){
     q.append(lv("买1",b),lv("卖1",k));if(b&&k)q.title="价差 "+cent(k[0]-b[0]);
     if(p.stale)q.append($("span","warn",p.age+" 秒前"))}
   else if(!p.error)q.append($("span","","等待获取"));
+  const pp=pointsPill(p);if(pp)q.append(pp);  // the market's points, after the quotes (a narrow card wraps it, not the quotes)
   if(p.error)w.append($("div","warn small",(has?"刷新失败，显示上次盘口：":"")+p.error));
   const v=bookView(p);
   if(v.edges.length){w.append(chips(key,v,ctxOf(p)));if(p.stale)w.append($("div","warn small","盘口过期，不给建议"))}  // framed = suggested, grey = not big enough
@@ -5918,22 +5928,22 @@ function priceLadderBook(c,it,L,live){
     const shown=all||live.length<=6?live:live.filter(r=>focus.has(r));
     const tools=$("div","price-tools");tools.append($("span","hint","挂单仅积分激活 · 吃单按 "+(amount||live[0].notional||100)+" U"));
     if(shown.length<live.length||all){const bt=$("button","cb",all?"收起完整档位":"全部 "+live.length+" 档（+"+(live.length-shown.length)+"）");bt.type="button";bt.setAttribute("aria-expanded",all?"true":"false");bt.title="默认显示有建议和最近的档位；展开可查看全部档位";bt.addEventListener("click",()=>{all?open.delete(allKey):open.add(allKey);if(last)render(last)});tools.append(bt)}
-    w.append(tools);const g=$("div","pg");g.append($("span","lh","目标 / 积分"),$("span","lh lr","模型 Yes"),$("span","lh","挂单"),$("span","lh","吃单"));
+    w.append(tools);const g=$("div","pg");g.append($("span","lh","目标"),$("span","lh lr","模型"),$("span","lh","挂单"),$("span","lh","吃单"));
     let marked=false;const spot=() => $("div","lspot","现价 "+L.price);
     shown.forEach(r=>{const v=views.get(r),rk=key+"#"+r.label,toggle=ev=>{ev.preventDefault();openChip[rk]=openChip[rk]?null:"row";if(last)render(last)};
       if(!marked&&L.spot!=null&&r.level<=L.spot){g.append(spot());marked=true}
       const target=$("button","pcell ptarget"),dist=r.dist==null?"距离暂缺":(r.dist>=0?"+":"−")+(Math.abs(r.dist)*100).toFixed(Math.abs(r.dist)<.1?1:0)+"%";
       target.type="button";target.setAttribute("aria-expanded",openChip[rk]?"true":"false");target.title=r.dir_note||"查看盘口、四个方向和计算明细";
-      target.append($("span","lt",r.label),$("span","pdist",dist));
-      const point=$("span","ppoints"+(r.points_active===true?" active":""),r.points_active===true?"● 积分激活":r.points_active===false?"积分未激活":"积分待确认");point.title=r.points_note||"积分状态暂缺";target.append(point);target.addEventListener("click",toggle);
+      const ltl=$("span","ltl");ltl.append($("span","lt",r.label),$("span","pdist",dist));target.append(ltl);
+      const point=pointsPill(r);if(point)target.append(point);target.addEventListener("click",toggle);
       const model=$("span","pcell pmodel",r.fair==null?"—":cent(r.fair));
       const action=maker=>{const a=$("button","pcell paction"+(maker&&r.makers===false?" disabled":""));a.type="button";a.addEventListener("click",toggle);a.setAttribute("aria-expanded",openChip[rk]?"true":"false");
         const candidates=v.edges.filter(e=>e.maker===maker),e=candidates.sort((a,b)=>b.edge-a.edge)[0],eligible=!maker||r.makers===true,ok=e&&eligible&&v.ok.includes(e);
-        if(maker&&!eligible){const text=r.points_active===true?"暂无有效挂价":r.points_active===false?"未激活":"待确认";a.append($("span","pa",text));a.title=r.maker_note||r.points_note||"积分状态确认后才提示挂单优势";return a}
+        if(maker&&!eligible){a.append($("span","pa","—"));a.title=r.maker_note||r.points_note||"积分状态确认后才提示挂单优势";return a}
         if(!e){a.append($("span","pa",r.error?"⚠ 请核实":r.stale?"盘口过期":"暂无报价"));a.title=r.error||r.hold||"等待有效盘口";return a}
         if(ok){a.classList.add("pos");if(e.edge>=HOT)a.classList.add("hot")}
-        const line=$("span","pa");line.append($("b","",e.up?"Yes":"No"),$("span","",cent(e.price)));a.append(line,$("span","pv",sg(e.edge)));
-        if(r.error||r.hold||r.stale)a.append($("span","pwhy",r.stale?"盘口过期":"暂不建议"));else if(!ok)a.append($("span","pwhy","未过门槛"));else if(!maker&&e.short)a.append($("span","pwhy","深度不足"));
+        const line=$("span","pa");line.append($("b","",e.up?"Yes":"No"),$("span","",cent(e.price)),$("span","pv",sg(e.edge)));a.append(line);
+        if(r.error||r.hold||r.stale)a.append($("span","pwhy",r.stale?"盘口过期":"暂不建议"));else if(ok&&!maker&&e.short)a.append($("span","pwhy","深度不足"));
         a.title=e.label+" @ "+cent(e.price)+"；净优势 "+sg(e.edge)+(maker?"，挂单排队，成交不保证":"，约 "+qty(e.size)+" 份；已扣手续费与滑点")+(r.error?"；"+r.error:r.hold?"；"+r.hold:r.stale?"；盘口过期":!ok?"；未过建议门槛":"");return a};
       g.append(target,model,action(true),action(false));
       if(openChip[rk]){const d=$("div","lrow");d.append(rowNote(r,L));if(v.edges.length)d.append(chips(rk+"/",v,ctxOf(r)));g.append(d)}});
@@ -5969,7 +5979,8 @@ function ladderBook(c,it,L,live){  // the ladder's Predict block: one row per op
       if(tk){t.append(tk.label+" ",$("span","lp",(tk.price*100).toFixed(1)+" "),$("b","",sg(tk.edge)),$("span","lz","×"+qk(tk.size)));t.title=tk.label+" @ "+cent(tk.price)+"，立即成交 "+qty(tk.size)+" 份"+(tk.short?"（深度不足）":"")+"；净优势已扣手续费 "+cent(tk.fee||0)+"、深度 "+cent(tk.slip||0)+(tk.edge>need?"":"；不够大，不建议")+(r.stale?"（盘口过期）":"")}
       else t.textContent="—";
       const dist=r.dist==null?"—":(r.dist>=0?"+":"−")+(Math.abs(r.dist)*100).toFixed(Math.abs(r.dist)<0.1&&L.kind==="price"?1:0)+"%";
-      const cells=[$("span","lt",r.label),$("span","ln ld",dist),$("span","ln",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b,t];
+      const lw=$("span","ltw");lw.append($("span","lt",r.label));const pp=pointsPill(r);if(pp)lw.append(pp);  // the level, its points
+      const cells=[lw,$("span","ln ld",dist),$("span","ln",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b,t];
       if(r.dir_note)cells[0].title=r.dir_note;  // the market does not say ↑ or ↓ (or disputes it): shown, never suggested
       const tap=v.edges.length>0||!!r.error;  // a level with a warning opens too: the reason has to be readable on a phone
       if(tap)cells.forEach(x=>{x.title=x.title||(v.edges.length?"点开看这一档的四个方向":"点开看原因");x.addEventListener("click",ev=>{ev.preventDefault();openChip[rk]=openChip[rk]?null:"row";if(last)render(last)})});
@@ -9278,6 +9289,16 @@ class Bot:
         """The net edge a suggestion must clear: the configured minimum, or the model's own error when that is larger."""
         return max(self.config.predict_min_edge, swing)
 
+    def points_fields(self, market_id: str, now_ms: int) -> dict:
+        """A market's LP points for its card: active (True / False; None while unknown or stale), the hourly rate, a
+        note. The details are read with the market's fee every PREDICT_META_SECONDS (ladder levels every
+        PREDICT_REWARD_SECONDS) and trusted for PREDICT_POINTS_STALE_SECONDS."""
+        cached = self.predict.market_meta.get(market_id) if market_id else None
+        status = predict_reward_status(cached[0] if cached else {}, now_ms)
+        if cached is None or time.monotonic() - cached[1] >= PREDICT_POINTS_STALE_SECONDS:
+            status.update(points_active=None, points_note="积分状态已过期" if cached else "积分状态暂缺")
+        return {k: status[k] for k in ("points_active", "points_note", "points_rate")}
+
     def book_block(self, out: dict, book: PredictBook, fair: float | None, need: float, swing: float, hold: str,
                    sides: tuple[str, str], now_ms: int, makers: bool = True) -> None:
         """Fill a card's book block: both sides' depth (priced as the 涨 / Yes side), the model's fair price for that side,
@@ -9288,6 +9309,8 @@ class Bot:
                    age=max(0, (now_ms - book.fetched_ms) // 1000), stale=book.stale(now_ms), fetched_ms=book.fetched_ms,
                    fee_bps=book.fee_bps if book.fee_bps is not None else self.config.predict_fee_bps, sides=list(sides),
                    notional=self.config.predict_trade_usd, makers=makers)
+        if "points_active" not in out:  # a price ladder sets its levels' points itself (with the maker gate)
+            out.update(self.points_fields(book.market_id, now_ms))
         if fair is None:
             return
         edges = book_edges(fair, book, self.edge_costs())
