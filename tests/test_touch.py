@@ -109,6 +109,42 @@ async def run():
     t.start_ms = start - H
     assert t.history == {}
 
+    # --- past the deadline: the hour it falls in is read minute by minute, through the deadline's own minute -----------
+    tail_hour = NOW - 3 * H
+    spec = m.dataclasses.replace(BNB, slug="tail-test", deadline_ms=tail_hour + 59 * 60_000)  # 23:59-style deadline
+    minutes = {"hits": {}, "upto": 60, "asked": []}
+
+    async def tail_get(path, **p):
+        if p["interval"] == "1h":
+            return [[h, "0", "820", "800", "810", "0", h + H - 1] for h in range(p["startTime"], min(p["endTime"], NOW), H)]
+        minutes["asked"].append((p["startTime"], p["endTime"]))
+        out = []
+        for i in range(minutes["upto"]):
+            opened = p["startTime"] + i * 60_000
+            hi, lo = minutes["hits"].get(i, (820, 800))
+            out.append([opened, "0", str(hi), str(lo), "810", "0", opened + 59_999])
+        return out
+    tail = m.TouchMarket(m.Store(":memory:"), spec); tail.get = tail_get; tail.start_ms = spec.deadline_ms - 6 * H
+    assert tail.window_end == spec.deadline_ms + 60_000
+    await tail.scan(spec.deadline_ms + 30_000)  # the deadline's minute is still running: the tail waits
+    assert tail.history["through"] == tail_hour and not tail.verified_clear() and minutes["asked"] == [], tail.history
+    await tail.scan(spec.deadline_ms + 120_000)
+    assert minutes["asked"] == [(tail_hour, spec.deadline_ms + 59_999)] and tail.verified_clear(), tail.history
+    assert tail.status() == "整个窗口都已核验：两条线都没碰到"
+    # a touch in that last hour (minute 40) is found, never settled as "neither"
+    tail.store.put(f"touch:{spec.slug}", {"kind": "clear", "through": tail_hour, "start": tail.start_ms})
+    minutes["hits"][40] = (901, 805)
+    await tail.scan(spec.deadline_ms + 120_000)
+    assert tail.history["kind"] == "high" and tail.history["time"] == tail_hour + 40 * 60_000 and not tail.verified_clear()
+    # a feed that does not reach the deadline's minute leaves the window unverified (read as far as it goes)
+    minutes["hits"].clear(); minutes["upto"] = 50
+    tail.store.put(f"touch:{spec.slug}", {"kind": "clear", "through": tail_hour, "start": tail.start_ms})
+    await tail.scan(spec.deadline_ms + 120_000)
+    assert tail.history["through"] == tail_hour + 50 * 60_000 and not tail.verified_clear(), tail.history
+    minutes["upto"] = 10  # the next look starts there and reaches the deadline's minute
+    await tail.scan(spec.deadline_ms + 180_000)
+    assert minutes["asked"][-1][0] == tail_hour + 50 * 60_000 and tail.verified_clear(), tail.history
+
     # --- Bot: the Predict book is oriented to "$900 first" whatever the outcome order ------------------------------------
     class FakeMarket:
         def now_ms(self): return NOW

@@ -130,6 +130,25 @@ async def run():
     # the first partial hour's minutes are unavailable: counted as skipped, not guessed
     skip = m.CapMarket(m.Store(":memory:"), NIU); skip.get, _ = world(first_minutes=[])
     await skip.scan(NOW); assert skip.history["first"] == "skipped"
+    assert skip.coverage() == "开窗那一小时的分钟 K 未取得"  # an incomplete history never settles "not reached"
+
+    # --- after the window: its last hour (it ends with the window's last minute) counts, later hours never do ----------
+    final_hour = NOW_S - NOW_S % H - 3 * H
+    ended = m.dataclasses.replace(NIU, slug="cap-ended", end_ms=(final_hour + 59 * 60) * 1000)  # a "23:59" end
+    done = m.CapMarket(m.Store(":memory:"), ended); done.get, _ = world(peak_hour=final_hour + H, peak_price=0.9)  # spike after
+    assert done.window_end_s == final_hour + H
+    await done.scan(NOW)
+    assert done.history["through"] == done.window_end_s and done.history["high"] < 0.1 and done.coverage() == "", done.history
+    inside = m.CapMarket(m.Store(":memory:"), ended); inside.get, _ = world(peak_hour=final_hour, peak_price=0.3)
+    await inside.scan(NOW)
+    assert inside.history["high"] == 0.3 and inside.history["at"] == final_hour and inside.coverage() == ""
+    # a price read after the window is not part of its high (nor is the running hour of a later day)
+    done.price, done.priced_ms, done.supply, done.sigma = D("0.9"), NOW, D("985000000"), 1.0
+    assert done.window_high()[0] < D("0.1") * D("985000000") and done.probability(D("5e8"), NOW) == 0.0
+    done.priced_ms = ended.end_ms + 30_000  # read during the window's last minute: it counts
+    assert done.window_high()[0] == D("0.9") * D("985000000")
+    # without any GeckoTerminal source (PONS) the history is only what the bot saw: never complete
+    assert m.CapMarket(m.Store(":memory:"), PONS).coverage() == "没有 K 线来源：窗口最高只含机器人看到的价格"
 
     # a failing supply RPC falls back to DexScreener's market cap; the error is shown
     fb = m.CapMarket(m.Store(":memory:"), NIU)
@@ -231,6 +250,9 @@ async def run():
     near[1] = m.dataclasses.replace(near[1], book=m.dataclasses.replace(near[1].book, fetched_ms=NOW - m.PREDICT_STALE_MS - 1))
     q = bot.cap_payload(cap, NOW)["ladder"]["rows"][1]
     assert q["stale"] and not any(e["best"] for e in q["edges"])
+    # once the window is over nothing is suggested any more (only what happened inside it counts)
+    after = bot.cap_payload(cap, NIU.end_ms + 120_000)["ladder"]["rows"]
+    assert all(r["hold"] == "窗口已结束，等待结算" for r in after if "bids" in r) and any("bids" in r for r in after), after
     assert "方向未确认" in r500["error"] and "edges" not in r500 and 0 < r500["fair"] < 1
     assert "404" in r1b["error"] and "bid" not in r1b
     # before any data: the default thresholds, and the card says what it waits for

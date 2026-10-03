@@ -76,10 +76,14 @@ async def run():
     base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 15, 35))
     assert base.value == D("1760000") and base.prev_value == D("1768000"), base
 
-    # the realtime quote fails: the chart's value stands (and still says where it came from)
+    # the realtime quote fails: the chart's value stands, and says it is the chart's (with NXT), not a KRX figure
     answers = {"fchart": CHART, "polling": m.RemoteError("网络错误 (URLError)")}
     base = await stocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 15, 27))
-    assert base.value == D("1761000") and base.source.endswith("·Naver"), base
+    assert base.value == D("1761000") and base.source.endswith("·Naver 日K·含 NXT"), base
+    # an undated realtime answer cannot replace anything either: same label
+    answers = {"fchart": CHART, "polling": realtime("1,769,000", "1,000", "2", "")}
+    base = await m.StockMarket(cfg, m.Store(":memory:")).fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 15, 27))
+    assert base.value == D("1761000") and base.source.endswith("·Naver 日K·含 NXT"), base
 
     # --- Yahoo 000660.KS: KRX-only daily bars (no NXT) come first ----------------------------------------------------
     ybars = yahoo([(dt.date(2026, 9, 25), 1750000.0), (dt.date(2026, 9, 28), 1768000.0), (dt.date(2026, 9, 29), 1765000.0),
@@ -100,6 +104,10 @@ async def run():
     cap = m.StockMarket(cfg, m.Store(":memory:")); cap.store.put("krx_close:000660:2026-09-29", ["1765000", "1768000"])
     base = await cap.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 19, 50))
     assert base.value == D("1765000") and "Naver KRX" in base.source, base
+    # the same figure as Yahoo's: nothing is replaced, so the close stays Yahoo's
+    cap.store.put("krx_close:000660:2026-09-29", ["1782000", "1768000"])
+    base = await cap.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 29, 19, 50))
+    assert base.value == D("1782000") and base.source.endswith("·Yahoo"), base
     # 10:00 the next day: Yahoo's 09-29 close (the 09-30 bar has no close yet)
     answers = {"finance.yahoo.com": ybars, "fchart": CHART, "polling": m.RemoteError("x")}
     base = await ystocks.fetch("SKHYNIXUSDT", ticker, kr(2026, 9, 30, 10, 0))

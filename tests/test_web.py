@@ -117,11 +117,11 @@ async def layout_check(browser, page):
     assert await page.inner_text("#h-ladder .hn") == "市值阶梯（已隐藏）" and await page.is_visible("#g-ladder.off .card")
     await page.click("#done")
     assert not await page.is_visible("#custom") and await page.locator(".ctl").count() == 0 and await page.inner_text("#edit") == "✎ 自定义"
-    for g in ["index", "contract", "ladder"]:
+    for g in ["index", "contract", "ladder", "sim"]:  # 模拟交易 is hidden by default (its review page has its own link)
         assert not await page.is_visible(f"#h-{g}") and not await page.is_visible(f"#g-{g}"), g
     await page.reload(); await page.wait_for_selector("#g-crypto .card")
     assert not await page.is_visible("#h-index") and not await page.is_visible("#h-ladder") and await names("crypto") == crypto
-    assert [await stored(k) for k in ("hidden", "hideSec")] == ['["上证指数","UNITREEUSDT"]', '["ladder"]']
+    assert [await stored(k) for k in ("hidden", "hideSec")] == ['["上证指数","UNITREEUSDT"]', '["sim","ladder"]']
     # bringing them back: one card by its own button, the rest with 全部显示, the section by its tick box
     await page.click("#edit")
     assert await names("ladder") == ["$ANSEM FDV", "$牛来 市值", "$PONS FDV"]
@@ -130,7 +130,7 @@ async def layout_check(browser, page):
     await page.click("#showall")
     assert await page.locator(".card.off").count() == 0 and await page.is_disabled("#showall")
     await page.check("#secs input[data-sec=ladder]")
-    assert await page.inner_text("#h-ladder .hn") == "市值阶梯" and await stored("hideSec") == "[]"
+    assert await page.inner_text("#h-ladder .hn") == "市值阶梯" and await stored("hideSec") == '["sim"]'
     # ↑ ↓ beside a section title move the whole section (the tick boxes follow); sections without cards are skipped
     heads = lambda: page.eval_on_selector_all(".wrap > h2:not([hidden])", "els => els.map(e => e.id.slice(2))")
     assert await heads() == ["index", "contract", "crypto", "ladder", "sim"]

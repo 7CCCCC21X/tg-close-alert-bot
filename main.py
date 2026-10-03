@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.18.0"
+VERSION = "1.19.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -130,8 +130,8 @@ def hhmm(ms: int | float) -> str:
 
 
 def short_source(source: str) -> str:
-    """'上交所688836·腾讯' -> '腾讯'"""
-    return source.split("·")[-1] if source else ""
+    """'上交所688836·腾讯' -> '腾讯'; '韩交所000660·Naver 日K·含 NXT' -> 'Naver 日K·含 NXT' (only the venue and code go)."""
+    return source.split("·", 1)[-1] if source else ""
 
 
 def baseline_brief(base: "Baseline") -> str:
@@ -1306,18 +1306,21 @@ class StockMarket:
                             close = close.quantize(D(1))  # whole won
                             prev = prev.quantize(D(1)) if prev is not None else None
                             # today's bar only counts from 15:45: until then a KRX close captured from 15:33 is newer
-                            kday, kclose, kprev, kname = await self.krx_official(ticker, day, close, prev, now_ms)
+                            kday, kclose, kprev, kname = await self.krx_official(ticker, day, close, prev, now_ms, name)
                             if kday > day:
                                 day, close, prev, name = kday, kclose, kprev, kname
                             elif self.store and (saved := self.store.get(f"krx_close:{ticker.code}:{day.isoformat()}")):
                                 # KRX now also trades after hours (to 20:00): the regular-session close captured
                                 # 15:33–15:40 is known-good, so it wins should Yahoo's bar carry an after-hours print
+                                # (the label moves to Naver only when the figure really changes)
                                 with contextlib.suppress(decimal.InvalidOperation, TypeError, IndexError):
-                                    close, prev, name = D(saved[0]), D(saved[1]) if saved[1] else prev, "Naver KRX"
+                                    if D(saved[0]) != close:
+                                        close, prev, name = D(saved[0]), D(saved[1]) if saved[1] else prev, "Naver KRX"
                     elif name in {"东方财富", "Naver"}:
                         day, close, prev = last_completed_bar(parse_daily_bars(ticker.market, raw), info, now_ms)
                         if ticker.market == "kr":
-                            day, close, prev, name = await self.krx_official(ticker, day, close, prev, now_ms)
+                            chart = "Naver 日K·含 NXT" if name == "Naver" else name  # the chart blends in after-hours trades
+                            day, close, prev, name = await self.krx_official(ticker, day, close, prev, now_ms, chart)
                     else:
                         day, close, prev = parse_quote_close(name, ticker.market, raw, info, now_ms)
                     base = self.baseline(ticker, info, name, day, close, prev)
@@ -1334,18 +1337,21 @@ class StockMarket:
         raise ValueError("；".join(dict.fromkeys(failures)))
 
     async def krx_official(self, ticker: StockTicker, day: dt.date, close: D, prev: D | None,
-                           now_ms: int) -> tuple[dt.date, D, D | None, str]:
+                           now_ms: int, source: str) -> tuple[dt.date, D, D | None, str]:
         """Naver's daily chart now blends in Nextrade (NXT) after-hours trades up to 20:00, so its "close" drifts
         away from the KRX closing auction. Naver's realtime quote is the KRX regular session: its price is the
         official close once the session is over, and price − change is the official previous close (기준가).
-        Best effort: on any failure the chart's values stand."""
+        Best effort: on any failure the incoming values stand. ``source`` names where the incoming close came from:
+        another source's close keeps its own name unless the KRX figure really replaces it (a different value or day);
+        Naver's own chart figure, once the KRX quote confirms it, is the KRX close."""
+        replaced = lambda d, c: source if (d, c) == (day, close) and not source.startswith("Naver") else "Naver KRX"
         try:
             url = self.live_sources(ticker)[0][1]
             q = parse_naver_index(await fetch_source(url, {"Referer": "https://finance.naver.com/"}), now_ms)
         except Exception:
-            return day, close, prev, "Naver"
+            return day, close, prev, source
         if q.quoted_ms <= 0:
-            return day, close, prev, "Naver"  # an undated quote cannot say which session it belongs to
+            return day, close, prev, source  # an undated quote cannot say which session it belongs to
         kst, info = dt.timezone(dt.timedelta(hours=9)), STOCK_MARKETS["kr"]
         quoted = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst)
         qday = quoted.date()  # may be newer than the chart's last final bar (today's counts only from 15:45)
@@ -1357,15 +1363,16 @@ class StockMarket:
             # between the KRX close and Nextrade's after-hours session the quote is the KRX close: keep it
             if self.store:
                 self.store.put(key, [str(q.last), str(q.prev_close or "")])
-            return qday, q.last, q.prev_close or prev, "Naver KRX"
+            return qday, q.last, q.prev_close or prev, replaced(qday, q.last)
         saved = self.store.get(key) if self.store else None
         if after_close and saved:
             # from 15:40 the quote follows NXT after-hours trades: use the KRX close captured before that
             with contextlib.suppress(decimal.InvalidOperation, TypeError, IndexError):
-                return qday, D(saved[0]), D(saved[1]) if saved[1] else prev, "Naver KRX"
+                return qday, D(saved[0]), D(saved[1]) if saved[1] else prev, replaced(qday, D(saved[0]))
         if qday > day and q.prev_close and not after_close:
-            return day, q.prev_close, prev, "Naver KRX"  # today's 기준가 = the close of the chart's last session
-        return day, close, prev, "Naver 日K（含 NXT）"
+            # today's 기준가 = the close of the chart's last session
+            return day, q.prev_close, prev, replaced(day, q.prev_close)
+        return day, close, prev, source
 
     @staticmethod
     def baseline(ticker: StockTicker, info: StockMarketInfo, source: str, day: dt.date | None, close: D,
@@ -3614,7 +3621,7 @@ class PredictFeed:
             stated = int(market.get("feeRateBps"))
             fee = stated if 0 <= stated <= 10_000 else None
         return {"outcomes": [str(o.get("name") or "") for o in rows], "created_ms": created,
-                "status": str(market.get("status") or ""), "fee_bps": fee}
+                "status": str(market.get("status") or ""), "fee_bps": fee, "resolved": predict_resolution(market)}
 
     async def market_fee(self, market_id: str) -> int | None:
         """The market's own taker fee rate (feeRateBps), re-read every 10 minutes; None when it states none (or the
@@ -3948,8 +3955,15 @@ class TouchMarket:
         except Exception as error:
             self.error = clean_error(error) or type(error).__name__
 
+    @property
+    def window_end(self) -> int:
+        """The end of the deadline's own minute: the window includes that minute."""
+        return self.spec.deadline_ms + 60_000
+
     async def scan(self, now_ms: int) -> None:
-        """Extend the barrier check from where it stopped (persisted) up to now."""
+        """Extend the barrier check from where it stopped (persisted) up to now. Whole hours are read as hourly bars;
+        once the deadline has passed, the hour it falls in is read minute by minute through the deadline's own minute,
+        so a "clear" record reaching window_end covers the whole window (never the last hours left unread)."""
         hist = self.history
         if hist.get("kind") in {"low", "high", "ambiguous"}:
             return
@@ -3974,7 +3988,32 @@ class TouchMarket:
             cursor = int(done[-1][6]) + 1
             if len(rows) < 1000:
                 break
+        if now_ms >= self.window_end and cursor < self.window_end:
+            # past the deadline: the rest of the window, minute by minute, through the deadline's minute
+            rows = await self.get("klines", symbol=self.spec.symbol, interval="1m", startTime=cursor,
+                                  endTime=self.window_end - 1, limit=1000)
+            minutes = [r for r in rows if isinstance(r, list) and len(r) > 6 and int(r[0]) >= cursor - 59_999
+                       and int(r[0]) <= self.spec.deadline_ms]
+            for row in minutes:
+                opened, closed, hi, lo = int(row[0]), int(row[6]), float(row[2]), float(row[3])
+                if closed < cursor:
+                    continue
+                hit_low, hit_high = lo <= low, hi >= high
+                if hit_low or hit_high:
+                    kind = "ambiguous" if (hit_low and hit_high) or opened < self.start_ms else "low" if hit_low else "high"
+                    self.store.put(f"touch:{self.spec.slug}", {"kind": kind, "time": opened, "hi": hi, "lo": lo,
+                                                               "start": self.start_ms})
+                    return
+            if minutes and max(int(r[0]) for r in minutes) >= self.spec.deadline_ms:
+                cursor = self.window_end  # every minute up to the deadline's own one has been read
+            elif minutes:
+                cursor = max(cursor, max(int(r[6]) for r in minutes) + 1)  # read this far; the rest next time
         self.store.put(f"touch:{self.spec.slug}", {"kind": "clear", "through": cursor, "start": self.start_ms})
+
+    def verified_clear(self) -> bool:
+        """The whole window, through the deadline's minute, has been read and neither line was reached."""
+        hist = self.history
+        return hist.get("kind") == "clear" and int(hist.get("through") or 0) >= self.window_end
 
     async def scan_hour(self, hour_ms: int, start: int, end: int) -> dict | None:
         rows = await self.get("klines", symbol=self.spec.symbol, interval="1m", startTime=hour_ms, endTime=hour_ms + 3_599_999, limit=60)
@@ -4038,6 +4077,8 @@ class TouchMarket:
             return f"已于 {stamp(hist['time'], seconds=False)} 先触及 ${int(self.spec.low if kind == 'low' else self.spec.high)}"
         if kind == "ambiguous":
             return f"需人工核对：{stamp(hist['time'], seconds=False)} 这一分钟无法判断先后（高 {hist['hi']:g}·低 {hist['lo']:g}）"
+        if kind == "clear" and int(hist["through"]) >= self.window_end:
+            return "整个窗口都已核验：两条线都没碰到"
         if kind == "clear":
             return f"开盘以来未触线（核至 {stamp(hist['through'], seconds=False)}）"
         return "开盘以来是否触线：待核验" if self.start_ms else "开盘时间未知：按此前未触线计算"
@@ -4788,9 +4829,17 @@ class CapMarket:
                 failures.append(f"窗口最高：{clean_error(error)}")
         self.error = "；".join(failures)
 
+    @property
+    def window_end_s(self) -> int:
+        """The end of the window's last minute (seconds): the window includes that minute."""
+        return (self.spec.end_ms + 60_000) // 1000
+
     async def scan(self, now_ms: int) -> None:
-        """Extend the window's highest price (persisted) with the hours finished since the last scan."""
-        start_s, end_s = self.spec.start_ms // 1000, min(now_ms, self.spec.end_ms) // 1000
+        """Extend the window's highest price (persisted) with the hours finished since the last scan. An hour counts
+        once it is over; only hours that start inside the window count (the last one ends with the window's own last
+        minute). Once the window is over and read to its end, "through" reaches window_end_s: the record is complete."""
+        now_s = now_ms // 1000
+        start_s, end_s = self.spec.start_ms // 1000, min(now_s, self.window_end_s)
         if end_s <= start_s:
             return
         hist = dict(self.history) or {"start": self.spec.start_ms, "high": 0.0, "at": 0}
@@ -4813,21 +4862,36 @@ class CapMarket:
             if not page or page[0][0] <= hist["through"] or len(page) < 1000:
                 break
             before = page[0][0]
-        finished = [b for b in rows if b[0] >= hist["through"] and b[0] + 3600 <= end_s]
-        running = [b for b in rows if b[0] + 3600 > end_s and b[0] >= hist["through"]]
+        inside = [b for b in rows if b[0] >= hist["through"] and b[0] < self.window_end_s]
+        finished = [b for b in inside if b[0] + 3600 <= now_s]
+        running = [b for b in inside if b[0] + 3600 > now_s]
         for bar in finished:
             if bar[2] > hist["high"]:
                 hist["high"], hist["at"] = bar[2], bar[0]
         if finished:
             hist["through"] = max(b[0] for b in finished) + 3600
+        if now_s >= self.window_end_s and not running:
+            hist["through"] = max(hist["through"], self.window_end_s)  # hours without a bar had no trades
         self.hour_high = max((b[2] for b in running), default=0.0)
         self.store.put(f"cap:{self.spec.slug}", hist)
 
+    def coverage(self) -> str:
+        """Why the window's history is not complete yet ("" once every hour of it has been read)."""
+        hist = self.history
+        if not self.spec.gecko:
+            return "没有 K 线来源：窗口最高只含机器人看到的价格"
+        if self.spec.start_ms // 1000 % 3600 and hist.get("first") == "skipped":
+            return "开窗那一小时的分钟 K 未取得"  # permanent: waiting does not fill it
+        if int(hist.get("through") or 0) < self.window_end_s or (self.spec.start_ms // 1000 % 3600 and hist.get("first") != "done"):
+            return "窗口尚未核验到截止"
+        return ""
+
     def window_high(self) -> tuple[D | None, int]:
-        """Highest market cap in the window so far (persisted hours, the running hour, the live price)."""
+        """Highest market cap in the window so far (persisted hours, the running hour, the live price). Only what falls
+        inside the window counts: a price read after its last minute never does."""
         hist = self.history
         prices = [(float(hist.get("high") or 0), int(hist.get("at") or 0)), (self.hour_high, 0)]
-        if self.price is not None:
+        if self.price is not None and self.spec.start_ms <= self.priced_ms < self.spec.end_ms + 60_000:
             prices.append((float(self.price), 0))
         top, at = max(prices)
         supply = self.supply or (self.dex_cap / self.price if self.dex_cap and self.price else None)
@@ -4845,6 +4909,8 @@ class CapMarket:
         cap, (high, _) = self.cap, self.window_high()
         if high is not None and high >= target:
             return 1.0
+        if now_ms >= self.spec.end_ms + 60_000:
+            return 0.0  # the window is over: only what happened inside it counts, never today's market cap
         if cap is None or self.sigma is None or self.input_problem(now_ms):
             return None
         years = max(0.0, (self.spec.end_ms - max(now_ms, self.spec.start_ms)) / YEAR_MS)
@@ -4866,6 +4932,7 @@ class SimMarket:
     hold: str                # why the card suggests nothing now ("" = it may)
     sides: tuple[str, str]   # the card's names for the two sides: (涨, 跌), (Yes, No), ($3k, $1k)
     settle: dict             # what deciding the result needs
+    evidence: dict = field(default_factory=dict)  # what the odds rest on: model inputs, price sources, proxy / anchor
 
 
 SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": "月度涨跌", "flip": "反超", "ladder": "市值阶梯"}
@@ -4929,34 +4996,180 @@ def fill_shares(levels: list[tuple[float, float]], shares: float) -> tuple[float
     return (cost / got if got else 0.0), got
 
 
+def own_levels(book: PredictBook, side: str) -> list[tuple[float, float]]:
+    """Where a resting buy of one side queues, best first: 涨 / Yes = the bids; 跌 / No = 1 − the asks."""
+    if side == "up":
+        return [(float(p), float(q)) for p, q in book.bids]
+    return [(1 - float(p), float(q)) for p, q in book.asks]
+
+
+def book_snapshot(book: PredictBook, depth: int = 5) -> dict:
+    """The top of a book as evidence, priced as the 涨 / Yes side (as on the card), with when it was read."""
+    return {"bids": [[float(p), float(q)] for p, q in book.bids[:depth]],
+            "asks": [[float(p), float(q)] for p, q in book.asks[:depth]],
+            "fetched_ms": book.fetched_ms, "market_id": book.market_id, "fee_bps": book.fee_bps}
+
+
+def price_evidence(what: str, source: str, symbol: str, kind: str, price: Any, quoted_ms: int = 0,
+                   fetched_ms: int = 0, **extra: Any) -> dict:
+    """One price behind a card: what it stands for, the source it really came from, the code asked for, the kind of
+    price (last trade, mark, mid, daily close ...), and when it was quoted (market time) and read (by the bot)."""
+    with contextlib.suppress(TypeError, ValueError, decimal.InvalidOperation):
+        price = float(price) if price is not None else None
+    return {"what": what, "source": source or "", "symbol": symbol, "type": kind, "price": price,
+            "quoted_ms": int(quoted_ms or 0), "fetched_ms": int(fetched_ms or 0), **extra}
+
+
+def taker_quote(book: PredictBook, side: str, shares: float, fee_bps: int) -> dict | None:
+    """Buying ``shares`` of one side now, across the book: average price, shares got (fewer when the book is thin),
+    fee per share, cost per share (average + fee), the best price and the levels walked. None for an empty side."""
+    levels = side_levels(book, side)
+    if not levels:
+        return None
+    avg, got = fill_shares(levels, shares)
+    if got <= 0:
+        return None
+    walked, left = [], shares
+    for price, size in levels:
+        if left <= 1e-12:
+            break
+        take = min(size, left)
+        walked.append([price, take])
+        left -= take
+    fee = taker_fee(avg, fee_bps)
+    return {"avg": avg, "got": got, "fee": fee, "cost": avg + fee, "best": levels[0][0], "short": got < shares - 1e-9,
+            "levels": walked}
+
+
+def maker_fill(trade: dict, book: PredictBook) -> tuple[float, dict]:
+    """Shares of a resting paper buy that the book now shows as filled, and the evidence. Sellers at or through its
+    price would have traded with it; while they show, every real bid at that price is gone, so the queue that was ahead
+    of it is too. Only what is visible counts, and the most ever seen, never a sum of looks (one resting seller is seen
+    again on every look): a conservative, presumed fill (推定成交)."""
+    price = trade["price"]
+    through = [(p, q) for p, q in side_levels(book, trade["side"]) if p <= price + 1e-9]
+    visible = sum(q for _, q in through)
+    credited = min(float(trade["order"]), max(float(trade["shares"]), visible))
+    queue = next((q for p, q in own_levels(book, trade["side"]) if abs(p - price) < 1e-9), 0.0)
+    return credited, {"through": [[round(p, 6), q] for p, q in through[:5]], "visible": visible, "queue_now": queue}
+
+
+def sim_upgrade(trade: dict) -> dict:
+    """A record kept before evidence was saved, in today's shape: the order size, its fills and its local settlement,
+    nothing invented (no snapshots: the review page says so). Old maker fills followed the old rule (touched = the whole
+    order filled); an order still resting had filled nothing."""
+    if trade.get("v") == 2:
+        return trade
+    t = dict(trade, v=2, legacy=True, revisions=list(trade.get("revisions") or []))
+    t.setdefault("order", t.get("shares", 0.0))
+    if t["status"] == "resting":
+        t["shares"] = 0.0
+    fills = []
+    if t.get("filled"):
+        fills.append({"at": t["filled"], "shares": t["shares"], "fair": t.get("fill_fair", t["fair"]),
+                      "how": "旧规则：触价即算全部成交" if t.get("maker") else "吃单立即成交"})
+    t.setdefault("fills", fills)
+    if t["status"] == "settled" and "local" not in t:
+        up = t["payout"] if t["side"] == "up" else 1 - t["payout"]
+        t["local"] = {"up": up, "note": t.get("note", ""), "at": t.get("settled", 0), "evidence": {}}
+        t.setdefault("confirm", "local")
+    return t
+
+
+def predict_resolution(market: dict) -> dict | None:
+    """What a Predict market object says it settled on, if it says anything readable: {"index": the winning outcome in
+    indexSet order, "name", "split": a 50/50, "how": the field that said so}. None while open or unreadable."""
+    rows = sorted((o for o in market.get("outcomes") or [] if isinstance(o, dict)), key=lambda o: int(o.get("indexSet") or 0))
+    names = [str(o.get("name") or "") for o in rows]
+    won = [i for i, o in enumerate(rows) if str(o.get("status") or "").strip().upper() in {"WON", "WIN", "WINNER"}]
+    if len(won) == 1:
+        return {"index": won[0], "name": names[won[0]], "split": False, "how": "outcomes.status"}
+    if len(won) == len(rows) == 2:
+        return {"index": None, "name": "50/50", "split": True, "how": "outcomes.status"}
+    pays = []
+    for o in rows:
+        value = next((o[k] for k in ("payout", "payoutNumerator", "payoutPerShare") if o.get(k) not in (None, "")), None)
+        with contextlib.suppress(TypeError, ValueError):
+            pays.append(float(value))
+    if rows and len(pays) == len(rows) and sum(pays) > 0:
+        top = max(pays)
+        if all(abs(p - top) < 1e-9 for p in pays):
+            return {"index": None, "name": "50/50", "split": True, "how": "outcomes.payout"}
+        if sum(1 for p in pays if p > 0) == 1:
+            i = pays.index(top)
+            return {"index": i, "name": names[i], "split": False, "how": "outcomes.payout"}
+    status = str(market.get("status") or "").upper()
+    if not any(word in status for word in ("RESOLV", "SETTL", "FINAL")):
+        return None
+    res = next((market.get(k) for k in ("resolution", "resolvedOutcome", "winningOutcome", "winner") if market.get(k)), None)
+    if isinstance(res, dict):
+        name = str(res.get("name") or res.get("outcome") or "")
+    else:
+        name = res if isinstance(res, str) else ""
+    index = None
+    if isinstance(res, dict) and str(res.get("indexSet") or "").isdigit():
+        index = next((i for i, o in enumerate(rows) if str(o.get("indexSet")) == str(res["indexSet"])), None)
+    if index is None and name:
+        index = next((i for i, n in enumerate(names) if n.strip().lower() == str(name).strip().lower()), None)
+    if index is None:
+        return None
+    return {"index": index, "name": names[index], "split": False, "how": "resolution"}
+
+
 def sim_payout(side: str, up_result: float) -> float:
     """What one share of ``side`` pays when the 涨 / Yes side settles at up_result (1, 0, or ½ for a tie)."""
     return up_result if side == "up" else 1 - up_result
 
 
+def sim_fill_expectation(trade: dict) -> float:
+    """The model's expectation for the shares bought, valued at the fair price when each of them was filled (a maker
+    order filled as the market turned against it shows up here, not in the expectation at the order)."""
+    fills = trade.get("fills") or []
+    if not fills:
+        return trade["edge"] * trade["shares"]
+    return sum((float(f.get("fair", trade["fair"])) - trade["price"]) * float(f["shares"]) for f in fills)
+
+
 def sim_stats(trades: list[dict]) -> dict:
     """Totals for a set of paper trades: settled count and result split, money in and out, the model's own expectation
-    for those positions (the net edge at entry × shares), and what is still open."""
+    for those positions (at the decision, and at the fills), how they were settled, and what is still open."""
     done = [t for t in trades if t["status"] == "settled"]
-    held = [t for t in trades if t["status"] == "filled"]
+    held = [t for t in trades if t["status"] in {"filled", "resting"} and float(t.get("shares") or 0) > 0]
     cost = sum(t["price"] * t["shares"] for t in done)
     back = sum(t["payout"] * t["shares"] for t in done)
     return {"trades": len(trades), "settled": len(done), "wins": sum(t["payout"] == 1 for t in done),
             "losses": sum(t["payout"] == 0 for t in done), "ties": sum(0 < t["payout"] < 1 for t in done),
             "cost": cost, "payout": back, "pnl": back - cost, "roi": (back - cost) / cost if cost else 0.0,
             "expected": sum(t["edge"] * t["shares"] for t in done),
-            "open": len(held), "open_cost": sum(t["price"] * t["shares"] for t in held),
-            "resting": sum(t["status"] == "resting" for t in trades), "expired": sum(t["status"] == "expired" for t in trades)}
+            "expected_fill": sum(sim_fill_expectation(t) for t in done),
+            "confirmed": sum(t.get("confirm") == "confirmed" for t in done),
+            "mismatch": sum(t.get("confirm") == "mismatch" for t in done),
+            "local": sum(t.get("confirm") not in {"confirmed", "mismatch"} for t in done),
+            "open": sum(t["status"] == "filled" for t in trades), "open_cost": sum(t["price"] * t["shares"] for t in held),
+            "resting": sum(t["status"] == "resting" for t in trades),
+            "partial": sum(bool(t.get("maker")) and 0 < float(t.get("shares") or 0) < float(t.get("order") or 0) - 1e-9
+                           for t in trades if t["status"] != "expired"),
+            "expired": sum(t["status"] == "expired" for t in trades)}
 
 
 def sim_status(trade: dict) -> str:
-    """'持仓' / '挂单中' / '未成交' / '赢 +$38.00' / '输 −$62.00' / '平局 −$12.00' (a tie pays ½)."""
+    """'持仓' / '挂单中' / '挂单中（推定成交 30/100 份）' / '未成交' / '赢 +$38.00' / '输 −$62.00' / '平局 −$12.00'."""
     status = trade["status"]
     if status != "settled":
+        if status == "resting" and float(trade.get("shares") or 0) > 0:
+            return f"挂单中（推定成交 {float(trade['shares']):g}/{float(trade['order']):g} 份）"
         return {"resting": "挂单中", "filled": "持仓", "expired": "未成交"}.get(status, status)
     pnl = (trade["payout"] - trade["price"]) * trade["shares"]
     word = "赢" if trade["payout"] == 1 else "输" if trade["payout"] == 0 else "平局"
     return f"{word} {'+' if pnl >= 0 else '−'}${abs(pnl):,.2f}"
+
+
+def sim_state(trade: dict) -> str:
+    """How far a settled trade's result is confirmed: 预结算 (the bot's own data) / 已确认 (Predict agrees, or settled
+    it) / 结果不一致 (Predict differs: re-settled on its result); "" while open."""
+    if trade["status"] != "settled":
+        return ""
+    return {"confirmed": "已确认", "mismatch": "结果不一致"}.get(trade.get("confirm", ""), "预结算")
 
 
 # --- read-only probability web page -------------------------------------------------------------
@@ -5040,7 +5253,7 @@ body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){displ
 .simg{display:grid;grid-template-columns:auto auto auto 1fr;gap:2px 12px;font-size:12.5px;font-variant-numeric:tabular-nums;margin-top:2px}.simg .lh{color:var(--faint);font-size:11px}.simg .ln{text-align:right}
 .simrows{display:flex;flex-direction:column;gap:3px;margin-top:4px}
 a.simrow{display:grid;grid-template-columns:auto 1fr auto auto;gap:2px 8px;font-size:12.5px;color:inherit;text-decoration:none;font-variant-numeric:tabular-nums;padding:2px 0;border-top:1px dashed var(--line)}
-a.simrow:hover{background:var(--chip)}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}.lg .lk b{color:var(--faint)}.lg .lk.pos b{color:var(--best)}.lg .lz{color:var(--faint);font-size:11px;margin-left:3px}
+a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);text-decoration:none;align-self:flex-start}.simj:hover{text-decoration:underline}.panel a.cb{text-decoration:none;color:var(--best)}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}.lg .lk b{color:var(--faint)}.lg .lk.pos b{color:var(--best)}.lg .lz{color:var(--faint);font-size:11px;margin-left:3px}
 @media (max-width:560px){.lg{gap:3px 7px;font-size:12px}.lg .ld,.lg .lz,.lg .lp{display:none}.lg{grid-template-columns:auto auto auto auto 1fr}}
 .small{font-size:12px;margin-top:3px}.mut{color:var(--faint)}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
 [hidden]{display:none!important}
@@ -5067,6 +5280,7 @@ button.tog{font-family:inherit;padding:2px 9px}.tog.on{border-color:var(--best);
 <div class="panel" id="custom" hidden>
 <div class="pr"><b>自定义布局</b><span class="mut">拖动 ⠿ 或点 ◀ ▶ 调整卡片顺序（收藏栏平时也能拖），栏目标题旁的 ↑ ↓ 调整栏目顺序；“隐藏”收起不看的卡片。只保存在这个浏览器。</span></div>
 <div class="pr" id="secs"></div>
+<div class="pr"><span class="mut">“模拟交易”栏默认不显示，勾上就在页面最下面出现；每笔交易的证据和导出在</span><a class="cb" id="journal" href="#">模拟交易复盘 ↗</a></div>
 <div class="pr"><label>高亮门槛 <input type="number" id="hotin" min="1" max="50" step="1"> ¢</label><span class="mut">净优势达到这个值的卡片标红框（和模型的“建议门槛”不是一回事：没超过建议门槛的方向不会被建议）</span></div>
 <div class="pr"><span class="mut" id="hidn"></span><span class="sp"></span><button type="button" class="cb" id="showall">全部显示</button><button type="button" class="cb" id="reset" title="还原卡片和栏目顺序、隐藏与高亮门槛（收藏保留）">恢复默认布局</button><button type="button" class="cb pri" id="done">完成</button></div>
 </div>
@@ -5093,7 +5307,8 @@ function keep(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
 function stored(k,d,ok){try{const v=JSON.parse(localStorage.getItem(k));return ok(v)?v:d}catch(e){return d}}
 const strs=v=>Array.isArray(v)&&v.every(x=>typeof x==="string");
 let order=stored("order",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Object.values(v).every(strs));
-let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",[],strs);
+let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim"],strs);
+try{if(!localStorage.getItem("simDefault")){if(!hideSec.includes("sim"))hideSec=[...hideSec,"sim"];keep("hideSec",hideSec);localStorage.setItem("simDefault","1")}}catch(e){}  // 模拟交易 starts hidden (show it in 自定义)
 let hotCents=stored("hot",10,v=>typeof v==="number"&&v>=1&&v<=50),HOT=hotCents/100;  // an edge this large gets the red frame
 let secOrder=stored("secs",SECTIONS,strs);secOrder=[...new Set([...secOrder.filter(g=>SECTIONS.includes(g)),...SECTIONS])];
 let editing=false,drag=null,pending=null;
@@ -5226,22 +5441,25 @@ function simCard(c,it){
   // paper trading: would buying every suggestion of 10¢ or more have made money? Results only, nothing is ever ordered
   const s=it.sim,t=s.total,cents=(s.edge*100).toFixed(0),money=x=>(x>=0?"+$":"−$")+Math.abs(x).toFixed(2),usd=x=>"$"+x.toFixed(2);
   const col=x=>x>0?upColor():x<0?downColor():"var(--muted)";
-  c.append($("div","small mut","净优势 ≥"+cents+"¢ 时按卡片建议买 "+s.shares+" 份，只记账不下单。吃单按盘口深度成交并扣手续费；挂单要等盘口成交到挂价才算成交，出结果时还没成交就作废。"));
+  c.append($("div","small mut","净优势 ≥"+cents+"¢ 时按卡片建议买 "+s.shares+" 份，只记账不下单。吃单按这么多份吃到的均价和手续费成交；挂单只按盘口出现的卖单数量推定成交，出结果时没成交的部分作废。先预结算，再以 Predict 结果确认。"));
+  const jl=$("a","simj","完整复盘（每笔证据、导出）↗");jl.href=location.pathname.replace(/\\/$/,"")+"/journal";c.append(jl);
   if(!t.trades){c.append($("p","","还没有触发过：等有卡片的净优势达到 "+cents+"¢ 就开始记录。"));return c}
   const top=$("div","simtop"),big=$("b","simpnl",money(t.pnl));big.style.color=col(t.pnl);
   top.append($("span","mut","已结算盈亏"),big);if(t.cost)top.append($("span","mut",(t.roi>=0?"+":"")+(t.roi*100).toFixed(1)+"%"));c.append(top);
   const line=(...xs)=>{const d=$("div","simln");xs.forEach(x=>d.append(typeof x==="string"?$("span","",x):x));c.append(d)};
   line("已结算 "+t.settled+" 笔：赢 "+t.wins+" · 输 "+t.losses+(t.ties?" · 平 "+t.ties:""),"成本 "+usd(t.cost)+" → 回款 "+usd(t.payout));
-  const exp=$("span","","模型预期 "+money(t.expected));exp.title="同一批已结算的交易，按下单时的净优势 × 份数加总：实际盈亏长期应接近它，差得多说明模型有偏差";line(exp);
-  line("持仓 "+t.open+" 笔（"+usd(t.open_cost)+"）","挂单中 "+t.resting+" 笔","未成交作废 "+t.expired+" 笔");
+  line("已确认 "+t.confirmed+" 笔","预结算 "+t.local+" 笔",...(t.mismatch?[$("b","warn","结果不一致 "+t.mismatch+" 笔")]:[]));
+  const exp=$("span","","模型预期 "+money(t.expected));exp.title="同一批已结算的交易，按下单时的净优势 × 份数加总：实际盈亏长期应接近它，差得多说明模型有偏差";
+  const expf=$("span","","成交时 "+money(t.expected_fill));expf.title="按每份成交那一刻的公平价算：比下单时低很多，说明挂单常在行情转向时被成交";line(exp,expf);
+  line("持仓 "+t.open+" 笔（"+usd(t.open_cost)+"）","挂单中 "+t.resting+" 笔",...(t.partial?["部分成交 "+t.partial+" 笔"]:[]),"未成交作废 "+t.expired+" 笔");
   const groups=[...s.kinds,...(s.modes.length>1?s.modes:[])];
   if(groups.length>1){const g=$("div","simg");g.append(...["类别","结算","盈亏","预期"].map(x=>$("span","lh",x)));
     groups.forEach(r=>{const v=$("span","ln",money(r.pnl));v.style.color=col(r.pnl);g.append($("span","",r.name),$("span","ln",r.settled+" 笔"),v,$("span","ln mut",money(r.expected)))});c.append(g)}
   const det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   det.append($("summary","","最近 "+s.rows.length+" 笔"));const list=$("div","simrows");
-  s.rows.forEach(r=>{const a=$("a","simrow");a.href=r.url;a.target="_blank";a.rel="noopener noreferrer";a.title=r.note||"打开 Predict 市场";
-    const st=$("b","",r.text);if(r.pnl!=null)st.style.color=col(r.pnl);
-    a.append($("span","mut",r.opened),$("span","",r.item+" "+r.label+" "+(r.price*100).toFixed(1)+"¢×"+r.shares),$("span","mut",(r.edge>=0?"+":"")+(r.edge*100).toFixed(1)+"¢"),st);list.append(a)});
+  s.rows.forEach(r=>{const a=$("a","simrow");a.href=jl.href+"#"+encodeURIComponent(r.id);a.title=(r.note?r.note+"；":"")+"点开看这笔的完整复盘";
+    const st=$("b","",r.text+(r.state?" · "+r.state:""));if(r.pnl!=null)st.style.color=col(r.pnl);if(r.state==="结果不一致")st.style.color="var(--hot)";
+    a.append($("span","mut",r.opened),$("span","",r.item+" "+r.label+" "+(r.price*100).toFixed(1)+"¢×"+r.shares+(r.maker&&r.shares<r.order?"/"+r.order:"")),$("span","mut",(r.edge>=0?"+":"")+(r.edge*100).toFixed(1)+"¢"),st);list.append(a)});
   det.append(list);c.append(det);return c}
 function ladder(c,it){
   c.classList.add("lad");
@@ -5433,6 +5651,7 @@ function setEditing(on){
   const b=document.getElementById("edit");b.classList.toggle("on",on);b.textContent=on?"✓ 完成":"✎ 自定义";
   if(on)drawPanel();if(last)render(last)}
 document.getElementById("edit").addEventListener("click",()=>setEditing(!editing));
+document.getElementById("journal").href=location.pathname.replace(/\\/$/,"")+"/journal";
 document.getElementById("done").addEventListener("click",()=>setEditing(false));
 document.getElementById("hotin").addEventListener("change",e=>{const v=Math.round(Number(e.target.value));
   if(e.target.value.trim()!==""&&Number.isFinite(v)){hotCents=Math.min(50,Math.max(1,v));HOT=hotCents/100;keep("hot",hotCents)}
@@ -5442,8 +5661,8 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=[];secOrder=[...SECTIONS];hotCents=10;HOT=.1;
-  ["order","hidden","hideSec","secs","hot"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});
+  order={};hidden=[];hideSec=["sim"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;
+  ["order","hidden","secs","hot"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 async function load(){
   try{
@@ -5479,11 +5698,197 @@ load();setInterval(load,10000);setInterval(tick,1000);
 </script></body></html>"""
 
 
+# --- the paper trades' review page (/p/<token>/journal): every trade with its evidence, exports ---------------------
+JOURNAL_PAGE = r"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>模拟交易复盘</title>
+<style>
+:root{--best:#2d6cdf;--best-bg:#eef3fd;--warn:#c77c00;--bg:#f4f5f7;--card:#fff;--text:#1b1f23;--muted:#6b737c;--faint:#9aa3ad;--line:#e5e8ec;--up:#d63b3b;--down:#1e9a54;--chip:#f0f2f5;--hot:#e02424;--hot-bg:#fdecec}
+@media (prefers-color-scheme:dark){:root{--bg:#101215;--card:#1a1d21;--text:#e8eaed;--muted:#9aa3ad;--faint:#6b737c;--line:#2a2f35;--chip:#23272c;--best:#6f9ef0;--best-bg:#1c2a42;--warn:#e0a040;--hot:#ff5a5a;--hot-bg:#3a1c1e}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding:12px 16px 40px}
+header{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 12px}
+h1{font-size:18px;margin:0}h2{font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin:14px 2px 6px}
+.meta{color:var(--muted);font-size:12px;display:flex;flex-wrap:wrap;gap:2px 10px}
+a{color:var(--best)}.mut{color:var(--muted)}.small{font-size:12.5px}.warn{color:var(--warn)}.bad{color:var(--hot)}.ok{color:var(--best)}
+.btns{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.btn{display:inline-flex;align-items:center;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:8px;padding:5px 11px;font:inherit;font-size:13px;text-decoration:none;cursor:pointer}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:8px;margin:6px 0}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 10px;min-width:0}
+.tile .k{font-size:12px;color:var(--muted)}.tile .v{font-size:18px;font-weight:650;font-variant-numeric:tabular-nums;white-space:nowrap}
+.tile .s{font-size:12px;color:var(--muted)}
+.tbl{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;font-size:12.5px;width:100%;font-variant-numeric:tabular-nums}
+td,th{border-bottom:1px solid var(--line);padding:4px 8px;text-align:left;vertical-align:top;white-space:nowrap}
+th{color:var(--muted);font-weight:500}tr:last-child td{border-bottom:0}td.wrap{white-space:normal;min-width:140px}
+.filters{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0;font-size:12.5px;color:var(--muted)}
+.chip{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:3px 10px;font:inherit;font-size:12.5px;color:var(--muted);cursor:pointer}
+.chip.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}
+.list{display:flex;flex-direction:column;gap:8px}
+.tr{background:var(--card);border:1px solid var(--line);border-radius:10px;min-width:0}
+.tr.open{border-color:var(--best)}
+.row{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:2px 12px;padding:9px 12px;cursor:pointer;width:100%;
+  background:none;border:0;font:inherit;color:inherit;text-align:left}
+.row .l{min-width:0;flex:1 1 220px}.row .t1{font-weight:600}.row .t2{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.row .r{text-align:right;font-variant-numeric:tabular-nums;flex:0 0 auto}.row .r b{display:block}
+.badge{font-size:11.5px;border-radius:6px;padding:0 6px;background:var(--chip);color:var(--muted);white-space:nowrap}
+.badge.ok{color:var(--best);background:var(--best-bg)}.badge.bad{color:#fff;background:var(--hot)}.badge.pre{color:var(--warn)}
+.det{border-top:1px solid var(--line);padding:8px 12px 12px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.sec h3{font-size:13px;margin:0 0 5px;display:flex;align-items:center;gap:8px}
+.sec .sub{font-size:12px;color:var(--muted);margin:6px 0 3px}
+dl{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;margin:0;font-size:12.5px}dt{color:var(--muted);white-space:nowrap}
+dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
+.note{font-size:12.5px;background:var(--chip);border-radius:8px;padding:6px 8px}
+footer{margin-top:18px;color:var(--faint);font-size:12px}
+</style></head><body><div class="wrap">
+<header><h1>模拟交易复盘</h1><div class="meta" id="meta">加载中…</div></header>
+<div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="csv" href="journal.csv" download="模拟交易日记.csv">导出 CSV</a><a class="btn" id="json" href="journal.json" download="模拟交易日记.json">导出 JSON</a></div>
+<p class="small mut" id="intro"></p>
+<div class="tiles" id="tiles"></div>
+<h2 id="h-groups" hidden>分组</h2><div class="tbl" id="groups" hidden></div>
+<h2>交易</h2><div class="filters" id="filters"></div>
+<div class="list" id="list"></div>
+<footer>只记账，不会向 Predict 下单。挂单的成交是按盘口快照推定的（推定成交），不代表真实成交。</footer>
+</div>
+<script>
+const $=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
+const cent=x=>x==null||!isFinite(x)?"—":(x*100).toFixed(1)+"¢",sg=x=>x==null||!isFinite(x)?"—":(x>=0?"+":"")+cent(x);
+const money=x=>(x>=0?"+$":"−$")+Math.abs(x).toFixed(2),usd=x=>"$"+Number(x).toFixed(2);
+const num=x=>x==null||x===""?"—":typeof x==="number"?x.toLocaleString("en-US",{maximumFractionDigits:6}):String(x);
+const when=ms=>ms?new Date(ms).toLocaleString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false,month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}):"—";
+const span=ms=>{if(ms==null||!isFinite(ms))return"—";const a=Math.abs(ms),s=Math.round(a/1000);
+  const t=s<90?s+" 秒":s<5400?Math.round(s/60)+" 分钟":s<172800?(s/3600).toFixed(1)+" 小时":(s/86400).toFixed(1)+" 天";return ms<0?t+"后":t};
+const KINDS={close:"指数/个股日涨跌",touch:"先触价",updown:"月度涨跌",flip:"反超",ladder:"市值阶梯"};
+const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参考说明",effective:"有效价",sigma_daily:"σ（日）",sigma_note:"σ 来源",
+  remaining:"剩余方差占比",sigma:"σ（剩余）",z:"z",beta:"β",mode:"口径",direct:"直接用现货",proxy_note:"代理换算",target:"目标日",warn:"提示",
+  close_ms:"收盘/截止",price:"现价",low:"低线",high:"高线",sigma_ms:"σ 计算时间",deadline_ms:"截止",years:"剩余年数",path:"路径核验",start_ms:"窗口开始",
+  line:"起点",settled:"已结算",start:"起点 K 线",end:"终点 K 线",a:"A 价格",b:"B 价格",ratio:"A/B",window:"窗口",cap:"市值",
+  supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
+  proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
+  anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
+  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",min_edge:"最低净优势",fee_bps:"默认费率（基点）",
+  trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",rule:"规则",close:"收盘",
+  source:"来源",day:"日期",history:"核验记录"};
+const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms","fetched_ms","anchor_ms","at"]);
+const CENT_KEYS=new Set(["fair_up"]);
+let data=null,stateF="all",wayF="all",kindF="all",openId=decodeURIComponent(location.hash.slice(1)||"");
+const base=location.pathname.replace(/\/journal\/?$/,"");
+document.getElementById("back").href=base;
+function val(k,v){if(v==null||v==="")return"—";if(typeof v==="boolean")return v?"是":"否";
+  if(MS_KEYS.has(k))return v?when(v):"—";if(k==="high_at")return v?when(v*1000):"—";if(CENT_KEYS.has(k))return cent(v);
+  if(k==="sigma_daily"||k==="sigma")return (v*100).toFixed(2)+"%";if(k==="history")return JSON.stringify(v);
+  if(typeof v==="object")return JSON.stringify(v);return num(v)}
+function dl(obj,skip){const d=$("dl");Object.entries(obj||{}).forEach(([k,v])=>{if(skip&&skip.includes(k))return;d.append($("dt","",LABELS[k]||k),$("dd","",val(k,v)))});return d}
+function table(head,rows){const w=$("div","tbl"),t=$("table"),h=$("tr");head.forEach(x=>h.append($("th","",x)));t.append(h);
+  rows.forEach(r=>{const tr=$("tr");r.forEach((x,i)=>{const td=$("td",i===r.length-1&&head[i]==="说明"?"wrap":"");td.append(x instanceof Node?x:String(x??"—"));tr.append(td)});t.append(tr)});w.append(t);return w}
+function sec(title,...kids){const s=$("div","sec"),h=$("h3","",title);s.append(h,...kids.filter(Boolean));return s}
+function cat(t){if(t.status==="resting"||t.status==="filled")return"open";if(t.status==="expired")return"exp";
+  return t.confirm==="confirmed"?"ok":t.confirm==="mismatch"?"bad":"pre"}
+function badge(t){const c=cat(t),b=$("span","badge"+(c==="ok"?" ok":c==="bad"?" bad":c==="pre"?" pre":""),t.state||t.text);return b}
+function perShare(t){return t.shares>0?t.expected_fill/t.shares:null}
+function sources(list,at){if(!list||!list.length)return $("p","small mut","没有记录行情来源");
+  return table(["项目","来源","代码","类型","价格","报价时间","报价距下单","抓取时间"],list.map(x=>[x.what||"",x.source||"",x.symbol||"",x.type||"",
+    x.price==null?"—":num(x.price),x.quoted_ms?when(x.quoted_ms):"—",x.quoted_ms?span(at-x.quoted_ms):"—",x.fetched_ms?when(x.fetched_ms):"—"]))}
+function bookTable(b){if(!b)return null;const n=Math.max((b.bids||[]).length,(b.asks||[]).length),rows=[];
+  for(let i=0;i<n;i++){const x=(b.bids||[])[i],y=(b.asks||[])[i];rows.push([x?cent(x[0]):"",x?num(x[1]):"",y?cent(y[0]):"",y?num(y[1]):""])}
+  const w=$("div");w.append($("div","sub","盘口快照（涨/Yes 一侧，"+when(b.fetched_ms)+" 读取"+(b.fee_bps!=null?"，费率 "+b.fee_bps+" 基点":"")+"）"),
+    table(["买价","买量","卖价","卖量"],rows));return w}
+function detail(t){
+  const d=$("div","det"),e=t.entry||{};
+  if(t.legacy)d.append($("div","note warn","这是旧版本记下的交易：当时没有保存判断依据、行情来源和盘口快照，只有价格、成交和结果。"));
+  // 1. why the model priced it so
+  const basis=$("div");if(e.basis){basis.append(dl(e.basis));if(e.basis.close_ms)basis.append($("div","sub","下单时距收盘/截止 "+span(e.basis.close_ms-t.opened)))}
+  else if(e.error)basis.append($("p","small warn","证据记录失败："+e.error));
+  const side=$("dl");[["这一边的公平价",cent(t.fair)],["建议门槛",cent(e.need)],["成本价",cent(t.price)],["下单时净优势",sg(t.edge)+" /份"]].forEach(([k,v])=>side.append($("dt","",k),$("dd","",v)));
+  d.append(sec("判断依据（下单时）",side,basis.childNodes.length?basis:null));
+  const fills=(t.fills||[]).filter(f=>f.basis);
+  if(t.maker&&fills.length){const f=fills[0],b=$("div");b.append($("div","sub","第一笔推定成交时（"+when(f.at)+"）的模型输入"),dl(f.basis));d.append(sec("判断依据（成交时）",b))}
+  // 2. prices behind it
+  if(!t.legacy){const s=$("div");s.append(sources(e.sources,t.opened));if(fills.length){s.append($("div","sub","成交时（"+when(fills[0].at)+"）"),sources(fills[0].sources,fills[0].at))}d.append(sec("行情来源",s))}
+  // 3. proxy and anchor
+  if(!t.legacy)d.append(sec("代理与锚点",e.proxy?dl(e.proxy):$("p","small mut",e.basis&&e.basis.direct===false?"没有记录代理":"直接用标的本身的价格，没有代理")));
+  // 4. how it filled
+  const fx=$("div"),fl=$("dl"),add=(k,v)=>fl.append($("dt","",k),$("dd","",v));
+  add("下单份数",num(t.order));add("成交份数",num(t.shares)+(t.unfilled?"（未成交 "+num(t.unfilled)+" 份已作废）":""));
+  if(t.maker){add("成交方式","推定成交：盘口出现卖到挂价或更低的卖单才算，按看到的数量、取最多看到的一次");
+    if(t.queue_ahead!=null)add("排队假设","排在挂单时该价位已有的 "+num(t.queue_ahead)+" 份之后；之后最少剩 "+num(t.queue_min)+" 份")}
+  else{add("成交方式","吃单立即成交");add("成交均价",cent(t.avg));add("最优价",cent(t.best));add("深度滑点",sg(t.slip));add("手续费",cent(t.fee)+" /份")}
+  fx.append(fl);
+  if((t.fills||[]).length)fx.append($("div","sub","成交记录"),table(["时间","份数","当时公平价","依据"],t.fills.map(f=>[when(f.at),num(f.shares),cent(f.fair),
+    f.levels?"吃过："+f.levels.map(l=>cent(l[0])+"×"+num(l[1])).join("、")+(f.short?"（盘口不够）":""):
+    f.seen?"看到卖单："+(f.seen.through||[]).map(l=>cent(l[0])+"×"+num(l[1])).join("、")+"，共 "+num(f.seen.visible)+" 份；挂价排队剩 "+num(f.seen.queue_now):f.how||""])));
+  const bt=bookTable(e.book);if(bt)fx.append(bt);
+  if(e.card&&e.card.length)fx.append($("div","sub","下单时卡片上的四个方向（按 $"+((t.version||{}).trade_usd||"")+" 计）"),
+    table(["方向","价格","净优势","建议"],e.card.map(c=>[c.label,cent(c.price),sg(c.edge),c.best?"✓ 加框":""])));
+  d.append(sec("成交证据",fx));
+  // 5. how it was settled
+  const st=$("div"),sl=$("dl"),put=(k,v)=>sl.append($("dt","",k),$("dd","",v));
+  const res=r=>r==null?"—":r.up===1?"涨 / Yes":r.up===0?"跌 / No":"50/50";
+  if(t.local){put("本地预结算",res(t.local)+" · "+(t.local.note||""));put("预结算时间",when(t.local.at))}
+  if(t.final){put("Predict 结果",res(t.final)+" · "+(t.final.name||"")+"（"+(t.final.how||"")+"）");put("确认时间",when(t.final.at))}
+  else if(t.status==="settled"||t.local)put("Predict 结果","待确认"+(t.final_error?"（读取失败："+t.final_error+"）":t.final_check?"（市场状态："+(t.final_check.status||"未知")+"）":""));
+  put("状态",t.text+(t.state?" · "+t.state:""));
+  st.append(sl);
+  if(t.local&&t.local.evidence&&Object.keys(t.local.evidence).length)st.append($("div","sub","本地结算依据"),dl(t.local.evidence));
+  if((t.revisions||[]).length)st.append($("div","sub","修订记录"),table(["时间","依据","回款/份","说明"],t.revisions.map(r=>[when(r.at),r.by,num(r.from)+" → "+num(r.to),r.note||""])));
+  if(t.confirm==="mismatch")st.prepend($("div","note bad","本地结果与 Predict 不一致，已按 Predict 的结果重新结算"));
+  d.append(sec("结算证据",st));
+  // 6. version
+  if(t.version)d.append(sec("版本与设置",dl(t.version)));
+  const a=$("a","btn","打开 Predict 市场 ↗");a.href=t.url;a.target="_blank";a.rel="noopener noreferrer";d.append(a);
+  return d}
+function row(t){
+  const w=$("div","tr"+(openId===t.id?" open":"")),b=$("button","row");b.type="button";b.setAttribute("aria-expanded",openId===t.id?"true":"false");
+  const l=$("div","l"),r=$("div","r");
+  l.append($("div","t1",t.item+" "+t.label+" @ "+cent(t.price)+" × "+num(t.shares)+(t.maker&&t.shares<t.order?"/"+num(t.order):"")));
+  l.append($("div","t2",when(t.opened)+" · "+(KINDS[t.kind]||t.kind)+" · 下单时 "+sg(t.edge)+" · 成交时 "+sg(perShare(t))+" /份"));
+  const pn=$("b","",t.pnl==null?"":money(t.pnl));if(t.pnl!=null)pn.className=t.pnl>=0?"ok":"bad";r.append(pn,badge(t));
+  b.append(l,r);b.addEventListener("click",()=>{openId=openId===t.id?"":t.id;history.replaceState(null,"",openId?"#"+encodeURIComponent(openId):location.pathname);render()});
+  w.append(b);if(openId===t.id)w.append(detail(t));return w}
+function tiles(){
+  const s=data.total,el=document.getElementById("tiles"),tile=(k,v,sub,cls)=>{const x=$("div","tile");x.append($("div","k",k));const vv=$("div","v",v);if(cls)vv.className+=" "+cls;x.append(vv);if(sub)x.append(typeof sub==="string"?$("div","s",sub):sub);return x};
+  const conf=$("div","s");conf.append("预结算 "+s.local+" · ",$("span",s.mismatch?"bad":"","结果不一致 "+s.mismatch));
+  el.replaceChildren(tile("已结算",s.settled+" 笔","赢 "+s.wins+" · 输 "+s.losses+" · 平 "+s.ties),
+    tile("盈亏",money(s.pnl),"成本 "+usd(s.cost)+(s.cost?" · "+(s.roi>=0?"+":"")+(s.roi*100).toFixed(1)+"%":""),s.pnl>=0?"ok":"bad"),
+    tile("模型预期（下单时）",money(s.expected),"按下单时的净优势 × 份数"),
+    tile("模型预期（成交时）",money(s.expected_fill),"按成交那一刻的公平价；比下单时低很多 = 挂单常在行情转向时被成交"),
+    tile("结算确认","已确认 "+s.confirmed,conf),
+    tile("进行中","持仓 "+s.open,"挂单中 "+s.resting+" · 部分成交 "+s.partial+" · 作废 "+s.expired))}
+function groups(){
+  const rows=[...data.kinds,...(data.modes.length>1?data.modes:[])],g=document.getElementById("groups"),h=document.getElementById("h-groups");
+  g.hidden=h.hidden=rows.length<2;if(rows.length<2)return;
+  g.replaceChildren(table(["分组","已结算","盈亏","下单时预期","成交时预期","不一致"],rows.map(r=>[r.name,r.settled+" 笔",money(r.pnl),money(r.expected),money(r.expected_fill),r.mismatch])).firstChild)}
+function filters(){
+  const f=document.getElementById("filters"),chip=(t,on,fn)=>{const b=$("button","chip"+(on?" on":""),t);b.type="button";b.addEventListener("click",fn);return b};
+  const sts=[["all","全部"],["open","持仓/挂单"],["pre","预结算"],["ok","已确认"],["bad","结果不一致"],["exp","未成交"]];
+  const ways=[["all","全部"],["maker","挂单"],["taker","吃单"]];
+  const kinds=[["all","全部"],...Object.entries(KINDS).filter(([k])=>data.trades.some(t=>t.kind===k))];
+  f.replaceChildren($("span","","状态"),...sts.map(([k,t])=>chip(t,stateF===k,()=>{stateF=k;render()})),$("span","","　方式"),
+    ...ways.map(([k,t])=>chip(t,wayF===k,()=>{wayF=k;render()})),...(kinds.length>2?[$("span","","　市场"),...kinds.map(([k,t])=>chip(t,kindF===k,()=>{kindF=k;render()}))]:[]))}
+function render(){
+  if(!data)return;
+  document.getElementById("intro").textContent="净优势 ≥"+(data.edge*100).toFixed(0)+"¢ 时按卡片建议买 "+data.shares+" 份。吃单按这么多份吃到的均价和手续费判断并成交；挂单排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交。先用机器人数据预结算，再以 Predict 的结果确认，不一致时按 Predict 重新结算并留下修订记录。";
+  tiles();groups();filters();
+  const list=document.getElementById("list"),shown=data.trades.filter(t=>(stateF==="all"||cat(t)===stateF)&&(wayF==="all"||(wayF==="maker")===t.maker)&&(kindF==="all"||t.kind===kindF));
+  list.replaceChildren(...(shown.length?shown.map(row):[$("p","mut",data.trades.length?"没有符合条件的交易":"还没有模拟交易")]))}
+async function load(){
+  try{const r=await fetch(base+"/journal.json",{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();
+    document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"));
+    render();const o=openId&&document.querySelector(".tr.open");if(o&&!load.done)o.scrollIntoView({block:"start"});load.done=true}
+  catch(e){document.getElementById("meta").replaceChildren($("span","bad","读取失败："+e.message))}}
+load();setInterval(load,60000);
+</script></body></html>"""
+
+
 class WebServer:
     """Tiny read-only HTTP server (stdlib asyncio) for the probability page.
 
-    Routes: /health, /p/<token> (HTML), /p/<token>/data.json (JSON). Everything else is 404, the
-    token is compared in constant time, and responses are no-store with a restrictive CSP.
+    Routes: /health, /p/<token> (HTML), /p/<token>/data.json (JSON), /p/<token>/journal (the paper trades' review page)
+    with journal.json / journal.csv (exports). Everything else is 404, the token is compared in constant time, and
+    responses are no-store with a restrictive CSP.
     """
     MAX_HEADER_BYTES = 8192
 
@@ -5514,6 +5919,13 @@ class WebServer:
             if parts[2] == "data.json":
                 body = json.dumps(self.bot.odds_payload(), ensure_ascii=False).encode("utf-8")
                 return 200, "application/json; charset=utf-8", body
+            if parts[2] == "journal":
+                return 200, "text/html; charset=utf-8", JOURNAL_PAGE.encode("utf-8")
+            if parts[2] == "journal.json":
+                body = json.dumps(self.bot.journal_payload(), ensure_ascii=False, default=str).encode("utf-8")
+                return 200, "application/json; charset=utf-8", body
+            if parts[2] == "journal.csv":
+                return 200, "text/csv; charset=utf-8", self.bot.journal_csv().encode("utf-8")
         return 404, "text/plain; charset=utf-8", b"not found"
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -5989,6 +6401,7 @@ class Bot:
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
         self.sim_ran = -1e9  # monotonic time of the paper trader's last look
+        self.sim_checked: dict[str, float] = {}  # market id -> monotonic time Predict was last asked for its result
         self.edge_ran = -1e9  # monotonic time of the edge alerts' last look
         self.reference_pool: ThreadPoolExecutor | None = None
         self.reference_state: dict[str, dict] = {}  # per background feed: last success, last error, duration
@@ -6570,20 +6983,26 @@ class Bot:
                 "move": raw.move, "beta": raw.beta, "sigma": raw.sigma_daily, "R": raw.remaining, "proxy": raw.proxy_note,
                 "slug": slug, "url": predict_url(slug, self.config.predict_ref) if slug else ""})
         if self.cn.close:
-            self.store.put(f"outcome:SSE:{self.cn.close.day.isoformat()}", float(self.cn.close.value))
+            self.note_outcome("SSE", self.cn.close.day.isoformat(), self.cn.close.value, self.cn.close.source)
         k = self.kospi.quote
         kst = dt.timezone(dt.timedelta(hours=9))
         if k and dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).time() >= dt.time(15, 30):
             day = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date()
-            self.store.put(f"outcome:KOSPI:{day.isoformat()}", float(self.kospi.official_close(day) or k.last))
+            official = self.kospi.official_close(day)
+            rank = self.kospi.daily_rank.get(day)
+            self.note_outcome("KOSPI", day.isoformat(), official or k.last,
+                              ("Yahoo ^KS11 日K", "Naver 日K")[rank] if official and rank in (0, 1) else f"{k.source} 实时（日K未出）")
         q, local = self.hsi.quote, dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
         if local.time() >= dt.time(16, 15) and hk_cash_close_date(now_ms, self.hsi.holidays) == local.date():
             # the dated daily close once it is out; before that the cash quote, if it is that day's
-            close = self.hsi_daily.daily.get(local.date())
-            if close is None and q is not None and q.spot is not None and not self.hsi.spot_problem(q, now_ms):
-                close = q.spot
+            close, source = self.hsi_daily.daily.get(local.date()), ""
             if close is not None:
-                self.store.put(f"outcome:HSI:{local.date().isoformat()}", float(close))
+                rank = self.hsi_daily.ranks.get(local.date())
+                source = f"{self.hsi_daily.sources[rank][0]} 日K" if rank is not None else "日K"
+            elif q is not None and q.spot is not None and not self.hsi.spot_problem(q, now_ms):
+                close, source = q.spot, f"{q.spot_source or q.source} 实时（日K未出）"
+            if close is not None:
+                self.note_outcome("HSI", local.date().isoformat(), close, source)
 
     def calibration_text(self) -> str:
         preds = [v for _, v in self.store.items("pred:")]
@@ -7229,7 +7648,160 @@ class Bot:
     SIM_SETTLE_MS = 60 * 60_000       # a daily market is settled this long after its close: the official close is in
 
     def sim_trades(self) -> dict[str, dict]:
-        return {k.removeprefix("sim:"): v for k, v in self.store.items("sim:") if isinstance(v, dict) and "status" in v}
+        return {k.removeprefix("sim:"): sim_upgrade(v) for k, v in self.store.items("sim:") if isinstance(v, dict) and "status" in v}
+
+    def note_outcome(self, key: str, day: str, value: Any, source: str) -> None:
+        """An official close as it becomes known (scored by /calib, settles the paper trades), with where it came from."""
+        value = float(value)
+        if self.store.get(f"outcome:{key}:{day}") != value:
+            self.store.put(f"outcome:{key}:{day}", value)
+        record = {"value": value, "source": source}
+        if {k: v for k, v in (self.store.get(f"outsrc:{key}:{day}") or {}).items() if k != "at"} != record:
+            self.store.put(f"outsrc:{key}:{day}", {**record, "at": self.market.now_ms()})
+
+    def close_evidence(self, title: str, odds: CloseOdds, now_ms: int) -> dict:
+        """What a daily card's odds rest on, for the trade's record: the model's inputs, every price behind them (its real
+        source, code, quote and read times, kind of price) and, for an estimate, the proxy and its anchor."""
+        basis = {"fair_up": odds.fair_up, "ref": float(odds.ref), "ref_note": odds.ref_note, "effective": float(odds.effective),
+                 "sigma_daily": odds.sigma_daily, "sigma_note": odds.sigma_note, "remaining": odds.remaining,
+                 "sigma": odds.sigma, "z": odds.z, "beta": odds.beta, "mode": odds.mode, "direct": odds.direct,
+                 "proxy_note": odds.proxy_note, "target": odds.target.isoformat(), "warn": odds.warn,
+                 "close_ms": self.target_close(title, odds.target)[0]}
+        sources: list[dict] = []
+        proxy: dict | None = None
+        if odds.ref_note.startswith("Predict 目标价"):
+            sources.append(price_evidence("参考线", "Predict 目标价（startPrice）", self.predict_key(title), "结算基准", odds.ref))
+        if title == "上证指数":
+            q, close = self.cn.quote, self.cn.close
+            if odds.direct and q is not None:
+                sources.append(price_evidence("上证现货", q.source, "sh000001", "最新价", q.last, q.quoted_ms, q.fetched_ms))
+            if close is not None:
+                sources.append(price_evidence("参考收盘", close.source, "sh000001", "日K收盘", close.value, close.close_ms,
+                                              close.checked_ms, day=close.day.isoformat()))
+            a50, anchor = self.cn.a50, self.anchors.get("A50")
+            if not odds.direct and a50 is not None:
+                sources.append(price_evidence("A50 期货", a50.source, a50.name, "最新价", a50.last, a50.quoted_ms, a50.fetched_ms))
+                proxy = {"proxy": "富时中国 A50 期货", "family": a50_family(a50.source), "contract": a50.name,
+                         "price": float(a50.last), "quoted_ms": a50.quoted_ms,
+                         "anchor": float(anchor[1]) if anchor else None, "anchor_ms": anchor[0] if anchor else 0,
+                         "anchor_note": self.a50_anchor_note, "anchor_family": a50_family(self.a50_anchor_source),
+                         "beta": odds.beta, "approx": "近似" in self.a50_anchor_note,
+                         "expiry_day": bool(close and a50_expiry(close.day))}
+        elif title == "恒生指数":
+            q, holidays = self.hsi.quote, self.hsi.holidays
+            if q is not None:
+                day = expected_close_date("hk", now_ms, holidays) if odds.direct else hk_cash_close_date(now_ms, holidays)
+                rank = self.hsi_daily.ranks.get(day)
+                ref_source = self.hsi_daily.sources[rank][0] + " 日K" if rank is not None else (q.spot_source or q.source) + " 实时"
+                sources.append(price_evidence("参考收盘", ref_source, "HSI", "收盘", odds.ref, day=day.isoformat()))
+                if odds.direct:
+                    sources.append(price_evidence("恒指现货", q.spot_source or q.source, "HSI", "现货指数", q.spot,
+                                                  q.spot_ms or q.quoted_ms, q.fetched_ms))
+                else:
+                    sources.append(price_evidence("恒指期货", q.source, q.name, "期货最新价", q.last, q.quoted_ms, q.fetched_ms))
+                    anchor, note, approx = self.hsi_anchor(q, day, now_ms)
+                    proxy = {"proxy": "恒指期货", "contract": q.contract or q.name, "exchange_contract": q.exchange_contract,
+                             "session": q.session_name(holidays), "price": float(q.last), "quoted_ms": q.quoted_ms,
+                             "anchor": float(anchor) if anchor is not None else None, "anchor_note": note, "approx": approx}
+        elif title == "KOSPI":
+            k, holidays = self.kospi.quote, self.config.holidays.get("kr", frozenset())
+            if k is not None:
+                kst = dt.timezone(dt.timedelta(hours=9))
+                day = (expected_close_date("kr", now_ms, holidays) if odds.direct
+                       else dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date())
+                rank = self.kospi.daily_rank.get(day) if day in self.kospi.daily else None
+                ref_source = ("Yahoo ^KS11 日K", "Naver 日K")[rank] if rank in (0, 1) else f"{k.source} 实时"
+                sources.append(price_evidence("参考收盘", ref_source, "KOSPI", "收盘", odds.ref, day=day.isoformat()))
+                if odds.direct:
+                    sources.append(price_evidence("KOSPI 现货", k.source, "KOSPI", "最新价", k.last, k.quoted_ms, k.fetched_ms))
+            hl, anchor = self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
+            if not odds.direct and hl is not None:
+                price, kind = kr200_price(hl)
+                sources.append(price_evidence("HL KR200 永续", "Hyperliquid", hl.coin, kind, price, 0, hl.fetched_ms))
+                proxy = {"proxy": "Hyperliquid KR200 永续（跟踪 KOSPI200）", "maps": "KOSPI200 → KOSPI 综合", "price": float(price),
+                         "fetched_ms": hl.fetched_ms, "anchor": float(anchor[1]) if anchor else None,
+                         "anchor_ms": anchor[0] if anchor else 0, "anchor_note": self.kospi_anchor_note, "beta": odds.beta,
+                         "approx": "近似" in self.kospi_anchor_note}
+        else:
+            symbol = title.split("｜")[-1]
+            ticker = self.config.tickers.get(symbol)
+            info = STOCK_MARKETS[ticker.market] if ticker else None
+            code = f"{ticker.market}:{ticker.code}" if ticker else symbol
+            base = self.stocks.closes.get(symbol)
+            if base is not None:
+                sources.append(price_evidence("参考收盘", base.source, code, "交易所收盘", base.value, base.close_ms))
+            live_close = self.store.get(f"live_close:{symbol}")
+            if isinstance(live_close, list) and len(live_close) == 3 and "现货收盘" in odds.ref_note:
+                sources.append(price_evidence("参考收盘（日K待确认）", f"{live_close[2]} 现货收盘价", code, "收盘价", live_close[1],
+                                              int(live_close[0])))
+            if odds.direct:
+                live = self.stocks.live.get(symbol)
+                if live is not None:
+                    sources.append(price_evidence(f"{info.name if info else ''}现货", live.source, code, "最新价", live.last,
+                                                  live.quoted_ms, live.fetched_ms))
+            else:
+                quote, anchor = (self.snapshots.get(symbol) or {}).get("quote"), self.anchors.get(symbol)
+                if quote is not None:
+                    kind = "最新成交价" if quote.source == "last" else "标记价"
+                    sources.append(price_evidence("币安合约", "币安 U 本位合约", symbol, kind, quote.price, quote.timestamp_ms))
+                    proxy = {"proxy": f"币安 {symbol} 合约", "price": float(quote.price), "quoted_ms": quote.timestamp_ms,
+                             "anchor": float(anchor[1]) if anchor else None, "anchor_ms": anchor[0] if anchor else 0,
+                             "anchor_note": "收盘时刻的币安价格", "approx": False}
+        return {"basis": basis, "sources": sources, "proxy": proxy}
+
+    def market_evidence(self, kind: str, now_ms: int, **parts: Any) -> dict:
+        """The same record for the crypto cards and the ladders (their prices are the resolution sources' own feeds)."""
+        if kind == "touch":
+            touch: TouchMarket = parts["touch"]
+            spec = touch.spec
+            return {"basis": {"price": float(touch.price or 0), "low": float(spec.low), "high": float(spec.high),
+                              "sigma": touch.sigma, "sigma_ms": touch.sigma_ms, "deadline_ms": spec.deadline_ms,
+                              "years": max(0.0, (spec.deadline_ms - max(now_ms, touch.start_ms)) / YEAR_MS),
+                              "path": touch.status(), "start_ms": touch.start_ms},
+                    "sources": [price_evidence("现货", "币安现货", spec.symbol, "最新价", touch.price, touch.priced_ms,
+                                               touch.priced_ms)], "proxy": None}
+        if kind == "updown":
+            mkt: UpDownMarket = parts["mkt"]
+            odds: UpDownOdds = parts["odds"]
+            spec = mkt.spec
+            return {"basis": {"line": float(odds.line), "price": float(odds.price), "sigma": mkt.sigma, "years": odds.years,
+                              "settled": odds.settled, "start": spec.label(spec.start_ms, plain=True),
+                              "end": spec.label(spec.end_ms, plain=True)},
+                    "sources": [price_evidence("现货", "币安现货", spec.symbol, "最新价", mkt.price, mkt.priced_ms, mkt.priced_ms),
+                                price_evidence("起点", "币安 1 分钟 K", spec.symbol, "收盘", odds.line, spec.start_ms)],
+                    "proxy": None}
+        if kind == "flip":
+            fm: FlipMarket = parts["fm"]
+            spec = fm.spec
+            return {"basis": {"a": float(fm.prices.get(spec.coin) or 0), "b": float(fm.prices.get(spec.other) or 0),
+                              "ratio": fm.ratio, "sigma": fm.sigma, "window": spec.window(), "path": fm.status(now_ms)},
+                    "sources": [price_evidence(coin, "Hyperliquid", coin, "中间价", fm.prices.get(coin), fm.priced_ms, fm.priced_ms)
+                                for coin in (spec.coin, spec.other)], "proxy": None}
+        cap: CapMarket = parts["cap"]
+        row = parts["row"]
+        high, high_at = cap.window_high()
+        supply = "BSC 节点：总量 − 销毁" if cap.spec.supply == "rpc" else "DexScreener FDV ÷ 价格"
+        return {"basis": {"cap": float(cap.cap) if cap.cap else None, "target": float(row.target), "price": float(cap.price or 0),
+                          "supply": float(cap.supply) if cap.supply else None, "sigma": cap.sigma, "sigma_kind": cap.sigma_kind,
+                          "sigma_note": cap.sigma_note, "window_high": float(high) if high else None, "high_at": high_at,
+                          "coverage": cap.coverage() or "完整"},
+                "sources": [price_evidence("价格", cap.source, cap.spec.pair or cap.spec.token, "最新价", cap.price, cap.priced_ms,
+                                           cap.priced_ms),
+                            price_evidence("供应量", supply, cap.spec.token, "供应量", cap.supply)], "proxy": None}
+
+    def sim_version(self) -> dict:
+        """The code and the settings a trade was made under, so a change in results can be traced to a change here."""
+        c = self.config
+        return {"code": VERSION, "sim_edge": c.sim_edge, "sim_shares": c.sim_shares, "min_edge": c.predict_min_edge,
+                "fee_bps": c.predict_fee_bps, "trade_usd": c.predict_trade_usd, "a50_beta": c.a50_beta,
+                "kospi_beta": c.kospi_beta, "sigma_error": MODEL_SIGMA_ERROR, "beta_error": MODEL_BETA_ERROR}
+
+    def evidence(self, build: Any) -> dict:
+        """An evidence record never stops a trade: a failure is kept as the record."""
+        try:
+            return build()
+        except Exception as error:
+            return {"error": clean_error(error) or type(error).__name__}
 
     def sim_markets(self, now_ms: int) -> list[SimMarket]:
         """Every Predict market a card prices right now, with the bar its suggestion must clear and why it holds back."""
@@ -7244,7 +7816,8 @@ class Bot:
                 close_ms, _ = self.target_close(title, odds.target)
                 out.append(SimMarket(slug, name, "close", key, odds.fair_up, book, self.edge_need(model_swing(odds)), odds.warn,
                                      ("涨", "跌"), {"key": symbol or key, "target": odds.target.isoformat(),
-                                                   "line": float(odds.ref), "close_ms": close_ms}))
+                                                   "line": float(odds.ref), "close_ms": close_ms},
+                                     self.evidence(lambda title=title, odds=odds: self.close_evidence(title, odds, now_ms))))
         if not self.config.touch:
             return out
         for touch in self.touches.values():
@@ -7254,19 +7827,23 @@ class Bot:
                 low, high = spec.label(spec.low), spec.label(spec.high)
                 out.append(SimMarket(spec.slug, f"{spec.symbol.removesuffix('USDT')} 先触 {low}/{high}", "touch", spec.key,
                                      odds.fair_upper, book, self.edge_need(touch.model_swing(now_ms)),
-                                     touch.advice_problem(now_ms), (high, low), {"deadline": spec.deadline_ms}))
+                                     touch.advice_problem(now_ms), (high, low), {"deadline": spec.deadline_ms},
+                                     self.evidence(lambda touch=touch: self.market_evidence("touch", now_ms, touch=touch))))
         for mkt in self.updowns.values():
             odds = mkt.odds(now_ms)
             book, _ = self.updown_book(mkt.spec)
             if isinstance(odds, UpDownOdds) and book is not None:
                 out.append(SimMarket(mkt.spec.slug, mkt.spec.name, "updown", mkt.spec.key, odds.fair_up, book,
-                                     self.edge_need(mkt.model_swing(odds)), self.updown_hold(mkt, odds, now_ms)[0], ("涨", "跌"), {}))
+                                     self.edge_need(mkt.model_swing(odds)), self.updown_hold(mkt, odds, now_ms)[0], ("涨", "跌"),
+                                     {"end": mkt.spec.end_ms},
+                                     self.evidence(lambda mkt=mkt, odds=odds: self.market_evidence("updown", now_ms, mkt=mkt, odds=odds))))
         for fm in self.flips.values():
             odds = fm.odds(now_ms)
             book, _ = self.flip_yes_book(fm.spec)
             if isinstance(odds, float) and book is not None:
                 out.append(SimMarket(fm.spec.slug, fm.spec.name, "flip", fm.spec.key, odds, book, self.edge_need(fm.model_swing(now_ms)),
-                                     self.flip_hold(fm, odds, book, now_ms), ("Yes", "No"), {"end": fm.spec.end_ms}))
+                                     self.flip_hold(fm, odds, book, now_ms), ("Yes", "No"), {"end": fm.spec.end_ms},
+                                     self.evidence(lambda fm=fm: self.market_evidence("flip", now_ms, fm=fm))))
         for cap in self.caps.values():
             for row in self.predict.ladders.get(cap.spec.key) or []:
                 fair = self.ladder_fair(cap, row, now_ms)
@@ -7275,10 +7852,12 @@ class Bot:
                     continue
                 top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0)
                 hold = ("数据显示已触及，但盘口仍低于 90¢" if fair == 1.0 and top < 0.9
+                        else "窗口已结束" if now_ms >= cap.spec.end_ms + 60_000
                         else "σ 是先验值" if cap.sigma_kind == "prior" else "")
                 out.append(SimMarket(f"{cap.spec.slug}#{row.market_id}", f"{cap.spec.name} {usd_short(row.target)}", "ladder",
                                      cap.spec.key, fair, book, self.edge_need(cap.model_swing(row.target, now_ms, fair)), hold,
-                                     ("Yes", "No"), {"target": str(row.target), "end": cap.spec.end_ms}))
+                                     ("Yes", "No"), {"target": str(row.target), "end": cap.spec.end_ms},
+                                     self.evidence(lambda cap=cap, row=row: self.market_evidence("ladder", now_ms, cap=cap, row=row))))
         return out
 
     def sim_note_closes(self) -> None:
@@ -7288,30 +7867,59 @@ class Bot:
             if ticker is None or not base.close_ms:
                 continue
             offset = dt.timezone(dt.timedelta(hours=STOCK_MARKETS[ticker.market].utc_offset))
-            key = f"outcome:{symbol}:{dt.datetime.fromtimestamp(base.close_ms / 1000, offset).date().isoformat()}"
-            if self.store.get(key) != float(base.value):
-                self.store.put(key, float(base.value))
+            day = dt.datetime.fromtimestamp(base.close_ms / 1000, offset).date().isoformat()
+            self.note_outcome(symbol, day, base.value, base.source)
 
-    def sim_open(self, mk: SimMarket, best: BookEdge, side: str, now_ms: int) -> dict | None:
-        """A paper buy of SIM_SHARES on ``side``: a taker fills now across the book's depth and pays the fee; a maker
-        rests at its price and counts as filled only once the book trades through it."""
+    def sim_open(self, mk: SimMarket, side: str, now_ms: int, maker: BookEdge | None = None,
+                 taker: dict | None = None) -> dict:
+        """A paper buy of SIM_SHARES of one side, with everything it was decided on (entry snapshot: the model's inputs,
+        the price sources and proxy, the book, the code and settings). A taker fills now across the book's depth (the
+        quote it was judged on); a maker rests at its price behind the queue already there and fills only as sellers
+        show up at or through it (see maker_fill)."""
         fair = mk.fair_up if side == "up" else 1 - mk.fair_up
-        trade = {"market": mk.market, "slug": mk.book.slug, "item": mk.item, "kind": mk.kind, "key": mk.key, "side": side,
-                 "label": ("挂" if best.maker else "吃") + mk.sides[0 if side == "up" else 1], "maker": best.maker,
-                 "fair": fair, "signal": best.edge, "opened": now_ms, "settle": mk.settle}
-        if best.maker:
-            trade.update(price=best.price, shares=self.config.sim_shares, status="resting", filled=None)
+        edges = book_edges(mk.fair_up, mk.book, self.edge_costs())
+        shown = None if mk.hold or mk.book.stale(now_ms) else best_edge(edges, mk.need)  # the card's framed direction
+        trade = {"v": 2, "market": mk.market, "slug": mk.book.slug, "market_id": mk.book.market_id, "item": mk.item,
+                 "kind": mk.kind, "key": mk.key, "side": side, "label": ("挂" if maker else "吃") + mk.sides[0 if side == "up" else 1],
+                 "maker": maker is not None, "fair": fair, "opened": now_ms, "settle": mk.settle,
+                 "order": self.config.sim_shares, "fills": [], "revisions": [],
+                 "entry": {"at": now_ms, "fair": fair, "fair_up": mk.fair_up, "need": mk.need, "book": book_snapshot(mk.book),
+                           "card": [edge_json(e, shown, e.label.replace("涨", mk.sides[0]).replace("跌", mk.sides[1]))
+                                    for e in edges], **mk.evidence},
+                 "version": self.sim_version()}
+        if maker is not None:
+            queue = next((q for p, q in own_levels(mk.book, side) if abs(p - maker.price) < 1e-9), 0.0)
+            trade.update(price=maker.price, signal=maker.edge, shares=0.0, status="resting", filled=None,
+                         queue_ahead=queue, queue_min=queue)
         else:
-            avg, got = fill_shares(side_levels(mk.book, side), self.config.sim_shares)
-            if got <= 0:
-                return None
-            bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
-            trade.update(price=avg + taker_fee(avg, bps), shares=got, status="filled", filled=now_ms)
-        trade["edge"] = fair - trade["price"]
+            trade.update(price=taker["cost"], avg=taker["avg"], fee=taker["fee"], best=taker["best"],
+                         slip=taker["avg"] - taker["best"], signal=fair - taker["cost"], shares=taker["got"], status="filled",
+                         filled=now_ms, fill_fair=fair,
+                         fills=[{"at": now_ms, "shares": taker["got"], "fair": fair, "how": "吃单立即成交",
+                                 "levels": taker["levels"], "short": taker["short"]}])
+        trade["edge"] = fair - trade["price"]  # the expectation per share when the decision was made
         return trade
 
-    def sim_result(self, trade: dict, now_ms: int) -> tuple[float, str] | None:
-        """(the 涨 / Yes side's result: 1, 0 or ½ for a tie, how it was decided) once the market is decided; None before."""
+    def sim_fill(self, trade: dict, mk: SimMarket, now_ms: int) -> None:
+        """A resting order against the book as it stands now: more shares presumed filled when sellers show at or
+        through its price (with a snapshot of what was seen, the model's view and its sources at that moment)."""
+        credited, seen = maker_fill(trade, mk.book)
+        trade["queue_min"] = min(float(trade.get("queue_min", trade.get("queue_ahead", 0.0))), seen["queue_now"])
+        if credited <= float(trade["shares"]) + 1e-9:
+            return
+        fair = mk.fair_up if trade["side"] == "up" else 1 - mk.fair_up
+        trade["fills"].append({"at": now_ms, "shares": credited - float(trade["shares"]), "fair": fair, "fair_up": mk.fair_up,
+                               "how": "推定成交", "seen": seen, "book": book_snapshot(mk.book), **mk.evidence})
+        trade["shares"] = credited
+        if trade.get("filled") is None:
+            trade["filled"], trade["fill_fair"] = now_ms, fair
+        if credited >= float(trade["order"]) - 1e-9:
+            trade["status"] = "filled"
+
+    def sim_result(self, trade: dict, now_ms: int) -> tuple[float, str, dict] | None:
+        """The market's result from the bot's own data, once it is decided: (the 涨 / Yes side's result: 1, 0 or ½ for a
+        tie, how it was decided, the evidence). None while undecided or while the data cannot decide it (a window not yet
+        read to its end): Predict's own result then settles it."""
         s, kind = trade.get("settle") or {}, trade.get("kind")
         if kind == "close":
             close = self.store.get(f"outcome:{s.get('key')}:{s.get('target')}")
@@ -7319,31 +7927,38 @@ class Bot:
                 return None
             line = float(s["line"])
             up = 1.0 if close > line else 0.0 if close < line else 0.5
-            return up, f"{s['target'][5:]} 收盘 {fmt(close)}，对 {fmt(line)}"
+            source = (self.store.get(f"outsrc:{s.get('key')}:{s.get('target')}") or {}).get("source", "")
+            return up, f"{s['target'][5:]} 收盘 {fmt(close)}，对 {fmt(line)}", {
+                "rule": "收盘高于参考线为涨，低于为跌，相同各半", "close": close, "line": line, "source": source,
+                "day": s.get("target")}
         if kind == "touch":
             touch = self.touches.get(trade["key"])
             hist = touch.history if touch else {}
+            proof = {"rule": "截止前先碰到哪条线；都没碰到 50/50", "source": "币安现货 1 小时 K，命中的那一小时逐分钟",
+                     "history": hist}
             if hist.get("kind") in {"low", "high"}:
-                return (1.0 if hist["kind"] == "high" else 0.0), touch.status()
+                return (1.0 if hist["kind"] == "high" else 0.0), touch.status(), proof
             deadline = int(s.get("deadline") or 0)
-            # the hourly check stops at the last full hour before the deadline
-            if hist.get("kind") == "clear" and now_ms > deadline + self.SIM_SETTLE_MS and int(hist.get("through") or 0) >= deadline - 3_600_000:
-                return 0.5, "截止前两条线都没碰到，按 50/50"
+            if touch and touch.verified_clear() and now_ms > deadline + self.SIM_SETTLE_MS:
+                return 0.5, "整个窗口都没碰到两条线，按 50/50", proof  # read through the deadline's own minute
             return None
         if kind == "updown":
             mkt = self.updowns.get(trade["key"])
             odds = mkt.odds(now_ms) if mkt else None
             if isinstance(odds, UpDownOdds) and odds.settled:
-                return odds.fair_up, f"终点 {odds.price:,.2f}，起点 {odds.line:,.2f}"
+                return odds.fair_up, f"终点 {odds.price:,.2f}，起点 {odds.line:,.2f}", {
+                    "rule": "终点那根 1 分钟 K 收盘高于起点为涨，低于为跌，相同 50/50", "source": "币安 1 分钟 K",
+                    "start": float(odds.line), "end": float(odds.price)}
             return None
         if kind == "flip":
             fm = self.flips.get(trade["key"])
             hist = fm.history if fm else {}
+            proof = {"rule": "窗口内任一分钟收盘 A > B 即 Yes", "source": "Hyperliquid 1 分钟 K", "history": hist}
             if hist.get("kind") == "flip":
-                return 1.0, fm.status(now_ms)
+                return 1.0, fm.status(now_ms), proof
             end = int(s.get("end") or 0)
             if hist.get("kind") == "clear" and int(hist.get("through") or 0) >= end + 60_000 and now_ms > end + self.SIM_SETTLE_MS:
-                return 0.0, "窗口内没有反超"
+                return 0.0, "窗口内没有反超", proof
             return None
         if kind == "ladder":
             cap = self.caps.get(trade["key"])
@@ -7351,104 +7966,273 @@ class Bot:
                 return None
             target, mid = D(str(s["target"])), trade["market"].partition("#")[2]
             row = next((r for r in self.predict.ladders.get(cap.spec.key) or [] if r.market_id == mid), None)
-            high, _ = cap.window_high()
+            high, high_at = cap.window_high()
             meta = (self.predict.market_meta.get(mid) or ({}, 0))[0]
+            proof = {"rule": f"窗口内任一分钟市值 ≥ {usd_short(target)} 即 Yes（以 {cap.spec.settle} 为准）",
+                     "source": "GeckoTerminal 小时 K + 机器人看到的价格", "window_high": float(high) if high else None,
+                     "high_at": high_at, "coverage": cap.coverage() or "完整"}
             reached = (high is not None and high >= target) or (
                 "RESOLVED" in str(meta.get("status", "")).upper() and now_ms < int(s["end"]))
             if reached:
                 book = self.predict.yes_book(row)[0] if row else None
                 top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=1.0) if book else 1.0
                 if top >= 0.9:  # the book agrees, or is gone: reached (an open disagreement waits)
-                    return 1.0, f"{usd_short(target)} 已触及（按机器人数据，以 {cap.spec.settle} 为准）"
+                    return 1.0, f"{usd_short(target)} 已触及（按机器人数据，以 {cap.spec.settle} 为准）", proof
                 return None
-            if now_ms > int(s["end"]) + self.SIM_SETTLE_MS:
-                return 0.0, f"窗口结束前没到 {usd_short(target)}（按机器人数据，以 {cap.spec.settle} 为准）"
+            if now_ms > int(s["end"]) + self.SIM_SETTLE_MS and not cap.coverage():
+                return 0.0, f"窗口结束前没到 {usd_short(target)}（按机器人数据，以 {cap.spec.settle} 为准）", proof
         return None
+
+    def sim_settle(self, trade: dict, up: float, note: str, now_ms: int, by: str) -> None:
+        """Settle (or re-settle) a trade on a result: the filled shares are paid, an unfilled rest of a maker order lapses.
+        A changed result is kept as a revision (when, by whom, from what to what)."""
+        if float(trade["shares"]) <= 1e-9:
+            if trade["status"] != "expired":
+                trade.update(status="expired", settled=now_ms, note="市场已出结果，挂单一直没成交：" + note)
+            return
+        payout = sim_payout(trade["side"], up)
+        if trade["status"] == "settled" and abs(float(trade.get("payout", payout)) - payout) > 1e-9:
+            trade["revisions"].append({"at": now_ms, "by": by, "from": trade["payout"], "to": payout, "note": note})
+        if trade.get("maker") and float(trade["shares"]) < float(trade["order"]) - 1e-9:
+            trade["unfilled"] = float(trade["order"]) - float(trade["shares"])
+        trade.update(status="settled", payout=payout, note=note, settled=trade.get("settled") or now_ms)
+
+    SIM_CONFIRM_SECONDS = 600  # each market's final result is asked of Predict at most this often
+
+    def sim_due(self, trade: dict, now_ms: int) -> bool:
+        """Should Predict have a final result for this trade's market by now (or has the local data decided it)?"""
+        if trade.get("final") or trade["status"] == "expired" and not float(trade.get("shares") or 0):
+            return False
+        if trade.get("local"):
+            return True
+        s = trade.get("settle") or {}
+        end = int(s.get("close_ms") or s.get("deadline") or s.get("end") or 0)
+        return bool(end) and now_ms > end + self.SIM_SETTLE_MS
+
+    def resolution_up(self, trade: dict, resolved: dict) -> float | None:
+        """Predict's result as the 涨 / Yes side's payout (1, 0, ½), read by outcome name for this kind of market."""
+        if resolved.get("split"):
+            return 0.5
+        name = str(resolved.get("name") or "").strip()
+        if trade["kind"] == "touch":
+            touch = self.touches.get(trade["key"])
+            side = touch_outcome(name, touch.spec) if touch else ""
+            return 1.0 if side == "high" else 0.0 if side == "low" else None
+        word = name.lower()
+        if word in {"yes", "up", "涨", "higher", "above"}:
+            return 1.0
+        if word in {"no", "down", "跌", "lower", "below"}:
+            return 0.0
+        if trade["kind"] == "close" and resolved.get("index") in (0, 1):
+            return 1.0 if resolved["index"] == 0 else 0.0  # a daily book prices its first outcome as 涨
+        return None
+
+    async def sim_confirm(self, trades: dict[str, dict], now_ms: int) -> None:
+        """Predict's final word on each decided market: it confirms the local result (已确认), or differs (结果不一致: the
+        trade is re-settled on Predict's result, the change kept as a revision), or settles what the local data could
+        not. Asked at most every SIM_CONFIRM_SECONDS per market; a failed or unreadable answer leaves it pending."""
+        wanted: dict[str, list[str]] = {}
+        for tid, trade in trades.items():
+            if self.sim_due(trade, now_ms):
+                mid = trade.get("market_id") or trade["market"].partition("#")[2]
+                if not mid:  # an old record without the market's id: look it up by its slug
+                    with contextlib.suppress(Exception):
+                        market = await self.predict.resolve(trade.get("slug") or trade["market"])
+                        mid = str(market["id"]) if market else ""
+                if mid:
+                    wanted.setdefault(mid, []).append(tid)
+        for mid, tids in wanted.items():
+            if time.monotonic() - self.sim_checked.get(mid, -1e9) < self.SIM_CONFIRM_SECONDS:
+                continue
+            self.sim_checked[mid] = time.monotonic()
+            try:
+                details = await self.predict.market_details(mid)
+            except Exception as error:
+                for tid in tids:
+                    trades[tid]["final_error"] = clean_error(error) or type(error).__name__
+                    self.store.put(f"sim:{tid}", trades[tid])
+                continue
+            resolved = details.get("resolved")
+            for tid in tids:
+                trade = trades[tid]
+                trade.pop("final_error", None)
+                up = self.resolution_up(trade, resolved) if resolved else None
+                if up is None:
+                    trade["final_check"] = {"at": now_ms, "status": details.get("status", ""), "resolved": resolved}
+                    self.store.put(f"sim:{tid}", trade)
+                    continue
+                trade["final"] = {"up": up, "name": resolved.get("name", ""), "how": resolved.get("how", ""), "at": now_ms,
+                                  "status": details.get("status", ""), "outcomes": details.get("outcomes", [])}
+                local = trade.get("local")
+                mismatch = bool(local) and abs(float(local["up"]) - up) > 1e-9
+                self.sim_settle(trade, up, f"Predict 结算：{resolved.get('name', '')}"
+                                + (f"（本地预结算为 {local['note']}）" if mismatch else ""), now_ms, "Predict 最终结果")
+                trade["confirm"] = "mismatch" if mismatch else "confirmed"
+                self.store.put(f"sim:{tid}", trade)
 
     async def sim_step(self, now_ms: int) -> "Refreshed | bool":
         """Paper trading: whenever a card suggests a trade whose net edge reaches SIM_EDGE_CENTS, buy SIM_SHARES of it.
-        The best maker (挂) and the best taker (吃) are judged apart, as the suggestions are, and each is taken once per
-        market and side; a resting order counts only when the book trades through it; every position is settled on the
-        market's result. Nothing is ever sent to Predict."""
+        The best maker (挂) and the best taker (吃) are judged apart, as the suggestions are, each once per market and
+        side. A taker is judged on the very fill it would get for SIM_SHARES (not on the card's PREDICT_TRADE_USD view):
+        signal, cost and net edge are one figure. A resting order fills only as far as sellers show at or through its
+        price. Every position is pre-settled on the bot's own data, then confirmed (or corrected) by Predict's result.
+        Nothing is ever sent to Predict."""
         if time.monotonic() - self.sim_ran < self.SIM_SECONDS:
             return False
         self.sim_ran = time.monotonic()
         self.sim_note_closes()
         markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
         trades = self.sim_trades()
-        costs = self.edge_costs()
+        costs, bar = self.edge_costs(), self.config.sim_edge
         for mk in markets.values():
             if mk.hold or mk.book.stale(now_ms):
                 continue
-            edges = book_edges(mk.fair_up, mk.book, costs)
-            for maker in (True, False):
-                best = best_edge([e for e in edges if e.maker == maker], mk.need)
-                if best is None or best.edge < self.config.sim_edge - 1e-9:
-                    continue
-                side = "up" if best.side == "涨" else "down"
-                tid = f"{mk.market}|{side}|{'挂' if maker else '吃'}"
-                if tid in trades:
-                    continue  # one position per market, side and way of trading, however long the edge lasts
-                trade = self.sim_open(mk, best, side, now_ms)
-                if trade:
-                    trades[tid] = trade
-                    self.store.put(f"sim:{tid}", trade)
+            maker = best_edge([e for e in book_edges(mk.fair_up, mk.book, costs) if e.maker], mk.need)
+            if maker is not None and maker.edge >= bar - 1e-9:
+                side = "up" if maker.side == "涨" else "down"
+                tid = f"{mk.market}|{side}|挂"
+                if tid not in trades:  # one position per market, side and way of trading, however long the edge lasts
+                    trades[tid] = self.sim_open(mk, side, now_ms, maker=maker)
+                    self.store.put(f"sim:{tid}", trades[tid])
+            bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
+            quotes = []
+            for side in ("up", "down"):
+                q = taker_quote(mk.book, side, self.config.sim_shares, bps)
+                fair = mk.fair_up if side == "up" else 1 - mk.fair_up
+                if q and fair - q["cost"] > mk.need and fair - q["cost"] >= bar - 1e-9:  # checked on the fill itself
+                    quotes.append((round(fair - q["cost"], 4), side, q))
+            if quotes:
+                _, side, q = max(quotes, key=lambda x: x[0])
+                tid = f"{mk.market}|{side}|吃"
+                if tid not in trades:
+                    trades[tid] = self.sim_open(mk, side, now_ms, taker=q)
+                    self.store.put(f"sim:{tid}", trades[tid])
         for tid, trade in trades.items():
-            before = dict(trade)
+            before = json.dumps(trade, sort_keys=True, default=str)
             mk = markets.get(trade["market"])
             if trade["status"] == "resting" and mk is not None and not mk.book.stale(now_ms):
-                levels = side_levels(mk.book, trade["side"])
-                if levels and levels[0][0] <= trade["price"] + 1e-9:  # someone now sells at our price: we were filled
-                    # the model's view when the fill came (fills tend to come as the market moves against the order)
-                    trade.update(status="filled", filled=now_ms, fill_fair=mk.fair_up if trade["side"] == "up" else 1 - mk.fair_up)
-            if trade["status"] in {"resting", "filled"}:
+                self.sim_fill(trade, mk, now_ms)
+            if not trade.get("final") and (trade["status"] in {"resting", "filled"} or trade.get("confirm") == "local"):
                 result = self.sim_result(trade, now_ms)
-                if result is not None:
-                    up, note = result
-                    if trade["status"] == "filled":
-                        trade.update(status="settled", payout=sim_payout(trade["side"], up), settled=now_ms, note=note)
-                    else:
-                        trade.update(status="expired", settled=now_ms, note="市场已出结果，挂单一直没成交：" + note)
-            if trade != before:
+                local = trade.get("local")
+                if result is not None and (local is None or abs(float(local["up"]) - result[0]) > 1e-9):
+                    # a first local result, or the local data corrected (e.g. the official close replacing a quote)
+                    up, note, proof = result
+                    trade["local"] = {"up": up, "note": note, "at": now_ms, "evidence": proof}
+                    self.sim_settle(trade, up, note, now_ms, "本地数据更正" if local else "本地预结算")
+                    trade["confirm"] = "local"
+            if json.dumps(trade, sort_keys=True, default=str) != before:
                 self.store.put(f"sim:{tid}", trade)
+        await self.sim_confirm(trades, now_ms)
         return Refreshed("ok")
+
+    def sim_url(self, trade: dict) -> str:
+        return predict_url(trade.get("slug") or trade["market"].partition("#")[0], self.config.predict_ref)
 
     def sim_report(self, recent: int = 30) -> dict:
         """The paper trader's record for the page: totals, by market kind and by maker / taker, the latest trades."""
-        trades = sorted(self.sim_trades().values(), key=lambda t: t.get("opened", 0))
-        rows = [{"opened": stamp(t["opened"], seconds=False), "item": t["item"], "label": t["label"], "maker": t["maker"],
-                 "price": t["price"], "shares": t["shares"], "edge": t["edge"], "status": t["status"], "text": sim_status(t),
+        trades = sorted(self.sim_trades().items(), key=lambda kv: kv[1].get("opened", 0))
+        rows = [{"id": tid, "opened": stamp(t["opened"], seconds=False), "item": t["item"], "label": t["label"],
+                 "maker": t["maker"], "price": t["price"], "shares": t["shares"], "order": t.get("order", t["shares"]),
+                 "edge": t["edge"], "status": t["status"], "text": sim_status(t), "state": sim_state(t),
                  "pnl": (t["payout"] - t["price"]) * t["shares"] if t["status"] == "settled" else None,
-                 "note": t.get("note", ""), "url": predict_url(t.get("slug") or t["market"].partition("#")[0], self.config.predict_ref)}
-                for t in reversed(trades[-recent:])]
-        return {"edge": self.config.sim_edge, "shares": self.config.sim_shares, "total": sim_stats(trades),
-                "kinds": [{"name": name, **sim_stats([t for t in trades if t["kind"] == kind])}
-                          for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in trades)],
-                "modes": [{"name": name, **sim_stats([t for t in trades if t["maker"] == maker])}
-                          for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in trades)],
+                 "note": t.get("note", ""), "url": self.sim_url(t)}
+                for tid, t in reversed(trades[-recent:])]
+        values = [t for _, t in trades]
+        return {"edge": self.config.sim_edge, "shares": self.config.sim_shares, "total": sim_stats(values),
+                "kinds": [{"name": name, **sim_stats([t for t in values if t["kind"] == kind])}
+                          for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in values)],
+                "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
+                          for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
                 "rows": rows}
 
     def sim_text(self) -> str:
         r = self.sim_report(recent=10)
         t, edge, shares = r["total"], r["edge"] * 100, f"{r['shares']:g}"
         lines = [f"🧪 {bold('模拟交易')}（净优势 ≥{edge:g}¢ 时按卡片建议买 {shares} 份，只记账不下单）",
-                 "吃单按盘口深度成交并扣手续费；挂单要等盘口成交到挂价才算成交，市场出结果时还没成交就作废。"]
+                 f"吃单按 {shares} 份吃到的均价和手续费判断并成交；挂单排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单"
+                 "才按看到的数量推定成交，出结果时没成交的部分作废。先按机器人数据预结算，再以 Predict 的结果确认。"]
         if not t["trades"]:
             lines.append(f"\n还没有触发过：等有卡片的净优势达到 {edge:g}¢ 就开始记录。")
             return "\n".join(lines)
         money = lambda x: f"{'+' if x >= 0 else '−'}${abs(x):,.2f}"
-        lines += ["", f"已结算 {t['settled']} 笔：赢 {t['wins']}｜输 {t['losses']}｜平 {t['ties']}",
+        lines += ["", f"已结算 {t['settled']} 笔：赢 {t['wins']}｜输 {t['losses']}｜平 {t['ties']}"
+                      f"（已确认 {t['confirmed']}｜预结算 {t['local']}｜结果不一致 {t['mismatch']}）",
                   f"成本 ${t['cost']:,.2f} → 回款 ${t['payout']:,.2f}｜盈亏 {bold(money(t['pnl']))}"
                   + (f"（{t['roi'] * 100:+.1f}%）" if t["cost"] else ""),
-                  f"同一批按下单时的净优势，模型预期 {money(t['expected'])}",
-                  f"持仓 {t['open']} 笔（成本 ${t['open_cost']:,.2f}）｜挂单中 {t['resting']} 笔｜未成交作废 {t['expired']} 笔"]
+                  f"模型预期：下单时 {money(t['expected'])}｜成交时 {money(t['expected_fill'])}",
+                  f"持仓 {t['open']} 笔（成本 ${t['open_cost']:,.2f}）｜挂单中 {t['resting']} 笔｜部分成交 {t['partial']} 笔"
+                  f"｜未成交作废 {t['expired']} 笔"]
         for group in (r["kinds"], r["modes"]):
             if len(group) > 1:
                 lines.append("｜".join(f"{g['name']} {g['settled']} 笔 {money(g['pnl'])}" for g in group))
         lines.append("\n最近：")
         lines += [f"{x['opened']} {x['item']} {x['label']} {x['price'] * 100:.1f}¢×{x['shares']:g}"
-                  f"（净优势 {x['edge'] * 100:+.1f}¢）→ {x['text']}" for x in r["rows"]]
+                  f"（净优势 {x['edge'] * 100:+.1f}¢）→ {x['text']}" + (f"·{x['state']}" if x["state"] else "") for x in r["rows"]]
+        if self.config.web_port and self.web_token:
+            lines.append(f"\n完整复盘（每笔的判断依据、来源、成交与结算证据，可导出）：{self.web_url()}/journal")
         return "\n".join(lines)
+
+    def journal_payload(self) -> dict:
+        """Every paper trade with its whole record (entry and fill snapshots, fills, local and final settlement,
+        revisions, version), newest first: the review page and the JSON export."""
+        now_ms = self.market.now_ms()
+        trades = sorted(self.sim_trades().items(), key=lambda kv: kv[1].get("opened", 0), reverse=True)
+        values = [t for _, t in trades]
+        rows = [{**t, "id": tid, "text": sim_status(t), "state": sim_state(t),
+                 "pnl": (t["payout"] - t["price"]) * t["shares"] if t["status"] == "settled" else None,
+                 "expected_fill": sim_fill_expectation(t) if float(t.get("shares") or 0) else 0.0, "url": self.sim_url(t)}
+                for tid, t in trades]
+        return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）",
+                "enabled": self.config.sim and self.config.predict, "edge": self.config.sim_edge,
+                "shares": self.config.sim_shares, "total": sim_stats(values),
+                "kinds": [{"key": kind, "name": name, **sim_stats([t for t in values if t["kind"] == kind])}
+                          for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in values)],
+                "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
+                          for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
+                "trades": rows}
+
+    JOURNAL_COLUMNS = ("编号", "下单时间", "市场", "类型", "方向", "挂/吃", "下单份数", "成交份数", "成本价", "成交均价", "手续费",
+                       "最优价", "滑点", "下单时公平价", "下单时净优势", "下单时预期", "成交时预期", "状态", "确认", "本地结果",
+                       "Predict 结果", "结果不一致", "回款/份", "盈亏", "结算时间", "说明", "修订", "参考线", "有效价", "σ（日）",
+                       "剩余方差占比", "β", "口径", "下单距收盘（小时）", "最旧报价年龄（秒）", "行情来源", "代理与锚点", "版本", "市场链接")
+
+    def journal_csv(self) -> str:
+        """The journal as one row per trade (UTF-8 with BOM, so spreadsheet apps read the Chinese), for analysis."""
+        import csv
+        import io
+        when = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING).strftime("%Y-%m-%d %H:%M:%S") if ms else ""
+        result = lambda r: "" if not r else {1.0: "涨/Yes", 0.0: "跌/No", 0.5: "50/50"}.get(float(r["up"]), str(r["up"]))
+        out = io.StringIO()
+        writer = csv.writer(out)
+        writer.writerow(self.JOURNAL_COLUMNS)
+        for t in self.journal_payload()["trades"]:
+            entry = t.get("entry") or {}
+            sources = "；".join(f"{x.get('what', '')}={x.get('source', '')}"
+                               + (f" {x['symbol']}" if x.get("symbol") else "")
+                               + (f" @{when(x['quoted_ms'])}" if x.get("quoted_ms") else "")
+                               for x in entry.get("sources") or [])
+            proxy = entry.get("proxy") or {}
+            proxy_text = (f"{proxy.get('proxy', '')}；锚点 {proxy.get('anchor')}（{proxy.get('anchor_note', '')}）"
+                          + ("；近似" if proxy.get("approx") else "")) if proxy else ""
+            final = t.get("final")
+            basis = entry.get("basis") or {}
+            ages = [(entry.get("at", t["opened"]) - x["quoted_ms"]) / 1000 for x in entry.get("sources") or [] if x.get("quoted_ms")]
+            left = (basis["close_ms"] - t["opened"]) / 3_600_000 if basis.get("close_ms") else ""
+            writer.writerow([
+                t["id"], when(t["opened"]), t["item"], SIM_KINDS.get(t["kind"], t["kind"]), t["label"],
+                "挂单" if t["maker"] else "吃单", t.get("order", t["shares"]), t["shares"], round(t["price"], 6),
+                round(t.get("avg", t["price"]), 6), round(t.get("fee", 0.0), 6), round(t.get("best", t["price"]), 6),
+                round(t.get("slip", 0.0), 6), round(t["fair"], 6), round(t["edge"], 6), round(t["edge"] * t["shares"], 4),
+                round(t["expected_fill"], 4), t["text"], t["state"], result(t.get("local")),
+                (result(final) + f"（{final.get('name', '')}）") if final else "", "是" if t.get("confirm") == "mismatch" else "",
+                t.get("payout", ""), round(t["pnl"], 4) if t["pnl"] is not None else "", when(t.get("settled") or 0),
+                t.get("note", ""), "；".join(f"{when(r['at'])} {r['by']}：{r['from']}→{r['to']}" for r in t.get("revisions") or []),
+                basis.get("ref", ""), basis.get("effective", ""), basis.get("sigma_daily", ""), basis.get("remaining", ""),
+                basis.get("beta", ""), basis.get("mode", ""), round(left, 2) if left != "" else "", round(max(ages), 1) if ages else "",
+                sources or ("旧记录：无快照" if t.get("legacy") else ""), proxy_text,
+                (t.get("version") or {}).get("code", "") or ("旧版" if t.get("legacy") else ""), t["url"]])
+        return "\ufeff" + out.getvalue()
 
     def cmd_sim(self, req: Request) -> "Reply":
         if not self.config.sim or not self.config.predict:
@@ -7476,9 +8260,10 @@ class Bot:
                     out["error"] = "数据显示已触及，但盘口仍低于 90¢；以 Flap.sh 为准，请核实"
                 priced = fair is not None and not out["error"]
                 swing = cap.model_swing(row.target, now_ms, fair) if priced else 0.0
-                # a prior σ: the edges are shown, never suggested (the page greys the closest one)
-                self.book_block(out, book, fair if priced else None, self.edge_need(swing), swing,
-                                "σ 是先验值，只作参考" if cap.sigma_kind == "prior" else "", ("Yes", "No"), now_ms)
+                # a prior σ or a finished window: the edges are shown, never suggested (the page greys the closest one)
+                hold = ("窗口已结束，等待结算" if now_ms >= spec.end_ms + 60_000
+                        else "σ 是先验值，只作参考" if cap.sigma_kind == "prior" else "")
+                self.book_block(out, book, fair if priced else None, self.edge_need(swing), swing, hold, ("Yes", "No"), now_ms)
             # reached, and the book agrees (settled, gone, or ≥ 90¢): folded into one "已触及" line on the card
             out["touched"] = fair == 1.0 and "请核实" not in out["error"]
             rows.append(out)
