@@ -440,6 +440,14 @@ async def browser_check():
         # the filter bar sees every level: 有建议 keeps the card (its $1B level); 3 小时内收盘 drops it (30 days left)
         await page.click("#fchips button:text-is('有建议')")
         assert await page.locator("#g-flat .card.lad").count() == 1
+        # in its own 500px card the table never sticks out either, points pills included (they sit under the level)
+        wide = """[...document.querySelectorAll('#g-ladder .card *')].filter(e => { const c = e.closest('.card').getBoundingClientRect(),
+                  r = e.getBoundingClientRect(); return r.width && (r.right > c.right + 0.5 || r.left < c.left - 0.5) }).length"""
+        for width in (1300, 900, 620):
+            await page.set_viewport_size({"width": width, "height": 900})
+            assert await page.evaluate(wide) == 0, width
+        assert await page.evaluate("document.querySelector('#g-ladder .ages').compareDocumentPosition(document.querySelector('#g-ladder .pb')) & 2")  # ages after the table
+        await page.set_viewport_size({"width": 390, "height": 900})
         # in a grid of ordinary cards (filtered, or starred) a ladder takes the whole row: its table never sticks out
         over = """[...document.querySelectorAll('#g-flat .card *')].filter(e => { const c = e.closest('.card').getBoundingClientRect(),
                   r = e.getBoundingClientRect(); return r.width && (r.right > c.right + 0.5 || r.left < c.left - 0.5) }).length"""

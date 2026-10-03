@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.21.2"
+VERSION = "1.21.3"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5600,9 +5600,8 @@ body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){displ
 .edge.best{border-color:var(--best);background:var(--best-bg)}.edge.best .el{color:var(--text)}.edge.best b{color:var(--best)}
 .edge.hot{border-color:var(--hot);background:var(--hot-bg)}.edge.hot b{color:var(--hot)}
 .quote .qe{white-space:normal;word-break:break-all}
-.grid.wide{grid-template-columns:repeat(auto-fill,minmax(min(100%,500px),500px));align-items:stretch}
+.grid.wide{grid-template-columns:repeat(auto-fill,minmax(min(100%,500px),500px));align-items:start}
 .card.lad .pb{margin-top:0}.grid:not(.wide)>.card.lad{grid-column:1/-1}.lstat{display:flex;flex-direction:column;gap:4px}.lstat:empty{display:none}
-@media (min-width:1040px){.grid.wide .lstat{min-height:44px;display:flex}}
 .card.lad .name{flex:0 1 auto}.card.lad .cd{margin-left:6px}
 .lg{display:grid;grid-template-columns:auto auto auto auto auto 1fr;gap:3px 9px;margin-top:5px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
 .lg .lh{color:var(--faint);font-size:11px;white-space:nowrap}.lg .lr{text-align:right}.lg .ln{text-align:right;white-space:nowrap}.lg .ld{color:var(--muted)}
@@ -5631,17 +5630,18 @@ a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);t
 .card.price-lad .lstat{min-height:0;gap:4px}.price-model summary{font-size:12px}.price-model dl{line-height:1.5}.price-model{padding-bottom:2px}
 .price-lad .touched{gap:4px}.price-lad .touched summary{font-size:12px;color:var(--down)}.price-lad .touched .tchips{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
 .price-tools{display:flex;flex-wrap:wrap;align-items:center;gap:5px 8px;margin-top:8px;font-size:11px;color:var(--muted)}.price-tools .cb{font-size:11px;margin-left:auto}.price-tools .hint{flex:1;min-width:0}
-.pg{display:grid;grid-template-columns:minmax(78px,auto) minmax(40px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:10px;row-gap:0;align-items:stretch;margin-top:7px;font-size:12px;font-variant-numeric:tabular-nums}
+.pg{display:grid;grid-template-columns:fit-content(190px) minmax(40px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:10px;row-gap:0;align-items:stretch;margin-top:7px;font-size:12px;font-variant-numeric:tabular-nums}
 .pg .lh{padding:0 0 5px;font-size:11px;color:var(--muted);white-space:nowrap}.pg .lr{text-align:right}.pg .pcell{border-top:1px solid var(--line);padding:6px 0;min-width:0;align-content:center}.pg .pmodel{text-align:right;color:var(--muted)}
-.ptarget{font:inherit;color:var(--text);border:0;background:none;text-align:left;cursor:pointer;min-width:0;padding-right:0}.ptarget .ltl{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 5px}.ptarget .lt{font-weight:650;white-space:nowrap}.ptarget .pdist{font-size:10.5px;color:var(--faint)}
+.ptarget{font:inherit;color:var(--text);border:0;background:none;text-align:left;cursor:pointer;min-width:0;padding-right:0}.ptarget .ltl{display:flex;flex-wrap:wrap;align-items:baseline;gap:1px 6px}.ptarget .lt{font-weight:650;white-space:nowrap}.ptarget .pdist{font-size:10.5px;color:var(--faint)}
 .ppoints{display:inline-block;font-size:10.5px;line-height:1.6;border-radius:999px;padding:0 6px;background:var(--chip);color:var(--muted);white-space:nowrap;font-weight:600;vertical-align:1px}
-.ppoints.active{background:var(--best-bg);color:var(--best)}.ppoints.off{padding:0 4px;color:var(--faint);font-weight:400}.ptarget .ppoints{margin-top:3px}.quote .ppoints{align-self:center}.lg .ltw{white-space:nowrap}.lg .ltw .ppoints{margin-left:4px}
+.ppoints.active{background:var(--best-bg);color:var(--best)}.ppoints.off{padding:0 4px;color:var(--faint);font-weight:400}.quote .ppoints{align-self:center}
+.lg .ltw{display:flex;flex-direction:column;align-items:flex-start;gap:1px;white-space:nowrap}
 .paction{font:inherit;border:0;background:none;color:var(--faint);text-align:left;cursor:pointer;line-height:1.35;min-width:0}.paction .pa{display:flex;flex-wrap:wrap;gap:1px 5px;align-items:baseline}.paction .pa b{font-weight:550}.paction .pv{font-weight:650}.paction.pos .pa{color:var(--text)}.paction.pos .pv{color:var(--best)}.paction.hot .pv{color:var(--hot)}.paction .pwhy{display:block;font-size:10px;line-height:1.35;color:var(--faint);margin-top:1px}.paction.disabled{cursor:pointer}
 body.olddata .paction .pa,body.olddata .paction .pv{color:var(--faint)}body.olddata .price-top{opacity:.55}
 .pg .lrow{grid-column:1/-1;margin:0 0 7px;padding:7px 8px;border-radius:8px;background:var(--chip)}.pg .lnote{font-size:12px;line-height:1.5;color:var(--muted)}.pg .lnote .warn{display:block}.pg .lnote b{color:var(--text)}.pg .lspot{grid-column:1/-1;color:var(--muted);font-size:11px;display:flex;align-items:center;gap:8px;padding:5px 0}.pg .lspot:before,.pg .lspot:after{content:"";flex:1;border-top:1px dashed var(--line)}
 .price-lad .pb{padding-top:8px}.price-lad .quote{gap:5px 8px}.price-lad .price-empty{font-size:12px;color:var(--muted);padding-top:8px}
-@media(max-width:560px){.lg .ltw .ppoints .pu{display:none}.pg{grid-template-columns:minmax(70px,auto) minmax(36px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:6px;font-size:11.5px}.pg .pcell{padding:6px 0}.ptarget .pdist,.ppoints,.paction .pwhy{font-size:10px}.price-top b{font-size:23px}.price-range{gap:3px 10px}.price-lad .edges{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:360px){.pg{grid-template-columns:minmax(64px,auto) minmax(30px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:4px;font-size:11px}.pg .lh{font-size:10px}}
+@media(max-width:560px){.lg .ltw .ppoints .pu{display:none}.pg{grid-template-columns:fit-content(150px) minmax(36px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:6px;font-size:11.5px}.pg .pcell{padding:6px 0}.ptarget .pdist,.ppoints,.paction .pwhy{font-size:10px}.price-top b{font-size:23px}.price-range{gap:3px 10px}.price-lad .edges{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:360px){.pg{grid-template-columns:fit-content(120px) minmax(30px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:4px;font-size:11px}.pg .lh{font-size:10px}}
 [hidden]{display:none!important}
 .grip{flex:none;border:0;background:none;padding:3px 5px;margin:-3px 0 -3px -6px;font-size:16px;line-height:1;color:var(--muted);cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}.grip:hover{color:var(--text)}
 body.sorting,body.sorting *{cursor:grabbing!important;user-select:none!important}
@@ -5937,8 +5937,8 @@ function priceLadderBook(c,it,L,live){
       if(!marked&&L.spot!=null&&r.level<=L.spot){g.append(spot());marked=true}
       const target=$("button","pcell ptarget"),dist=r.dist==null?"距离暂缺":(r.dist>=0?"+":"−")+(Math.abs(r.dist)*100).toFixed(Math.abs(r.dist)<.1?1:0)+"%";
       target.type="button";target.setAttribute("aria-expanded",openChip[rk]?"true":"false");target.title=r.dir_note||"查看盘口、四个方向和计算明细";
-      const ltl=$("span","ltl");ltl.append($("span","lt",r.label),$("span","pdist",dist));target.append(ltl);
-      const point=pointsPill(r);if(point)target.append(point);target.addEventListener("click",toggle);
+      const ltl=$("span","ltl");ltl.append($("span","lt",r.label),$("span","pdist",dist));const point=pointsPill(r);if(point)ltl.append(point);
+      target.append(ltl);target.addEventListener("click",toggle);
       const model=$("span","pcell pmodel",r.fair==null?"—":cent(r.fair));
       const action=maker=>{const a=$("button","pcell paction"+(maker&&r.makers===false?" disabled":""));a.type="button";a.addEventListener("click",toggle);a.setAttribute("aria-expanded",openChip[rk]?"true":"false");
         const candidates=v.edges.filter(e=>e.maker===maker),e=candidates.sort((a,b)=>b.edge-a.edge)[0],eligible=!maker||r.makers===true,ok=e&&eligible&&v.ok.includes(e);
@@ -5957,7 +5957,6 @@ function priceLadderBook(c,it,L,live){
     const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);hots.push({key,name:it.name,group:it.group||"levels",best:{text:text(hot),edge:hot.edge},taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
   return c}
 function ladderBook(c,it,L,live){  // the ladder's Predict block: one row per open level, tap a row for its four directions
-  const ag=ages(it);if(ag)c.append(ag);
   const w=$("div","pb"),h=$("div","quote");h.append(it.predict?openLink(it.predict.url):$("span","pt","Predict"));
   if(it.predict&&it.predict.error)h.append($("span","warn qe",it.predict.error));
   w.append(h);let hot=null,hotTk=null;const key=favKey(it);
@@ -5991,7 +5990,7 @@ function ladderBook(c,it,L,live){  // the ladder's Predict block: one row per op
       if(openChip[rk]&&tap){const d=$("div","lrow");d.append(rowNote(r,L));if(v.edges.length)d.append(chips(rk+"/",v,ctxOf(r)));g.append(d)}});
     if(L.kind==="price"&&!marked&&L.spot!=null)g.append(spotRow());
     w.append(g)}
-  c.append(w);
+  c.append(w);const ag=ages(it);if(ag)c.append(ag);
   if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" +"+cent(hot.edge);
     const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);
     hots.push({key,name:it.name,group:it.group||"contract",best:{text:text(hot),edge:hot.edge},taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
