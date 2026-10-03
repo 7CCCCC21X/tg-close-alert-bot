@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.20.1"
+VERSION = "1.20.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5001,6 +5001,10 @@ RANGE_GUESS = {"推断": "这个市场的规则和标题都没写明上破还是
                "默认": "这个市场的规则和标题都没写明上破还是下破，方向按本类规则默认；只作参考",
                "冲突": "标题的箭头和规则写的方向相反，按标题显示；请到 Predict 核实后再看"}
 RANGE_GUESS_SHORT = {"推断": "方向是推断的", "默认": "方向按本类规则默认", "冲突": "标题与规则的方向相反"}
+# Price-ladder levels: only taker (吃单) edges count as suggestions. A maker's edge is only real once it fills, and far
+# out-of-the-money levels hold a lone ask at 99¢ or so: "挂No at 0.5¢ for +99.5¢" never fills. The maker directions are
+# still shown (grey, with the reason), never framed, alerted on or paper-traded.
+RANGE_TAKER_ONLY = True
 
 
 def low_probability(spot: float, level: float, sigma: float, years: float) -> float:
@@ -5018,6 +5022,14 @@ def level_label(value: D | float) -> str:
     """130000 -> '$130k', 4500 -> '$4.5k', 250 -> '$250', 62.5 -> '$62.5'."""
     v = float(value)
     return f"${v / 1000:,.4g}k" if v >= 1000 else f"${v:,.6g}"
+
+
+def book_disputes(book: "PredictBook | None") -> bool:
+    """Our data says a level was reached, yet its Yes book still trades under 90¢: the market does not agree. A book
+    with no quotes at all (often a market already settled) disputes nothing."""
+    if book is None or not (book.bids or book.asks):
+        return False
+    return max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0) < 0.9
 
 
 async def binance_futures(path: str, **params: Any) -> Any:
@@ -5220,6 +5232,7 @@ class SimMarket:
     sides: tuple[str, str]   # the card's names for the two sides: (涨, 跌), (Yes, No), ($3k, $1k)
     settle: dict             # what deciding the result needs
     evidence: dict = field(default_factory=dict)  # what the odds rest on: model inputs, price sources, proxy / anchor
+    makers: bool = True      # whether maker (挂单) edges count as suggestions here (price ladders: takers only)
 
 
 SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": "月度涨跌", "flip": "反超", "range": "价格阶梯",
@@ -5576,6 +5589,7 @@ button.tog{font-family:inherit;padding:2px 9px}.tog.on{border-color:var(--best);
 <div class="panel" id="custom" hidden>
 <div class="pr"><b>自定义布局</b><span class="mut">拖动 ⠿ 或点 ◀ ▶ 调整卡片顺序（收藏栏平时也能拖），栏目标题旁的 ↑ ↓ 调整栏目顺序；“隐藏”收起不看的卡片。只保存在这个浏览器。</span></div>
 <div class="pr" id="secs"></div>
+<div class="pr" id="oppsrc"></div>
 <div class="pr"><span class="mut">“模拟交易”栏默认不显示，勾上就在页面最下面出现；每笔交易的证据和导出在</span><a class="cb" id="journal" href="#">模拟交易复盘 ↗</a></div>
 <div class="pr"><label>高亮门槛 <input type="number" id="hotin" min="1" max="50" step="1"> ¢</label><span class="mut">净优势达到这个值的卡片标红框（和模型的“建议门槛”不是一回事：没超过建议门槛的方向不会被建议）</span></div>
 <div class="pr"><span class="mut" id="hidn"></span><span class="sp"></span><button type="button" class="cb" id="showall">全部显示</button><button type="button" class="cb" id="reset" title="还原卡片和栏目顺序、隐藏与高亮门槛（收藏保留）">恢复默认布局</button><button type="button" class="cb pri" id="done">完成</button></div>
@@ -5607,6 +5621,7 @@ let order=stored("order",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Obje
 let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim"],strs);
 try{if(!localStorage.getItem("simDefault")){if(!hideSec.includes("sim"))hideSec=[...hideSec,"sim"];keep("hideSec",hideSec);localStorage.setItem("simDefault","1")}}catch(e){}  // 模拟交易 starts hidden (show it in 自定义)
 let hotCents=stored("hot",10,v=>typeof v==="number"&&v>=1&&v<=50),HOT=hotCents/100;  // an edge this large gets the red frame
+let oppOff=stored("oppOff",[],strs),oppTaker=stored("oppTaker",false,v=>typeof v==="boolean");  // the strip on top: sections left out, takers only
 let secOrder=stored("secs",SECTIONS,strs);secOrder=[...new Set(secOrder.filter(g=>SECTIONS.includes(g)))];
 SECTIONS.forEach((g,i)=>{if(!secOrder.includes(g)){const prev=SECTIONS.slice(0,i).reverse().find(x=>secOrder.includes(x));  // a new section joins after its default neighbour
   secOrder.splice(prev?secOrder.indexOf(prev)+1:0,0,g)}});
@@ -5676,9 +5691,9 @@ const rank=e=>Math.round(e.edge*1e4);
 function bestOf(edges,need){  // the largest net edge above the bar; a maker wins a tie (as on the server)
   return edges.filter(e=>e.edge>need).reduce((a,b)=>!a||rank(b)>rank(a)||(rank(b)===rank(a)&&b.maker&&!a.maker)?b:a,null)}
 function bookView(p){  // a book block's edges for the chosen size, its suggestion, and every direction that may be suggested
-  if(!p||!p.edges||p.fair==null)return{edges:[],best:null,ok:[]};
-  const edges=edgesFor(p,p.fair),blocked=!!(p.stale||p.hold),need=p.need||0;
-  return{edges,best:blocked?null:bestOf(edges,need),ok:blocked?[]:edges.filter(e=>e.edge>need)}}
+  if(!p||!p.edges||p.fair==null)return{edges:[],pool:[],best:null,ok:[]};
+  const edges=edgesFor(p,p.fair),pool=p.makers===false?edges.filter(e=>!e.maker):edges,blocked=!!(p.stale||p.hold),need=p.need||0;
+  return{edges,pool,best:blocked?null:bestOf(pool,need),ok:blocked?[]:pool.filter(e=>e.edge>need)}}  // pool: the directions that may be suggested
 function view(it){  // a card's suggestions (a ladder: every level's) and its best one, for highlights, filters and sorting
   if(it.kind==="ladder"){const ok=[];let best=null;
     (it.ladder.rows||[]).filter(r=>!r.touched).forEach(r=>{const v=bookView(r);ok.push(...v.ok);if(v.best&&(!best||v.best.edge>best.edge))best=v.best});
@@ -5691,20 +5706,21 @@ function chipDetail(e,ctx){  // everything behind one edge chip, readable on a p
   if(e.maker)line("这个价位已有 "+qty(e.size)+" 份在排队");
   else line("按 $"+(amount||ctx.notional)+" 吃单：均价 "+cent(e.price+e.slip)+"（深度滑点 "+sg(e.slip)+"）· 手续费 "+cent(e.fee)+"/份 · "+
     (e.short?"盘口只够买 "+qty(e.size)+" 份，金额超出已读取的深度":"约 "+qty(e.size)+" 份"));
-  const ok=e.edge>ctx.need;
-  line("净优势 "+sg(e.edge)+" · 建议门槛 "+cent(ctx.need)+(ctx.swing&&ctx.swing>=ctx.need-1e-9?"（模型误差）":"（最低净优势）")+" → ",$("b",ok?"ok":"no",ok?"满足":"不满足"));
+  const counted=!(e.maker&&ctx.makers===false),ok=counted&&e.edge>ctx.need;
+  if(!counted)line($("span","warn","这类档位的挂单不算建议：挂的价位往往只是对面一张远离行情的挂单，基本不会成交"));
+  line("净优势 "+sg(e.edge)+" · 建议门槛 "+cent(ctx.need)+(ctx.swing&&ctx.swing>=ctx.need-1e-9?"（模型误差）":"（最低净优势）")+" → ",$("b",ok?"ok":"no",ok?"满足":counted?"不满足":"不计入"));
   if(ok)line("高亮门槛 "+hotCents+"¢ → "+(e.edge>=HOT?"标红框":"不标红框"));
   if(ctx.stale)line($("span","warn","盘口过期：不给建议"));else if(ctx.hold)line($("span","warn","暂不建议："+ctx.hold));
   return d}
 function chips(key,v,ctx){  // the four edge chips; tap one for its details (kept open across the 10-second refresh)
   const box=$("div","edgebox"),g=$("div","edges"),sel=openChip[key];
-  v.edges.forEach(e=>{const x=$("button","edge"+(e===v.best?" best":"")+(e===v.best&&e.edge>=HOT?" hot":"")+(e.edge>ctx.need?" pos":"")+(sel===e.label?" sel":""));
+  v.edges.forEach(e=>{const x=$("button","edge"+(e===v.best?" best":"")+(e===v.best&&e.edge>=HOT?" hot":"")+(v.pool.includes(e)&&e.edge>ctx.need?" pos":"")+(sel===e.label?" sel":""));
     x.type="button";x.title="点开看明细";x.setAttribute("aria-expanded",sel===e.label?"true":"false");
     const el=$("span","el",e.label+" ");el.append($("i","",(e.price*100).toFixed(1)));x.append(el,$("b","",sg(e.edge)));
     if(e.short)x.append($("span","short","深度不足"));
     x.addEventListener("click",ev=>{ev.preventDefault();ev.stopPropagation();openChip[key]=sel===e.label?null:e.label;if(last)render(last)});g.append(x)});
   box.append(g);const e=v.edges.find(x=>x.label===sel);if(e)box.append(chipDetail(e,ctx));return box}
-const ctxOf=p=>({fair:p.fair,need:p.need||0,swing:p.swing||0,hold:p.hold||"",stale:p.stale,notional:p.notional||100});
+const ctxOf=p=>({fair:p.fair,need:p.need||0,swing:p.swing||0,hold:p.hold||"",stale:p.stale,notional:p.notional||100,makers:p.makers!==false});
 function ageSpan(ms,old){const s=$("span","age");s.dataset.ms=ms;s.dataset.old=old;return s}
 function ages(it){  // when this card's price and book were last read, and what the price is (spot, a proxy's estimate, ...)
   const row=$("div","ages"),book=it.kind==="ladder"?Math.min(...(it.ladder.rows||[]).map(r=>r.fetched_ms||Infinity)):it.predict&&it.predict.fetched_ms;
@@ -5811,7 +5827,7 @@ function ladderBook(c,it,L,live){  // the ladder's Predict block: one row per op
   const ag=ages(it);if(ag)c.append(ag);
   const w=$("div","pb"),h=$("div","quote");h.append(it.predict?openLink(it.predict.url):$("span","pt","Predict"));
   if(it.predict&&it.predict.error)h.append($("span","warn qe",it.predict.error));
-  w.append(h);let hot=null;const key=favKey(it);
+  w.append(h);let hot=null,hotTk=null;const key=favKey(it);
   if(live.length){const g=$("div","lg");
     const hd=(t,cl,tip)=>{const x=$("span","lh"+(cl?" "+cl:""),t);if(tip)x.title=tip;return x};
     g.append(hd("目标"),hd("距离","ln ld",L.kind==="price"?"现价还要涨（+）或跌（−）多少才碰到":"还要涨多少才碰到"),hd("模型","ln","模型给 Yes 的公平价"),hd("买1 / 卖1","","Yes 的盘口"),hd("最优","","点一行看这一档的四个方向和明细"),hd("吃单","","立即成交的较优一边：吃Yes@卖1 或 吃No@1−买1，× 为能买的份数"));
@@ -5821,7 +5837,9 @@ function ladderBook(c,it,L,live){  // the ladder's Predict block: one row per op
       const q=r.bid==null&&r.ask==null?(r.error?"—":"…"):n(r.bid)+" / "+n(r.ask);
       const need=r.need||0,b=$("span","lb"+(best?(best.edge>=HOT?" hot":" pos"):""));
       // nothing to suggest: the closest direction, grey (a prior σ always lands here: shown, never suggested)
-      const near=!best&&!r.error&&!r.stale&&v.edges.length?v.edges.reduce((a,e)=>!a||rank(e)>rank(a)||(rank(e)===rank(a)&&e.maker&&!a.maker)?e:a,null):null;
+      const near=!best&&!r.error&&!r.stale&&v.pool.length?v.pool.reduce((a,e)=>!a||rank(e)>rank(a)||(rank(e)===rank(a)&&e.maker&&!a.maker)?e:a,null):null;
+      const tko=v.ok.filter(e=>!e.maker).sort((a,b)=>b.edge-a.edge)[0];  // the level's best taker, for the strip's takers-only view
+      if(tko&&tko.edge>=HOT&&(!hotTk||tko.edge>hotTk.edge))hotTk={...tko,row:r.label};
       if(best){b.append(best.label+" "+(best.price*100).toFixed(1)+" ",$("b","",sg(best.edge)));b.title=best.maker?"挂单排队，成交不保证":"立即成交，量 "+qty(best.size);
         if(best.edge>=HOT&&(!hot||best.edge>hot.edge))hot={...best,row:r.label}}
       else if(near){b.classList.add("miss");b.append(near.label+" "+(near.price*100).toFixed(1)+" ",$("b","",sg(near.edge)));b.title=near.label+" @ "+cent(near.price)+" 净优势 "+sg(near.edge)+"，"+(r.hold||"不够大，不建议")}
@@ -5841,14 +5859,17 @@ function ladderBook(c,it,L,live){  // the ladder's Predict block: one row per op
     w.append(g)}
   c.append(w);
   if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" +"+cent(hot.edge);
-    hots.push({key,name:it.name,text:hot.row+" "+hot.label+" "+(hot.price*100).toFixed(1),edge:hot.edge})}
+    const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);
+    hots.push({key,name:it.name,group:it.group||"contract",best:{text:text(hot),edge:hot.edge},taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
   return c}
-function drawOpps(){  // every red-framed suggestion on the page in one strip on top, largest first; tap one to jump to its card
-  const el=document.getElementById("opps"),list=hots.filter((h,i)=>hots.findIndex(x=>x.key===h.key)===i).sort((a,b)=>b.edge-a.edge);
+function drawOpps(){  // every red-framed suggestion on the page in one strip on top, largest first; tap one to jump to its card.
+  // 自定义 leaves sections out of it, or lists taker (吃单) suggestions only: a maker's edge is only real once it fills
+  const el=document.getElementById("opps"),seen=new Set();
+  const list=hots.map(h=>({...h,pick:oppTaker?h.taker:h.best})).filter(h=>h.pick&&!oppOff.includes(h.group)&&!seen.has(h.key)&&seen.add(h.key)).sort((a,b)=>b.pick.edge-a.pick.edge);
   el.hidden=editing||!list.length;if(el.hidden){el.replaceChildren();return}
-  el.replaceChildren($("span","ok","🔥 机会 "+list.length));
+  el.replaceChildren($("span","ok","🔥 机会 "+list.length+(oppTaker?"（只列吃单）":"")));
   list.slice(0,8).forEach(h=>{const b=$("button","opp");b.type="button";b.title="跳到这张卡";
-    b.append($("b","",h.name),$("span","",h.text),$("i","",sg(h.edge)));
+    b.append($("b","",h.name),$("span","",h.pick.text),$("i","",sg(h.pick.edge)));
     b.addEventListener("click",()=>{const c=[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);if(!c)return;
       c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+8)+"px";c.scrollIntoView({behavior:"smooth",block:"start"});
       c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")});el.append(b)});
@@ -5888,9 +5909,10 @@ function card(it,g){
   c.append(head);
   if(it.kind==="sim")return simCard(c,it);
   if(it.kind==="ladder")return ladder(c,it);
-  const best=view(it).best;  // for the trade size picked in the bar
+  const v=view(it),best=v.best;  // for the trade size picked in the bar
   if(best&&best.edge>=HOT){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge);
-    hots.push({key:fk,name:it.name,text:best.label+" "+(best.price*100).toFixed(1),edge:best.edge})}
+    const tk=v.ok.filter(e=>!e.maker).sort((a,b)=>b.edge-a.edge)[0],text=e=>e.label+" "+(e.price*100).toFixed(1);
+    hots.push({key:fk,name:it.name,group:it.group||"contract",best:{text:text(best),edge:best.edge},taker:tk&&tk.edge>=HOT?{text:text(tk),edge:tk.edge}:null})}
   if(it.missing){c.append($("p","","概率暂缺："+it.missing));tail(c,it);return c}
   const o=$("div","odds"),a=$("b",style==="us"?"d":"u"),b=$("b",style==="us"?"u":"d");
   const lb=it.labels||["涨","跌"];a.append($("span","lbl",lb[0]),pct(it.fair_up)+"¢");b.append(pct(it.fair_down)+"¢",$("span","lbl",lb[1]));
@@ -5993,6 +6015,12 @@ function drawPanel(){
   secOrder.forEach(g=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=!hideSec.includes(g);i.dataset.sec=g;
     i.addEventListener("change",()=>{hideSec=i.checked?hideSec.filter(x=>x!==g):[...hideSec,g];keep("hideSec",hideSec);if(last)render(last)});
     l.append(i,SEC_NAMES[g]);secs.append(l)});
+  const os=document.getElementById("oppsrc");os.replaceChildren($("span","mut","🔥 机会条列出："));
+  SECTIONS.filter(g=>g!=="sim").forEach(g=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=!oppOff.includes(g);i.dataset.opp=g;
+    i.addEventListener("change",()=>{oppOff=i.checked?oppOff.filter(x=>x!==g):[...oppOff,g];keep("oppOff",oppOff);if(last)render(last)});l.append(i,SEC_NAMES[g]);os.append(l)});
+  const lt=$("label","tog"),ti=$("input");ti.type="checkbox";ti.id="opptaker";ti.checked=oppTaker;
+  ti.addEventListener("change",()=>{oppTaker=ti.checked;keep("oppTaker",oppTaker);if(last)render(last)});
+  lt.append(ti,"只列吃单（挂单不算）");lt.title="挂单的优势要等成交才算数；价格阶梯的档位本来就只算吃单";os.append(lt);
   document.getElementById("hotin").value=hotCents;
   document.getElementById("hidn").textContent=hidden.length?"已隐藏 "+hidden.length+" 张卡片（变淡显示，点“显示”恢复）":"没有隐藏的卡片";
   document.getElementById("showall").disabled=!hidden.length}
@@ -6011,8 +6039,8 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;
-  ["order","hidden","secs","hot"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
+  order={};hidden=[];hideSec=["sim"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppTaker=false;
+  ["order","hidden","secs","hot","oppOff","oppTaker"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 async function load(){
   try{
@@ -7911,10 +7939,8 @@ class Bot:
     def flip_hold(self, fm: "FlipMarket", odds: float, book: PredictBook | None, now_ms: int) -> str:
         """Why no trade is suggested: the market's own reasons, or our data says it flipped while the book disagrees."""
         hold = fm.advice_problem(now_ms)
-        if book is not None and odds >= 1.0 and fm.history.get("kind") == "flip":
-            top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0)
-            if top < 0.9:
-                hold = hold or "数据显示已反超，但盘口仍低于 90¢；以 Hyperliquid 1 分钟 K 为准，请核实"
+        if odds >= 1.0 and fm.history.get("kind") == "flip" and book_disputes(book):
+            hold = hold or "数据显示已反超，但盘口仍低于 90¢；以 Hyperliquid 1 分钟 K 为准，请核实"
         return hold
 
     def flip_payload(self, fm: "FlipMarket", now_ms: int) -> dict:
@@ -8222,8 +8248,7 @@ class Bot:
                 book, _ = self.predict.yes_book(row) if row.market_id else (None, "")
                 if fair is None or book is None:
                     continue
-                top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0)
-                hold = ("数据显示已触及，但盘口仍低于 90¢" if fair == 1.0 and top < 0.9 else problem
+                hold = ("数据显示已触及，但盘口仍低于 90¢" if fair == 1.0 and book_disputes(book) else problem
                         or ("Predict 已结算" if self.range_settled(row) else "") or RANGE_GUESS_SHORT.get(source, ""))
                 out.append(SimMarket(f"{rm.spec.slug}#{row.market_id}", f"{rm.spec.name} {('↑ ' if direction == 'up' else '↓ ')}"
                                      f"{level_label(row.target)}", "range", rm.spec.key, fair, book,
@@ -8231,15 +8256,14 @@ class Bot:
                                      {"target": str(row.target), "dir": direction, "end": rm.spec.end_ms},
                                      self.evidence(lambda rm=rm, row=row, direction=direction, source=source:
                                                    self.market_evidence("range", now_ms, rm=rm, row=row, direction=direction,
-                                                                        source=source))))
+                                                                        source=source)), makers=not RANGE_TAKER_ONLY))
         for cap in self.caps.values():
             for row in self.predict.ladders.get(cap.spec.key) or []:
                 fair = self.ladder_fair(cap, row, now_ms)
                 book, _ = self.predict.yes_book(row) if row.market_id else (None, "")
                 if fair is None or book is None:
                     continue
-                top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0)
-                hold = ("数据显示已触及，但盘口仍低于 90¢" if fair == 1.0 and top < 0.9
+                hold = ("数据显示已触及，但盘口仍低于 90¢" if fair == 1.0 and book_disputes(book)
                         else "窗口已结束" if now_ms >= cap.spec.end_ms + 60_000
                         else "σ 是先验值" if cap.sigma_kind == "prior" else "")
                 out.append(SimMarket(f"{cap.spec.slug}#{row.market_id}", f"{cap.spec.name} {usd_short(row.target)}", "ladder",
@@ -8359,6 +8383,10 @@ class Bot:
                      "source": ("币安合约" if rm.spec.venue == "futures" else "币安现货") + f" {rm.spec.symbol} 小时 K（与 1 分钟 K 的最高/最低一致）",
                      **marks, "through": int(rm.history.get("through") or 0)}
             if rm.reached(level, direction):
+                mid = trade["market"].partition("#")[2]
+                row = next((r for r in self.predict.ladders.get(rm.spec.key) or [] if r.market_id == mid), None)
+                if book_disputes(self.predict.yes_book(row)[0] if row else None):
+                    return None  # the book still trades it as open: Predict's own result settles it
                 seen = high if direction == "up" else low
                 return 1.0, (f"{'↑' if direction == 'up' else '↓'} {level_label(level)} 已触及（{rm.spec.symbol} 本月"
                              f"{'最高' if direction == 'up' else '最低'} {seen:,.6g}）"), proof
@@ -8492,7 +8520,7 @@ class Bot:
         for mk in markets.values():
             if mk.hold or mk.book.stale(now_ms):
                 continue
-            maker = best_edge([e for e in book_edges(mk.fair_up, mk.book, costs) if e.maker], mk.need)
+            maker = best_edge([e for e in book_edges(mk.fair_up, mk.book, costs) if e.maker], mk.need) if mk.makers else None
             if maker is not None and maker.edge >= bar - 1e-9:
                 side = "up" if maker.side == "涨" else "down"
                 tid = f"{mk.market}|{side}|挂"
@@ -8659,8 +8687,7 @@ class Bot:
                                    "dist": float(row.target / cap.cap - 1) if cap.cap else None}
             if book is not None:
                 out.update(bid=float(book.bid[0]) if book.bid else None, ask=float(book.ask[0]) if book.ask else None)
-                top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0)
-                if fair == 1.0 and top < 0.9:
+                if fair == 1.0 and book_disputes(book):
                     # our history says touched, the market does not: sources disagree, so no "sure thing" edge
                     out["error"] = "数据显示已触及，但盘口仍低于 90¢；以 Flap.sh 为准，请核实"
                 priced = fair is not None and not out["error"]
@@ -8745,14 +8772,14 @@ class Bot:
                                    "dist": float(row.target / rm.price - 1) if rm.price else None}
             if book is not None:
                 out.update(bid=float(book.bid[0]) if book.bid else None, ask=float(book.ask[0]) if book.ask else None)
-                top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0)
-                if fair == 1.0 and top < 0.9:
+                if fair == 1.0 and book_disputes(book):
                     # our candles say reached, the market does not: no "sure thing" edge until someone looks
                     out["error"] = "数据显示已触及，但盘口仍低于 90¢；以币安 1 分钟 K 为准，请核实"
                 priced = fair is not None and not out["error"]
                 swing = rm.model_swing(row.target, direction, now_ms, fair) if priced else 0.0
                 hold = problem or ("Predict 已结算" if self.range_settled(row) else "") or self.range_guess(source)
-                self.book_block(out, book, fair if priced else None, self.edge_need(swing), swing, hold, ("Yes", "No"), now_ms)
+                self.book_block(out, book, fair if priced else None, self.edge_need(swing), swing, hold, ("Yes", "No"), now_ms,
+                                makers=not RANGE_TAKER_ONLY)
             out["touched"] = fair == 1.0 and "请核实" not in out["error"]
             rows.append(out)
         rows.sort(key=lambda r: -r["level"])  # high to low: the price sits between the ↑ and the ↓ levels
@@ -8816,7 +8843,7 @@ class Bot:
             st = state.get(mk.market, {})
             edges, sides, best = [], None, None
             if not mk.hold and not mk.book.stale(now_ms):
-                edges = book_edges(mk.fair_up, mk.book, costs)
+                edges = [e for e in book_edges(mk.fair_up, mk.book, costs) if mk.makers or not e.maker]
                 best = best_edge(edges, mk.need)
                 sides = {key: best_edge([e for e in edges if e.side == side], mk.need) for key, side in (("up", "涨"), ("down", "跌"))}
             note = st.get("note")
@@ -8996,18 +9023,19 @@ class Bot:
         return max(self.config.predict_min_edge, swing)
 
     def book_block(self, out: dict, book: PredictBook, fair: float | None, need: float, swing: float, hold: str,
-                   sides: tuple[str, str], now_ms: int) -> None:
+                   sides: tuple[str, str], now_ms: int, makers: bool = True) -> None:
         """Fill a card's book block: both sides' depth (priced as the 涨 / Yes side), the model's fair price for that side,
         the bar a suggestion must clear and why none is made, and the four edges for PREDICT_TRADE_USD. The page
-        recomputes the edges from the same depth for the trade size the viewer picks."""
+        recomputes the edges from the same depth for the trade size the viewer picks. ``makers`` False: only the taker
+        edges may be suggested (the maker ones are shown, never best)."""
         out.update(bids=[[float(p), float(q)] for p, q in book.bids], asks=[[float(p), float(q)] for p, q in book.asks],
                    age=max(0, (now_ms - book.fetched_ms) // 1000), stale=book.stale(now_ms), fetched_ms=book.fetched_ms,
                    fee_bps=book.fee_bps if book.fee_bps is not None else self.config.predict_fee_bps, sides=list(sides),
-                   notional=self.config.predict_trade_usd)
+                   notional=self.config.predict_trade_usd, makers=makers)
         if fair is None:
             return
         edges = book_edges(fair, book, self.edge_costs())
-        best = None if book.stale(now_ms) or hold else best_edge(edges, need)
+        best = None if book.stale(now_ms) or hold else best_edge([e for e in edges if makers or not e.maker], need)
         label = lambda e: e.label.replace("涨", sides[0]).replace("跌", sides[1])
         out.update(fair=fair, need=need, swing=swing, hold=hold, edges=[edge_json(e, best, label(e)) for e in edges])
 

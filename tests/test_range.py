@@ -272,10 +272,12 @@ async def run():
         ("25", "$100,000", "Bitcoin $100,000 in October 2026?", "", "Yes"),   # nothing says: below the month's first price, so ↓
         ("26", "Other", "Other", "", "Yes"),                                   # no level: left out
         ("29", "↑ 125,000", q("reach $125,000"), LOW, "Yes"),                 # a ↑ title under "Low ≤" rules: flagged, never suggested
+        ("30", "↑ 160,000", q("reach $160,000"), HIGH, "Yes"),                # far out: a lone Yes ask at 99.8¢, no bids
+        ("31", "↑ 110,000", q("reach $110,000"), HIGH, "Yes"),                # reached; its book is empty (no quotes at all)
     ]
     books = {"21": (["0.20", "500"], ["0.24", "500"]), "22": (["0.50", "500"], ["0.55", "500"]), "23": (["0.97", "500"], ["0.99", "500"]),
              "24": (["0.30", "500"], ["0.35", "500"]), "25": (["0.05", "500"], ["0.08", "500"]), "26": (["0.5", "1"], ["0.6", "1"]),
-             "29": (["0.10", "500"], ["0.12", "500"])}
+             "29": (["0.10", "500"], ["0.12", "500"]), "30": ([], ["0.998", "50"]), "31": ([], [])}
 
     async def fetch(url, payload=None):
         if url == m.PREDICT_GRAPHQL:
@@ -290,7 +292,7 @@ async def run():
                 return {"data": {"id": i, "status": "OPEN", "title": t, "question": qq, "description": rules,
                                  "outcomes": [{"name": names[0], "indexSet": 1}, {"name": names[1], "indexSet": 2}]}}
             if url.endswith(f"/markets/{i}/orderbook"):
-                return {"data": {"bids": [books[i][0]], "asks": [books[i][1]]}}
+                return {"data": {"bids": [books[i][0]] if books[i][0] else [], "asks": [books[i][1]] if books[i][1] else []}}
         if "/categories/" in url:
             raise m.RemoteError("HTTP 404: 接口请求失败")
         raise AssertionError(url)
@@ -298,11 +300,12 @@ async def run():
     await bot.predict.refresh({"BTC-HIT-10": BTC.slug}, force=True)
     rows = bot.predict.ladders["BTC-HIT-10"]
     assert [(r.target, r.market_id) for r in rows] == [(D("100000"), "25"), (D("105000"), "22"), (D("108500"), "24"),
-                                                       (D("118000"), "23"), (D("120000"), "21"), (D("125000"), "29")], rows
+                                                       (D("110000"), "31"), (D("118000"), "23"), (D("120000"), "21"),
+                                                       (D("125000"), "29"), (D("160000"), "30")], rows
     assert rows[1].question == q("dip to $105,000") and "BTC-HIT-10" not in bot.predict.errors
     assert bot.predict.market_meta["21"][0]["rules"] == HIGH and bot.predict.market_meta["23"][0]["question"].startswith("Bitcoin $118,000")
     assert [bot.range_level(rm, r) for r in rows] == [("down", "推断"), ("down", "规则"), ("down", "规则"), ("up", "规则"), ("up", "规则"),
-                                                      ("up", "冲突")]
+                                                      ("up", "规则"), ("up", "冲突"), ("up", "规则")]
     # a level nothing labels is guessed from the side of the month's first price it sits on (a ↓ level above that price
     # would have been reached at once); with no price at all, the category's default
     bare_row = m.LadderRow(D("130000"), "", "$130,000", None)
@@ -324,11 +327,19 @@ async def run():
         "window": "10-01 00:00 ET（北京 10-01 12:00）起", "hold": "", "error": ""}, L
     assert L["high_at"] == m.stamp(RUN, seconds=False) and L["low_at"] == m.stamp(DIP, seconds=False) and L["through"] == m.stamp(NOW - NOW % H + H, seconds=False)
     assert abs(L["years"] - years) < 1e-12 and L["sigma"] == rm.sigma and "waiting" not in L
-    r125, r120, r118, r1085, r105, r100 = L["rows"]  # high to low: the price sits between the ↑ and the ↓ levels
-    assert [r["label"] for r in L["rows"]] == ["↑ $125k", "↑ $120k", "↑ $118k", "↓ $108.5k", "↓ $105k", "↓ $100k"]
-    assert [(r["dir"], r["dir_source"]) for r in L["rows"]] == [("up", "冲突"), ("up", "规则"), ("up", "规则"), ("down", "规则"), ("down", "规则"),
-                                                              ("down", "推断")]
-    assert [r["dir_note"] == "" for r in L["rows"]] == [False, True, True, True, True, False]
+    r160, r125, r120, r118, r110, r1085, r105, r100 = L["rows"]  # high to low: the price sits between the ↑ and the ↓ levels
+    assert [r["label"] for r in L["rows"]] == ["↑ $160k", "↑ $125k", "↑ $120k", "↑ $118k", "↑ $110k", "↓ $108.5k", "↓ $105k", "↓ $100k"]
+    assert [(r["dir"], r["dir_source"]) for r in L["rows"]] == [("up", "规则"), ("up", "冲突"), ("up", "规则"), ("up", "规则"), ("up", "规则"),
+                                                              ("down", "规则"), ("down", "规则"), ("down", "推断")]
+    assert [r["dir_note"] == "" for r in L["rows"]] == [True, False, True, True, True, True, True, False]
+    # only taker edges may be suggested on a price ladder: ↑ $120k's best is 吃Yes although 挂Yes is listed with a larger edge
+    assert r120["makers"] is False and [e["label"] for e in r120["edges"] if e["best"]] == ["吃Yes"], r120["edges"]
+    assert max(r120["edges"], key=lambda e: e["edge"])["label"] == "挂Yes"
+    # the far level: a lone ask at 99.8¢ gives "挂No at 0.2¢ for +99.6¢" on paper; it is never best, framed or traded
+    assert r160["fair"] < 0.01 and r160["bid"] is None and r160["ask"] == 0.998 and not any(e["best"] for e in r160["edges"]), r160
+    assert {e["label"]: round(e["edge"], 3) for e in r160["edges"] if e["maker"]} == {"挂No": round(1 - r160["fair"] - 0.002, 3)}
+    # reached, and the book has no quotes at all: nothing disputes it (the market is likely settled already)
+    assert r110["fair"] == 1.0 and r110["touched"] is True and r110["error"] == "" and r110["bid"] is None and r110["ask"] is None, r110
     assert L["spot"] == 112050.4  # the page draws the price's own line between the ↑ and the ↓ levels
     # a title arrow against the rules text: priced as the title says, shown with the warning, never suggested
     assert r125["hold"] == r125["dir_note"] == m.RANGE_GUESS["冲突"] and r125["edges"] and not any(e["best"] for e in r125["edges"]), r125
@@ -351,7 +362,8 @@ async def run():
 
     # a market Predict settled before the window closed: its own result when readable, else reached (only a touch
     # settles one early); nothing is suggested on it any more
-    row21, meta21 = bot.predict.ladders["BTC-HIT-10"][4], bot.predict.market_meta["21"][0]
+    row21 = next(r for r in bot.predict.ladders["BTC-HIT-10"] if r.market_id == "21")
+    meta21 = bot.predict.market_meta["21"][0]
     bot.predict.market_meta["21"] = ({**meta21, "status": "RESOLVED"}, time.monotonic())
     assert bot.range_fair(rm, row21, "up", NOW) == 1.0
     assert bot.range_fair(rm, row21, "up", rm.window_end) is None  # after it: the data decides
@@ -408,8 +420,21 @@ async def run():
 
     # --- the paper trader sees every priced level exactly as the card does -----------------------------------------
     sims = {mk.market: mk for mk in bot.sim_markets(NOW) if mk.kind == "range"}
-    assert set(sims) == {f"{BTC.slug}#{i}" for i in ("21", "22", "23", "24", "25", "29")}, sorted(sims)
+    assert set(sims) == {f"{BTC.slug}#{i}" for i in ("21", "22", "23", "24", "25", "29", "30", "31")}, sorted(sims)
     assert sims[f"{BTC.slug}#29"].hold == "标题与规则的方向相反"
+    assert all(not mk.makers for mk in sims.values()) and sims[f"{BTC.slug}#30"].hold == ""
+    # the paper trader buys the taker at ↑ $120k (+25¢) and never the far level's 挂No at 0.2¢; the alerts say the same
+    await bot.sim_step(NOW)
+    trades = bot.sim_trades()
+    assert set(trades) == {f"{BTC.slug}#21|up|吃"}, sorted(trades)
+    assert trades[f"{BTC.slug}#21|up|吃"]["maker"] is False and trades[f"{BTC.slug}#21|up|吃"]["edge"] > 0.2
+    await bot.edge_alerts(NOW)
+    bot.edge_ran = -1e9
+    await bot.edge_alerts(NOW + 61_000)  # the edge held for the confirmation time: announced
+    alerts = bot.store.get("edgealerts", {})
+    text = alerts[f"{BTC.slug}#21"]["alert"]["text"].replace(m.B0, "").replace(m.B1, "")  # without the bold markers
+    assert text.startswith("🟢 新机会｜BTC 10月价格 ↑ $120k\n吃Yes @ 24.0¢｜净优势 +25.2¢") and "挂" not in text, text
+    assert not any(st.get("alert") or st.get("pending") or st.get("told") for mkt, st in alerts.items() if mkt != f"{BTC.slug}#21"), alerts
     s120, s1085, s100 = sims[f"{BTC.slug}#21"], sims[f"{BTC.slug}#24"], sims[f"{BTC.slug}#25"]
     assert s120.item == "BTC 10月价格 ↑ $120k" and s120.key == "BTC-HIT-10" and s120.hold == "" and s120.sides == ("Yes", "No")
     assert s120.fair_up == r120["fair"] and s120.need == r120["need"] and s120.settle == {"target": "120000", "dir": "up", "end": BTC.end_ms}
@@ -422,10 +447,12 @@ async def run():
     # results from the bot's own candles: reached → Yes at once; not reached → No once the whole window is read
     trade = lambda target, direction, mid="21": {"kind": "range", "key": "BTC-HIT-10", "market": f"{BTC.slug}#{mid}",
                                                  "settle": {"target": target, "dir": direction, "end": BTC.end_ms}}
-    up, note, proof = bot.sim_result(trade("118000", "up"), NOW)
+    up, note, proof = bot.sim_result(trade("118000", "up", "23"), NOW)
     assert up == 1.0 and note == "↑ $118k 已触及（BTCUSDT 本月最高 119,200）" and proof["high"] == 119200.0 and proof["high_at"] == RUN, (note, proof)
+    assert bot.sim_result(trade("108500", "down", "24"), NOW) is None  # reached by our candles, but the book trades it at 30-35¢: Predict decides
+    assert bot.sim_result(trade("110000", "up", "31"), NOW)[0] == 1.0  # an empty book disputes nothing
     assert proof["rule"] == "窗口内任一 1 分钟 K 的最高价 ≥ $118k 即 Yes" and proof["source"].startswith("币安现货 BTCUSDT 小时 K")
-    up, note, _ = bot.sim_result(trade("108500", "down"), NOW)
+    up, note, _ = bot.sim_result(trade("108500", "down", "no-such-market"), NOW)  # no book to dispute it
     assert up == 1.0 and note == "↓ $108.5k 已触及（BTCUSDT 本月最低 108,000）", note
     assert bot.sim_result(trade("120000", "up"), NOW) is None  # open
     assert bot.sim_result(trade("120000", "up"), rm.window_end + bot.SIM_SETTLE_MS + 1) is None  # the window not read to its end
@@ -462,7 +489,12 @@ async def browser_check(bot):
         return
     bot.market.now_ms = lambda: NOW
     payload = bot.odds_payload()
-    payload["items"] = [i for i in payload["items"] if i["group"] == "levels"]
+    jia = {"name": "甲", "symbol": "JIA", "group": "index", "missing": "等待行情", "predict": {"url": "https://predict.fun/zh-cn/market/x", "error": ""}}
+    book = m.PredictBook("JIA", "x", "1", "x", ((D("0.30"), D("500")),), ((D("0.95"), D("500")),), NOW, 200)
+    bot.book_block(jia["predict"], book, 0.5, bot.edge_need(0.0), 0.0, "", ("涨", "跌"), NOW)  # 挂跌 @ 5¢ +45¢, 挂涨 @ 30¢ +20¢; no taker edge
+    payload["items"] = [jia, *(i for i in payload["items"] if i["group"] == "levels")]
+    btc = next(i for i in payload["items"] if i["name"] == "BTC 10月价格")
+    tk = next(e for e in next(r for r in btc["ladder"]["rows"] if r["label"] == "↑ $120k")["edges"] if e["best"])
     bot.odds_payload = lambda: payload
     web = m.WebServer(bot, 0, "t" * 20); port = await web.start()
     async with async_playwright() as pw:
@@ -476,19 +508,30 @@ async def browser_check(bot):
         summary = await card.locator("summary").inner_text()
         assert re.sub(r"\s+", " ", summary).strip() == "现价 $112,050 本月最高 $119,200 最低 $108,000 σ " + f"{rm_sigma(bot) * 100:.0f}%", summary
         labels = await card.locator(".lg .lt").all_inner_texts()
-        assert labels == ["↑ $125k", "↑ $120k", "↓ $108.5k", "↓ $105k", "↓ $100k"], labels  # ↑ $118k is reached: a chip
+        assert labels == ["↑ $160k", "↑ $125k", "↑ $120k", "↓ $108.5k", "↓ $105k", "↓ $100k"], labels  # ↑ $118k, ↑ $110k reached: chips
         # the price's own line sits between the ↑ levels and the ↓ levels
-        assert await card.locator(".lg .lt, .lg .lspot").all_inner_texts() == ["↑ $125k", "↑ $120k", "现价 $112,050", "↓ $108.5k", "↓ $105k", "↓ $100k"]
+        assert await card.locator(".lg .lt, .lg .lspot").all_inner_texts() == ["↑ $160k", "↑ $125k", "↑ $120k", "现价 $112,050", "↓ $108.5k",
+                                                                               "↓ $105k", "↓ $100k"]
         # signed distance to each level (a decimal under 10%); the column itself is hidden on a phone
         dists = await card.locator(".lg .ln.ld").evaluate_all("els => els.map(e => e.textContent)")
-        assert dists == ["距离", "+12%", "+7.1%", "−3.2%", "−6.3%", "−11%"], dists
-        assert await card.locator(".touched .tchip").all_inner_texts() == ["↑ $118k"]
-        assert await card.locator(".touched .tchip").get_attribute("title") == "本月最高价已到 $118k"
+        assert dists == ["距离", "+43%", "+12%", "+7.1%", "−3.2%", "−6.3%", "−11%"], dists
+        assert await card.locator(".touched .tchip").all_inner_texts() == ["↑ $118k", "↑ $110k"]
+        assert await card.locator(".touched .tchip").first.get_attribute("title") == "本月最高价已到 $118k"
         assert await card.locator(".lg .lt:text-is('↓ $100k')").get_attribute("title") == \
             "这个市场的规则和标题都没写明上破还是下破，按档位在月初价格之上（↑）还是之下（↓）推断；只作参考"
-        cells = await card.locator(".lg .lb:not(.lk)").evaluate_all("els => els.map(e => [e.className, e.title])")
-        assert cells[2][1].startswith("数据显示已触及，但盘口仍低于 90¢") and "pos" not in cells[4][0] and "hot" not in cells[4][0], cells
-        assert "hot" in cells[1][0] and "miss" in cells[0][0], cells  # ↑ $120k at 24¢ against a fair price near 50¢; ↑ $125k disputed
+        cells = await card.locator(".lg .lb:not(.lk)").evaluate_all("els => els.map(e => [e.className, e.title, e.innerText])")
+        assert cells[3][1].startswith("数据显示已触及，但盘口仍低于 90¢") and "pos" not in cells[5][0] and "hot" not in cells[5][0], cells
+        assert "hot" in cells[2][0] and "miss" in cells[1][0], cells  # ↑ $120k's taker at 24¢ against a fair price near 50¢; ↑ $125k disputed
+        # the far level: its 挂No at 0.2¢ is not a suggestion; the closest counted direction (the taker) shows grey
+        assert cells[0][0] == "lb miss" and cells[0][2].startswith("吃Yes 99.8 ") and "不够大，不建议" in cells[0][1], cells[0]
+        await card.locator(".lg .lt:text-is('↑ $160k')").click()
+        chips = card.locator(".lrow .edge")
+        assert await chips.count() == 2 and await card.locator(".lrow .edge.best, .lrow .edge.pos").count() == 0
+        assert (await chips.nth(0).inner_text()).startswith("挂No 0.2\n+99.")
+        await chips.nth(0).click()
+        det = await card.locator(".lrow .edet").inner_text()
+        assert "这类档位的挂单不算建议" in det and "→ 不计入" in det, det
+        await card.locator(".lg .lt:text-is('↑ $160k')").click()
         # tap the ⚠️ level: its note says why (a tooltip is no use on a phone); no directions are offered on it
         await card.locator(".lg .lt:text-is('↓ $108.5k')").click()
         note = await card.locator(".lrow .lnote").inner_text()
@@ -506,11 +549,21 @@ async def browser_check(bot):
         await card.locator(".lg .lt:text-is('↑ $125k')").click()
         # the strip on top lists every red-framed suggestion; tapping one jumps to its card (hidden while customising)
         strip = await page.inner_text("#opps")
-        assert strip.startswith("🔥 机会 1") and "BTC 10月价格" in strip and "↑ $120k 挂Yes 20.0" in strip and "+29.7¢" in strip, strip
-        await page.click("#opps .opp"); await page.wait_for_timeout(300)
+        assert strip.startswith("🔥 机会 2") and "甲挂跌 5.0+45.0¢" in strip.replace("\n", "") and f"↑ $120k {tk['label']} {tk['price'] * 100:.1f}" in strip, strip
+        assert strip.index("甲") < strip.index("BTC 10月价格") and m.cents(tk["edge"], True) in strip
+        await page.click("#opps .opp:nth-of-type(2)"); await page.wait_for_timeout(300)
         assert await card.evaluate("c => c.classList.contains('flash') && c.style.scrollMarginTop !== ''")
+        # 自定义: takers only drops 甲 (its edges are maker ones); a section can be left out; hidden while customising
         await page.click("#edit"); assert await page.is_hidden("#opps")
-        await page.click("#done"); assert await page.is_visible("#opps")
+        await page.check("#opptaker"); await page.click("#done")
+        assert (await page.inner_text("#opps")).startswith("🔥 机会 1（只列吃单）") and "甲" not in await page.inner_text("#opps")
+        assert await page.evaluate("localStorage.getItem('oppTaker')") == "true"
+        await page.click("#edit"); await page.uncheck("#oppsrc input[data-opp=levels]"); await page.click("#done")
+        assert await page.is_hidden("#opps") and await page.evaluate("localStorage.getItem('oppOff')") == '["levels"]'
+        await page.click("#edit"); await page.uncheck("#opptaker"); await page.click("#done")
+        assert (await page.inner_text("#opps")).startswith("🔥 机会 1") and "甲" in await page.inner_text("#opps")
+        await page.click("#edit"); await page.click("#reset"); await page.click("#reset"); await page.click("#done")
+        assert (await page.inner_text("#opps")).startswith("🔥 机会 2") and await page.evaluate("localStorage.getItem('oppOff')") is None
         await card.locator("summary").click()
         text = await card.locator("dl").inner_text()
         assert "币安现货 BTCUSDT" in text and "最低价 ≤ 档位即 Yes" in text and "已核至" in text, text
