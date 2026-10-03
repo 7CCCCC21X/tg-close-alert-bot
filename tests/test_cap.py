@@ -1,4 +1,4 @@
-import asyncio, os, sys, math, time, datetime as dt
+import asyncio, os, re, sys, math, time, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
@@ -130,6 +130,25 @@ async def run():
     # the first partial hour's minutes are unavailable: counted as skipped, not guessed
     skip = m.CapMarket(m.Store(":memory:"), NIU); skip.get, _ = world(first_minutes=[])
     await skip.scan(NOW); assert skip.history["first"] == "skipped"
+    assert skip.coverage() == "开窗那一小时的分钟 K 未取得"  # an incomplete history never settles "not reached"
+
+    # --- after the window: its last hour (it ends with the window's last minute) counts, later hours never do ----------
+    final_hour = NOW_S - NOW_S % H - 3 * H
+    ended = m.dataclasses.replace(NIU, slug="cap-ended", end_ms=(final_hour + 59 * 60) * 1000)  # a "23:59" end
+    done = m.CapMarket(m.Store(":memory:"), ended); done.get, _ = world(peak_hour=final_hour + H, peak_price=0.9)  # spike after
+    assert done.window_end_s == final_hour + H
+    await done.scan(NOW)
+    assert done.history["through"] == done.window_end_s and done.history["high"] < 0.1 and done.coverage() == "", done.history
+    inside = m.CapMarket(m.Store(":memory:"), ended); inside.get, _ = world(peak_hour=final_hour, peak_price=0.3)
+    await inside.scan(NOW)
+    assert inside.history["high"] == 0.3 and inside.history["at"] == final_hour and inside.coverage() == ""
+    # a price read after the window is not part of its high (nor is the running hour of a later day)
+    done.price, done.priced_ms, done.supply, done.sigma = D("0.9"), NOW, D("985000000"), 1.0
+    assert done.window_high()[0] < D("0.1") * D("985000000") and done.probability(D("5e8"), NOW) == 0.0
+    done.priced_ms = ended.end_ms + 30_000  # read during the window's last minute: it counts
+    assert done.window_high()[0] == D("0.9") * D("985000000")
+    # without any GeckoTerminal source (PONS) the history is only what the bot saw: never complete
+    assert m.CapMarket(m.Store(":memory:"), PONS).coverage() == "没有 K 线来源：窗口最高只含机器人看到的价格"
 
     # a failing supply RPC falls back to DexScreener's market cap; the error is shown
     fb = m.CapMarket(m.Store(":memory:"), NIU)
@@ -208,9 +227,10 @@ async def run():
     bot.predict.ladders["NIULAI"] = gone
     assert bot.cap_payload(cap, NOW)["ladder"]["rows"][0]["touched"] is True
     assert r300["bid"] == 0.86 and {e["label"] for e in r300["edges"]} == {"挂Yes", "挂No", "吃Yes", "吃No"}
-    assert r["miss"] is None and r["need"] >= r["swing"] >= 0  # this row has a best direction: no "miss" beside it
-    # a book within the model's error of the fair price: nothing is recommended, the closest direction is kept for the
-    # card (grey, with the bar it missed); ranked like best_edge (a maker wins a tie)
+    assert r["need"] >= r["swing"] >= 0 and r["hold"] == "" and r["sides"] == ["Yes", "No"] and r["fee_bps"] is not None
+    assert r["bids"] == [[0.98, 10.0]] and r["asks"] == [[0.99, 10.0]] and r["fetched_ms"] == NOW and r["notional"] == 100, r
+    # a book within the model's error of the fair price: nothing is recommended (the page greys the closest direction,
+    # ranked like best_edge: a maker wins a tie)
     near = bot.predict.ladders["NIULAI"][:]
     fair300 = r300["fair"]
     assert 0.006 < fair300 < 0.5, fair300
@@ -224,12 +244,15 @@ async def run():
     assert abs(q["bid"] - yes_bid) < 1e-9 and abs(q["ask"] - yes_ask) < 1e-9, q
     assert not any(e["best"] for e in q["edges"]) and q["need"] >= m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).predict_min_edge
     top = max(q["edges"], key=lambda e: (round(e["edge"], 4), e["maker"]))
-    assert q["miss"] == {**top, "best": False} and q["miss"]["label"] == "挂No" and abs(q["miss"]["edge"] - 0.015) < 1e-6, q
+    assert top["label"] == "挂No" and abs(top["edge"] - 0.015) < 1e-6 and "miss" not in q, q
     assert q["swing"] == cap.model_swing(D("3e8"), NOW, fair300)
     # a stale book: no suggestion and no "closest" either (the card says 过期)
     near[1] = m.dataclasses.replace(near[1], book=m.dataclasses.replace(near[1].book, fetched_ms=NOW - m.PREDICT_STALE_MS - 1))
     q = bot.cap_payload(cap, NOW)["ladder"]["rows"][1]
-    assert q["stale"] and q["miss"] is None and not any(e["best"] for e in q["edges"])
+    assert q["stale"] and not any(e["best"] for e in q["edges"])
+    # once the window is over nothing is suggested any more (only what happened inside it counts)
+    after = bot.cap_payload(cap, NIU.end_ms + 120_000)["ladder"]["rows"]
+    assert all(r["hold"] == "窗口已结束，等待结算" for r in after if "bids" in r) and any("bids" in r for r in after), after
     assert "方向未确认" in r500["error"] and "edges" not in r500 and 0 < r500["fair"] < 1
     assert "404" in r1b["error"] and "bid" not in r1b
     # before any data: the default thresholds, and the card says what it waits for
@@ -362,17 +385,20 @@ async def browser_check():
     cap.price, cap.priced_ms, cap.supply, cap.sigma, cap.sigma_kind = D("0.0996"), now, D("985000000"), 3.31, "bars"
     edge = lambda label, maker, price, value, best=False: {"label": label, "maker": maker, "price": price, "edge": value, "size": 100.0,
                                                           "gross": value, "fee": 0.0, "slip": 0.0, "short": False, "best": best}
-    def row(label, fair, bid, ask, edges, need, miss=None, **extra):
+    def row(label, fair, bid, ask, edges, need, **extra):
+        # the page prices the four directions itself, from the depth (Yes side), the fee and the trade size
         return {"label": label, "fair": fair, "error": "", "dist": 1.0, "bid": bid, "ask": ask, "stale": False, "edges": edges,
-                "need": need, "swing": need, "miss": miss, "touched": False, **extra}
+                "bids": [[bid, 5000.0]], "asks": [[ask, 5000.0]], "fee_bps": 200, "notional": 100, "sides": ["Yes", "No"],
+                "fetched_ms": now, "need": need, "swing": need, "hold": "", "touched": False, **extra}
     e200 = [edge("挂Yes", True, 0.352, -0.048), edge("挂No", True, 0.638, 0.058), edge("吃Yes", False, 0.362, -0.065), edge("吃No", False, 0.648, 0.041)]
     e500 = [edge("挂Yes", True, 0.06, -0.024), edge("挂No", True, 0.932, 0.0318), edge("吃Yes", False, 0.068, -0.033), edge("吃No", False, 0.94, 0.023)]
     e1b = [edge("挂Yes", True, 0.025, -0.021), edge("挂No", True, 0.974, 0.022, True), edge("吃Yes", False, 0.026, -0.022), edge("吃No", False, 0.975, 0.020)]
     item = bot.cap_payload(cap, now)
-    item["ladder"]["rows"] = [row("$200M", 0.304, 0.352, 0.362, e200, 0.067, e200[1]),
-                              row("$500M", 0.036, 0.06, 0.068, e500, 0.0324, e500[1]),
+    item["ladder"]["rows"] = [row("$200M", 0.304, 0.352, 0.362, e200, 0.067),
+                              row("$500M", 0.036, 0.06, 0.068, e500, 0.0324),
                               row("$1B", 0.004, 0.025, 0.026, e1b, 0.02),
-                              row("$2B", 0.001, 0.01, 0.02, e1b[:1], 0.02, stale=True)]
+                              row("$2B", 0.001, 0.01, 0.02, e1b[:1], 0.02, stale=True),
+                              row("$3B", 0.004, 0.025, 0.026, e1b, 0.02, hold="σ 是先验值，只作参考", fetched_ms=now - 30_000)]
     payload = bot.odds_payload()
     payload["items"] = [item]
     bot.odds_payload = lambda: payload
@@ -383,11 +409,39 @@ async def browser_check():
         await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
         await page.wait_for_selector("#g-ladder .lg")
         cells = await page.eval_on_selector_all("#g-ladder .lg .lb:not(.lk)", "els => els.map(e => [e.className, e.innerText])")
-        assert cells == [["lb miss", "挂No 63.8 +5.8¢"], ["lb miss", "挂No 93.2 +3.2¢"], ["lb pos", "挂No 97.4 +2.2¢"], ["lb", "过期"]], cells
+        assert cells == [["lb miss", "挂No 63.8 +5.8¢"], ["lb miss", "挂No 93.2 +3.2¢"], ["lb pos", "挂No 97.4 +2.2¢"], ["lb", "过期"],
+                         ["lb miss", "挂No 97.4 +2.2¢"]], cells  # $3B: the same book, but a prior σ is never suggested
         tip = await page.get_attribute("#g-ladder .lg .lb.miss", "title")
         assert tip == "挂No @ 63.8¢ 净优势 +5.8¢，不够大，不建议", tip
+        assert await page.get_attribute("#g-ladder .lg .lb.miss >> nth=2", "title") == "挂No @ 97.4¢ 净优势 +2.2¢，σ 是先验值，只作参考"
         assert "门槛" not in await page.inner_text("#g-ladder")
+        # the book's age: the oldest level's (30 s)
+        assert re.fullmatch(r"行情 \d 秒前\s+盘口 3\d 秒前", await page.inner_text("#g-ladder .ages")), await page.inner_text("#g-ladder .ages")
+        # tap a level: its four directions as chips, then a chip for the details; tap the level again to close it
+        await page.click("#g-ladder .lg .lt:text-is('$1B')")
+        chips = page.locator("#g-ladder .lrow .edge")
+        assert await chips.count() == 4 and await page.locator("#g-ladder .lrow .edge.best").inner_text() == "挂No 97.4\n+2.2¢"
+        await chips.nth(1).click()
+        det = await page.inner_text("#g-ladder .lrow .edet")
+        assert det.startswith("挂No @ 97.4¢：挂单排队") and "这个价位已有 5,000 份在排队" in det and "→ 满足" in det and "不标红框" in det, det
+        await page.click("#g-ladder .lg .lb.pos")
+        assert await page.locator("#g-ladder .lrow").count() == 0
+        await page.click("#g-ladder .lg .lt:text-is('$3B')")
+        assert await page.locator("#g-ladder .lrow .edge.best").count() == 0
+        await page.locator("#g-ladder .lrow .edge").nth(1).click()
+        assert "暂不建议：σ 是先验值，只作参考" in await page.inner_text("#g-ladder .lrow .edet")
         assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "no sideways scroll"
+        # the filter bar sees every level: 有建议 keeps the card (its $1B level); 3 小时内收盘 drops it (30 days left)
+        await page.click("#fchips button:text-is('有建议')")
+        assert await page.locator("#g-flat .card.lad").count() == 1
+        # in a grid of ordinary cards (filtered, or starred) a ladder takes the whole row: its table never sticks out
+        over = """[...document.querySelectorAll('#g-flat .card *')].filter(e => { const c = e.closest('.card').getBoundingClientRect(),
+                  r = e.getBoundingClientRect(); return r.width && (r.right > c.right + 0.5 || r.left < c.left - 0.5) }).length"""
+        for width in (620, 900, 1300, 390):
+            await page.set_viewport_size({"width": width, "height": 900})
+            assert await page.evaluate(over) == 0, width
+        await page.click("#fchips button:text-is('3 小时内收盘')")
+        assert await page.locator("#g-flat .card").count() == 0 and "没有符合条件的卡片" in await page.inner_text("#g-flat")
         await browser.close()
     await web.stop()
 

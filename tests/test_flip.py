@@ -172,7 +172,7 @@ async def run():
     assert bot.sim_result(trade, NOW)[0] == 1.0
     # no flip through the whole window: No, an hour after it ends
     fresh.put(f"flip:{SPEC.slug}", {"kind": "clear", "through": SPEC.end_ms + 60_000, "start": SPEC.start_ms, "top": 0.4, "top_at": NOW})
-    assert bot.sim_result(trade, SPEC.end_ms + 30 * 60_000) is None and bot.sim_result(trade, SPEC.end_ms + 2 * H) == (0.0, "窗口内没有反超")
+    assert bot.sim_result(trade, SPEC.end_ms + 30 * 60_000) is None and bot.sim_result(trade, SPEC.end_ms + 2 * H)[:2] == (0.0, "窗口内没有反超")
     assert live.odds(SPEC.end_ms + 2 * H) == 0.0
     # 加密 switched off: no card, no market, no job
     off = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BNB_TOUCH": "off"}), m.Store(":memory:"), FM(NOW), None)
