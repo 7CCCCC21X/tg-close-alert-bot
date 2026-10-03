@@ -564,6 +564,12 @@ async def browser_check(bot):
         assert (await page.inner_text("#opps")).startswith("🔥 机会 1") and "甲" in await page.inner_text("#opps")
         await page.click("#edit"); await page.click("#reset"); await page.click("#reset"); await page.click("#done")
         assert (await page.inner_text("#opps")).startswith("🔥 机会 2") and await page.evaluate("localStorage.getItem('oppOff')") is None
+        # a folded section still counts its red-framed cards in its title; the strip unfolds it before jumping in
+        await page.click("#h-levels .fold")
+        assert not await page.is_visible("#g-levels") and await page.inner_text("#h-levels .fs") == "4 张 · 🔥 1"
+        await page.click("#opps .opp:nth-of-type(2)"); await page.wait_for_timeout(300)
+        assert await page.is_visible("#g-levels .card") and await card.evaluate("c => c.classList.contains('flash')")
+        assert await page.evaluate("localStorage.getItem('folded')") == "[]"
         await card.locator("summary").click()
         text = await card.locator("dl").inner_text()
         assert "币安现货 BTCUSDT" in text and "最低价 ≤ 档位即 Yes" in text and "已核至" in text, text

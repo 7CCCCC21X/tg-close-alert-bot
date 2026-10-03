@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.20.2"
+VERSION = "1.20.3"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5573,6 +5573,9 @@ body.sorting,body.sorting *{cursor:grabbing!important;user-select:none!important
 .cb{border:1px solid var(--line);background:var(--chip);color:var(--text);border-radius:6px;padding:1px 9px;font:inherit;font-size:12px;line-height:1.6;cursor:pointer}.cb:hover{border-color:var(--best);color:var(--best)}
 .cb.pri{background:var(--best);border-color:var(--best);color:#fff}.cb.arm{border-color:var(--warn);color:var(--warn)}.cb:disabled{opacity:.4;cursor:default}
 h2 .cb{margin-left:6px;padding:0 8px;letter-spacing:0;font-weight:400}
+h2 .fold{border:0;background:none;font:inherit;color:inherit;letter-spacing:inherit;padding:4px 8px 4px 0;margin:-4px 0;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
+h2 .fold:before{content:"▾";color:var(--faint);font-size:11px;width:10px}h2 .fold[aria-expanded=false]:before{content:"▸"}h2 .fold:hover .hn{color:var(--text)}
+h2 .fs{font-weight:400;color:var(--faint)}h2 .fs b{color:var(--hot);font-weight:600}
 .card.off,.grid.off .card{opacity:.45}
 .panel{background:var(--card);border:1px solid var(--best);border-radius:12px;padding:10px 12px;margin:4px 0 8px;display:flex;flex-direction:column;gap:8px;font-size:13px}
 .panel .pr{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
@@ -5622,6 +5625,8 @@ let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim"],strs);
 try{if(!localStorage.getItem("simDefault")){if(!hideSec.includes("sim"))hideSec=[...hideSec,"sim"];keep("hideSec",hideSec);localStorage.setItem("simDefault","1")}}catch(e){}  // 模拟交易 starts hidden (show it in 自定义)
 let hotCents=stored("hot",10,v=>typeof v==="number"&&v>=1&&v<=50),HOT=hotCents/100;  // an edge this large gets the red frame
 let oppOff=stored("oppOff",[],strs),oppTaker=stored("oppTaker",false,v=>typeof v==="boolean");  // the strip on top: sections left out, takers only
+let folded=stored("folded",[],strs);  // sections folded away: the title stays, with how many cards it holds and how many are red-framed
+function toggleFold(g){folded=folded.includes(g)?folded.filter(x=>x!==g):[...folded,g];keep("folded",folded);if(last)render(last)}
 let secOrder=stored("secs",SECTIONS,strs);secOrder=[...new Set(secOrder.filter(g=>SECTIONS.includes(g)))];
 SECTIONS.forEach((g,i)=>{if(!secOrder.includes(g)){const prev=SECTIONS.slice(0,i).reverse().find(x=>secOrder.includes(x));  // a new section joins after its default neighbour
   secOrder.splice(prev?secOrder.indexOf(prev)+1:0,0,g)}});
@@ -5870,7 +5875,8 @@ function drawOpps(){  // every red-framed suggestion on the page in one strip on
   el.replaceChildren($("span","ok","🔥 机会 "+list.length+(oppTaker?"（只列吃单）":"")));
   list.slice(0,8).forEach(h=>{const b=$("button","opp");b.type="button";b.title="跳到这张卡";
     b.append($("b","",h.name),$("span","",h.pick.text),$("i","",sg(h.pick.edge)));
-    b.addEventListener("click",()=>{const c=[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);if(!c)return;
+    b.addEventListener("click",()=>{const find=()=>[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);let c=find();if(!c)return;
+      const g=c.parentElement.id.slice(2);if(folded.includes(g)){folded=folded.filter(x=>x!==g);keep("folded",folded);if(last)render(last);c=find()}
       c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+8)+"px";c.scrollIntoView({behavior:"smooth",block:"start"});
       c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")});el.append(b)});
   if(list.length>8)el.append($("span","mut","还有 "+(list.length-8)+" 个"))}
@@ -5998,9 +6004,14 @@ function render(d){
   const vis=secOrder.filter(s=>lists[s].length),foot=document.getElementById("foot");
   for(const[g,items]of Object.entries(lists)){
     const grid=document.getElementById("g-"+g),h=document.getElementById("h-"+g),off=g!=="fav"&&hideSec.includes(g),i=vis.indexOf(g);
+    const fold=!editing&&folded.includes(g);  // 自定义 shows every section open, so cards can be arranged
     grid.replaceChildren(...items.map(it=>card(it,g)));
-    h.hidden=grid.hidden=!items.length||(off&&!editing);grid.classList.toggle("off",off);
-    h.replaceChildren($("span","hn",SEC_NAMES[g]+(off?"（已隐藏）":"")),
+    h.hidden=!items.length||(off&&!editing);grid.hidden=h.hidden||fold;grid.classList.toggle("off",off);
+    const name=$("span","hn",SEC_NAMES[g]+(off?"（已隐藏）":""));let head=name,sum=null;
+    if(!editing){head=$("button","fold");head.type="button";head.setAttribute("aria-expanded",fold?"false":"true");
+      head.title=fold?"展开这一栏":"折叠这一栏（标题留着，写明张数和红框机会数）";head.append(name);head.addEventListener("click",()=>toggleFold(g))}
+    if(fold){const hot=grid.querySelectorAll(".card.hot").length;sum=$("span","fs",items.length+" 张");if(hot)sum.append(" · ",$("b","","🔥 "+hot))}
+    h.replaceChildren(head,...(sum?[sum]:[]),
       ...(editing&&g!=="fav"?[ctlBtn("↑","栏目上移",()=>moveSec(g,-1),i<=0),ctlBtn("↓","栏目下移",()=>moveSec(g,1),i<0||i>=vis.length-1)]:[]))}
   const now=[...document.querySelectorAll(".wrap>.grid")].map(e=>e.id.slice(2)).filter(g=>g!=="fav");
   if(now.join()!==secOrder.join())for(const g of secOrder)foot.before(document.getElementById("h-"+g),document.getElementById("g-"+g));
@@ -6039,8 +6050,8 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppTaker=false;
-  ["order","hidden","secs","hot","oppOff","oppTaker"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
+  order={};hidden=[];hideSec=["sim"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppTaker=false;folded=[];
+  ["order","hidden","secs","hot","oppOff","oppTaker","folded"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 async function load(){
   try{
