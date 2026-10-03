@@ -400,7 +400,8 @@ async def browser_check():
                                   points_spread=0.06, points_min_shares=100),
                               row("$2B", 0.001, 0.01, 0.02, e1b[:1], 0.02, stale=True, points_active=False, points_ok=False, points_note="积分未激活",
                                   points_why="积分未激活"),
-                              row("$3B", 0.004, 0.025, 0.026, e1b, 0.02, hold="σ 是先验值，只作参考", fetched_ms=now - 30_000)]
+                              row("$3B", 0.004, 0.025, 0.026, e1b, 0.02, hold="σ 是先验值，只作参考", fetched_ms=now - 30_000),
+                              {"label": "$5B", "fair": 0.001, "error": "", "dist": 4.0, "touched": False}]  # no Predict book: cap_payload's bare row
     payload = bot.odds_payload()
     payload["items"] = [item]
     bot.odds_payload = lambda: payload
@@ -420,7 +421,9 @@ async def browser_check():
                                          ["", "No 93.2¢ +3.2¢"], ["", "No 94.0¢ +2.3¢"],                    # $500M: 3.2¢ under a 3.24¢ bar
                                          ["pos", "No 97.4¢ +2.2¢"], ["pos", "No 97.5¢ +2.1¢"],              # $1B: both clear 2¢
                                          ["", "No 98.0¢ +1.9¢ 盘口过期"], ["", "No 99.0¢ +0.9¢ 盘口过期"],    # $2B: a stale book
-                                         ["", "No 97.4¢ +2.2¢ 暂不建议"], ["", "No 97.5¢ +2.1¢ 暂不建议"]], cells  # $3B: a prior σ
+                                         ["", "No 97.4¢ +2.2¢ 暂不建议"], ["", "No 97.5¢ +2.1¢ 暂不建议"],      # $3B: a prior σ
+                                         ["", "—"], ["", "—"]], cells                                          # $5B: no book
+        assert cells[10][2] == cells[11][2] == "Predict 暂无盘口", cells[10:]  # not a points-gate tooltip
         assert cells[0][2] == "挂No @ 63.8¢；净优势 +5.8¢，挂单排队，成交不保证；未过建议门槛", cells[0][2]
         assert cells[8][2].endswith("；σ 是先验值，只作参考"), cells[8][2]
         assert "门槛" not in await page.inner_text("#g-ladder")
@@ -435,6 +438,8 @@ async def browser_check():
         assert note.startswith("$1B：市值还要涨 100.0% 才碰到 · 模型 Yes 0.4¢ · Yes 盘口 2.5 / 2.6") and "50 PP/小时" in note, note
         chips = page.locator("#g-ladder .lrow .edge")
         assert await chips.count() == 4 and await page.locator("#g-ladder .lrow .edge.best").inner_text() == "挂No 97.4\n+2.2¢"
+        cols = await page.evaluate("getComputedStyle(document.querySelector('#g-ladder .lrow .edges')).gridTemplateColumns")
+        assert len(cols.split()) == 2, cols  # a phone: two chips per row, as on the price ladders
         await chips.nth(1).click()
         det = await page.inner_text("#g-ladder .lrow .edet")
         assert det.startswith("挂No @ 97.4¢：挂单排队") and "这个价位已有 5,000 份在排队" in det and "→ 满足" in det and "不标红框" in det, det

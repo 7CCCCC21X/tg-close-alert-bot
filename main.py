@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.21.5"
+VERSION = "1.21.6"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5631,7 +5631,7 @@ a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);t
 body.olddata .paction .pa,body.olddata .paction .pv{color:var(--faint)}body.olddata .price-top{opacity:.55}
 .pg .lrow{grid-column:1/-1;margin:0 0 7px;padding:7px 8px;border-radius:8px;background:var(--chip)}.pg .lnote{font-size:12px;line-height:1.5;color:var(--muted)}.pg .lnote .warn{display:block}.pg .lnote b{color:var(--text)}.pg .lspot{grid-column:1/-1;color:var(--muted);font-size:11px;display:flex;align-items:center;gap:8px;padding:5px 0}.pg .lspot:before,.pg .lspot:after{content:"";flex:1;border-top:1px dashed var(--line)}
 .price-lad .pb{padding-top:8px}.price-lad .quote{gap:5px 8px}.price-empty{font-size:12px;color:var(--muted);padding-top:8px}
-@media(max-width:560px){.pg{grid-template-columns:fit-content(150px) minmax(36px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:6px;font-size:11.5px}.pg .pcell{padding:6px 0}.ptarget .pdist,.ppoints,.paction .pwhy{font-size:10px}.price-top b{font-size:23px}.price-range{gap:3px 10px}.price-lad .edges{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:560px){.pg{grid-template-columns:fit-content(150px) minmax(36px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:6px;font-size:11.5px}.pg .pcell{padding:6px 0}.ptarget .pdist,.ppoints,.paction .pwhy{font-size:10px}.price-top b{font-size:23px}.price-range{gap:3px 10px}.price-lad .edges,.pg .edges{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:360px){.pg{grid-template-columns:fit-content(120px) minmax(30px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:4px;font-size:11px}.pg .lh{font-size:10px}}
 [hidden]{display:none!important}
 .grip{flex:none;border:0;background:none;padding:3px 5px;margin:-3px 0 -3px -6px;font-size:16px;line-height:1;color:var(--muted);cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}.grip:hover{color:var(--text)}
@@ -5935,8 +5935,10 @@ function priceLadderBook(c,it,L,live){
   // Compute opportunities from every level, including those folded out of the compact table.
   for(const r of live){const v=views.get(r);for(const e of v.ok){if(e.edge>=HOT){if(!hot||e.edge>hot.edge)hot={...e,row:r.label};if(!e.maker&&(!hotTk||e.edge>hotTk.edge))hotTk={...e,row:r.label}}}}
   if(live.length){
-    // the compact view: every level whose quote earns points now or that has a suggestion, then the nearest ones up to five
+    // the compact view: every level whose quote earns points now or that has a suggestion, the two around the price, then the nearest up to five
     const allKey=it.name+"#all-levels",all=open.has(allKey),focus=new Set(live.filter(r=>r.points_ok===true||views.get(r).ok.length));
+    const above=live.filter(r=>r.dist>0).sort((a,b)=>a.dist-b.dist)[0],below=live.filter(r=>r.dist<=0).sort((a,b)=>b.dist-a.dist)[0];
+    for(const r of [above,below])if(r)focus.add(r);  // the price keeps its neighbours however many levels earn points
     [...live].sort((a,b)=>Math.abs(a.dist??Infinity)-Math.abs(b.dist??Infinity)).forEach(r=>{if(focus.size<5)focus.add(r)});
     const shown=all||live.length<=6?live:live.filter(r=>focus.has(r));
     const tools=$("div","price-tools");tools.append($("span","hint",(L.kind==="price"?"挂单只在积分可得的档位 · ":"")+"吃单按 "+(amount||live[0].notional||100)+" U"));
@@ -5952,8 +5954,9 @@ function priceLadderBook(c,it,L,live){
       const model=$("span","pcell pmodel",r.fair==null?"—":cent(r.fair));
       const action=maker=>{const a=$("button","pcell paction"+(maker&&r.makers===false?" disabled":""));a.type="button";a.addEventListener("click",toggle);a.setAttribute("aria-expanded",openChip[rk]?"true":"false");
         const candidates=v.edges.filter(e=>e.maker===maker),e=candidates.sort((a,b)=>b.edge-a.edge)[0],eligible=!maker||r.makers===true,ok=e&&eligible&&v.ok.includes(e);
-        if(maker&&!eligible){a.append($("span","pa","—"));a.title=r.maker_note||r.points_note||"积分状态确认后才提示挂单优势";return a}
-        if(!e){a.append($("span","pa",r.error?"⚠ 请核实":r.stale?"盘口过期":r.bids==null&&r.asks==null?"—":"暂无报价"));a.title=r.error||r.hold||"等待有效盘口";return a}
+        if(maker&&!eligible){a.append($("span","pa","—"));a.title=r.bids==null&&r.asks==null?r.error||"Predict 暂无盘口":r.maker_note||r.points_note||"积分状态确认后才提示挂单优势";return a}
+        if(!e){const nobook=r.bids==null&&r.asks==null;a.append($("span","pa",r.error?"⚠ 请核实":r.stale?"盘口过期":nobook?"—":r.fair==null?"模型暂缺":"暂无报价"));
+          a.title=r.error||r.hold||(nobook?"Predict 暂无盘口":r.fair==null?"模型价暂缺，等待行情或 σ":"等待有效盘口");return a}
         if(ok){a.classList.add("pos");if(e.edge>=HOT)a.classList.add("hot")}
         const line=$("span","pa");line.append($("b","",e.up?"Yes":"No"),$("span","",cent(e.price)),$("span","pv",sg(e.edge)));a.append(line);
         if(r.error||r.hold||r.stale)a.append($("span","pwhy",r.stale?"盘口过期":"暂不建议"));else if(ok&&!maker&&e.short)a.append($("span","pwhy","深度不足"));
@@ -8877,7 +8880,7 @@ class Bot:
     def points_status(self, market_id: str, book: PredictBook | None, now_ms: int, stale_s: float) -> dict:
         """A market's LP points as its card shows them: the programme (points_active: paying now, points_rate per hour)
         and whether a quote placed now would earn (points_ok), else why not (points_why: Predict's own requirements —
-        trading open, a two-sided book, the spread under the market's cap). Unknown or stale rewards fail closed.
+        trading open, a two-sided book, the spread at or under the market's cap). Unknown or stale rewards fail closed.
         A one-sided book must not turn an isolated 99.9¢ ask into a supposedly profitable 0.1¢ maker quote."""
         cached = self.predict.market_meta.get(market_id) if market_id else None
         meta = cached[0] if cached else {}

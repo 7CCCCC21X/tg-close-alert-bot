@@ -130,6 +130,10 @@ async def run():
     block = {}; bot.book_block(block, wide, 0.5, 0.02, 0.0, "", ("涨", "跌"), NOW)
     assert block["points_active"] is True and block["points_rate"] == 55 and block["points_ok"] is False, block
     assert block["points_why"] == "价差 34.0¢ 超过积分上限 10.0¢", block["points_why"]
+    # right at the cap (10¢ wide against 10¢) still earns on an ordinary card's book too: the ETH 1k/3k case ran through here
+    exact = m.PredictBook("SSE", "sse-up", "sse-1", "t", ((D("0.55"), D("100")),), ((D("0.65"), D("100")),), NOW, 200)
+    block = {}; bot.book_block(block, exact, 0.5, 0.02, 0.0, "", ("涨", "跌"), NOW)
+    assert block["points_ok"] is True and block["points_why"] == "" and block["points_spread"] == 0.1, block
     bot.predict.market_meta["sse-1"] = (bot.predict.market_meta["sse-1"][0], time.monotonic() - m.PREDICT_POINTS_STALE_SECONDS - 1)
     block = {}; bot.book_block(block, other, 0.5, 0.02, 0.0, "", ("涨", "跌"), NOW)
     assert block["points_active"] is None and block["points_note"] == "积分状态已过期"
@@ -159,17 +163,19 @@ async def run():
                                    (meta(period(), trading_status=""), True, "市场交易状态暂缺"),
                                    (meta(period(), spread_threshold=None), True, "积分价差要求暂缺"),
                                    (meta(period(), spread_threshold=0.03), True, "超过积分上限"),
-                                   (meta(period(), spread_threshold=1), True, "超过积分上限 1.0¢")):  # "1" is 1¢, never a 100% cap
+                                   (meta(period(), spread_threshold=1), True, "超过积分上限 1.0¢"),  # "1" is 1¢, never a 100% cap
+                                   (meta(period(), spread_threshold=2.5), True, "价差 4.0¢ 超过积分上限 2.5¢"),  # fractional cents
+                                   (meta(period(), spread_threshold=101), True, "积分价差要求暂缺")):  # not a cap in cents or a fraction
         bot.predict.market_meta[MID] = (detail, time.monotonic())
         p = bot.range_payload(rm, NOW)["ladder"]["rows"][0]
         assert p["points_active"] is active and p["makers"] is False and reason in p["maker_note"], p
         assert [e["label"] for e in p["edges"] if e["best"]] == ["吃Yes"]
     # Predict's "最大价差" is inclusive: a 4¢ book at a 4¢ cap still earns (ETH 1k/3k: 78/84 at a 6¢ cap showed as 积分已激活);
     # a cap stated in cents means the same
-    for threshold in (0.04, 4):
+    for threshold, cap in ((0.04, 0.04), (4, 0.04), (100, 1.0)):  # 100 is the last value read as cents: a 100% cap never blocks
         set_meta(bot, period(), spread_threshold=threshold)
         p = bot.range_payload(rm, NOW)["ladder"]["rows"][0]
-        assert p["makers"] is True and p["maker_note"] == "" and p["points_spread"] == 0.04, (threshold, p["maker_note"])
+        assert p["makers"] is True and p["maker_note"] == "" and p["points_spread"] == cap, (threshold, p["maker_note"])
     bot.predict.market_meta[MID] = (meta(period()), time.monotonic() - m.PREDICT_REWARD_STALE_SECONDS - 1)
     p = bot.range_payload(rm, NOW)["ladder"]["rows"][0]
     assert p["points_active"] is None and p["makers"] is False and p["maker_note"] == "积分状态已过期"

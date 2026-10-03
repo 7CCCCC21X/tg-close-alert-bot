@@ -623,20 +623,24 @@ async def browser_check(bot):
                                          maker_note="积分未激活：不给挂单建议"),
                                    uirow("↑ $185k", 185000, points_active=True, points_ok=False, points_note="积分已激活", points_rate=150,
                                          points_why="价差 34.0¢ 超过积分上限 6.0¢", maker_note="价差 34.0¢ 超过积分上限 6.0¢"),
+                                   uirow("↑ $180k", 180000, fair=None),  # unknown points, a book without a model price
                                    uirow("↑ $175k", 175000, points_active=True, points_ok=True, points_note="积分已激活", points_rate=60, points_why="",
                                          makers=True, maker_note="", fair=.5, bid=.5, ask=.52, bids=[[.5, 5000]], asks=[[.52, 5000]]),  # earns, no edge
-                                   uirow("↑ $180k", 180000),
-                                   *[uirow("↑ $" + str(n) + "k", n * 1000) for n in range(170, 115, -5)],
-                                   uirow("↑ $114k", 114000, fair=.74, bid=.49, ask=.50, bids=[[.49, 5000]], asks=[[.50, 5000]], need=.02, swing=.02)]
+                                   *[uirow("↑ $" + str(n) + "k", n * 1000, points_active=True, points_ok=True, points_note="积分已激活", points_rate=40,
+                                           points_why="", makers=True, maker_note="") for n in (170, 165, 160)],  # five earning levels: past the pad
+                                   *[uirow("↑ $" + str(n) + "k", n * 1000) for n in range(155, 115, -5)],
+                                   uirow("↑ $114k", 114000, fair=.74, bid=.49, ask=.50, bids=[[.49, 5000]], asks=[[.50, 5000]], need=.02, swing=.02),
+                                   uirow("↓ $100k", 100000, dir="down")]
         payload["items"] = [stress]
         await page.reload()
         await page.wait_for_selector("#g-levels .pg")
         card = page.locator("#g-levels .card").first
-        assert await card.locator(".pg .ptarget").count() == 5
+        assert await card.locator(".pg .ptarget").count() == 7
         visible = await card.locator(".pg .lt").all_inner_texts()
-        # the compact view: levels that earn points now (↑ $200k, ↑ $175k) or carry a suggestion (↑ $114k's taker), then the nearest
-        assert "↑ $200k" in visible and "↑ $175k" in visible and "↑ $114k" in visible, visible
-        assert "↑ $190k" not in visible and "↑ $130k" not in visible, visible
+        # the compact view: the five levels that earn points now, ↑ $114k's taker suggestion, and ↓ $100k as the price's lower neighbour
+        # (the earning levels alone fill the five, so nothing else is padded in); ↑ $185k pays but cannot earn now, so it stays out
+        assert visible == ["↑ $200k", "↑ $175k", "↑ $170k", "↑ $165k", "↑ $160k", "↑ $114k", "↓ $100k"], visible
+        assert (await card.locator(".pg .lspot").inner_text()).startswith("现价") and await card.locator(".pg .lspot").count() == 1
         assert "挂Yes 50.0" in await page.inner_text("#opps")
         active = card.locator(".ptarget:has(.lt:text-is('↑ $200k'))")
         assert await active.locator(".ppoints.active").inner_text() == "● 200 PP/h"  # colour says active, the number the rate
@@ -660,12 +664,15 @@ async def browser_check(bot):
         assert await card.locator(".ptarget:has(.lt:text-is('↑ $180k')) .ppoints").count() == 0  # unknown: nothing
         unknown = card.locator(".ptarget:has(.lt:text-is('↑ $180k')) + .pmodel + .paction")
         assert await unknown.inner_text() == "—" and "积分状态暂缺" in await unknown.get_attribute("title")
+        nomodel = card.locator(".ptarget:has(.lt:text-is('↑ $180k')) + .pmodel + .paction + .paction")
+        assert await nomodel.inner_text() == "模型暂缺" and await nomodel.get_attribute("title") == "模型价暂缺，等待行情或 σ"  # a book, no fair price
+        assert await card.locator(".ptarget:has(.lt:text-is('↑ $180k')) + .pmodel").inner_text() == "—"
         await page.click("#fchips button:text-is('仅挂单')")
         assert await page.locator("#g-flat .card.price-lad").count() == 1
         assert "↑ $200k" in await page.locator("#g-flat .pg").inner_text()
         await page.click("#fchips button:text-is('仅挂单')")
         await card.locator(".price-tools button").click()
-        assert await card.locator(".pg .ptarget").count() == 5
+        assert await card.locator(".pg .ptarget").count() == 7
         for width in (320, 390, 900, 1300):
             await page.set_viewport_size({"width": width, "height": 900})
             assert await page.evaluate(over) == 0, width
