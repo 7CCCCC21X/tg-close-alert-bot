@@ -498,7 +498,7 @@ async def browser_check(bot):
     book = m.PredictBook("JIA", "x", "1", "x", ((D("0.30"), D("500")),), ((D("0.95"), D("500")),), NOW, 200)
     bot.book_block(jia["predict"], book, 0.5, bot.edge_need(0.0), 0.0, "", ("涨", "跌"), NOW)  # 挂跌 @ 5¢ +45¢, 挂涨 @ 30¢ +20¢; no taker edge
     assert jia["predict"]["points_active"] is None and jia["predict"]["points_note"] == "积分状态暂缺"  # every block carries its points
-    jia["predict"].update(points_active=True, points_rate=120, points_note="积分已激活")
+    jia["predict"].update(points_active=True, points_ok=True, points_rate=120, points_note="积分已激活", points_spread=0.06, points_min_shares=100)
     payload["items"] = [jia, *(i for i in payload["items"] if i["group"] == "levels")]
     btc = next(i for i in payload["items"] if i["name"] == "BTC 10月价格")
     tk = next(e for e in next(r for r in btc["ladder"]["rows"] if r["label"] == "↑ $120k")["edges"] if e["best"])
@@ -613,13 +613,16 @@ async def browser_check(bot):
             r = copy(template)
             r.update(label=label, level=level, dir="up", dist=level / 112050 - 1, fair=.8, bid=.5, ask=.52,
                      bids=[[.5, 5000]], asks=[[.52, 5000]], need=.285, swing=.285, error="", hold="", dir_note="",
-                     stale=False, touched=False, points_active=None, points_note="积分状态暂缺", makers=False,
-                     maker_note="积分状态暂缺：不给挂单建议")
+                     stale=False, touched=False, points_active=None, points_ok=None, points_note="积分状态暂缺", points_why="积分状态暂缺",
+                     makers=False, maker_note="积分状态暂缺：不给挂单建议")
             r.update(extra)
             return r
-        stress["ladder"]["rows"] = [uirow("↑ $200k", 200000, points_active=True, points_note="积分已激活", points_rate=200,
+        stress["ladder"]["rows"] = [uirow("↑ $200k", 200000, points_active=True, points_ok=True, points_note="积分已激活", points_rate=200, points_why="",
                                          makers=True, maker_note=""),
-                                   uirow("↑ $190k", 190000, points_active=False, points_note="积分未激活", maker_note="积分未激活：不给挂单建议"),
+                                   uirow("↑ $190k", 190000, points_active=False, points_ok=False, points_note="积分未激活", points_why="积分未激活",
+                                         maker_note="积分未激活：不给挂单建议"),
+                                   uirow("↑ $185k", 185000, points_active=True, points_ok=False, points_note="积分已激活", points_rate=150,
+                                         points_why="价差 34.0¢ 未低于积分要求 6.0¢", maker_note="价差 34.0¢ 未低于积分要求 6.0¢"),
                                    uirow("↑ $180k", 180000),
                                    *[uirow("↑ $" + str(n) + "k", n * 1000) for n in range(170, 115, -5)],
                                    uirow("↑ $114k", 114000, fair=.74, bid=.49, ask=.50, bids=[[.49, 5000]], asks=[[.50, 5000]], need=.02, swing=.02)]
@@ -647,6 +650,9 @@ async def browser_check(bot):
         assert "积分未激活：不给挂单建议" in await card.locator(".lrow .edet").inner_text()
         await card.locator(".ptarget:has(.lt:text-is('↑ $190k'))").click()
         assert await card.locator(".ptarget:has(.lt:text-is('↑ $190k')) .ppoints.off").get_attribute("title") == "积分未激活"  # a faint ○, no text
+        # a programme that pays, on a book too wide to earn: ○ keeps the rate, the tooltip says why (your BTC 70k/90k case)
+        paid = card.locator(".ptarget:has(.lt:text-is('↑ $185k')) .ppoints.off")
+        assert await paid.inner_text() == "○ 150 PP/h" and await paid.get_attribute("title") == "有积分（每小时 150 PP），但现在拿不到：价差 34.0¢ 未低于积分要求 6.0¢"
         assert await card.locator(".ptarget:has(.lt:text-is('↑ $180k')) .ppoints").count() == 0  # unknown: nothing
         unknown = card.locator(".ptarget:has(.lt:text-is('↑ $180k')) + .pmodel + .paction")
         assert await unknown.inner_text() == "—" and "积分状态暂缺" in await unknown.get_attribute("title")

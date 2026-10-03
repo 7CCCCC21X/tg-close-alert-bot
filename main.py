@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.21.1"
+VERSION = "1.21.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5822,11 +5822,14 @@ function matches(it){  // the filter bar: every chip that is on must hold for on
   return pool.length?Math.max(...pool.map(e=>e.edge)):-1}  // the sort key: its largest matching net edge
 function openLink(url){  // the market opens from this one button (in a new tab); the chips open their details instead
   const a=$("a","pt open","Predict ↗");a.href=url;a.target="_blank";a.rel="noopener noreferrer";a.title="在新标签页打开 Predict 市场";return a}
-function pointsPill(p){  // LP points on this market: a coloured ● with the hourly rate while active, a faint ○ when not; nothing while unknown
-  if(p.points_active===true){const x=$("span","ppoints active","● "+(p.points_rate!=null?qty(p.points_rate):"积分"));if(p.points_rate!=null)x.append(" ",$("span","pu","PP/h"));
-    x.title=(p.points_note||"积分已激活")+(p.points_rate!=null?"：这个市场的挂单每小时发 "+qty(p.points_rate)+" PP":"");return x}
-  if(p.points_active===false){const x=$("span","ppoints off","○");x.title=p.points_note||"积分未激活";x.setAttribute("aria-label",x.title);return x}
-  return null}
+function pointsPill(p){  // LP points: blue ● with the hourly rate when a quote placed now would earn (Predict's own requirements met);
+  // a faint ○ when not, keeping the rate when the market pays at all (the tooltip says why); nothing while unknown
+  if(p.points_active==null)return null;  // unknown (nothing read yet, stale, or a refresh failure): the gate fails closed, the pill stays off
+  const rate=p.points_active===true&&p.points_rate!=null?qty(p.points_rate):"",unit=x=>{if(rate)x.append(" ",$("span","pu","PP/h"));return x};
+  if(p.points_ok===true){const x=unit($("span","ppoints active","● "+(rate||"积分")));
+    x.title="积分可得：这个市场的挂单每小时发 "+(rate||"?")+" PP"+(p.points_spread!=null?"（价差须低于 "+cent(p.points_spread)+(p.points_min_shares?"、至少 "+p.points_min_shares+" 份":"")+"）":"");return x}
+  const x=unit($("span","ppoints off","○"+(rate?" "+rate:"")));
+  x.title=(rate?"有积分（每小时 "+rate+" PP），但现在拿不到：":"")+(p.points_why||p.points_note||"积分未激活");x.setAttribute("aria-label",x.title);return x}
 function book(p,key){
   const w=$("div","pb"),q=$("div","quote");q.append(openLink(p.url));w.append(q);
   const has=p.bids||p.asks;
@@ -6012,7 +6015,8 @@ function rowNote(r,L){  // one line about a ladder level itself, above its four 
   if(r.fair!=null)parts.push("模型 Yes "+cent(r.fair));
   if(r.bid!=null||r.ask!=null)parts.push("Yes 盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1)));
   d.append($("b","",r.label),$("span","",parts.length?"："+parts.join(" · "):""));
-  if(L.kind==="price"){const point=r.points_note||"积分状态暂缺";d.append($("div","",point+(r.points_active===true&&r.points_rate!=null?" · "+qty(r.points_rate)+" PP/小时":"")));if(r.makers===false&&r.maker_note&&r.maker_note!==point)d.append($("div","warn",r.maker_note))}
+  if(r.points_active!==undefined){const point=r.points_note||"积分状态暂缺",why=r.maker_note||r.points_why;d.append($("div","",point+(r.points_active===true&&r.points_rate!=null?" · "+qty(r.points_rate)+" PP/小时":"")));
+    if(r.points_ok===false&&why&&why!==point)d.append($("div","warn",why))}
   if(r.error)d.append($("span","warn","⚠️ "+r.error));
   if(r.dir_note)d.append($("span","warn",r.dir_note));
   if(r.hold&&!r.error&&r.hold!==r.dir_note)d.append($("span","warn","暂不建议："+r.hold));
@@ -8898,15 +8902,17 @@ class Bot:
         meta = (self.predict.market_meta.get(row.market_id) or ({}, 0))[0] if row.market_id else {}
         return "RESOLVED" in str(meta.get("status", "")).upper()
 
-    def range_maker_status(self, row: LadderRow, book: PredictBook | None, now_ms: int) -> dict:
-        """The UI and alerts use the same price-ladder maker gate; unknown or stale rewards fail closed.
+    def points_status(self, market_id: str, book: PredictBook | None, now_ms: int, stale_s: float) -> dict:
+        """A market's LP points as its card shows them: the programme (points_active: paying now, points_rate per hour)
+        and whether a quote placed now would earn (points_ok), else why not (points_why: Predict's own requirements —
+        trading open, a two-sided book, the spread under the market's cap). Unknown or stale rewards fail closed.
         A one-sided book must not turn an isolated 99.9¢ ask into a supposedly profitable 0.1¢ maker quote."""
-        cached = self.predict.market_meta.get(row.market_id)
+        cached = self.predict.market_meta.get(market_id) if market_id else None
         meta = cached[0] if cached else {}
         status = predict_reward_status(meta, now_ms)
-        if cached is None or time.monotonic() - cached[1] >= PREDICT_REWARD_STALE_SECONDS:
+        if cached is None or time.monotonic() - cached[1] >= stale_s:
             status.update(points_active=None, points_note="积分状态已过期" if cached else "积分状态暂缺")
-        elif row.market_id in self.predict.meta_errors:
+        elif market_id in self.predict.meta_errors:
             status.update(points_active=None, points_note="积分状态刷新失败")
         reason = status["points_note"] if status["points_active"] is not True else ""
         if not reason and str(meta.get("trading_status", "")).upper() != "OPEN":
@@ -8926,9 +8932,15 @@ class Bot:
             reason = f"价差 {cents(float(book.ask[0] - book.bid[0]))} 未低于积分要求 {cents(float(threshold))}"
         if not reason and book.stale(now_ms):
             reason = "盘口已过期，挂单暂不建议"
-        return {**status, "makers": not bool(reason), "maker_note": reason,
+        return {**status, "points_ok": not bool(reason), "points_why": reason,
                 "points_spread": float(threshold) if threshold is not None else None,
                 "points_min_shares": meta.get("share_threshold")}
+
+    def range_maker_status(self, row: LadderRow, book: PredictBook | None, now_ms: int) -> dict:
+        """The UI and alerts use the same price-ladder maker gate: a maker is suggested only where its quote would earn
+        points now; the level's reward metadata is read every minute and trusted for PREDICT_REWARD_STALE_SECONDS."""
+        status = self.points_status(row.market_id, book, now_ms, PREDICT_REWARD_STALE_SECONDS)
+        return {**status, "makers": status["points_ok"], "maker_note": status["points_why"]}
 
     def range_fair(self, rm: RangeMarket, row: LadderRow, direction: str, now_ms: int) -> float | None:
         """P(Yes) for one level as its card shows it. A market Predict settled before the window closed: its own result
@@ -9289,16 +9301,6 @@ class Bot:
         """The net edge a suggestion must clear: the configured minimum, or the model's own error when that is larger."""
         return max(self.config.predict_min_edge, swing)
 
-    def points_fields(self, market_id: str, now_ms: int) -> dict:
-        """A market's LP points for its card: active (True / False; None while unknown or stale), the hourly rate, a
-        note. The details are read with the market's fee every PREDICT_META_SECONDS (ladder levels every
-        PREDICT_REWARD_SECONDS) and trusted for PREDICT_POINTS_STALE_SECONDS."""
-        cached = self.predict.market_meta.get(market_id) if market_id else None
-        status = predict_reward_status(cached[0] if cached else {}, now_ms)
-        if cached is None or time.monotonic() - cached[1] >= PREDICT_POINTS_STALE_SECONDS:
-            status.update(points_active=None, points_note="积分状态已过期" if cached else "积分状态暂缺")
-        return {k: status[k] for k in ("points_active", "points_note", "points_rate")}
-
     def book_block(self, out: dict, book: PredictBook, fair: float | None, need: float, swing: float, hold: str,
                    sides: tuple[str, str], now_ms: int, makers: bool = True) -> None:
         """Fill a card's book block: both sides' depth (priced as the 涨 / Yes side), the model's fair price for that side,
@@ -9309,8 +9311,8 @@ class Bot:
                    age=max(0, (now_ms - book.fetched_ms) // 1000), stale=book.stale(now_ms), fetched_ms=book.fetched_ms,
                    fee_bps=book.fee_bps if book.fee_bps is not None else self.config.predict_fee_bps, sides=list(sides),
                    notional=self.config.predict_trade_usd, makers=makers)
-        if "points_active" not in out:  # a price ladder sets its levels' points itself (with the maker gate)
-            out.update(self.points_fields(book.market_id, now_ms))
+        if "points_active" not in out:  # a price ladder sets its levels' points itself (read every minute, with the maker gate)
+            out.update(self.points_status(book.market_id, book, now_ms, PREDICT_POINTS_STALE_SECONDS))
         if fair is None:
             return
         edges = book_edges(fair, book, self.edge_costs())
