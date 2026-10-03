@@ -146,7 +146,8 @@ async def layout_check(browser, page):
     await page.click("#g-fav .card .star")
     await page.reload(); await page.wait_for_selector("#g-crypto .card"); await page.click("#edit")
     assert await heads() == ["crypto", "contract", "levels", "index", "ladder", "sim"]
-    # 恢复默认布局 takes a second click within 4 s and leaves the stars alone
+    # 恢复默认布局 takes a second click within 4 s and leaves the stars alone (folded sections open again too)
+    await page.evaluate("keep('folded', ['index'])")
     await page.click("#g-crypto .card:nth-child(4) .star")
     await page.click("#reset")
     assert await page.inner_text("#reset") == "再点一次确认" and await names("ladder") == ["$ANSEM FDV", "$牛来 市值", "$PONS FDV"]
@@ -157,6 +158,7 @@ async def layout_check(browser, page):
     assert await page.inner_text("#reset") == "恢复默认布局" and await heads() == ["fav", "index", "contract", "crypto", "levels", "ladder", "sim"]
     assert await names("ladder") == ["$牛来 市值", "$ANSEM FDV", "$PONS FDV"] and await names("crypto") == [*crypto[:3], *crypto[4:]]
     assert await stored("order") is None and await stored("secs") is None and await stored("favs") == '["BTCUSDT"]'
+    assert await stored("folded") is None
     assert await names("fav") == ["BTC 先触 70k/90k"]
     await page.click("#done"); await page.click("#g-fav .card .star")
     assert not await page.is_visible("#h-fav") and await names("crypto") == ["BNB 先触 700/900", "SOL 先触 60/140", "BTC 先触 70k/90k",
@@ -201,6 +203,14 @@ async def browser_check(async_playwright, chrome, port, token):
         await page.click("#g-fav .card:nth-child(2) .star")
         await page.click("#g-fav .card .star")
         assert not await page.is_visible("#h-fav") and await page.locator("#g-contract .card").count() == 1
+        # a section title folds its cards away: the title stays, with the count; kept in this browser across reloads
+        await page.click("#h-crypto .fold")
+        assert not await page.is_visible("#g-crypto") and await page.is_visible("#h-crypto") and await page.inner_text("#h-crypto .fs") == "6 张"
+        assert await page.get_attribute("#h-crypto .fold", "aria-expanded") == "false" and await page.evaluate("localStorage.getItem('folded')") == '["crypto"]'
+        await page.reload(); await page.wait_for_selector("#g-index .card")
+        assert not await page.is_visible("#g-crypto") and await page.inner_text("#h-index") == "指数" and await page.is_visible("#g-index .card")
+        await page.click("#h-crypto .fold")
+        assert await page.is_visible("#g-crypto .card") and await page.locator("#h-crypto .fs").count() == 0 and await page.evaluate("localStorage.getItem('folded')") == "[]"
         await layout_check(browser, page)
         if os.environ.get("WEB_SCREENSHOT"):
             await page.screenshot(path=os.environ["WEB_SCREENSHOT"], full_page=True)
