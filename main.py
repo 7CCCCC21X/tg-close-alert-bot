@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.20.0"
+VERSION = "1.20.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4973,20 +4973,34 @@ def price_level(title: str) -> D | None:
 
 
 def level_direction(rules: str, *titles: str) -> tuple[str, str]:
-    """('up' | 'down' | '', where it was read): a market's own rules first (High ≥ / Low ≤; rules naming both say nothing
-    about this one market), then its title or question (↑ reach / ↓ dip); '' when neither says."""
+    """('up' | 'down' | '', where it was read): a market's own rules (High ≥ / Low ≤; rules naming both say nothing about
+    this one market), else an arrow in its title or question, else a word there (reach / dip); '' when nothing says. An
+    arrow against the rules (the rules text may be the whole category's) is returned as the arrow says, marked "冲突"."""
     text = re.sub(r"\s+", " ", re.sub(r"[\"'“”‘’*]", "", str(rules))).lower()
     down = re.search(r"\blow(?: price)? (?:is )?(?:equal to or (?:lower|less|below)|at or below|<=|≤)|\bfinal low\b", text)
     up = re.search(r"\bhigh(?: price)? (?:is )?(?:equal to or (?:greater|higher|above)|at or above|>=|≥)|\bfinal high\b", text)
-    if bool(down) != bool(up):
-        return ("down" if down else "up"), "规则"
+    by_rules = ("down" if down else "up") if bool(down) != bool(up) else ""
+    arrow = next((d for t in titles for d, mark in (("down", r"[↓▼]"), ("up", r"[↑▲]")) if re.search(mark, str(t))), "")
+    if by_rules and arrow and arrow != by_rules:
+        return arrow, "冲突"
+    if by_rules:
+        return by_rules, "规则"
+    if arrow:
+        return arrow, "标题"
     for title in titles:
         t = str(title).lower()
-        if re.search(r"[↓▼]|\bdips?\b|\bdrops?\b|\bfalls?\b|\bbelow\b|跌", t):
+        if re.search(r"\bdips?\b|\bdrops?\b|\bfalls?\b|\bbelow\b|跌", t):
             return "down", "标题"
-        if re.search(r"[↑▲]|\breach(?:es)?\b|\babove\b|\brises?\b|\bhigh(?:er)?\b|涨", t):
+        if re.search(r"\breach(?:es)?\b|\babove\b|\brises?\b|\bhigh(?:er)?\b|涨", t):
             return "up", "标题"
     return "", ""
+
+
+# a level whose market does not say ↑ or ↓ (or says both ways): the card's note, and the short reason the paper trader keeps
+RANGE_GUESS = {"推断": "这个市场的规则和标题都没写明上破还是下破，按档位在月初价格之上（↑）还是之下（↓）推断；只作参考",
+               "默认": "这个市场的规则和标题都没写明上破还是下破，方向按本类规则默认；只作参考",
+               "冲突": "标题的箭头和规则写的方向相反，按标题显示；请到 Predict 核实后再看"}
+RANGE_GUESS_SHORT = {"推断": "方向是推断的", "默认": "方向按本类规则默认", "冲突": "标题与规则的方向相反"}
 
 
 def low_probability(spot: float, level: float, sigma: float, years: float) -> float:
@@ -5530,6 +5544,13 @@ a.simrow{display:grid;grid-template-columns:auto 1fr auto auto;gap:2px 8px;font-
 a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);text-decoration:none;align-self:flex-start}.simj:hover{text-decoration:underline}.panel a.cb{text-decoration:none;color:var(--best)}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}.lg .lk b{color:var(--faint)}.lg .lk.pos b{color:var(--best)}.lg .lz{color:var(--faint);font-size:11px;margin-left:3px}
 @media (max-width:560px){.lg{gap:3px 7px;font-size:12px}.lg .ld,.lg .lz,.lg .lp{display:none}.lg{grid-template-columns:auto auto auto auto 1fr}}
 .small{font-size:12px;margin-top:3px}.mut{color:var(--faint)}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
+#opps{display:flex;flex-wrap:wrap;align-items:center;gap:5px 6px;margin:6px 0 2px;font-size:12px}#opps .ok{color:var(--hot);font-weight:650;white-space:nowrap}
+.opp{display:inline-flex;align-items:baseline;gap:4px;max-width:100%;border:1px solid var(--hot);background:var(--hot-bg);color:var(--text);border-radius:999px;padding:2px 9px;font:inherit;font-size:12px;line-height:1.4;cursor:pointer;font-variant-numeric:tabular-nums}
+.opp b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46vw}.opp span{color:var(--muted);white-space:nowrap}.opp i{font-style:normal;color:var(--hot);font-weight:650}
+.opp:hover{border-color:var(--hot);box-shadow:0 0 0 2px var(--hot-bg)}body.olddata #opps{display:none}
+.card.flash{animation:flash 1.4s ease-out}@keyframes flash{from{outline:3px solid var(--best);outline-offset:3px}to{outline:3px solid transparent;outline-offset:3px}}
+.lg .lspot{grid-column:1/-1;display:flex;align-items:center;gap:8px;color:var(--faint);font-size:11px;line-height:1;margin:1px 0;cursor:default}.lg .lspot:before,.lg .lspot:after{content:"";flex:1;border-top:1px dashed var(--line)}
+.lg .lnote{font-size:12px;color:var(--muted);line-height:1.5;cursor:default}.lg .lnote b{color:var(--text)}.lg .lnote .warn{display:block}
 [hidden]{display:none!important}
 .grip{flex:none;border:0;background:none;padding:3px 5px;margin:-3px 0 -3px -6px;font-size:16px;line-height:1;color:var(--muted);cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}.grip:hover{color:var(--text)}
 body.sorting,body.sorting *{cursor:grabbing!important;user-select:none!important}
@@ -5551,6 +5572,7 @@ button.tog{font-family:inherit;padding:2px 9px}.tog.on{border-color:var(--best);
 <label class="fsort">排序 <select id="sortsel"><option value="">默认</option><option value="edge">按净优势</option><option value="time">按剩余时间</option></select></label>
 <span class="famt" title="吃单按这个金额计算成交均价、可买份数、手续费和滑点">试算 <span id="amts"></span><input type="number" id="amtin" min="1" step="1" placeholder="自定" aria-label="自定金额"> U</span></div>
 <div id="stale" hidden><span id="stalemsg"></span><button type="button" class="cb" id="retry">立即重试</button></div>
+<div id="opps" hidden></div>
 <div class="panel" id="custom" hidden>
 <div class="pr"><b>自定义布局</b><span class="mut">拖动 ⠿ 或点 ◀ ▶ 调整卡片顺序（收藏栏平时也能拖），栏目标题旁的 ↑ ↓ 调整栏目顺序；“隐藏”收起不看的卡片。只保存在这个浏览器。</span></div>
 <div class="pr" id="secs"></div>
@@ -5637,7 +5659,7 @@ let filt=stored("filt",[],strs),sortBy=stored("sort","",v=>["","edge","time"].in
 const FILTERS=[["sug","有建议","只看现在有建议的卡片"],["no","仅 No/跌","只看建议买 No（或 跌、后一个结果）的"],["maker","仅挂单","只看建议挂单的"],
   ["taker","仅吃单","只看建议吃单的"],["soon","3 小时内收盘","只看 3 小时内收盘或截止的"]];
 const SOON_MS=3*3600e3,STALE_MS=60e3;  // no successful refresh for a minute: every highlight comes off
-let openChip={},okAt=0,failMsg="";
+let openChip={},okAt=0,failMsg="",hots=[];  // hots: this render's red-framed suggestions, for the strip on top
 function takerFill(levels,notional){  // [average price, shares, short?] buying `notional` USD across [[price, size]], best first
   if(!levels.length)return[0,0,true];let spent=0,shares=0;
   for(const[p,q]of levels){const take=Math.min(q,(notional-spent)/p);spent+=take*p;shares+=take;if(spent>=notional-1e-9)return[spent/shares,shares,false]}
@@ -5780,7 +5802,7 @@ function priceLadder(c,it,L,det,sm){
   const st=$("div","lstat");
   if(it.missing)st.append($("p","","概率暂缺："+it.missing));else if(L.error)st.append($("div","warn small","⚠️ "+L.error));
   if(L.hold&&!it.missing)st.append($("div","warn small","⚠️ "+L.hold));
-  if(L.waiting)st.append($("p","mut",L.waiting));
+  if(L.waiting)st.append($("div","mut small",L.waiting));
   const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
   if(done.length){const t=$("div","touched");t.append($("span","k","✓ 已触及"));
     done.forEach(r=>{const x=$("span","tchip",r.label);x.title="本月"+(r.dir==="up"?"最高价":"最低价")+"已到 "+r.label.slice(2);t.append(x)});st.append(t)}
@@ -5793,7 +5815,9 @@ function ladderBook(c,it,L,live){  // the ladder's Predict block: one row per op
   if(live.length){const g=$("div","lg");
     const hd=(t,cl,tip)=>{const x=$("span","lh"+(cl?" "+cl:""),t);if(tip)x.title=tip;return x};
     g.append(hd("目标"),hd("距离","ln ld",L.kind==="price"?"现价还要涨（+）或跌（−）多少才碰到":"还要涨多少才碰到"),hd("模型","ln","模型给 Yes 的公平价"),hd("买1 / 卖1","","Yes 的盘口"),hd("最优","","点一行看这一档的四个方向和明细"),hd("吃单","","立即成交的较优一边：吃Yes@卖1 或 吃No@1−买1，× 为能买的份数"));
+    let marked=false;const spotRow=()=>$("div","lspot","现价 "+L.price);  // ↑ levels above the price's own line, ↓ levels below
     live.forEach(r=>{const v=bookView(r),best=v.best,n=x=>x==null?"无":(x*100).toFixed(1),rk=key+"#"+r.label;
+      if(L.kind==="price"&&!marked&&L.spot!=null&&r.level<=L.spot){g.append(spotRow());marked=true}
       const q=r.bid==null&&r.ask==null?(r.error?"—":"…"):n(r.bid)+" / "+n(r.ask);
       const need=r.need||0,b=$("span","lb"+(best?(best.edge>=HOT?" hot":" pos"):""));
       // nothing to suggest: the closest direction, grey (a prior σ always lands here: shown, never suggested)
@@ -5808,14 +5832,38 @@ function ladderBook(c,it,L,live){  // the ladder's Predict block: one row per op
       else t.textContent="—";
       const dist=r.dist==null?"—":(r.dist>=0?"+":"−")+(Math.abs(r.dist)*100).toFixed(Math.abs(r.dist)<0.1&&L.kind==="price"?1:0)+"%";
       const cells=[$("span","lt",r.label),$("span","ln ld",dist),$("span","ln",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b,t];
-      if(r.dir_note)cells[0].title=r.dir_note;  // the market does not say ↑ or ↓: a guess, never suggested
-      if(v.edges.length)cells.forEach(x=>{x.title=x.title||"点开看这一档的四个方向";x.addEventListener("click",ev=>{ev.preventDefault();openChip[rk]=openChip[rk]?null:"row";if(last)render(last)})});
+      if(r.dir_note)cells[0].title=r.dir_note;  // the market does not say ↑ or ↓ (or disputes it): shown, never suggested
+      const tap=v.edges.length>0||!!r.error;  // a level with a warning opens too: the reason has to be readable on a phone
+      if(tap)cells.forEach(x=>{x.title=x.title||(v.edges.length?"点开看这一档的四个方向":"点开看原因");x.addEventListener("click",ev=>{ev.preventDefault();openChip[rk]=openChip[rk]?null:"row";if(last)render(last)})});
       g.append(...cells);
-      if(openChip[rk]&&v.edges.length){const d=$("div","lrow");d.append(chips(rk+"/",v,ctxOf(r)));g.append(d)}});
+      if(openChip[rk]&&tap){const d=$("div","lrow");d.append(rowNote(r,L));if(v.edges.length)d.append(chips(rk+"/",v,ctxOf(r)));g.append(d)}});
+    if(L.kind==="price"&&!marked&&L.spot!=null)g.append(spotRow());
     w.append(g)}
   c.append(w);
-  if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" +"+cent(hot.edge)}
+  if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" +"+cent(hot.edge);
+    hots.push({key,name:it.name,text:hot.row+" "+hot.label+" "+(hot.price*100).toFixed(1),edge:hot.edge})}
   return c}
+function drawOpps(){  // every red-framed suggestion on the page in one strip on top, largest first; tap one to jump to its card
+  const el=document.getElementById("opps"),list=hots.filter((h,i)=>hots.findIndex(x=>x.key===h.key)===i).sort((a,b)=>b.edge-a.edge);
+  el.hidden=editing||!list.length;if(el.hidden){el.replaceChildren();return}
+  el.replaceChildren($("span","ok","🔥 机会 "+list.length));
+  list.slice(0,8).forEach(h=>{const b=$("button","opp");b.type="button";b.title="跳到这张卡";
+    b.append($("b","",h.name),$("span","",h.text),$("i","",sg(h.edge)));
+    b.addEventListener("click",()=>{const c=[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);if(!c)return;
+      c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+8)+"px";c.scrollIntoView({behavior:"smooth",block:"start"});
+      c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")});el.append(b)});
+  if(list.length>8)el.append($("span","mut","还有 "+(list.length-8)+" 个"))}
+function rowNote(r,L){  // one line about a ladder level itself, above its four directions: on a phone nothing hovers
+  const d=$("div","lnote"),parts=[];
+  if(r.dist!=null)parts.push((L.kind==="price"?"现价还要"+(r.dist>=0?"涨 ":"跌 "):L.metric+"还要涨 ")+(Math.abs(r.dist)*100).toFixed(1)+"% 才碰到");
+  if(r.fair!=null)parts.push("模型 Yes "+cent(r.fair));
+  if(r.bid!=null||r.ask!=null)parts.push("Yes 盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1)));
+  d.append($("b","",r.label),$("span","",parts.length?"："+parts.join(" · "):""));
+  if(r.error)d.append($("span","warn","⚠️ "+r.error));
+  if(r.dir_note)d.append($("span","warn",r.dir_note));
+  if(r.hold&&!r.error&&r.hold!==r.dir_note)d.append($("span","warn","暂不建议："+r.hold));
+  else if(r.stale&&!r.error)d.append($("span","warn","盘口过期：不给建议"));
+  return d}
 function card(it,g){
   const c=$("div","card"+(it.missing?" missing":"")),head=$("div","head"),nm=$("div","name",it.name);
   nm.title=it.symbol||it.name;const fk=favKey(it),on=favs.includes(fk),st=$("button","star"+(on?" on":""),on?"★":"☆");
@@ -5841,7 +5889,8 @@ function card(it,g){
   if(it.kind==="sim")return simCard(c,it);
   if(it.kind==="ladder")return ladder(c,it);
   const best=view(it).best;  // for the trade size picked in the bar
-  if(best&&best.edge>=HOT){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge)}
+  if(best&&best.edge>=HOT){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge);
+    hots.push({key:fk,name:it.name,text:best.label+" "+(best.price*100).toFixed(1),edge:best.edge})}
   if(it.missing){c.append($("p","","概率暂缺："+it.missing));tail(c,it);return c}
   const o=$("div","odds"),a=$("b",style==="us"?"d":"u"),b=$("b",style==="us"?"u":"d");
   const lb=it.labels||["涨","跌"];a.append($("span","lbl",lb[0]),pct(it.fair_up)+"¢");b.append(pct(it.fair_down)+"¢",$("span","lbl",lb[1]));
@@ -5905,7 +5954,7 @@ let plan={};  // section -> the card keys it shows, for the ◀ ▶ buttons whil
 function keysOrder(g){return plan[g]||[]}
 function render(d){
   if(drag){pending=d;return}  // never rebuild the cards under a drag; the latest data is drawn when it ends
-  drawBar();
+  drawBar();hots=[];
   const flat=!editing&&(filt.length>0||sortBy!=="");document.body.classList.toggle("flatview",flat);
   const fh=document.getElementById("h-flat"),fg=document.getElementById("g-flat");fh.hidden=fg.hidden=!flat;
   if(flat){  // every visible card that passes the bar, in one list (cards and sections hidden in 自定义 stay hidden)
@@ -5917,7 +5966,7 @@ function render(d){
     const clear=ctlBtn("清除筛选","回到按栏目分组的页面",()=>{filt=[];sortBy="";keep("filt",filt);keep("sort",sortBy);if(last)render(last)});
     fh.replaceChildren($("span","hn",(filt.length?"筛选结果":"全部卡片")+" "+hits.length+" 张"+(sortBy==="edge"?" · 按净优势":sortBy==="time"?" · 按剩余时间":"")),clear);
     fg.replaceChildren(...(hits.length?hits.map(x=>card(x.it,"flat")):[$("p","mut","没有符合条件的卡片")]));
-    tick();return}
+    drawOpps();tick();return}
   // starred cards leave their own section for the one on top, in the order the viewer keeps them (drag ⠿ to change);
   // hidden cards and sections are left out, except in 自定义 where they show faded so they can be brought back
   const shown=i=>editing||!hidden.includes(favKey(i));
@@ -5933,7 +5982,7 @@ function render(d){
       ...(editing&&g!=="fav"?[ctlBtn("↑","栏目上移",()=>moveSec(g,-1),i<=0),ctlBtn("↓","栏目下移",()=>moveSec(g,1),i<0||i>=vis.length-1)]:[]))}
   const now=[...document.querySelectorAll(".wrap>.grid")].map(e=>e.id.slice(2)).filter(g=>g!=="fav");
   if(now.join()!==secOrder.join())for(const g of secOrder)foot.before(document.getElementById("h-"+g),document.getElementById("g-"+g));
-  tick()}
+  drawOpps();tick()}
 function drawLegend(){
   const lg=document.getElementById("legend");const sw=$("span","sw");[["涨",upColor()],["平","var(--flat)"],["跌",downColor()]].forEach(([t,col])=>{const i=$("i");i.style.background=col;sw.append(i,t)});
   const hot=$("span","sw hot");hot.append($("i"),"红框 = 净优势 ≥"+hotCents+"¢（高亮门槛）");hot.title="可在 ✎ 自定义 里修改；和建议门槛不是一回事：没超过建议门槛的方向不会被建议";
@@ -8175,7 +8224,7 @@ class Bot:
                     continue
                 top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0)
                 hold = ("数据显示已触及，但盘口仍低于 90¢" if fair == 1.0 and top < 0.9 else problem
-                        or ("Predict 已结算" if self.range_settled(row) else "") or ("方向是推断的" if self.range_guess(source) else ""))
+                        or ("Predict 已结算" if self.range_settled(row) else "") or RANGE_GUESS_SHORT.get(source, ""))
                 out.append(SimMarket(f"{rm.spec.slug}#{row.market_id}", f"{rm.spec.name} {('↑ ' if direction == 'up' else '↓ ')}"
                                      f"{level_label(row.target)}", "range", rm.spec.key, fair, book,
                                      self.edge_need(rm.model_swing(row.target, direction, now_ms, fair)), hold, ("Yes", "No"),
@@ -8664,9 +8713,8 @@ class Bot:
 
     @staticmethod
     def range_guess(source: str) -> str:
-        """Why a level's direction is only a guess ("" when its market says it)."""
-        return {"推断": "这个市场的规则和标题都没写明上破还是下破，按档位在月初价格之上（↑）还是之下（↓）推断；只作参考",
-                "默认": "这个市场的规则和标题都没写明上破还是下破，方向按本类规则默认；只作参考"}.get(source, "")
+        """Why a level's direction is only a guess, or disputed ("" when its market says it)."""
+        return RANGE_GUESS.get(source, "")
 
     def range_settled(self, row: LadderRow) -> bool:
         """Predict has settled this level's market (nothing is suggested on it any more)."""
@@ -8717,6 +8765,7 @@ class Bot:
             "source": "币安合约" if spec.venue == "futures" else "币安现货",
             "close_label": f"{spec.label(spec.end_ms)}这根 1 分钟 K 为止",
             "ladder": {"kind": "price", "metric": "价格", "price": price_text(float(rm.price) if rm.price is not None else None),
+                       "spot": float(rm.price) if rm.price is not None else None,  # the page draws its line among the levels
                        "high": price_text(high), "low": price_text(low),
                        "high_at": stamp(marks["high_at"], seconds=False) if marks["high_at"] else "",
                        "low_at": stamp(marks["low_at"], seconds=False) if marks["low_at"] else "",
@@ -8733,7 +8782,7 @@ class Bot:
         elif now_ms - rm.priced_ms > rm.PRICE_STALE_MS and now_ms < rm.window_end:
             item["missing"] = f"币安价格停在 {stamp(rm.priced_ms, seconds=False)}，暂停概率（已触及的档位仍算已触及）"
         if not rows and self.config.predict:
-            item["ladder"]["waiting"] = "等待 Predict 档位" + (f"（{self.predict.errors[spec.key]}）" if spec.key in self.predict.errors else "")
+            item["ladder"]["waiting"] = "等待 Predict 档位"  # the Predict line of the card says why (not listed yet, an error)
         return item
 
     def item_market(self, title: str) -> str | None:
