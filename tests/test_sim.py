@@ -23,9 +23,14 @@ FEE = 0.02  # Predict: 2% × min(p, 1 − p) when the market states no rate
 # --- settings ----------------------------------------------------------------------------------------------------------
 c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"})
 assert c.sim and c.sim_edge == 0.10 and c.sim_shares == 100
-c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM": "off", "SIM_EDGE_CENTS": "15", "SIM_SHARES": "250"})
-assert not c.sim and abs(c.sim_edge - 0.15) < 1e-12 and c.sim_shares == 250
-for bad in ({"SIM_EDGE_CENTS": "0"}, {"SIM_EDGE_CENTS": "60"}, {"SIM_SHARES": "0"}):
+assert c.sim_ways == "taker" and c.sim_markets == frozenset({"close"}) and m.sim_scope(c) == ("只吃单", "指数/个股日涨跌")  # the defaults
+c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM": "off", "SIM_EDGE_CENTS": "15", "SIM_SHARES": "250", "SIM_WAYS": "Both",
+                       "SIM_MARKETS": "range, Ladder"})
+assert not c.sim and abs(c.sim_edge - 0.15) < 1e-12 and c.sim_shares == 250 and c.sim_ways == "both" and c.sim_markets == {"range", "ladder"}
+assert m.sim_scope(c) == ("挂单和吃单", "价格阶梯、市值阶梯")
+c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MARKETS": "all", "SIM_WAYS": ""})
+assert c.sim_markets == frozenset(m.SIM_KINDS) and c.sim_ways == "taker" and m.sim_scope(c) == ("只吃单", "全部市场")
+for bad in ({"SIM_EDGE_CENTS": "0"}, {"SIM_EDGE_CENTS": "60"}, {"SIM_SHARES": "0"}, {"SIM_WAYS": "none"}, {"SIM_MARKETS": "index"}):
     try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
     except ValueError: pass
 
@@ -100,7 +105,7 @@ def hsi(fair, bids, asks, at, **kw):
 
 async def run():
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
-                             "WEB_PORT": "8080"})
+                             "WEB_PORT": "8080", "SIM_WAYS": "both", "SIM_MARKETS": "all"})  # every kind and both ways, as below
     store = m.Store(":memory:")
     bot = m.Bot(cfg, store, FM(NOW), None)
     bot.sim_markets = lambda now: world["markets"]
@@ -133,7 +138,7 @@ async def run():
     assert entry["sources"] == [{"what": "恒指期货", "source": "etnet"}] and entry["proxy"]["anchor"] == 24500.0
     assert entry["book"] == {"bids": [[0.55, 300.0]], "asks": [[0.58, 400.0]], "fetched_ms": NOW, "market_id": "101", "fee_bps": None}
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
-    assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "min_edge": 0.02, "fee_bps": 200,
+    assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
                                 "beta_error": m.MODEL_BETA_ERROR} and maker["market_id"] == "101"
     # the edge lasting for hours buys nothing more
@@ -423,6 +428,24 @@ async def run():
     assert ev["sources"][0]["source"] == "韩交所000660·Naver KRX" and ev["sources"][1]["type"] == "标记价" and not ev["basis"]["direct"]
     # an evidence failure never stops a trade: the failure is the record
     assert sbot.evidence(lambda: 1 / 0) == {"error": "division by zero"}
+
+    # the default scope: only the index / contract daily cards, only takers (SIM_MARKETS and SIM_WAYS widen it)
+    dbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"}),
+                 m.Store(":memory:"), FM(NOW), None)
+    dbot.sim_markets = lambda now: world["markets"]
+    rep = dbot.sim_report()
+    assert rep["ways"] == "只吃单" and rep["scope"] == "指数/个股日涨跌" and "范围：指数/个股日涨跌；只吃单。吃单按 100 份" in dbot.cmd_sim(None).text
+    assert "挂单" not in dbot.cmd_sim(None).text.split("\n")[1] and dbot.sim_version()["sim_ways"] == "只吃单"
+    far = m.SimMarket("will-bnb-hit-700-or-900", "BNB 先触 700/900", "touch", "BNB", 0.70, book([(0.55, 100)], [(0.58, 100)], NOW), 0.03, "",
+                      ("$900", "$700"), {"low": 700, "high": 900, "deadline": CLOSE}, {})
+    await step(dbot, NOW, hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW), far)  # 挂涨 +15¢ and 吃涨 +11¢ on both
+    assert sorted(dbot.sim_trades()) == [f"{HSI_SLUG}|up|吃"], sorted(dbot.sim_trades())
+    mbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                    "SIM_WAYS": "maker", "SIM_MARKETS": "touch"}), m.Store(":memory:"), FM(NOW), None)
+    mbot.sim_markets = lambda now: world["markets"]
+    await step(mbot, NOW, hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW), far)
+    assert sorted(mbot.sim_trades()) == ["will-bnb-hit-700-or-900|up|挂"], sorted(mbot.sim_trades())
+    assert "范围：先触价；只挂单。挂单排在已有挂单之后" in mbot.cmd_sim(None).text
 
     await browser_check(bot)
     print("SIM_OK")

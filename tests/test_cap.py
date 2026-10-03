@@ -396,8 +396,8 @@ async def browser_check():
     item = bot.cap_payload(cap, now)
     item["ladder"]["rows"] = [row("$200M", 0.304, 0.352, 0.362, e200, 0.067),
                               row("$500M", 0.036, 0.06, 0.068, e500, 0.0324),
-                              row("$1B", 0.004, 0.025, 0.026, e1b, 0.02),
-                              row("$2B", 0.001, 0.01, 0.02, e1b[:1], 0.02, stale=True),
+                              row("$1B", 0.004, 0.025, 0.026, e1b, 0.02, points_active=True, points_rate=50, points_note="积分已激活"),
+                              row("$2B", 0.001, 0.01, 0.02, e1b[:1], 0.02, stale=True, points_active=False, points_note="积分未激活"),
                               row("$3B", 0.004, 0.025, 0.026, e1b, 0.02, hold="σ 是先验值，只作参考", fetched_ms=now - 30_000)]
     payload = bot.odds_payload()
     payload["items"] = [item]
@@ -415,6 +415,10 @@ async def browser_check():
         assert tip == "挂No @ 63.8¢ 净优势 +5.8¢，不够大，不建议", tip
         assert await page.get_attribute("#g-ladder .lg .lb.miss >> nth=2", "title") == "挂No @ 97.4¢ 净优势 +2.2¢，σ 是先验值，只作参考"
         assert "门槛" not in await page.inner_text("#g-ladder")
+        # points on a cap-ladder level: ● with the rate when active, a faint ○ when not, nothing while unknown
+        assert await page.locator("#g-ladder .lg .ltw .ppoints").evaluate_all("els => els.map(e => [e.className, e.textContent, e.title])") == \
+            [["ppoints active", "● 50 PP/h", "积分已激活：这个市场的挂单每小时发 50 PP"], ["ppoints off", "○", "积分未激活"]]
+        assert await page.locator("#g-ladder .lg .ltw .ppoints.active").inner_text() == "● 50"  # on a phone the unit is dropped
         # the book's age: the oldest level's (30 s)
         assert re.fullmatch(r"行情 \d 秒前\s+盘口 3\d 秒前", await page.inner_text("#g-ladder .ages")), await page.inner_text("#g-ladder .ages")
         # tap a level: its four directions as chips, then a chip for the details; tap the level again to close it
