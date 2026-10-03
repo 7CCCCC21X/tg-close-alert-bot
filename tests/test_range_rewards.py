@@ -129,7 +129,7 @@ async def run():
     wide = m.PredictBook("SSE", "sse-up", "sse-1", "t", ((D("0.55"), D("100")),), ((D("0.89"), D("100")),), NOW, 200)
     block = {}; bot.book_block(block, wide, 0.5, 0.02, 0.0, "", ("涨", "跌"), NOW)
     assert block["points_active"] is True and block["points_rate"] == 55 and block["points_ok"] is False, block
-    assert block["points_why"] == "价差 34.0¢ 未低于积分要求 10.0¢", block["points_why"]
+    assert block["points_why"] == "价差 34.0¢ 超过积分上限 10.0¢", block["points_why"]
     bot.predict.market_meta["sse-1"] = (bot.predict.market_meta["sse-1"][0], time.monotonic() - m.PREDICT_POINTS_STALE_SECONDS - 1)
     block = {}; bot.book_block(block, other, 0.5, 0.02, 0.0, "", ("涨", "跌"), NOW)
     assert block["points_active"] is None and block["points_note"] == "积分状态已过期"
@@ -158,11 +158,18 @@ async def run():
                                    (meta(period(), trading_status="CLOSED"), True, "市场暂停交易"),
                                    (meta(period(), trading_status=""), True, "市场交易状态暂缺"),
                                    (meta(period(), spread_threshold=None), True, "积分价差要求暂缺"),
-                                   (meta(period(), spread_threshold=0.04), True, "未低于积分要求")):
+                                   (meta(period(), spread_threshold=0.03), True, "超过积分上限"),
+                                   (meta(period(), spread_threshold=1), True, "超过积分上限 1.0¢")):  # "1" is 1¢, never a 100% cap
         bot.predict.market_meta[MID] = (detail, time.monotonic())
         p = bot.range_payload(rm, NOW)["ladder"]["rows"][0]
         assert p["points_active"] is active and p["makers"] is False and reason in p["maker_note"], p
         assert [e["label"] for e in p["edges"] if e["best"]] == ["吃Yes"]
+    # Predict's "最大价差" is inclusive: a 4¢ book at a 4¢ cap still earns (ETH 1k/3k: 78/84 at a 6¢ cap showed as 积分已激活);
+    # a cap stated in cents means the same
+    for threshold in (0.04, 4):
+        set_meta(bot, period(), spread_threshold=threshold)
+        p = bot.range_payload(rm, NOW)["ladder"]["rows"][0]
+        assert p["makers"] is True and p["maker_note"] == "" and p["points_spread"] == 0.04, (threshold, p["maker_note"])
     bot.predict.market_meta[MID] = (meta(period()), time.monotonic() - m.PREDICT_REWARD_STALE_SECONDS - 1)
     p = bot.range_payload(rm, NOW)["ladder"]["rows"][0]
     assert p["points_active"] is None and p["makers"] is False and p["maker_note"] == "积分状态已过期"
@@ -172,7 +179,7 @@ async def run():
                          (m.dataclasses.replace(row.book, bids=((D("0.3"), D(100)),)), "盘口交叉"),
                          (m.dataclasses.replace(row.book, fetched_ms=NOW - m.PREDICT_STALE_MS - 1), "盘口已过期"),
                          (m.dataclasses.replace(row.book, bids=((D("0.001"), D(100)),),
-                                                asks=((D("0.999"), D(100)),)), "未低于积分要求")):
+                                                asks=((D("0.999"), D(100)),)), "超过积分上限")):
         result = bot.range_maker_status(row, book, NOW)
         assert result["points_active"] is True and not result["makers"] and reason in result["maker_note"], result
 

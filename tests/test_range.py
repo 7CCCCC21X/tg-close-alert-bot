@@ -622,7 +622,9 @@ async def browser_check(bot):
                                    uirow("↑ $190k", 190000, points_active=False, points_ok=False, points_note="积分未激活", points_why="积分未激活",
                                          maker_note="积分未激活：不给挂单建议"),
                                    uirow("↑ $185k", 185000, points_active=True, points_ok=False, points_note="积分已激活", points_rate=150,
-                                         points_why="价差 34.0¢ 未低于积分要求 6.0¢", maker_note="价差 34.0¢ 未低于积分要求 6.0¢"),
+                                         points_why="价差 34.0¢ 超过积分上限 6.0¢", maker_note="价差 34.0¢ 超过积分上限 6.0¢"),
+                                   uirow("↑ $175k", 175000, points_active=True, points_ok=True, points_note="积分已激活", points_rate=60, points_why="",
+                                         makers=True, maker_note="", fair=.5, bid=.5, ask=.52, bids=[[.5, 5000]], asks=[[.52, 5000]]),  # earns, no edge
                                    uirow("↑ $180k", 180000),
                                    *[uirow("↑ $" + str(n) + "k", n * 1000) for n in range(170, 115, -5)],
                                    uirow("↑ $114k", 114000, fair=.74, bid=.49, ask=.50, bids=[[.49, 5000]], asks=[[.50, 5000]], need=.02, swing=.02)]
@@ -632,7 +634,9 @@ async def browser_check(bot):
         card = page.locator("#g-levels .card").first
         assert await card.locator(".pg .ptarget").count() == 5
         visible = await card.locator(".pg .lt").all_inner_texts()
-        assert "↑ $200k" in visible and "↑ $114k" in visible and "↑ $190k" not in visible, visible
+        # the compact view: levels that earn points now (↑ $200k, ↑ $175k) or carry a suggestion (↑ $114k's taker), then the nearest
+        assert "↑ $200k" in visible and "↑ $175k" in visible and "↑ $114k" in visible, visible
+        assert "↑ $190k" not in visible and "↑ $130k" not in visible, visible
         assert "挂Yes 50.0" in await page.inner_text("#opps")
         active = card.locator(".ptarget:has(.lt:text-is('↑ $200k'))")
         assert await active.locator(".ppoints.active").inner_text() == "● 200 PP/h"  # colour says active, the number the rate
@@ -652,7 +656,7 @@ async def browser_check(bot):
         assert await card.locator(".ptarget:has(.lt:text-is('↑ $190k')) .ppoints.off").get_attribute("title") == "积分未激活"  # a faint ○, no text
         # a programme that pays, on a book too wide to earn: ○ keeps the rate, the tooltip says why (your BTC 70k/90k case)
         paid = card.locator(".ptarget:has(.lt:text-is('↑ $185k')) .ppoints.off")
-        assert await paid.inner_text() == "○ 150 PP/h" and await paid.get_attribute("title") == "有积分（每小时 150 PP），但现在拿不到：价差 34.0¢ 未低于积分要求 6.0¢"
+        assert await paid.inner_text() == "○ 150 PP/h" and await paid.get_attribute("title") == "有积分（每小时 150 PP），但现在拿不到：价差 34.0¢ 超过积分上限 6.0¢"
         assert await card.locator(".ptarget:has(.lt:text-is('↑ $180k')) .ppoints").count() == 0  # unknown: nothing
         unknown = card.locator(".ptarget:has(.lt:text-is('↑ $180k')) + .pmodel + .paction")
         assert await unknown.inner_text() == "—" and "积分状态暂缺" in await unknown.get_attribute("title")

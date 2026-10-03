@@ -363,8 +363,8 @@ async def run():
 
 
 async def browser_check():
-    """The 最优 cell: a passing direction in colour; otherwise the closest one in grey (the bar itself is never shown);
-    过期 / ⚠️ as before."""
+    """The cap ladder's table (shared with the price ladders): the best maker and the best taker per level, in colour when
+    suggested, grey otherwise (the bar itself is never shown); 盘口过期 / 暂不建议 as text."""
     try:
         from playwright.async_api import async_playwright
     except ImportError:
@@ -389,7 +389,7 @@ async def browser_check():
         # the page prices the four directions itself, from the depth (Yes side), the fee and the trade size
         return {"label": label, "fair": fair, "error": "", "dist": 1.0, "bid": bid, "ask": ask, "stale": False, "edges": edges,
                 "bids": [[bid, 5000.0]], "asks": [[ask, 5000.0]], "fee_bps": 200, "notional": 100, "sides": ["Yes", "No"],
-                "fetched_ms": now, "need": need, "swing": need, "hold": "", "touched": False, **extra}
+                "fetched_ms": now, "need": need, "swing": need, "hold": "", "touched": False, "makers": True, **extra}
     e200 = [edge("挂Yes", True, 0.352, -0.048), edge("挂No", True, 0.638, 0.058), edge("吃Yes", False, 0.362, -0.065), edge("吃No", False, 0.648, 0.041)]
     e500 = [edge("挂Yes", True, 0.06, -0.024), edge("挂No", True, 0.932, 0.0318), edge("吃Yes", False, 0.068, -0.033), edge("吃No", False, 0.94, 0.023)]
     e1b = [edge("挂Yes", True, 0.025, -0.021), edge("挂No", True, 0.974, 0.022, True), edge("吃Yes", False, 0.026, -0.022), edge("吃No", False, 0.975, 0.020)]
@@ -409,30 +409,37 @@ async def browser_check():
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         page = await browser.new_page(viewport={"width": 390, "height": 900})
         await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
-        await page.wait_for_selector("#g-ladder .lg")
-        cells = await page.eval_on_selector_all("#g-ladder .lg .lb:not(.lk)", "els => els.map(e => [e.className, e.innerText])")
-        assert cells == [["lb miss", "挂No 63.8 +5.8¢"], ["lb miss", "挂No 93.2 +3.2¢"], ["lb pos", "挂No 97.4 +2.2¢"], ["lb", "过期"],
-                         ["lb miss", "挂No 97.4 +2.2¢"]], cells  # $3B: the same book, but a prior σ is never suggested
-        tip = await page.get_attribute("#g-ladder .lg .lb.miss", "title")
-        assert tip == "挂No @ 63.8¢ 净优势 +5.8¢，不够大，不建议", tip
-        assert await page.get_attribute("#g-ladder .lg .lb.miss >> nth=2", "title") == "挂No @ 97.4¢ 净优势 +2.2¢，σ 是先验值，只作参考"
+        await page.wait_for_selector("#g-ladder .pg")
+        # the same four-column table as the price ladders: 目标 / 模型 / 挂单 (the best maker) / 吃单 (the best taker); blue =
+        # suggested, grey = not big enough (the bar itself is never shown), 盘口过期 / 暂不建议 as text
+        assert await page.locator("#g-ladder .pg .lh").all_inner_texts() == ["目标", "模型", "挂单", "吃单"]
+        cells = await page.locator("#g-ladder .pg .paction").evaluate_all(
+            "els => els.map(e => [e.className.replace('pcell paction', '').trim(), e.innerText.replace(/\\s+/g, ' ').trim(), e.title])")
+        assert [c[:2] for c in cells] == [["", "No 63.8¢ +5.8¢"], ["", "No 64.8¢ +4.1¢"],                    # $200M: nothing clears 6.7¢
+                                         ["", "No 93.2¢ +3.2¢"], ["", "No 94.0¢ +2.3¢"],                    # $500M: 3.2¢ under a 3.24¢ bar
+                                         ["pos", "No 97.4¢ +2.2¢"], ["pos", "No 97.5¢ +2.1¢"],              # $1B: both clear 2¢
+                                         ["", "No 98.0¢ +1.9¢ 盘口过期"], ["", "No 99.0¢ +0.9¢ 盘口过期"],    # $2B: a stale book
+                                         ["", "No 97.4¢ +2.2¢ 暂不建议"], ["", "No 97.5¢ +2.1¢ 暂不建议"]], cells  # $3B: a prior σ
+        assert cells[0][2] == "挂No @ 63.8¢；净优势 +5.8¢，挂单排队，成交不保证；未过建议门槛", cells[0][2]
+        assert cells[8][2].endswith("；σ 是先验值，只作参考"), cells[8][2]
         assert "门槛" not in await page.inner_text("#g-ladder")
-        # points on a cap-ladder level: ● with the rate when active, a faint ○ when not, nothing while unknown
-        assert await page.locator("#g-ladder .lg .ltw .ppoints").evaluate_all("els => els.map(e => [e.className, e.textContent, e.title])") == \
-            [["ppoints active", "● 50 PP/h", "积分可得：这个市场的挂单每小时发 50 PP（价差须低于 6.0¢、至少 100 份）"], ["ppoints off", "○", "积分未激活"]]
-        assert await page.locator("#g-ladder .lg .ltw .ppoints.active").inner_text() == "● 50"  # on a phone the unit is dropped
+        # points on a cap-ladder level: ● with the rate when a quote would earn, a faint ○ when not, nothing while unknown
+        assert await page.locator("#g-ladder .pg .ptarget .ppoints").evaluate_all("els => els.map(e => [e.className, e.textContent, e.title])") == \
+            [["ppoints active", "● 50 PP/h", "积分可得：这个市场的挂单每小时发 50 PP（价差不超过 6.0¢、至少 100 份）"], ["ppoints off", "○", "积分未激活"]]
         # the book's age: the oldest level's (30 s)
         assert re.fullmatch(r"行情 \d 秒前\s+盘口 3\d 秒前", await page.inner_text("#g-ladder .ages")), await page.inner_text("#g-ladder .ages")
-        # tap a level: its four directions as chips, then a chip for the details; tap the level again to close it
-        await page.click("#g-ladder .lg .lt:text-is('$1B')")
+        # tap a level: its note (distance, model, book, points), its four directions as chips, then a chip's details; tap again to close
+        await page.click("#g-ladder .pg .lt:text-is('$1B')")
+        note = await page.inner_text("#g-ladder .lrow .lnote")
+        assert note.startswith("$1B：市值还要涨 100.0% 才碰到 · 模型 Yes 0.4¢ · Yes 盘口 2.5 / 2.6") and "50 PP/小时" in note, note
         chips = page.locator("#g-ladder .lrow .edge")
         assert await chips.count() == 4 and await page.locator("#g-ladder .lrow .edge.best").inner_text() == "挂No 97.4\n+2.2¢"
         await chips.nth(1).click()
         det = await page.inner_text("#g-ladder .lrow .edet")
         assert det.startswith("挂No @ 97.4¢：挂单排队") and "这个价位已有 5,000 份在排队" in det and "→ 满足" in det and "不标红框" in det, det
-        await page.click("#g-ladder .lg .lb.pos")
+        await page.click("#g-ladder .pg .lt:text-is('$1B')")
         assert await page.locator("#g-ladder .lrow").count() == 0
-        await page.click("#g-ladder .lg .lt:text-is('$3B')")
+        await page.click("#g-ladder .pg .lt:text-is('$3B')")
         assert await page.locator("#g-ladder .lrow .edge.best").count() == 0
         await page.locator("#g-ladder .lrow .edge").nth(1).click()
         assert "暂不建议：σ 是先验值，只作参考" in await page.inner_text("#g-ladder .lrow .edet")
@@ -440,7 +447,7 @@ async def browser_check():
         # the filter bar sees every level: 有建议 keeps the card (its $1B level); 3 小时内收盘 drops it (30 days left)
         await page.click("#fchips button:text-is('有建议')")
         assert await page.locator("#g-flat .card.lad").count() == 1
-        # in its own 500px card the table never sticks out either, points pills included (they sit under the level)
+        # in its own 500px card the table never sticks out either, points pills included
         wide = """[...document.querySelectorAll('#g-ladder .card *')].filter(e => { const c = e.closest('.card').getBoundingClientRect(),
                   r = e.getBoundingClientRect(); return r.width && (r.right > c.right + 0.5 || r.left < c.left - 0.5) }).length"""
         for width in (1300, 900, 620):

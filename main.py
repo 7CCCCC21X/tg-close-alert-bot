@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.21.3"
+VERSION = "1.21.4"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5591,10 +5591,9 @@ button.tog{font-family:inherit}.fsort select{font:inherit;border:1px solid var(-
 #stale{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;background:var(--hot-bg);border:1px solid var(--warn);color:var(--text);border-radius:10px;padding:6px 10px;margin:4px 0;font-size:13px}
 body.olddata .card.hot{border:1px solid var(--line);box-shadow:none;padding:10px 12px 8px}
 body.olddata .edge.best,body.olddata .edge.hot{border-color:transparent;background:var(--chip)}
-body.olddata .edge b,body.olddata .edge .el,body.olddata .lg .lb b,body.olddata .lg .lb.hot,body.olddata .lg .lb.pos{color:var(--faint)}body.olddata .odds{opacity:.55}
+body.olddata .edge b,body.olddata .edge .el{color:var(--faint)}body.olddata .odds{opacity:.55}
 body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){display:none!important}
 #h-flat{display:flex;align-items:center;gap:8px}
-.lg .lrow{grid-column:1/-1;margin:0 0 4px}.lg .lt,.lg .lb,.lg .ln,.lg .lq{cursor:pointer}
 .edge .el{color:var(--faint);font-size:11px;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}.edge .el i{font-style:normal;font-variant-numeric:tabular-nums}
 .edge b{font-weight:650;font-size:14px;color:var(--faint);white-space:nowrap;font-variant-numeric:tabular-nums}.edge.pos b{color:var(--text)}.edge.pos .el{color:var(--muted)}
 .edge.best{border-color:var(--best);background:var(--best-bg)}.edge.best .el{color:var(--text)}.edge.best b{color:var(--best)}
@@ -5603,27 +5602,20 @@ body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){displ
 .grid.wide{grid-template-columns:repeat(auto-fill,minmax(min(100%,500px),500px));align-items:start}
 .card.lad .pb{margin-top:0}.grid:not(.wide)>.card.lad{grid-column:1/-1}.lstat{display:flex;flex-direction:column;gap:4px}.lstat:empty{display:none}
 .card.lad .name{flex:0 1 auto}.card.lad .cd{margin-left:6px}
-.lg{display:grid;grid-template-columns:auto auto auto auto auto 1fr;gap:3px 9px;margin-top:5px;font-size:12.5px;font-variant-numeric:tabular-nums;align-items:baseline}
-.lg .lh{color:var(--faint);font-size:11px;white-space:nowrap}.lg .lr{text-align:right}.lg .ln{text-align:right;white-space:nowrap}.lg .ld{color:var(--muted)}
-.lg .lt{font-weight:650;white-space:nowrap}.lg .lq{color:var(--muted);white-space:nowrap}
 .touched{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font-size:12px}.touched .k{color:var(--down);font-weight:600}
 .tchip{border-radius:6px;padding:0 6px;background:var(--chip);color:var(--muted);font-variant-numeric:tabular-nums}
-.lg .lb{color:var(--faint);white-space:nowrap}
 .simtop{display:flex;align-items:baseline;gap:8px}.simpnl{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums}
 .simln{display:flex;flex-wrap:wrap;gap:2px 12px;font-size:13px;color:var(--muted)}
 .simg{display:grid;grid-template-columns:auto auto auto 1fr;gap:2px 12px;font-size:12.5px;font-variant-numeric:tabular-nums;margin-top:2px}.simg .lh{color:var(--faint);font-size:11px}.simg .ln{text-align:right}
 .simrows{display:flex;flex-direction:column;gap:3px;margin-top:4px}
 a.simrow{display:grid;grid-template-columns:auto 1fr auto auto;gap:2px 8px;font-size:12.5px;color:inherit;text-decoration:none;font-variant-numeric:tabular-nums;padding:2px 0;border-top:1px dashed var(--line)}
-a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);text-decoration:none;align-self:flex-start}.simj:hover{text-decoration:underline}.panel a.cb{text-decoration:none;color:var(--best)}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}.lg .lk b{color:var(--faint)}.lg .lk.pos b{color:var(--best)}.lg .lz{color:var(--faint);font-size:11px;margin-left:3px}
-@media (max-width:560px){.lg{gap:3px 7px;font-size:12px}.lg .ld,.lg .lz,.lg .lp{display:none}.lg{grid-template-columns:auto auto auto auto 1fr}.lg .lk{white-space:normal;line-height:1.25}}
+a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);text-decoration:none;align-self:flex-start}.simj:hover{text-decoration:underline}.panel a.cb{text-decoration:none;color:var(--best)}
 .small{font-size:12px;margin-top:3px}.mut{color:var(--faint)}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
 #opps{display:flex;flex-wrap:wrap;align-items:center;gap:5px 6px;margin:6px 0 2px;font-size:12px}#opps .ok{color:var(--hot);font-weight:650;white-space:nowrap}
 .opp{display:inline-flex;align-items:baseline;gap:4px;max-width:100%;border:1px solid var(--hot);background:var(--hot-bg);color:var(--text);border-radius:999px;padding:2px 9px;font:inherit;font-size:12px;line-height:1.4;cursor:pointer;font-variant-numeric:tabular-nums}
 .opp b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46vw}.opp span{color:var(--muted);white-space:nowrap}.opp i{font-style:normal;color:var(--hot);font-weight:650}
 .opp:hover{border-color:var(--hot);box-shadow:0 0 0 2px var(--hot-bg)}body.olddata #opps{display:none}
 .card.flash{animation:flash 1.4s ease-out}@keyframes flash{from{outline:3px solid var(--best);outline-offset:3px}to{outline:3px solid transparent;outline-offset:3px}}
-.lg .lspot{grid-column:1/-1;display:flex;align-items:center;gap:8px;color:var(--faint);font-size:11px;line-height:1;margin:1px 0;cursor:default}.lg .lspot:before,.lg .lspot:after{content:"";flex:1;border-top:1px dashed var(--line)}
-.lg .lnote{font-size:12px;color:var(--muted);line-height:1.5;cursor:default}.lg .lnote b{color:var(--text)}.lg .lnote .warn{display:block}
 #g-levels{grid-template-columns:repeat(auto-fill,minmax(min(100%,440px),1fr))}
 .card.price-lad{gap:8px}.price-top{display:flex;flex-wrap:wrap;align-items:baseline;gap:5px 9px;font-variant-numeric:tabular-nums}.price-top b{font-size:25px;letter-spacing:-.02em}.price-top .plabel{font-size:12px;color:var(--muted)}
 .price-range{display:flex;flex-wrap:wrap;gap:4px 14px;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}.price-range b{font-weight:500;color:var(--text)}
@@ -5635,12 +5627,11 @@ a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);t
 .ptarget{font:inherit;color:var(--text);border:0;background:none;text-align:left;cursor:pointer;min-width:0;padding-right:0}.ptarget .ltl{display:flex;flex-wrap:wrap;align-items:baseline;gap:1px 6px}.ptarget .lt{font-weight:650;white-space:nowrap}.ptarget .pdist{font-size:10.5px;color:var(--faint)}
 .ppoints{display:inline-block;font-size:10.5px;line-height:1.6;border-radius:999px;padding:0 6px;background:var(--chip);color:var(--muted);white-space:nowrap;font-weight:600;vertical-align:1px}
 .ppoints.active{background:var(--best-bg);color:var(--best)}.ppoints.off{padding:0 4px;color:var(--faint);font-weight:400}.quote .ppoints{align-self:center}
-.lg .ltw{display:flex;flex-direction:column;align-items:flex-start;gap:1px;white-space:nowrap}
 .paction{font:inherit;border:0;background:none;color:var(--faint);text-align:left;cursor:pointer;line-height:1.35;min-width:0}.paction .pa{display:flex;flex-wrap:wrap;gap:1px 5px;align-items:baseline}.paction .pa b{font-weight:550}.paction .pv{font-weight:650}.paction.pos .pa{color:var(--text)}.paction.pos .pv{color:var(--best)}.paction.hot .pv{color:var(--hot)}.paction .pwhy{display:block;font-size:10px;line-height:1.35;color:var(--faint);margin-top:1px}.paction.disabled{cursor:pointer}
 body.olddata .paction .pa,body.olddata .paction .pv{color:var(--faint)}body.olddata .price-top{opacity:.55}
 .pg .lrow{grid-column:1/-1;margin:0 0 7px;padding:7px 8px;border-radius:8px;background:var(--chip)}.pg .lnote{font-size:12px;line-height:1.5;color:var(--muted)}.pg .lnote .warn{display:block}.pg .lnote b{color:var(--text)}.pg .lspot{grid-column:1/-1;color:var(--muted);font-size:11px;display:flex;align-items:center;gap:8px;padding:5px 0}.pg .lspot:before,.pg .lspot:after{content:"";flex:1;border-top:1px dashed var(--line)}
-.price-lad .pb{padding-top:8px}.price-lad .quote{gap:5px 8px}.price-lad .price-empty{font-size:12px;color:var(--muted);padding-top:8px}
-@media(max-width:560px){.lg .ltw .ppoints .pu{display:none}.pg{grid-template-columns:fit-content(150px) minmax(36px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:6px;font-size:11.5px}.pg .pcell{padding:6px 0}.ptarget .pdist,.ppoints,.paction .pwhy{font-size:10px}.price-top b{font-size:23px}.price-range{gap:3px 10px}.price-lad .edges{grid-template-columns:repeat(2,1fr)}}
+.price-lad .pb{padding-top:8px}.price-lad .quote{gap:5px 8px}.price-empty{font-size:12px;color:var(--muted);padding-top:8px}
+@media(max-width:560px){.pg{grid-template-columns:fit-content(150px) minmax(36px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:6px;font-size:11.5px}.pg .pcell{padding:6px 0}.ptarget .pdist,.ppoints,.paction .pwhy{font-size:10px}.price-top b{font-size:23px}.price-range{gap:3px 10px}.price-lad .edges{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:360px){.pg{grid-template-columns:fit-content(120px) minmax(30px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:4px;font-size:11px}.pg .lh{font-size:10px}}
 [hidden]{display:none!important}
 .grip{flex:none;border:0;background:none;padding:3px 5px;margin:-3px 0 -3px -6px;font-size:16px;line-height:1;color:var(--muted);cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}.grip:hover{color:var(--text)}
@@ -5827,7 +5818,7 @@ function pointsPill(p){  // LP points: blue ● with the hourly rate when a quot
   if(p.points_active==null)return null;  // unknown (nothing read yet, stale, or a refresh failure): the gate fails closed, the pill stays off
   const rate=p.points_active===true&&p.points_rate!=null?qty(p.points_rate):"",unit=x=>{if(rate)x.append(" ",$("span","pu","PP/h"));return x};
   if(p.points_ok===true){const x=unit($("span","ppoints active","● "+(rate||"积分")));
-    x.title="积分可得：这个市场的挂单每小时发 "+(rate||"?")+" PP"+(p.points_spread!=null?"（价差须低于 "+cent(p.points_spread)+(p.points_min_shares?"、至少 "+p.points_min_shares+" 份":"")+"）":"");return x}
+    x.title="积分可得：这个市场的挂单每小时发 "+(rate||"?")+" PP"+(p.points_spread!=null?"（价差不超过 "+cent(p.points_spread)+(p.points_min_shares?"、至少 "+p.points_min_shares+" 份":"")+"）":"");return x}
   const x=unit($("span","ppoints off","○"+(rate?" "+rate:"")));
   x.title=(rate?"有积分（每小时 "+rate+" PP），但现在拿不到：":"")+(p.points_why||p.points_note||"积分未激活");x.setAttribute("aria-label",x.title);return x}
 function book(p,key){
@@ -5895,7 +5886,7 @@ function ladder(c,it){
     const shown=done.length>3?[{label:"≤ "+done[done.length-1].label+" · "+done.length+" 档"}]:done;  // many levels: one chip
     shown.forEach(r=>{const x=$("span","tchip",r.label);x.title="窗口内"+L.metric+"已达到："+tip;t.append(x)});
     st.append(t)}
-  c.append(st);return ladderBook(c,it,L,live)}
+  c.append(st);return priceLadderBook(c,it,L,live)}  // the same table as the price ladders
 function priceLadder(c,it,L,det,sm){
   // a price ladder: one Yes/No market per level, ↑ reached by a 1-minute High, ↓ by a 1-minute Low, inside the month
   c.classList.add("price-lad");det.classList.add("price-model");
@@ -5926,24 +5917,25 @@ function priceLadderBook(c,it,L,live){
   // Compute opportunities from every level, including those folded out of the compact table.
   for(const r of live){const v=views.get(r);for(const e of v.ok){if(e.edge>=HOT){if(!hot||e.edge>hot.edge)hot={...e,row:r.label};if(!e.maker&&(!hotTk||e.edge>hotTk.edge))hotTk={...e,row:r.label}}}}
   if(live.length){
-    const allKey=it.name+"#all-levels",all=open.has(allKey),focus=new Set(live.filter(r=>views.get(r).ok.length));
+    // the compact view: every level whose quote earns points now or that has a suggestion, then the nearest ones up to five
+    const allKey=it.name+"#all-levels",all=open.has(allKey),focus=new Set(live.filter(r=>r.points_ok===true||views.get(r).ok.length));
     [...live].sort((a,b)=>Math.abs(a.dist??Infinity)-Math.abs(b.dist??Infinity)).forEach(r=>{if(focus.size<5)focus.add(r)});
     const shown=all||live.length<=6?live:live.filter(r=>focus.has(r));
-    const tools=$("div","price-tools");tools.append($("span","hint","挂单仅积分激活 · 吃单按 "+(amount||live[0].notional||100)+" U"));
-    if(shown.length<live.length||all){const bt=$("button","cb",all?"收起完整档位":"全部 "+live.length+" 档（+"+(live.length-shown.length)+"）");bt.type="button";bt.setAttribute("aria-expanded",all?"true":"false");bt.title="默认显示有建议和最近的档位；展开可查看全部档位";bt.addEventListener("click",()=>{all?open.delete(allKey):open.add(allKey);if(last)render(last)});tools.append(bt)}
+    const tools=$("div","price-tools");tools.append($("span","hint",(L.kind==="price"?"挂单只在积分可得的档位 · ":"")+"吃单按 "+(amount||live[0].notional||100)+" U"));
+    if(shown.length<live.length||all){const bt=$("button","cb",all?"收起完整档位":"全部 "+live.length+" 档（+"+(live.length-shown.length)+"）");bt.type="button";bt.setAttribute("aria-expanded",all?"true":"false");bt.title="默认显示积分可得、有建议和离现价最近的档位；展开可查看全部档位";bt.addEventListener("click",()=>{all?open.delete(allKey):open.add(allKey);if(last)render(last)});tools.append(bt)}
     w.append(tools);const g=$("div","pg");g.append($("span","lh","目标"),$("span","lh lr","模型"),$("span","lh","挂单"),$("span","lh","吃单"));
     let marked=false;const spot=() => $("div","lspot","现价 "+L.price);
     shown.forEach(r=>{const v=views.get(r),rk=key+"#"+r.label,toggle=ev=>{ev.preventDefault();openChip[rk]=openChip[rk]?null:"row";if(last)render(last)};
       if(!marked&&L.spot!=null&&r.level<=L.spot){g.append(spot());marked=true}
-      const target=$("button","pcell ptarget"),dist=r.dist==null?"距离暂缺":(r.dist>=0?"+":"−")+(Math.abs(r.dist)*100).toFixed(Math.abs(r.dist)<.1?1:0)+"%";
+      const target=$("button","pcell ptarget"),dist=r.dist==null?"":(r.dist>=0?"+":"−")+(Math.abs(r.dist)*100).toFixed(Math.abs(r.dist)<.1?1:0)+"%";
       target.type="button";target.setAttribute("aria-expanded",openChip[rk]?"true":"false");target.title=r.dir_note||"查看盘口、四个方向和计算明细";
-      const ltl=$("span","ltl");ltl.append($("span","lt",r.label),$("span","pdist",dist));const point=pointsPill(r);if(point)ltl.append(point);
+      const ltl=$("span","ltl");ltl.append($("span","lt",r.label));if(dist)ltl.append($("span","pdist",dist));const point=pointsPill(r);if(point)ltl.append(point);
       target.append(ltl);target.addEventListener("click",toggle);
       const model=$("span","pcell pmodel",r.fair==null?"—":cent(r.fair));
       const action=maker=>{const a=$("button","pcell paction"+(maker&&r.makers===false?" disabled":""));a.type="button";a.addEventListener("click",toggle);a.setAttribute("aria-expanded",openChip[rk]?"true":"false");
         const candidates=v.edges.filter(e=>e.maker===maker),e=candidates.sort((a,b)=>b.edge-a.edge)[0],eligible=!maker||r.makers===true,ok=e&&eligible&&v.ok.includes(e);
         if(maker&&!eligible){a.append($("span","pa","—"));a.title=r.maker_note||r.points_note||"积分状态确认后才提示挂单优势";return a}
-        if(!e){a.append($("span","pa",r.error?"⚠ 请核实":r.stale?"盘口过期":"暂无报价"));a.title=r.error||r.hold||"等待有效盘口";return a}
+        if(!e){a.append($("span","pa",r.error?"⚠ 请核实":r.stale?"盘口过期":r.bids==null&&r.asks==null?"—":"暂无报价"));a.title=r.error||r.hold||"等待有效盘口";return a}
         if(ok){a.classList.add("pos");if(e.edge>=HOT)a.classList.add("hot")}
         const line=$("span","pa");line.append($("b","",e.up?"Yes":"No"),$("span","",cent(e.price)),$("span","pv",sg(e.edge)));a.append(line);
         if(r.error||r.hold||r.stale)a.append($("span","pwhy",r.stale?"盘口过期":"暂不建议"));else if(ok&&!maker&&e.short)a.append($("span","pwhy","深度不足"));
@@ -5955,45 +5947,6 @@ function priceLadderBook(c,it,L,live){
   c.append(w);const ag=ages(it);if(ag)c.append(ag);
   if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" "+sg(hot.edge);
     const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);hots.push({key,name:it.name,group:it.group||"levels",best:{text:text(hot),edge:hot.edge},taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
-  return c}
-function ladderBook(c,it,L,live){  // the ladder's Predict block: one row per open level, tap a row for its four directions
-  const w=$("div","pb"),h=$("div","quote");h.append(it.predict?openLink(it.predict.url):$("span","pt","Predict"));
-  if(it.predict&&it.predict.error)h.append($("span","warn qe",it.predict.error));
-  w.append(h);let hot=null,hotTk=null;const key=favKey(it);
-  if(live.length){const g=$("div","lg");
-    const hd=(t,cl,tip)=>{const x=$("span","lh"+(cl?" "+cl:""),t);if(tip)x.title=tip;return x};
-    g.append(hd("目标"),hd("距离","ln ld",L.kind==="price"?"现价还要涨（+）或跌（−）多少才碰到":"还要涨多少才碰到"),hd("模型","ln","模型给 Yes 的公平价"),hd("买1 / 卖1","","Yes 的盘口"),hd("最优","","点一行看这一档的四个方向和明细"),hd("吃单","","立即成交的较优一边：吃Yes@卖1 或 吃No@1−买1，× 为能买的份数"));
-    let marked=false;const spotRow=()=>$("div","lspot","现价 "+L.price);  // ↑ levels above the price's own line, ↓ levels below
-    live.forEach(r=>{const v=bookView(r),best=v.best,n=x=>x==null?"无":(x*100).toFixed(1),rk=key+"#"+r.label;
-      if(L.kind==="price"&&!marked&&L.spot!=null&&r.level<=L.spot){g.append(spotRow());marked=true}
-      const q=r.bid==null&&r.ask==null?(r.error?"—":"…"):n(r.bid)+" / "+n(r.ask);
-      const need=r.need||0,b=$("span","lb"+(best?(best.edge>=HOT?" hot":" pos"):""));
-      // nothing to suggest: the closest direction, grey (a prior σ always lands here: shown, never suggested)
-      const near=!best&&!r.error&&!r.stale&&v.pool.length?v.pool.reduce((a,e)=>!a||rank(e)>rank(a)||(rank(e)===rank(a)&&e.maker&&!a.maker)?e:a,null):null;
-      const tko=v.ok.filter(e=>!e.maker).sort((a,b)=>b.edge-a.edge)[0];  // the level's best taker, for the strip's takers-only view
-      if(tko&&tko.edge>=HOT&&(!hotTk||tko.edge>hotTk.edge))hotTk={...tko,row:r.label};
-      if(best){b.append(best.label+" "+(best.price*100).toFixed(1)+" ",$("b","",sg(best.edge)));b.title=best.maker?"挂单排队，成交不保证":"立即成交，量 "+qty(best.size);
-        if(best.edge>=HOT&&(!hot||best.edge>hot.edge))hot={...best,row:r.label}}
-      else if(near){b.classList.add("miss");b.append(near.label+" "+(near.price*100).toFixed(1)+" ",$("b","",sg(near.edge)));b.title=near.label+" @ "+cent(near.price)+" 净优势 "+sg(near.edge)+"，"+(r.hold||"不够大，不建议")}
-      else b.textContent=r.error?"⚠️":r.stale?"过期":"—";
-      if(r.error)b.title=r.error;
-      const tk=v.edges.filter(e=>!e.maker).sort((x,y)=>y.edge-x.edge)[0],t=$("span","lb lk"+(tk&&tk.edge>need&&!r.hold&&!r.stale?" pos":""));
-      if(tk){t.append(tk.label+" ",$("span","lp",(tk.price*100).toFixed(1)+" "),$("b","",sg(tk.edge)),$("span","lz","×"+qk(tk.size)));t.title=tk.label+" @ "+cent(tk.price)+"，立即成交 "+qty(tk.size)+" 份"+(tk.short?"（深度不足）":"")+"；净优势已扣手续费 "+cent(tk.fee||0)+"、深度 "+cent(tk.slip||0)+(tk.edge>need?"":"；不够大，不建议")+(r.stale?"（盘口过期）":"")}
-      else t.textContent="—";
-      const dist=r.dist==null?"—":(r.dist>=0?"+":"−")+(Math.abs(r.dist)*100).toFixed(Math.abs(r.dist)<0.1&&L.kind==="price"?1:0)+"%";
-      const lw=$("span","ltw");lw.append($("span","lt",r.label));const pp=pointsPill(r);if(pp)lw.append(pp);  // the level, its points
-      const cells=[lw,$("span","ln ld",dist),$("span","ln",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b,t];
-      if(r.dir_note)cells[0].title=r.dir_note;  // the market does not say ↑ or ↓ (or disputes it): shown, never suggested
-      const tap=v.edges.length>0||!!r.error;  // a level with a warning opens too: the reason has to be readable on a phone
-      if(tap)cells.forEach(x=>{x.title=x.title||(v.edges.length?"点开看这一档的四个方向":"点开看原因");x.addEventListener("click",ev=>{ev.preventDefault();openChip[rk]=openChip[rk]?null:"row";if(last)render(last)})});
-      g.append(...cells);
-      if(openChip[rk]&&tap){const d=$("div","lrow");d.append(rowNote(r,L));if(v.edges.length)d.append(chips(rk+"/",v,ctxOf(r)));g.append(d)}});
-    if(L.kind==="price"&&!marked&&L.spot!=null)g.append(spotRow());
-    w.append(g)}
-  c.append(w);const ag=ages(it);if(ag)c.append(ag);
-  if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" +"+cent(hot.edge);
-    const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);
-    hots.push({key,name:it.name,group:it.group||"contract",best:{text:text(hot),edge:hot.edge},taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
   return c}
 function drawOpps(){  // every red-framed suggestion on the page in one strip on top, largest first; tap one to jump to its card.
   // 自定义 leaves sections out of it, or lists taker (吃单) suggestions only: a maker's edge is only real once it fills
@@ -8923,12 +8876,14 @@ class Bot:
         threshold = None
         with contextlib.suppress(decimal.InvalidOperation, ValueError, TypeError):
             value = D(str(meta.get("spread_threshold")))
+            if value.is_finite() and 1 <= value <= 100:
+                value = value / 100  # stated in cents (a cap of "1" can only mean 1¢: a 100% spread caps nothing)
             if value.is_finite() and 0 < value <= 1:
                 threshold = value
         if not reason and threshold is None:
             reason = "积分价差要求暂缺，挂单暂不建议"
-        if not reason and book.ask[0] - book.bid[0] >= threshold:
-            reason = f"价差 {cents(float(book.ask[0] - book.bid[0]))} 未低于积分要求 {cents(float(threshold))}"
+        if not reason and book.ask[0] - book.bid[0] > threshold:  # Predict's "最大价差": a spread right at the cap still earns
+            reason = f"价差 {cents(float(book.ask[0] - book.bid[0]))} 超过积分上限 {cents(float(threshold))}"
         if not reason and book.stale(now_ms):
             reason = "盘口已过期，挂单暂不建议"
         return {**status, "points_ok": not bool(reason), "points_why": reason,
