@@ -3,7 +3,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
 D = m.D
-NIU, ANSEM, PONS = m.CAP_MARKETS
+NIU, ANSEM, PONS, MEME, CASHCAT, AI = m.CAP_MARKETS
 m.CapMarket.GECKO_GAP = 0  # request spacing is tested on its own below
 TOKEN = NIU.token
 
@@ -50,6 +50,17 @@ assert ANSEM.start_ms == int(dt.datetime(2026, 8, 17, 17, 0, tzinfo=dt.timezone.
 assert ANSEM.token == "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump" and ANSEM.supply == "fdv" and ANSEM.gecko == "solana"
 assert PONS.start_ms == int(dt.datetime(2026, 8, 31, 10, 0, tzinfo=dt.timezone.utc).timestamp() * 1000) and PONS.chain == "robinhood"
 assert PONS.pair == "0x10cc6bd38112cac182db90b6a71d8bb5939526ba" and PONS.gecko == "" and ANSEM.end_ms == PONS.end_ms == NIU.end_ms
+# MEME, CASHCAT and AI: Robinhood chain, settled on the rules' DexScreener pairs, their levels read from Predict (none listed)
+for cs, c_start, c_pair, c_token in ((MEME, dt.datetime(2026, 9, 4, 10, 0, tzinfo=dt.timezone.utc), "0xc6e298e137f2905398db87e6eae49ede64d231fee37330fa433fec917f4618b6",
+                                  "0x385F4f8ae47651ce5F58F5265395a669f8281e18"),
+                                 (CASHCAT, dt.datetime(2026, 9, 2, 5, 0, tzinfo=dt.timezone.utc), "0xa70fc67c9f69da90b63a0e4c05d229954574e313",
+                                  "0x020bfC650A365f8BB26819deAAbF3E21291018b4"),
+                                 (AI, dt.datetime(2026, 9, 1, 9, 0, tzinfo=dt.timezone.utc), "0xcbdfea90430a30ee4469c9902e120a77e7c7e4711d5643671c1d1957f2f1ce27",
+                                  "0x2E8c31162b855A2ffa90F6F8634643Ad6F111e18")):
+    assert cs.start_ms == int(c_start.timestamp() * 1000) and cs.end_ms == PONS.end_ms and cs.pair == c_pair and cs.token == c_token, cs.key
+    assert cs.chain == "robinhood" and cs.supply == "fdv" and cs.gecko == "" and cs.metric == "FDV" and cs.settle == "DexScreener"
+    assert cs.targets == () and cs.name == f"${cs.key} FDV" and cs.slug.startswith(f"what-fdv-will-{cs.key.lower()}-hit-before-")
+assert len({s.key for s in m.CAP_MARKETS}) == 6 and len({s.slug for s in m.CAP_MARKETS}) == 6
 # a named pair's answer ({"pair": {...}}), the base matched without regard to case, FDV kept apart from market cap
 single = {"schemaVersion": "1.0.0", "pair": {"dexId": "uniswap", "baseToken": {"address": PONS.token.lower()}, "priceUsd": "0.8",
                                            "liquidity": {"usd": 5e5}, "marketCap": 6e8, "fdv": 7.2e8}}
@@ -409,7 +420,6 @@ async def browser_check():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         page = await browser.new_page(viewport={"width": 390, "height": 900})
-        await page.add_init_script("if(!localStorage.getItem('ladderDefault')){localStorage.setItem('hideSec','[\"sim\"]');localStorage.setItem('ladderDefault','1')}")  # 市值阶梯 is hidden by default; one-shot so reloads keep the test's state
         await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
         await page.wait_for_selector("#g-ladder .pg")
         # the same four-column table as the price ladders: 目标 / 模型 / 挂单 (the best maker) / 吃单 (the best taker); blue =
@@ -469,6 +479,17 @@ async def browser_check():
             assert await page.evaluate(over) == 0, width
         await page.click("#fchips button:text-is('3 小时内收盘')")
         assert await page.locator("#g-flat .card").count() == 0 and "没有符合条件的卡片" in await page.inner_text("#g-flat")
+        await page.evaluate("filt=[];sortBy='';keep('filt',filt);keep('sort',sortBy)")  # back from the flat view
+        # the cap unknown (every distance null) and five earning levels: the compact view is exactly those five; a level
+        # without a distance is never forced in as the price's neighbour
+        for r in item["ladder"]["rows"]:
+            r["dist"] = None
+            if r["label"] in ("$500M", "$2B", "$3B", "$5B"):
+                r.update(points_active=True, points_ok=True, points_note="积分已激活", points_rate=10, points_why="")
+        item["ladder"]["rows"].append({"label": "$4B", "fair": 0.002, "error": "", "dist": None, "touched": False})
+        await page.reload(); await page.wait_for_selector("#g-ladder .pg")
+        assert await page.locator("#g-ladder .pg .lt").all_inner_texts() == ["$500M", "$1B", "$2B", "$3B", "$5B"]
+        assert await page.inner_text("#g-ladder .price-tools button") == "全部 7 档（+2）"
         await browser.close()
     await web.stop()
 

@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.21.6"
+VERSION = "1.22.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4560,6 +4560,22 @@ CAP_MARKETS = (
             (D("7e8"), D("8e8"), D("9e8"), D("1e9")),
             chain="robinhood", pair="0x10cc6bd38112cac182db90b6a71d8bb5939526ba", supply="fdv", gecko="",
             metric="FDV", settle="DexScreener"),
+    # three more Robinhood-chain FDV ladders settled on the rules' own DexScreener pairs (FDV = (total − burned) × price);
+    # their levels are not listed here: the card shows the ones Predict's market titles carry
+    # "between market creation on September 4 at 6:00 AM ET, 2026 to October 31, 2026 at 11:59 PM ET" (MEME/USDG)
+    CapSpec("MEME", "what-fdv-will-meme-hit-before-november-2026", "$MEME FDV", "0x385F4f8ae47651ce5F58F5265395a669f8281e18",
+            et_ms(2026, 9, 4, 6, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
+            chain="robinhood", pair="0xc6e298e137f2905398db87e6eae49ede64d231fee37330fa433fec917f4618b6", supply="fdv", gecko="",
+            metric="FDV", settle="DexScreener"),
+    # "between market creation on September 2, 2026 at 01:00 AM ET to October 31, 2026 at 11:59 PM ET" (CASHCAT/WETH)
+    CapSpec("CASHCAT", "what-fdv-will-cashcat-hit-before-november-2026", "$CASHCAT FDV", "0x020bfC650A365f8BB26819deAAbF3E21291018b4",
+            et_ms(2026, 9, 2, 1, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
+            chain="robinhood", pair="0xa70fc67c9f69da90b63a0e4c05d229954574e313", supply="fdv", gecko="", metric="FDV", settle="DexScreener"),
+    # "between market creation on September 1, 2026 at 5:00 AM ET to October 31, 2026 at 11:59 PM ET" (the AI pair)
+    CapSpec("AI", "what-fdv-will-ai-hit-before-nov-2026", "$AI FDV", "0x2E8c31162b855A2ffa90F6F8634643Ad6F111e18",
+            et_ms(2026, 9, 1, 5, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
+            chain="robinhood", pair="0xcbdfea90430a30ee4469c9902e120a77e7c7e4711d5643671c1d1957f2f1ce27", supply="fdv", gecko="",
+            metric="FDV", settle="DexScreener"),
 )
 BSC_RPC = ("https://bsc-dataseed.bnbchain.org", "https://bsc-dataseed.binance.org", "https://bsc-rpc.publicnode.com")
 BURN_ADDRESSES = ("0x000000000000000000000000000000000000dead", "0x0000000000000000000000000000000000000000")
@@ -5647,7 +5663,7 @@ h2 .fold:before{content:"▾";color:var(--faint);font-size:11px;width:10px}h2 .f
 h2 .fs{font-weight:400;color:var(--faint)}h2 .fs b{color:var(--hot);font-weight:600}
 .card.off,.grid.off .card{opacity:.45}
 .panel{background:var(--card);border:1px solid var(--best);border-radius:12px;padding:10px 12px;margin:4px 0 8px;display:flex;flex-direction:column;gap:8px;font-size:13px}
-.panel .pr{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
+.panel .pr{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}.panel .cgrp{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;width:100%}
 .panel input[type=number]{width:58px;font:inherit;padding:1px 4px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text)}
 button.tog{font-family:inherit;padding:2px 9px}.tog.on{border-color:var(--best);color:var(--best)}
 </style></head><body><div class="wrap">
@@ -5661,8 +5677,9 @@ button.tog{font-family:inherit;padding:2px 9px}.tog.on{border-color:var(--best);
 <div class="panel" id="custom" hidden>
 <div class="pr"><b>自定义布局</b><span class="mut">拖动 ⠿ 或点 ◀ ▶ 调整卡片顺序（收藏栏平时也能拖）；拖动栏目标题前的 ⠿ 或点旁边的 ↑ ↓ 调整栏目顺序；“隐藏”收起不看的卡片。只保存在这个浏览器。</span></div>
 <div class="pr" id="secs"></div>
+<div class="pr" id="cards"></div>
 <div class="pr" id="oppsrc"></div>
-<div class="pr"><span class="mut">“市值阶梯”和“模拟交易”栏默认不显示，勾上才出现；每笔交易的证据和导出在</span><a class="cb" id="journal" href="#">模拟交易复盘 ↗</a></div>
+<div class="pr"><span class="mut">“价格阶梯”和“模拟交易”栏默认不显示，勾上才出现；每笔交易的证据和导出在</span><a class="cb" id="journal" href="#">模拟交易复盘 ↗</a></div>
 <div class="pr"><label>高亮门槛 <input type="number" id="hotin" min="1" max="50" step="1"> ¢</label><span class="mut">净优势达到这个值的卡片标红框（和模型的“建议门槛”不是一回事：没超过建议门槛的方向不会被建议）</span></div>
 <div class="pr"><span class="mut" id="hidn"></span><span class="sp"></span><button type="button" class="cb" id="showall">全部显示</button><button type="button" class="cb" id="reset" title="还原卡片和栏目顺序、隐藏与高亮门槛（收藏保留）">恢复默认布局</button><button type="button" class="cb pri" id="done">完成</button></div>
 </div>
@@ -5690,9 +5707,11 @@ function keep(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
 function stored(k,d,ok){try{const v=JSON.parse(localStorage.getItem(k));return ok(v)?v:d}catch(e){return d}}
 const strs=v=>Array.isArray(v)&&v.every(x=>typeof x==="string");
 let order=stored("order",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Object.values(v).every(strs));
-let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim","ladder"],strs);
+let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim","levels"],strs);
 try{if(!localStorage.getItem("simDefault")){if(!hideSec.includes("sim"))hideSec=[...hideSec,"sim"];keep("hideSec",hideSec);localStorage.setItem("simDefault","1")}}catch(e){}  // 模拟交易 starts hidden (show it in 自定义)
-try{if(!localStorage.getItem("ladderDefault")){if(!hideSec.includes("ladder"))hideSec=[...hideSec,"ladder"];keep("hideSec",hideSec);localStorage.setItem("ladderDefault","1")}}catch(e){}  // 市值阶梯 starts hidden too
+try{if(!localStorage.getItem("levelsDefault")){if(!hideSec.includes("levels"))hideSec=[...hideSec,"levels"];  // 价格阶梯 starts hidden too
+  if(localStorage.getItem("ladderDefault")){hideSec=hideSec.filter(x=>x!=="ladder");localStorage.removeItem("ladderDefault")}  // 1.21.5 hid 市值阶梯 instead: undo that once
+  keep("hideSec",hideSec);localStorage.setItem("levelsDefault","1")}}catch(e){}
 let hotCents=stored("hot",10,v=>typeof v==="number"&&v>=1&&v<=50),HOT=hotCents/100;  // an edge this large gets the red frame
 let oppOff=stored("oppOff",[],strs),oppTaker=stored("oppTaker",false,v=>typeof v==="boolean");  // the strip on top: sections left out, takers only
 let folded=stored("folded",[],strs);  // sections folded away: the title stays, with how many cards it holds and how many are red-framed
@@ -5937,7 +5956,7 @@ function priceLadderBook(c,it,L,live){
   if(live.length){
     // the compact view: every level whose quote earns points now or that has a suggestion, the two around the price, then the nearest up to five
     const allKey=it.name+"#all-levels",all=open.has(allKey),focus=new Set(live.filter(r=>r.points_ok===true||views.get(r).ok.length));
-    const above=live.filter(r=>r.dist>0).sort((a,b)=>a.dist-b.dist)[0],below=live.filter(r=>r.dist<=0).sort((a,b)=>b.dist-a.dist)[0];
+    const dists=live.filter(r=>r.dist!=null),above=dists.filter(r=>r.dist>0).sort((a,b)=>a.dist-b.dist)[0],below=dists.filter(r=>r.dist<=0).sort((a,b)=>b.dist-a.dist)[0];
     for(const r of [above,below])if(r)focus.add(r);  // the price keeps its neighbours however many levels earn points
     [...live].sort((a,b)=>Math.abs(a.dist??Infinity)-Math.abs(b.dist??Infinity)).forEach(r=>{if(focus.size<5)focus.add(r)});
     const shown=all||live.length<=6?live:live.filter(r=>focus.has(r));
@@ -5956,7 +5975,7 @@ function priceLadderBook(c,it,L,live){
         const candidates=v.edges.filter(e=>e.maker===maker),e=candidates.sort((a,b)=>b.edge-a.edge)[0],eligible=!maker||r.makers===true,ok=e&&eligible&&v.ok.includes(e);
         if(maker&&!eligible){a.append($("span","pa","—"));a.title=r.bids==null&&r.asks==null?r.error||"Predict 暂无盘口":r.maker_note||r.points_note||"积分状态确认后才提示挂单优势";return a}
         if(!e){const nobook=r.bids==null&&r.asks==null;a.append($("span","pa",r.error?"⚠ 请核实":r.stale?"盘口过期":nobook?"—":r.fair==null?"模型暂缺":"暂无报价"));
-          a.title=r.error||r.hold||(nobook?"Predict 暂无盘口":r.fair==null?"模型价暂缺，等待行情或 σ":"等待有效盘口");return a}
+          a.title=r.error||r.hold||(r.stale?"盘口过期，等待新盘口":nobook?"Predict 暂无盘口":r.fair==null?"模型价暂缺，等待行情或 σ":"等待有效盘口");return a}
         if(ok){a.classList.add("pos");if(e.edge>=HOT)a.classList.add("hot")}
         const line=$("span","pa");line.append($("b","",e.up?"Yes":"No"),$("span","",cent(e.price)),$("span","pv",sg(e.edge)));a.append(line);
         if(r.error||r.hold||r.stale)a.append($("span","pwhy",r.stale?"盘口过期":"暂不建议"));else if(ok&&!maker&&e.short)a.append($("span","pwhy","深度不足"));
@@ -6132,6 +6151,13 @@ function drawPanel(){
   secOrder.forEach(g=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=!hideSec.includes(g);i.dataset.sec=g;
     i.addEventListener("change",()=>{hideSec=i.checked?hideSec.filter(x=>x!==g):[...hideSec,g];keep("hideSec",hideSec);if(last)render(last)});
     l.append(i,SEC_NAMES[g]);secs.append(l)});
+  // every card, by section: untick to hide it (the same as the card's own 隐藏 button), tick to bring it back
+  const cl=document.getElementById("cards");cl.replaceChildren($("span","mut","显示的卡片："));
+  if(last)for(const g of secOrder){const items=last.items.filter(it=>(it.group||"contract")===g);if(!items.length)continue;
+    const grp=$("span","cgrp");grp.append($("span","mut",SEC_NAMES[g]+"："));
+    items.forEach(it=>{const k=favKey(it),l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=!hidden.includes(k);i.dataset.card=k;
+      i.addEventListener("change",()=>{hidden=i.checked?hidden.filter(x=>x!==k):[...hidden,k];keep("hidden",hidden);drawPanel();if(last)render(last)});
+      l.append(i,it.name);grp.append(l)});cl.append(grp)}
   const os=document.getElementById("oppsrc");os.replaceChildren($("span","mut","🔥 机会条列出："));
   SECTIONS.filter(g=>g!=="sim").forEach(g=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=!oppOff.includes(g);i.dataset.opp=g;
     i.addEventListener("change",()=>{oppOff=i.checked?oppOff.filter(x=>x!==g):[...oppOff,g];keep("oppOff",oppOff);if(last)render(last)});l.append(i,SEC_NAMES[g]);os.append(l)});
@@ -6156,7 +6182,7 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim","ladder"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppTaker=false;folded=[];
+  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppTaker=false;folded=[];
   ["order","hidden","secs","hot","oppOff","oppTaker","folded"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 async function load(){
@@ -8846,6 +8872,8 @@ class Bot:
         }
         if self.config.predict:
             item["predict"] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
+        if not rows and self.config.predict:
+            item["ladder"]["waiting"] = "等待 Predict 档位"  # a spec without levels of its own: they come from Predict's market titles
         if cap.cap is None or cap.sigma is None:
             item["missing"] = f"等待市值数据（{brief_error(cap.error, 80)}）" if cap.error else "等待市值数据"
         elif cap.input_problem(now_ms):

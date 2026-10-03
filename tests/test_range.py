@@ -507,8 +507,9 @@ async def browser_check(bot):
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         page = await browser.new_page(viewport={"width": 390, "height": 900})
+        await page.add_init_script("if(!localStorage.getItem('levelsDefault')){localStorage.setItem('hideSec','[\"sim\"]');localStorage.setItem('levelsDefault','1')}")
         await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
-        await page.wait_for_selector("#g-levels .pg")
+        await page.wait_for_selector("#g-levels .pg")  # (价格阶梯 is hidden by default: the init script above shows it)
         assert await page.inner_text("#h-levels .hn") == "价格阶梯"
         card = page.locator("#g-levels .card").first
         assert await card.locator(".name").inner_text() == "BTC 10月价格"
@@ -582,7 +583,8 @@ async def browser_check(bot):
         assert await page.is_hidden("#opps") and await page.evaluate("localStorage.getItem('oppOff')") == '["levels"]'
         await page.click("#edit"); await page.uncheck("#opptaker"); await page.click("#done")
         assert (await page.inner_text("#opps")).startswith("🔥 机会 1") and "甲" in await page.inner_text("#opps")
-        await page.click("#edit"); await page.click("#reset"); await page.click("#reset"); await page.click("#done")
+        await page.click("#edit"); await page.click("#reset"); await page.click("#reset")
+        await page.check("#secs input[data-sec=levels]"); await page.click("#done")  # the reset hides 价格阶梯 again (its default)
         assert (await page.inner_text("#opps")).startswith("🔥 机会 2") and await page.evaluate("localStorage.getItem('oppOff')") is None
         # a folded section still counts its red-framed cards in its title; the strip unfolds it before jumping in
         await page.click("#h-levels .fold")
@@ -628,6 +630,7 @@ async def browser_check(bot):
                                          makers=True, maker_note="", fair=.5, bid=.5, ask=.52, bids=[[.5, 5000]], asks=[[.52, 5000]]),  # earns, no edge
                                    *[uirow("↑ $" + str(n) + "k", n * 1000, points_active=True, points_ok=True, points_note="积分已激活", points_rate=40,
                                            points_why="", makers=True, maker_note="") for n in (170, 165, 160)],  # five earning levels: past the pad
+                                   uirow("↑ $158k", 158000, stale=True, fair=None),  # a stale book and no model price
                                    *[uirow("↑ $" + str(n) + "k", n * 1000) for n in range(155, 115, -5)],
                                    uirow("↑ $114k", 114000, fair=.74, bid=.49, ask=.50, bids=[[.49, 5000]], asks=[[.50, 5000]], need=.02, swing=.02),
                                    uirow("↓ $100k", 100000, dir="down")]
@@ -667,6 +670,8 @@ async def browser_check(bot):
         nomodel = card.locator(".ptarget:has(.lt:text-is('↑ $180k')) + .pmodel + .paction + .paction")
         assert await nomodel.inner_text() == "模型暂缺" and await nomodel.get_attribute("title") == "模型价暂缺，等待行情或 σ"  # a book, no fair price
         assert await card.locator(".ptarget:has(.lt:text-is('↑ $180k')) + .pmodel").inner_text() == "—"
+        stale = card.locator(".ptarget:has(.lt:text-is('↑ $158k')) + .pmodel + .paction + .paction")
+        assert await stale.inner_text() == "盘口过期" and await stale.get_attribute("title") == "盘口过期，等待新盘口"  # the tooltip follows the text
         await page.click("#fchips button:text-is('仅挂单')")
         assert await page.locator("#g-flat .card.price-lad").count() == 1
         assert "↑ $200k" in await page.locator("#g-flat .pg").inner_text()
