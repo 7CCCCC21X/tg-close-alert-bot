@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.21.6"
+VERSION = "1.23.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4560,6 +4560,22 @@ CAP_MARKETS = (
             (D("7e8"), D("8e8"), D("9e8"), D("1e9")),
             chain="robinhood", pair="0x10cc6bd38112cac182db90b6a71d8bb5939526ba", supply="fdv", gecko="",
             metric="FDV", settle="DexScreener"),
+    # three more Robinhood-chain FDV ladders settled on the rules' own DexScreener pairs (FDV = (total − burned) × price);
+    # their levels are not listed here: the card shows the ones Predict's market titles carry
+    # "between market creation on September 4 at 6:00 AM ET, 2026 to October 31, 2026 at 11:59 PM ET" (MEME/USDG)
+    CapSpec("MEME", "what-fdv-will-meme-hit-before-november-2026", "$MEME FDV", "0x385F4f8ae47651ce5F58F5265395a669f8281e18",
+            et_ms(2026, 9, 4, 6, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
+            chain="robinhood", pair="0xc6e298e137f2905398db87e6eae49ede64d231fee37330fa433fec917f4618b6", supply="fdv", gecko="",
+            metric="FDV", settle="DexScreener"),
+    # "between market creation on September 2, 2026 at 01:00 AM ET to October 31, 2026 at 11:59 PM ET" (CASHCAT/WETH)
+    CapSpec("CASHCAT", "what-fdv-will-cashcat-hit-before-november-2026", "$CASHCAT FDV", "0x020bfC650A365f8BB26819deAAbF3E21291018b4",
+            et_ms(2026, 9, 2, 1, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
+            chain="robinhood", pair="0xa70fc67c9f69da90b63a0e4c05d229954574e313", supply="fdv", gecko="", metric="FDV", settle="DexScreener"),
+    # "between market creation on September 1, 2026 at 5:00 AM ET to October 31, 2026 at 11:59 PM ET" (the AI pair)
+    CapSpec("AI", "what-fdv-will-ai-hit-before-nov-2026", "$AI FDV", "0x2E8c31162b855A2ffa90F6F8634643Ad6F111e18",
+            et_ms(2026, 9, 1, 5, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
+            chain="robinhood", pair="0xcbdfea90430a30ee4469c9902e120a77e7c7e4711d5643671c1d1957f2f1ce27", supply="fdv", gecko="",
+            metric="FDV", settle="DexScreener"),
 )
 BSC_RPC = ("https://bsc-dataseed.bnbchain.org", "https://bsc-dataseed.binance.org", "https://bsc-rpc.publicnode.com")
 BURN_ADDRESSES = ("0x000000000000000000000000000000000000dead", "0x0000000000000000000000000000000000000000")
@@ -5600,7 +5616,12 @@ body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){displ
 .edge.hot{border-color:var(--hot);background:var(--hot-bg)}.edge.hot b{color:var(--hot)}
 .quote .qe{white-space:normal;word-break:break-all}
 .grid.wide{grid-template-columns:repeat(auto-fill,minmax(min(100%,500px),500px));align-items:start}
-.card.lad .pb{margin-top:0}.grid:not(.wide)>.card.lad{grid-column:1/-1}.lstat{display:flex;flex-direction:column;gap:4px}.lstat:empty{display:none}
+.card.lad .pb{margin-top:0}.grid:not(.wide)>.card.lad{grid-column:1/-1}
+/* 市值阶梯 two or more to a row: every card the same height (the tallest, up to a cap); a longer table scrolls inside the card under a sticky header */
+@media(min-width:1042px){#g-ladder.wide{grid-auto-rows:1fr;align-items:stretch}#g-ladder.wide>.card.lad{max-height:460px}
+#g-ladder.wide>.card.lad .pb{display:flex;flex-direction:column;flex:0 1 auto;min-height:0}#g-ladder.wide>.card.lad .pg{overflow-y:auto;min-height:0;overscroll-behavior:contain}
+#g-ladder.wide>.card.lad .pg .lh{position:sticky;top:0;background:var(--card);z-index:1}#g-ladder.wide>.card.lad .ages{margin-top:0}}
+.lstat{display:flex;flex-direction:column;gap:4px}.lstat:empty{display:none}
 .card.lad .name{flex:0 1 auto}.card.lad .cd{margin-left:6px}
 .touched{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font-size:12px}.touched .k{color:var(--down);font-weight:600}
 .tchip{border-radius:6px;padding:0 6px;background:var(--chip);color:var(--muted);font-variant-numeric:tabular-nums}
@@ -5611,7 +5632,7 @@ body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){displ
 a.simrow{display:grid;grid-template-columns:auto 1fr auto auto;gap:2px 8px;font-size:12.5px;color:inherit;text-decoration:none;font-variant-numeric:tabular-nums;padding:2px 0;border-top:1px dashed var(--line)}
 a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);text-decoration:none;align-self:flex-start}.simj:hover{text-decoration:underline}.panel a.cb{text-decoration:none;color:var(--best)}
 .small{font-size:12px;margin-top:3px}.mut{color:var(--faint)}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
-#opps{display:flex;flex-wrap:wrap;align-items:center;gap:5px 6px;margin:6px 0 2px;font-size:12px}#opps .ok{color:var(--hot);font-weight:650;white-space:nowrap}
+#opps{display:flex;flex-wrap:wrap;align-items:center;gap:5px 6px;margin:6px 0 2px;font-size:12px}#opps .ok{color:var(--hot);font-weight:650;white-space:nowrap}#opps .og{color:var(--muted);font-weight:600;white-space:nowrap;margin-left:2px}
 .opp{display:inline-flex;align-items:baseline;gap:4px;max-width:100%;border:1px solid var(--hot);background:var(--hot-bg);color:var(--text);border-radius:999px;padding:2px 9px;font:inherit;font-size:12px;line-height:1.4;cursor:pointer;font-variant-numeric:tabular-nums}
 .opp b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46vw}.opp span{color:var(--muted);white-space:nowrap}.opp i{font-style:normal;color:var(--hot);font-weight:650}
 .opp:hover{border-color:var(--hot);box-shadow:0 0 0 2px var(--hot-bg)}body.olddata #opps{display:none}
@@ -5627,6 +5648,12 @@ a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);t
 .ptarget{font:inherit;color:var(--text);border:0;background:none;text-align:left;cursor:pointer;min-width:0;padding-right:0}.ptarget .ltl{display:flex;flex-wrap:wrap;align-items:baseline;gap:1px 6px}.ptarget .lt{font-weight:650;white-space:nowrap}.ptarget .pdist{font-size:10.5px;color:var(--faint)}
 .ppoints{display:inline-block;font-size:10.5px;line-height:1.6;border-radius:999px;padding:0 6px;background:var(--chip);color:var(--muted);white-space:nowrap;font-weight:600;vertical-align:1px}
 .ppoints.active{background:var(--best-bg);color:var(--best)}.ppoints.off{padding:0 4px;color:var(--faint);font-weight:400}.quote .ppoints{align-self:center}
+/* a wide card: 目标 is three aligned columns (level, distance, points), so the pills line up down the table; a phone puts the pill under the level */
+@supports(grid-template-columns:subgrid){@media(min-width:561px){.pg{grid-template-columns:max-content max-content max-content minmax(40px,auto) minmax(0,1fr) minmax(0,1fr)}
+.pg>.lh:first-child,.pg .ptarget{grid-column:span 3}.pg .ptarget{display:grid;grid-template-columns:subgrid;column-gap:8px;align-items:baseline}
+.ptarget .ltl{display:contents}.ptarget .lt{grid-column:1}.ptarget .pdist{grid-column:2;justify-self:start}.ptarget .ppoints{grid-column:3;justify-self:start}}}
+@supports not (grid-template-columns:subgrid){@media(min-width:561px){.ptarget .lt{min-width:4em}.ptarget .pdist{min-width:3.4em}}}
+@media(max-width:560px){.ptarget .ltl{display:grid;grid-template-columns:auto minmax(0,1fr);column-gap:5px;row-gap:1px;align-items:baseline}.ptarget .pdist{grid-column:2;justify-self:start}.ptarget .ppoints{grid-column:1/-1;justify-self:start}}
 .paction{font:inherit;border:0;background:none;color:var(--faint);text-align:left;cursor:pointer;line-height:1.35;min-width:0}.paction .pa{display:flex;flex-wrap:wrap;gap:1px 5px;align-items:baseline}.paction .pa b{font-weight:550}.paction .pv{font-weight:650}.paction.pos .pa{color:var(--text)}.paction.pos .pv{color:var(--best)}.paction.hot .pv{color:var(--hot)}.paction .pwhy{display:block;font-size:10px;line-height:1.35;color:var(--faint);margin-top:1px}.paction.disabled{cursor:pointer}
 body.olddata .paction .pa,body.olddata .paction .pv{color:var(--faint)}body.olddata .price-top{opacity:.55}
 .pg .lrow{grid-column:1/-1;margin:0 0 7px;padding:7px 8px;border-radius:8px;background:var(--chip)}.pg .lnote{font-size:12px;line-height:1.5;color:var(--muted)}.pg .lnote .warn{display:block}.pg .lnote b{color:var(--text)}.pg .lspot{grid-column:1/-1;color:var(--muted);font-size:11px;display:flex;align-items:center;gap:8px;padding:5px 0}.pg .lspot:before,.pg .lspot:after{content:"";flex:1;border-top:1px dashed var(--line)}
@@ -5647,7 +5674,7 @@ h2 .fold:before{content:"▾";color:var(--faint);font-size:11px;width:10px}h2 .f
 h2 .fs{font-weight:400;color:var(--faint)}h2 .fs b{color:var(--hot);font-weight:600}
 .card.off,.grid.off .card{opacity:.45}
 .panel{background:var(--card);border:1px solid var(--best);border-radius:12px;padding:10px 12px;margin:4px 0 8px;display:flex;flex-direction:column;gap:8px;font-size:13px}
-.panel .pr{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
+.panel .pr{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}.panel .cgrp{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;width:100%}
 .panel input[type=number]{width:58px;font:inherit;padding:1px 4px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text)}
 button.tog{font-family:inherit;padding:2px 9px}.tog.on{border-color:var(--best);color:var(--best)}
 </style></head><body><div class="wrap">
@@ -5661,8 +5688,11 @@ button.tog{font-family:inherit;padding:2px 9px}.tog.on{border-color:var(--best);
 <div class="panel" id="custom" hidden>
 <div class="pr"><b>自定义布局</b><span class="mut">拖动 ⠿ 或点 ◀ ▶ 调整卡片顺序（收藏栏平时也能拖）；拖动栏目标题前的 ⠿ 或点旁边的 ↑ ↓ 调整栏目顺序；“隐藏”收起不看的卡片。只保存在这个浏览器。</span></div>
 <div class="pr" id="secs"></div>
+<div class="pr" id="cards"></div>
+<div class="pr" id="onerow"></div>
 <div class="pr" id="oppsrc"></div>
-<div class="pr"><span class="mut">“市值阶梯”和“模拟交易”栏默认不显示，勾上才出现；每笔交易的证据和导出在</span><a class="cb" id="journal" href="#">模拟交易复盘 ↗</a></div>
+<div class="pr" id="oppway"></div>
+<div class="pr"><span class="mut">“价格阶梯”和“模拟交易”栏默认不显示，勾上才出现；每笔交易的证据和导出在</span><a class="cb" id="journal" href="#">模拟交易复盘 ↗</a></div>
 <div class="pr"><label>高亮门槛 <input type="number" id="hotin" min="1" max="50" step="1"> ¢</label><span class="mut">净优势达到这个值的卡片标红框（和模型的“建议门槛”不是一回事：没超过建议门槛的方向不会被建议）</span></div>
 <div class="pr"><span class="mut" id="hidn"></span><span class="sp"></span><button type="button" class="cb" id="showall">全部显示</button><button type="button" class="cb" id="reset" title="还原卡片和栏目顺序、隐藏与高亮门槛（收藏保留）">恢复默认布局</button><button type="button" class="cb pri" id="done">完成</button></div>
 </div>
@@ -5690,11 +5720,15 @@ function keep(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
 function stored(k,d,ok){try{const v=JSON.parse(localStorage.getItem(k));return ok(v)?v:d}catch(e){return d}}
 const strs=v=>Array.isArray(v)&&v.every(x=>typeof x==="string");
 let order=stored("order",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Object.values(v).every(strs));
-let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim","ladder"],strs);
+let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim","levels"],strs),oneRow=stored("oneRow",[],strs);  // oneRow: ladder sections shown one card per row
 try{if(!localStorage.getItem("simDefault")){if(!hideSec.includes("sim"))hideSec=[...hideSec,"sim"];keep("hideSec",hideSec);localStorage.setItem("simDefault","1")}}catch(e){}  // 模拟交易 starts hidden (show it in 自定义)
-try{if(!localStorage.getItem("ladderDefault")){if(!hideSec.includes("ladder"))hideSec=[...hideSec,"ladder"];keep("hideSec",hideSec);localStorage.setItem("ladderDefault","1")}}catch(e){}  // 市值阶梯 starts hidden too
+try{if(!localStorage.getItem("levelsDefault")){if(!hideSec.includes("levels"))hideSec=[...hideSec,"levels"];  // 价格阶梯 starts hidden too
+  if(localStorage.getItem("ladderDefault")){hideSec=hideSec.filter(x=>x!=="ladder");localStorage.removeItem("ladderDefault")}  // 1.21.5 hid 市值阶梯 instead: undo that once
+  keep("hideSec",hideSec);localStorage.setItem("levelsDefault","1")}}catch(e){}
 let hotCents=stored("hot",10,v=>typeof v==="number"&&v>=1&&v<=50),HOT=hotCents/100;  // an edge this large gets the red frame
-let oppOff=stored("oppOff",[],strs),oppTaker=stored("oppTaker",false,v=>typeof v==="boolean");  // the strip on top: sections left out, takers only
+const isBool=v=>typeof v==="boolean";
+let oppOff=stored("oppOff",[],strs),oppMakers=stored("oppMakers",true,isBool),oppTakers=stored("oppTakers",true,isBool),oppPoints=stored("oppPoints",true,isBool);  // the strip on top: sections left out, which sides, makers only where points are earned
+try{if(localStorage.getItem("oppTaker")==="true"){oppMakers=false;keep("oppMakers",false)}localStorage.removeItem("oppTaker")}catch(e){}  // the old "只列吃单" switch carries over, once
 let folded=stored("folded",[],strs);  // sections folded away: the title stays, with how many cards it holds and how many are red-framed
 function toggleFold(g){folded=folded.includes(g)?folded.filter(x=>x!==g):[...folded,g];keep("folded",folded);if(last)render(last)}
 let secOrder=stored("secs",SECTIONS,strs);secOrder=[...new Set(secOrder.filter(g=>SECTIONS.includes(g)))];
@@ -5894,6 +5928,7 @@ function ladder(c,it){
   det.append(dl);c.append(det);
   const st=$("div","lstat");  // status lines (missing / errors / prior σ / reached): a fixed band so tables line up
   if(it.missing)st.append($("p","","概率暂缺："+it.missing));else if(L.error)st.append($("div","warn small","⚠️ "+L.error));
+  if(L.waiting)st.append($("div","mut small",L.waiting));  // a spec without levels of its own, before Predict lists them
   const prior=L.sigma_kind==="prior";
   if(prior&&!it.missing){const prog=(L.sigma_note||"").match(/自采价格 ([0-9.]+)/);
     const w=$("div","warn small","⚠️ σ 暂用先验 "+(L.sigma*100).toFixed(0)+"%"+(prog?"（自采 "+prog[1]+"/12 小时）":"")+"，优势仅供参考");
@@ -5931,13 +5966,14 @@ function priceLadder(c,it,L,det,sm){
 function priceLadderBook(c,it,L,live){
   const w=$("div","pb"),h=$("div","quote"),key=favKey(it);h.append(it.predict?openLink(it.predict.url):$("span","pt","Predict"));
   if(it.predict&&it.predict.error)h.append($("span","warn qe",it.predict.error));
-  w.append(h);const views=new Map(live.map(r=>[r,bookView(r)]));let hot=null,hotTk=null;
-  // Compute opportunities from every level, including those folded out of the compact table.
-  for(const r of live){const v=views.get(r);for(const e of v.ok){if(e.edge>=HOT){if(!hot||e.edge>hot.edge)hot={...e,row:r.label};if(!e.maker&&(!hotTk||e.edge>hotTk.edge))hotTk={...e,row:r.label}}}}
+  w.append(h);const views=new Map(live.map(r=>[r,bookView(r)]));let hot=null,hotTk=null,hotMk=null;
+  // Compute opportunities from every level, including those folded out of the compact table: the best maker and the best taker.
+  for(const r of live){const v=views.get(r);for(const e of v.ok){if(e.edge>=HOT){if(!hot||e.edge>hot.edge)hot={...e,row:r.label};
+    if(e.maker){if(!hotMk||e.edge>hotMk.edge)hotMk={...e,row:r.label,points:r.points_ok===true}}else if(!hotTk||e.edge>hotTk.edge)hotTk={...e,row:r.label}}}}
   if(live.length){
     // the compact view: every level whose quote earns points now or that has a suggestion, the two around the price, then the nearest up to five
     const allKey=it.name+"#all-levels",all=open.has(allKey),focus=new Set(live.filter(r=>r.points_ok===true||views.get(r).ok.length));
-    const above=live.filter(r=>r.dist>0).sort((a,b)=>a.dist-b.dist)[0],below=live.filter(r=>r.dist<=0).sort((a,b)=>b.dist-a.dist)[0];
+    const dists=live.filter(r=>r.dist!=null),above=dists.filter(r=>r.dist>0).sort((a,b)=>a.dist-b.dist)[0],below=dists.filter(r=>r.dist<=0).sort((a,b)=>b.dist-a.dist)[0];
     for(const r of [above,below])if(r)focus.add(r);  // the price keeps its neighbours however many levels earn points
     [...live].sort((a,b)=>Math.abs(a.dist??Infinity)-Math.abs(b.dist??Infinity)).forEach(r=>{if(focus.size<5)focus.add(r)});
     const shown=all||live.length<=6?live:live.filter(r=>focus.has(r));
@@ -5956,7 +5992,7 @@ function priceLadderBook(c,it,L,live){
         const candidates=v.edges.filter(e=>e.maker===maker),e=candidates.sort((a,b)=>b.edge-a.edge)[0],eligible=!maker||r.makers===true,ok=e&&eligible&&v.ok.includes(e);
         if(maker&&!eligible){a.append($("span","pa","—"));a.title=r.bids==null&&r.asks==null?r.error||"Predict 暂无盘口":r.maker_note||r.points_note||"积分状态确认后才提示挂单优势";return a}
         if(!e){const nobook=r.bids==null&&r.asks==null;a.append($("span","pa",r.error?"⚠ 请核实":r.stale?"盘口过期":nobook?"—":r.fair==null?"模型暂缺":"暂无报价"));
-          a.title=r.error||r.hold||(nobook?"Predict 暂无盘口":r.fair==null?"模型价暂缺，等待行情或 σ":"等待有效盘口");return a}
+          a.title=r.error||r.hold||(r.stale?"盘口过期，等待新盘口":nobook?"Predict 暂无盘口":r.fair==null?"模型价暂缺，等待行情或 σ":"等待有效盘口");return a}
         if(ok){a.classList.add("pos");if(e.edge>=HOT)a.classList.add("hot")}
         const line=$("span","pa");line.append($("b","",e.up?"Yes":"No"),$("span","",cent(e.price)),$("span","pv",sg(e.edge)));a.append(line);
         if(r.error||r.hold||r.stale)a.append($("span","pwhy",r.stale?"盘口过期":"暂不建议"));else if(ok&&!maker&&e.short)a.append($("span","pwhy","深度不足"));
@@ -5967,21 +6003,28 @@ function priceLadderBook(c,it,L,live){
   }else if(!L.waiting)w.append($("div","price-empty","暂无待触及的档位"));
   c.append(w);const ag=ages(it);if(ag)c.append(ag);
   if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" "+sg(hot.edge);
-    const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);hots.push({key,name:it.name,group:it.group||"levels",best:{text:text(hot),edge:hot.edge},taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
+    const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);
+    hots.push({key,name:it.name,group:it.group||"levels",maker:hotMk?{text:text(hotMk),edge:hotMk.edge,points:hotMk.points}:null,taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
   return c}
-function drawOpps(){  // every red-framed suggestion on the page in one strip on top, largest first; tap one to jump to its card.
-  // 自定义 leaves sections out of it, or lists taker (吃单) suggestions only: a maker's edge is only real once it fills
-  const el=document.getElementById("opps"),seen=new Set();
-  const list=hots.map(h=>({...h,pick:oppTaker?h.taker:h.best})).filter(h=>h.pick&&!oppOff.includes(h.group)&&!seen.has(h.key)&&seen.add(h.key)).sort((a,b)=>b.pick.edge-a.pick.edge);
-  el.hidden=editing||!list.length;if(el.hidden){el.replaceChildren();return}
-  el.replaceChildren($("span","ok","🔥 机会 "+list.length+(oppTaker?"（只列吃单）":"")));
-  list.slice(0,8).forEach(h=>{const b=$("button","opp");b.type="button";b.title="跳到这张卡";
-    b.append($("b","",h.name),$("span","",h.pick.text),$("i","",sg(h.pick.edge)));
-    b.addEventListener("click",()=>{const find=()=>[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);let c=find();if(!c)return;
-      const g=c.parentElement.id.slice(2);if(folded.includes(g)){folded=folded.filter(x=>x!==g);keep("folded",folded);if(last)render(last);c=find()}
-      c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+8)+"px";c.scrollIntoView({behavior:"smooth",block:"start"});
-      c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")});el.append(b)});
-  if(list.length>8)el.append($("span","mut","还有 "+(list.length-8)+" 个"))}
+function drawOpps(){  // every red-framed suggestion on the page in one strip on top: makers (挂单) first, then takers (吃单), largest first; tap one to jump to its card.
+  // 自定义 leaves sections out, drops either side, or lists makers whatever their points; by default a maker is listed only where a
+  // quote placed now earns points (a maker's edge is only real once it fills: the points are what makes the wait pay)
+  const el=document.getElementById("opps"),seen=new Set(),byEdge=(a,b)=>b.pick.edge-a.pick.edge;
+  const pool=hots.filter(h=>!oppOff.includes(h.group)&&!seen.has(h.key)&&seen.add(h.key));
+  const makers=oppMakers?pool.filter(h=>h.maker&&(!oppPoints||h.maker.points)).map(h=>({...h,pick:h.maker})).sort(byEdge):[];
+  const takers=oppTakers?pool.filter(h=>h.taker).map(h=>({...h,pick:h.taker})).sort(byEdge):[];
+  const n=makers.length+takers.length;el.hidden=editing||!n;if(el.hidden){el.replaceChildren();return}
+  el.replaceChildren($("span","ok","🔥 机会 "+n));
+  const jump=h=>{const find=()=>[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);let c=find();if(!c)return;
+    const g=c.parentElement.id.slice(2);if(folded.includes(g)){folded=folded.filter(x=>x!==g);keep("folded",folded);if(last)render(last);c=find()}
+    c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+8)+"px";c.scrollIntoView({behavior:"smooth",block:"start"});
+    c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")};
+  const group=(label,list,title)=>{if(!list.length)return;const t=$("span","og",label+" "+list.length);t.title=title;el.append(t);
+    list.slice(0,6).forEach(h=>{const b=$("button","opp");b.type="button";b.title="跳到这张卡";b.append($("b","",h.name),$("span","",h.pick.text),$("i","",sg(h.pick.edge)));
+      b.addEventListener("click",()=>jump(h));el.append(b)});
+    if(list.length>6)el.append($("span","mut","还有 "+(list.length-6)+" 个"))};
+  group("挂单",makers,"挂单机会：排队等成交，不保证成交"+(oppPoints?"；只列现在挂单能拿积分的市场":""));
+  group("吃单",takers,"吃单机会：立即成交，已扣手续费与滑点")}
 function rowNote(r,L){  // one line about a ladder level itself, above its four directions: on a phone nothing hovers
   const d=$("div","lnote"),parts=[];
   if(r.dist!=null)parts.push((L.kind==="price"?"现价还要"+(r.dist>=0?"涨 ":"跌 "):L.metric+"还要涨 ")+(Math.abs(r.dist)*100).toFixed(1)+"% 才碰到");
@@ -6021,8 +6064,9 @@ function card(it,g){
   if(it.kind==="ladder")return ladder(c,it);
   const v=view(it),best=v.best;  // for the trade size picked in the bar
   if(best&&best.edge>=HOT){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge);
-    const tk=v.ok.filter(e=>!e.maker).sort((a,b)=>b.edge-a.edge)[0],text=e=>e.label+" "+(e.price*100).toFixed(1);
-    hots.push({key:fk,name:it.name,group:it.group||"contract",best:{text:text(best),edge:best.edge},taker:tk&&tk.edge>=HOT?{text:text(tk),edge:tk.edge}:null})}
+    const by=(a,b)=>b.edge-a.edge,mk=v.ok.filter(e=>e.maker).sort(by)[0],tk=v.ok.filter(e=>!e.maker).sort(by)[0],text=e=>e.label+" "+(e.price*100).toFixed(1);
+    hots.push({key:fk,name:it.name,group:it.group||"contract",maker:mk&&mk.edge>=HOT?{text:text(mk),edge:mk.edge,points:!!(it.predict&&it.predict.points_ok===true)}:null,
+               taker:tk&&tk.edge>=HOT?{text:text(tk),edge:tk.edge}:null})}
   if(it.missing){c.append($("p","","概率暂缺："+it.missing));tail(c,it);return c}
   const o=$("div","odds"),a=$("b",style==="us"?"d":"u"),b=$("b",style==="us"?"u":"d");
   const lb=it.labels||["涨","跌"];a.append($("span","lbl",lb[0]),pct(it.fair_up)+"¢");b.append(pct(it.fair_down)+"¢",$("span","lbl",lb[1]));
@@ -6111,6 +6155,7 @@ function render(d){
     const fold=!editing&&folded.includes(g);  // 自定义 shows every section open, so cards can be arranged
     grid.replaceChildren(...items.map(it=>card(it,g)));
     h.hidden=!items.length||(off&&!editing);grid.hidden=h.hidden||fold;grid.classList.toggle("off",off);
+    grid.classList.toggle("wide",["levels","ladder","sim"].includes(g)&&!oneRow.includes(g));  // 自定义 "整行显示": one wide card per row, as in the starred section
     const name=$("span","hn",SEC_NAMES[g]+(off?"（已隐藏）":""));let head=name,sum=null;
     if(!editing){head=$("button","fold");head.type="button";head.setAttribute("aria-expanded",fold?"false":"true");
       head.title=fold?"展开这一栏":"折叠这一栏（标题留着，写明张数和红框机会数）";head.append(name);head.addEventListener("click",()=>toggleFold(g))}
@@ -6132,12 +6177,26 @@ function drawPanel(){
   secOrder.forEach(g=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=!hideSec.includes(g);i.dataset.sec=g;
     i.addEventListener("change",()=>{hideSec=i.checked?hideSec.filter(x=>x!==g):[...hideSec,g];keep("hideSec",hideSec);if(last)render(last)});
     l.append(i,SEC_NAMES[g]);secs.append(l)});
+  // every card, by section: untick to hide it (the same as the card's own 隐藏 button), tick to bring it back
+  const cl=document.getElementById("cards");cl.replaceChildren($("span","mut","显示的卡片："));
+  if(last)for(const g of secOrder){const items=last.items.filter(it=>(it.group||"contract")===g);if(!items.length)continue;
+    const grp=$("span","cgrp");grp.append($("span","mut",SEC_NAMES[g]+"："));
+    items.forEach(it=>{const k=favKey(it),l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=!hidden.includes(k);i.dataset.card=k;
+      i.addEventListener("change",()=>{hidden=i.checked?hidden.filter(x=>x!==k):[...hidden,k];keep("hidden",hidden);drawPanel();if(last)render(last)});
+      l.append(i,it.name);grp.append(l)});cl.append(grp)}
+  const orw=document.getElementById("onerow");orw.replaceChildren($("span","mut","整行显示（每行一张卡）："));
+  ["levels","ladder"].forEach(g=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=oneRow.includes(g);i.dataset.row=g;
+    i.addEventListener("change",()=>{oneRow=i.checked?[...oneRow,g]:oneRow.filter(x=>x!==g);keep("oneRow",oneRow);if(last)render(last)});
+    l.append(i,SEC_NAMES[g]);l.title="这一栏每行只放一张卡，表格和收藏栏里一样宽";orw.append(l)});
   const os=document.getElementById("oppsrc");os.replaceChildren($("span","mut","🔥 机会条列出："));
   SECTIONS.filter(g=>g!=="sim").forEach(g=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=!oppOff.includes(g);i.dataset.opp=g;
     i.addEventListener("change",()=>{oppOff=i.checked?oppOff.filter(x=>x!==g):[...oppOff,g];keep("oppOff",oppOff);if(last)render(last)});l.append(i,SEC_NAMES[g]);os.append(l)});
-  const lt=$("label","tog"),ti=$("input");ti.type="checkbox";ti.id="opptaker";ti.checked=oppTaker;
-  ti.addEventListener("change",()=>{oppTaker=ti.checked;keep("oppTaker",oppTaker);if(last)render(last)});
-  lt.append(ti,"只列吃单（挂单不算）");lt.title="只展示立即成交方向，挂单方向从机会条中隐藏";os.append(lt);
+  const ow=document.getElementById("oppway");ow.replaceChildren($("span","mut","机会条的方向："));
+  [["opp-maker","挂单",oppMakers,v=>{oppMakers=v;keep("oppMakers",v)},"列出挂单机会（排队等成交，不保证成交）"],
+   ["opp-taker","吃单",oppTakers,v=>{oppTakers=v;keep("oppTakers",v)},"列出吃单机会（立即成交，已扣手续费与滑点）"],
+   ["opp-points","挂单只列积分可得的",oppPoints,v=>{oppPoints=v;keep("oppPoints",v)},"挂单机会只列现在挂单能拿积分的市场（蓝色 ● 的那些）；勾掉则所有标红框的挂单都列"]
+  ].forEach(([id,label,on,set,title])=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.id=id;i.checked=on;l.title=title;
+    i.addEventListener("change",()=>{set(i.checked);if(last)render(last)});l.append(i,label);ow.append(l)});
   document.getElementById("hotin").value=hotCents;
   document.getElementById("hidn").textContent=hidden.length?"已隐藏 "+hidden.length+" 张卡片（变淡显示，点“显示”恢复）":"没有隐藏的卡片";
   document.getElementById("showall").disabled=!hidden.length}
@@ -6156,8 +6215,8 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim","ladder"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppTaker=false;folded=[];
-  ["order","hidden","secs","hot","oppOff","oppTaker","folded"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
+  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;folded=[];oneRow=[];
+  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","folded","oneRow"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 async function load(){
   try{
@@ -8846,6 +8905,8 @@ class Bot:
         }
         if self.config.predict:
             item["predict"] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
+        if not rows and self.config.predict:
+            item["ladder"]["waiting"] = "等待 Predict 档位"  # a spec without levels of its own: they come from Predict's market titles
         if cap.cap is None or cap.sigma is None:
             item["missing"] = f"等待市值数据（{brief_error(cap.error, 80)}）" if cap.error else "等待市值数据"
         elif cap.input_problem(now_ms):

@@ -3,7 +3,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
 D = m.D
-NIU, ANSEM, PONS = m.CAP_MARKETS
+NIU, ANSEM, PONS, MEME, CASHCAT, AI = m.CAP_MARKETS
 m.CapMarket.GECKO_GAP = 0  # request spacing is tested on its own below
 TOKEN = NIU.token
 
@@ -50,6 +50,17 @@ assert ANSEM.start_ms == int(dt.datetime(2026, 8, 17, 17, 0, tzinfo=dt.timezone.
 assert ANSEM.token == "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump" and ANSEM.supply == "fdv" and ANSEM.gecko == "solana"
 assert PONS.start_ms == int(dt.datetime(2026, 8, 31, 10, 0, tzinfo=dt.timezone.utc).timestamp() * 1000) and PONS.chain == "robinhood"
 assert PONS.pair == "0x10cc6bd38112cac182db90b6a71d8bb5939526ba" and PONS.gecko == "" and ANSEM.end_ms == PONS.end_ms == NIU.end_ms
+# MEME, CASHCAT and AI: Robinhood chain, settled on the rules' DexScreener pairs, their levels read from Predict (none listed)
+for cs, c_start, c_pair, c_token in ((MEME, dt.datetime(2026, 9, 4, 10, 0, tzinfo=dt.timezone.utc), "0xc6e298e137f2905398db87e6eae49ede64d231fee37330fa433fec917f4618b6",
+                                  "0x385F4f8ae47651ce5F58F5265395a669f8281e18"),
+                                 (CASHCAT, dt.datetime(2026, 9, 2, 5, 0, tzinfo=dt.timezone.utc), "0xa70fc67c9f69da90b63a0e4c05d229954574e313",
+                                  "0x020bfC650A365f8BB26819deAAbF3E21291018b4"),
+                                 (AI, dt.datetime(2026, 9, 1, 9, 0, tzinfo=dt.timezone.utc), "0xcbdfea90430a30ee4469c9902e120a77e7c7e4711d5643671c1d1957f2f1ce27",
+                                  "0x2E8c31162b855A2ffa90F6F8634643Ad6F111e18")):
+    assert cs.start_ms == int(c_start.timestamp() * 1000) and cs.end_ms == PONS.end_ms and cs.pair == c_pair and cs.token == c_token, cs.key
+    assert cs.chain == "robinhood" and cs.supply == "fdv" and cs.gecko == "" and cs.metric == "FDV" and cs.settle == "DexScreener"
+    assert cs.targets == () and cs.name == f"${cs.key} FDV" and cs.slug.startswith(f"what-fdv-will-{cs.key.lower()}-hit-before-")
+assert len({s.key for s in m.CAP_MARKETS}) == 6 and len({s.slug for s in m.CAP_MARKETS}) == 6
 # a named pair's answer ({"pair": {...}}), the base matched without regard to case, FDV kept apart from market cap
 single = {"schemaVersion": "1.0.0", "pair": {"dexId": "uniswap", "baseToken": {"address": PONS.token.lower()}, "priceUsd": "0.8",
                                            "liquidity": {"usd": 5e5}, "marketCap": 6e8, "fdv": 7.2e8}}
@@ -166,6 +177,9 @@ async def run():
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
     bot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(), None)
     assert bot.predict_targets(NOW)["NIULAI"] == NIU.slug and "NIULAI" in bot.predict.ladder_keys
+    assert {"MEME", "CASHCAT", "AI"} <= bot.predict.ladder_keys and bot.predict_targets(NOW)["AI"] == AI.slug
+    meme = bot.cap_payload(bot.caps["MEME"], NOW)["ladder"]  # no levels of its own: the card waits for Predict's titles
+    assert meme["rows"] == [] and meme["waiting"] == "等待 Predict 档位", meme
     markets = [("11", "$200M", "Yes"), ("12", "$300M", "No"), ("13", "$500M", "Yes"), ("14", "$1B", "Yes"), ("15", "Other", "Yes")]
 
     async def fetch(url, payload=None):
@@ -394,13 +408,13 @@ async def browser_check():
     e500 = [edge("挂Yes", True, 0.06, -0.024), edge("挂No", True, 0.932, 0.0318), edge("吃Yes", False, 0.068, -0.033), edge("吃No", False, 0.94, 0.023)]
     e1b = [edge("挂Yes", True, 0.025, -0.021), edge("挂No", True, 0.974, 0.022, True), edge("吃Yes", False, 0.026, -0.022), edge("吃No", False, 0.975, 0.020)]
     item = bot.cap_payload(cap, now)
-    item["ladder"]["rows"] = [row("$200M", 0.304, 0.352, 0.362, e200, 0.067),
-                              row("$500M", 0.036, 0.06, 0.068, e500, 0.0324),
+    item["ladder"]["rows"] = [row("$200M", 0.304, 0.352, 0.362, e200, 0.067, dist=0.52),  # distances of different widths: the columns must still align
+                              row("$500M", 0.036, 0.06, 0.068, e500, 0.0324, dist=2.8),
                               row("$1B", 0.004, 0.025, 0.026, e1b, 0.02, points_active=True, points_ok=True, points_rate=50, points_note="积分已激活",
                                   points_spread=0.06, points_min_shares=100),
                               row("$2B", 0.001, 0.01, 0.02, e1b[:1], 0.02, stale=True, points_active=False, points_ok=False, points_note="积分未激活",
-                                  points_why="积分未激活"),
-                              row("$3B", 0.004, 0.025, 0.026, e1b, 0.02, hold="σ 是先验值，只作参考", fetched_ms=now - 30_000),
+                                  points_why="积分未激活", dist=15),
+                              row("$3B", 0.004, 0.025, 0.026, e1b, 0.02, hold="σ 是先验值，只作参考", fetched_ms=now - 30_000, dist=24),
                               {"label": "$5B", "fair": 0.001, "error": "", "dist": 4.0, "touched": False}]  # no Predict book: cap_payload's bare row
     payload = bot.odds_payload()
     payload["items"] = [item]
@@ -409,7 +423,6 @@ async def browser_check():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         page = await browser.new_page(viewport={"width": 390, "height": 900})
-        await page.add_init_script("if(!localStorage.getItem('ladderDefault')){localStorage.setItem('hideSec','[\"sim\"]');localStorage.setItem('ladderDefault','1')}")  # 市值阶梯 is hidden by default; one-shot so reloads keep the test's state
         await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
         await page.wait_for_selector("#g-ladder .pg")
         # the same four-column table as the price ladders: 目标 / 模型 / 挂单 (the best maker) / 吃单 (the best taker); blue =
@@ -453,15 +466,27 @@ async def browser_check():
         # the filter bar sees every level: 有建议 keeps the card (its $1B level); 3 小时内收盘 drops it (30 days left)
         await page.click("#fchips button:text-is('有建议')")
         assert await page.locator("#g-flat .card.lad").count() == 1
+        await page.click("#fchips button:text-is('有建议')")  # back to the sections: the card in its own 500px grid
         # in its own 500px card the table never sticks out either, points pills included
         wide = """[...document.querySelectorAll('#g-ladder .card *')].filter(e => { const c = e.closest('.card').getBoundingClientRect(),
                   r = e.getBoundingClientRect(); return r.width && (r.right > c.right + 0.5 || r.left < c.left - 0.5) }).length"""
+        lefts = lambda sel: page.eval_on_selector_all(sel, "els => els.map(e => Math.round(e.getBoundingClientRect().left))")
         for width in (1300, 900, 620):
             await page.set_viewport_size({"width": width, "height": 900})
             assert await page.evaluate(wide) == 0, width
+            # on a wide card the level, its distance and its points pill are three aligned columns ($1B / $2B carry pills)
+            pl, dl = await lefts("#g-ladder .pg .ptarget .ppoints"), await lefts("#g-ladder .pg .ptarget .pdist")
+            assert len(pl) == 2 and len(set(pl)) == 1 and len(dl) == 6 and len(set(dl)) == 1 and pl[0] > dl[0], (width, pl, dl)
         assert await page.evaluate("document.querySelector('#g-ladder .ages').compareDocumentPosition(document.querySelector('#g-ladder .pb')) & 2")  # ages after the table
         await page.set_viewport_size({"width": 390, "height": 900})
+        # a phone: the pill sits under the level, at its left edge, on every row (no inline pill on the short labels)
+        rect = "e => { const r = e.getBoundingClientRect(); return [r.left, r.top, r.bottom] }"
+        for label in ("$1B", "$2B"):
+            lt = await page.locator(f"#g-ladder .ptarget:has(.lt:text-is('{label}')) .lt").evaluate(rect)
+            pp = await page.locator(f"#g-ladder .ptarget:has(.lt:text-is('{label}')) .ppoints").evaluate(rect)
+            assert abs(lt[0] - pp[0]) < 1 and pp[1] >= lt[2] - 1, (label, lt, pp)
         # in a grid of ordinary cards (filtered, or starred) a ladder takes the whole row: its table never sticks out
+        await page.click("#fchips button:text-is('有建议')")
         over = """[...document.querySelectorAll('#g-flat .card *')].filter(e => { const c = e.closest('.card').getBoundingClientRect(),
                   r = e.getBoundingClientRect(); return r.width && (r.right > c.right + 0.5 || r.left < c.left - 0.5) }).length"""
         for width in (620, 900, 1300, 390):
@@ -469,6 +494,35 @@ async def browser_check():
             assert await page.evaluate(over) == 0, width
         await page.click("#fchips button:text-is('3 小时内收盘')")
         assert await page.locator("#g-flat .card").count() == 0 and "没有符合条件的卡片" in await page.inner_text("#g-flat")
+        await page.evaluate("filt=[];sortBy='';keep('filt',filt);keep('sort',sortBy)")  # back from the flat view
+        # the cap unknown (every distance null) and five earning levels: the compact view is exactly those five; a level
+        # without a distance is never forced in as the price's neighbour
+        for r in item["ladder"]["rows"]:
+            r["dist"] = None
+            if r["label"] in ("$500M", "$2B", "$3B", "$5B"):
+                r.update(points_active=True, points_ok=True, points_note="积分已激活", points_rate=10, points_why="")
+        item["ladder"]["rows"].append({"label": "$4B", "fair": 0.002, "error": "", "dist": None, "touched": False})
+        await page.reload(); await page.wait_for_selector("#g-ladder .pg")
+        assert await page.locator("#g-ladder .pg .lt").all_inner_texts() == ["$500M", "$1B", "$2B", "$3B", "$5B"]
+        assert await page.inner_text("#g-ladder .price-tools button") == "全部 7 档（+2）"
+        # two or more cards to a row: every card the same height, capped; a long table scrolls inside the card under a sticky header
+        await page.set_viewport_size({"width": 1300, "height": 900})
+        item["ladder"]["rows"] = [row(f"${n}M", 0.3, 0.352, 0.362, e200, 0.067, dist=n / 10) for n in range(1, 15)]
+        await page.reload(); await page.wait_for_selector("#g-ladder .pg")
+        await page.click("#g-ladder .price-tools button")  # all 14 levels
+        pg = "document.querySelector('#g-ladder .pg')"
+        card_h = await page.evaluate("document.querySelector('#g-ladder .card').getBoundingClientRect().height")
+        assert card_h <= 460 and await page.evaluate(f"{pg}.querySelectorAll('.ptarget').length") == 14, card_h
+        assert await page.evaluate(f"{pg}.scrollHeight > {pg}.clientHeight + 40") and await page.evaluate(f"getComputedStyle({pg}).overflowY") == "auto"
+        await page.evaluate(f"{pg}.scrollTop = 150")
+        assert await page.evaluate(f"Math.abs({pg}.querySelector('.lh').getBoundingClientRect().top - {pg}.getBoundingClientRect().top) < 1")  # the header stays
+        assert await page.evaluate("document.querySelector('#g-ladder .ages').getBoundingClientRect().top") > await page.evaluate(f"{pg}.getBoundingClientRect().bottom") - 1
+        await page.set_viewport_size({"width": 390, "height": 900})
+        assert await page.evaluate(f"getComputedStyle({pg}).overflowY") == "visible"  # a phone: the page scrolls, not the card
+        item["ladder"]["rows"] = []; item["ladder"]["waiting"] = "等待 Predict 档位"  # a new spec before Predict lists its levels
+        await page.reload(); await page.wait_for_selector("#g-ladder .card")
+        assert "等待 Predict 档位" in await page.inner_text("#g-ladder .lstat") and await page.locator("#g-ladder .pg").count() == 0
+        assert "暂无待触及的档位" not in await page.inner_text("#g-ladder .card")
         await browser.close()
     await web.stop()
 
