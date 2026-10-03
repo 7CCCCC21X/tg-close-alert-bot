@@ -116,13 +116,20 @@ async def run():
     other = m.PredictBook("SSE", "sse-up", "sse-1", "t", ((D("0.40"), D("100")),), ((D("0.45"), D("100")),), NOW, 200)
     async def details(url, payload=None):
         assert url.endswith("/markets/sse-1"), url
-        return {"data": {"id": "sse-1", "feeRateBps": 150, "status": "OPEN", "outcomes": [{"name": "Up", "indexSet": 1}, {"name": "Down", "indexSet": 2}],
+        return {"data": {"id": "sse-1", "feeRateBps": 150, "status": "OPEN", "tradingStatus": "OPEN", "spreadThreshold": 0.1, "shareThreshold": 100,
+                         "outcomes": [{"name": "Up", "indexSet": 1}, {"name": "Down", "indexSet": 2}],
                          "rewards": {"current": {"hourlyRate": 55, "startsAt": iso(NOW - MIN), "endsAt": iso(NOW + m.DAY_MS)}}}}
     bot.predict.fetch = details
     assert await bot.predict.market_fee("sse-1") == 150 and bot.predict.market_meta["sse-1"][0]["rewards"]["current"]["hourlyRate"] == 55
     block = {}
     bot.book_block(block, other, 0.5, 0.02, 0.0, "", ("涨", "跌"), NOW)
     assert block["points_active"] is True and block["points_rate"] == 55 and block["points_note"] == "积分已激活", block
+    assert block["points_ok"] is True and block["points_why"] == "" and block["points_spread"] == 0.1 and block["points_min_shares"] == 100
+    # the programme pays, but the book is 34¢ wide against a 10¢ cap: a quote placed now earns nothing (the card shows ○)
+    wide = m.PredictBook("SSE", "sse-up", "sse-1", "t", ((D("0.55"), D("100")),), ((D("0.89"), D("100")),), NOW, 200)
+    block = {}; bot.book_block(block, wide, 0.5, 0.02, 0.0, "", ("涨", "跌"), NOW)
+    assert block["points_active"] is True and block["points_rate"] == 55 and block["points_ok"] is False, block
+    assert block["points_why"] == "价差 34.0¢ 未低于积分要求 10.0¢", block["points_why"]
     bot.predict.market_meta["sse-1"] = (bot.predict.market_meta["sse-1"][0], time.monotonic() - m.PREDICT_POINTS_STALE_SECONDS - 1)
     block = {}; bot.book_block(block, other, 0.5, 0.02, 0.0, "", ("涨", "跌"), NOW)
     assert block["points_active"] is None and block["points_note"] == "积分状态已过期"

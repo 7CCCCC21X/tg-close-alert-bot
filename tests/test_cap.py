@@ -396,8 +396,10 @@ async def browser_check():
     item = bot.cap_payload(cap, now)
     item["ladder"]["rows"] = [row("$200M", 0.304, 0.352, 0.362, e200, 0.067),
                               row("$500M", 0.036, 0.06, 0.068, e500, 0.0324),
-                              row("$1B", 0.004, 0.025, 0.026, e1b, 0.02, points_active=True, points_rate=50, points_note="积分已激活"),
-                              row("$2B", 0.001, 0.01, 0.02, e1b[:1], 0.02, stale=True, points_active=False, points_note="积分未激活"),
+                              row("$1B", 0.004, 0.025, 0.026, e1b, 0.02, points_active=True, points_ok=True, points_rate=50, points_note="积分已激活",
+                                  points_spread=0.06, points_min_shares=100),
+                              row("$2B", 0.001, 0.01, 0.02, e1b[:1], 0.02, stale=True, points_active=False, points_ok=False, points_note="积分未激活",
+                                  points_why="积分未激活"),
                               row("$3B", 0.004, 0.025, 0.026, e1b, 0.02, hold="σ 是先验值，只作参考", fetched_ms=now - 30_000)]
     payload = bot.odds_payload()
     payload["items"] = [item]
@@ -417,7 +419,7 @@ async def browser_check():
         assert "门槛" not in await page.inner_text("#g-ladder")
         # points on a cap-ladder level: ● with the rate when active, a faint ○ when not, nothing while unknown
         assert await page.locator("#g-ladder .lg .ltw .ppoints").evaluate_all("els => els.map(e => [e.className, e.textContent, e.title])") == \
-            [["ppoints active", "● 50 PP/h", "积分已激活：这个市场的挂单每小时发 50 PP"], ["ppoints off", "○", "积分未激活"]]
+            [["ppoints active", "● 50 PP/h", "积分可得：这个市场的挂单每小时发 50 PP（价差须低于 6.0¢、至少 100 份）"], ["ppoints off", "○", "积分未激活"]]
         assert await page.locator("#g-ladder .lg .ltw .ppoints.active").inner_text() == "● 50"  # on a phone the unit is dropped
         # the book's age: the oldest level's (30 s)
         assert re.fullmatch(r"行情 \d 秒前\s+盘口 3\d 秒前", await page.inner_text("#g-ladder .ages")), await page.inner_text("#g-ladder .ages")
@@ -438,6 +440,14 @@ async def browser_check():
         # the filter bar sees every level: 有建议 keeps the card (its $1B level); 3 小时内收盘 drops it (30 days left)
         await page.click("#fchips button:text-is('有建议')")
         assert await page.locator("#g-flat .card.lad").count() == 1
+        # in its own 500px card the table never sticks out either, points pills included (they sit under the level)
+        wide = """[...document.querySelectorAll('#g-ladder .card *')].filter(e => { const c = e.closest('.card').getBoundingClientRect(),
+                  r = e.getBoundingClientRect(); return r.width && (r.right > c.right + 0.5 || r.left < c.left - 0.5) }).length"""
+        for width in (1300, 900, 620):
+            await page.set_viewport_size({"width": width, "height": 900})
+            assert await page.evaluate(wide) == 0, width
+        assert await page.evaluate("document.querySelector('#g-ladder .ages').compareDocumentPosition(document.querySelector('#g-ladder .pb')) & 2")  # ages after the table
+        await page.set_viewport_size({"width": 390, "height": 900})
         # in a grid of ordinary cards (filtered, or starred) a ladder takes the whole row: its table never sticks out
         over = """[...document.querySelectorAll('#g-flat .card *')].filter(e => { const c = e.closest('.card').getBoundingClientRect(),
                   r = e.getBoundingClientRect(); return r.width && (r.right > c.right + 0.5 || r.left < c.left - 0.5) }).length"""
