@@ -644,6 +644,17 @@ async def browser_check(bot):
         # (the earning levels alone fill the five, so nothing else is padded in); ↑ $185k pays but cannot earn now, so it stays out
         assert visible == ["↑ $200k", "↑ $175k", "↑ $170k", "↑ $165k", "↑ $160k", "↑ $114k", "↓ $100k"], visible
         assert (await card.locator(".pg .lspot").inner_text()).startswith("现价") and await card.locator(".pg .lspot").count() == 1
+        # level / distance / points line up as three columns on a wide card; on a phone the pill sits under the level
+        await page.set_viewport_size({"width": 900, "height": 900})
+        for sel in (".pg .ptarget .ppoints", ".pg .ptarget .pdist"):
+            lefts = await card.locator(sel).evaluate_all("els => els.map(e => Math.round(e.getBoundingClientRect().left))")
+            assert len(lefts) >= 5 and len(set(lefts)) == 1, (sel, lefts)
+        await page.set_viewport_size({"width": 390, "height": 900})
+        rect = "e => { const r = e.getBoundingClientRect(); return [r.left, r.top, r.bottom] }"
+        lt = await card.locator(".ptarget:has(.lt:text-is('↑ $200k')) .lt").evaluate(rect)
+        pp = await card.locator(".ptarget:has(.lt:text-is('↑ $200k')) .ppoints").evaluate(rect)
+        assert abs(lt[0] - pp[0]) < 1 and pp[1] >= lt[2] - 1, (lt, pp)
+        await page.set_viewport_size({"width": 1300, "height": 900})
         assert "挂Yes 50.0" in await page.inner_text("#opps")
         active = card.locator(".ptarget:has(.lt:text-is('↑ $200k'))")
         assert await active.locator(".ppoints.active").inner_text() == "● 200 PP/h"  # colour says active, the number the rate

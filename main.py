@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.22.0"
+VERSION = "1.22.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5643,6 +5643,12 @@ a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);t
 .ptarget{font:inherit;color:var(--text);border:0;background:none;text-align:left;cursor:pointer;min-width:0;padding-right:0}.ptarget .ltl{display:flex;flex-wrap:wrap;align-items:baseline;gap:1px 6px}.ptarget .lt{font-weight:650;white-space:nowrap}.ptarget .pdist{font-size:10.5px;color:var(--faint)}
 .ppoints{display:inline-block;font-size:10.5px;line-height:1.6;border-radius:999px;padding:0 6px;background:var(--chip);color:var(--muted);white-space:nowrap;font-weight:600;vertical-align:1px}
 .ppoints.active{background:var(--best-bg);color:var(--best)}.ppoints.off{padding:0 4px;color:var(--faint);font-weight:400}.quote .ppoints{align-self:center}
+/* a wide card: 目标 is three aligned columns (level, distance, points), so the pills line up down the table; a phone puts the pill under the level */
+@supports(grid-template-columns:subgrid){@media(min-width:561px){.pg{grid-template-columns:max-content max-content max-content minmax(40px,auto) minmax(0,1fr) minmax(0,1fr)}
+.pg>.lh:first-child,.pg .ptarget{grid-column:span 3}.pg .ptarget{display:grid;grid-template-columns:subgrid;column-gap:8px;align-items:baseline}
+.ptarget .ltl{display:contents}.ptarget .lt{grid-column:1}.ptarget .pdist{grid-column:2;justify-self:start}.ptarget .ppoints{grid-column:3;justify-self:start}}}
+@supports not (grid-template-columns:subgrid){@media(min-width:561px){.ptarget .lt{min-width:4em}.ptarget .pdist{min-width:3.4em}}}
+@media(max-width:560px){.ptarget .ltl{display:grid;grid-template-columns:auto minmax(0,1fr);column-gap:5px;row-gap:1px;align-items:baseline}.ptarget .pdist{grid-column:2;justify-self:start}.ptarget .ppoints{grid-column:1/-1;justify-self:start}}
 .paction{font:inherit;border:0;background:none;color:var(--faint);text-align:left;cursor:pointer;line-height:1.35;min-width:0}.paction .pa{display:flex;flex-wrap:wrap;gap:1px 5px;align-items:baseline}.paction .pa b{font-weight:550}.paction .pv{font-weight:650}.paction.pos .pa{color:var(--text)}.paction.pos .pv{color:var(--best)}.paction.hot .pv{color:var(--hot)}.paction .pwhy{display:block;font-size:10px;line-height:1.35;color:var(--faint);margin-top:1px}.paction.disabled{cursor:pointer}
 body.olddata .paction .pa,body.olddata .paction .pv{color:var(--faint)}body.olddata .price-top{opacity:.55}
 .pg .lrow{grid-column:1/-1;margin:0 0 7px;padding:7px 8px;border-radius:8px;background:var(--chip)}.pg .lnote{font-size:12px;line-height:1.5;color:var(--muted)}.pg .lnote .warn{display:block}.pg .lnote b{color:var(--text)}.pg .lspot{grid-column:1/-1;color:var(--muted);font-size:11px;display:flex;align-items:center;gap:8px;padding:5px 0}.pg .lspot:before,.pg .lspot:after{content:"";flex:1;border-top:1px dashed var(--line)}
@@ -5678,6 +5684,7 @@ button.tog{font-family:inherit;padding:2px 9px}.tog.on{border-color:var(--best);
 <div class="pr"><b>自定义布局</b><span class="mut">拖动 ⠿ 或点 ◀ ▶ 调整卡片顺序（收藏栏平时也能拖）；拖动栏目标题前的 ⠿ 或点旁边的 ↑ ↓ 调整栏目顺序；“隐藏”收起不看的卡片。只保存在这个浏览器。</span></div>
 <div class="pr" id="secs"></div>
 <div class="pr" id="cards"></div>
+<div class="pr" id="onerow"></div>
 <div class="pr" id="oppsrc"></div>
 <div class="pr"><span class="mut">“价格阶梯”和“模拟交易”栏默认不显示，勾上才出现；每笔交易的证据和导出在</span><a class="cb" id="journal" href="#">模拟交易复盘 ↗</a></div>
 <div class="pr"><label>高亮门槛 <input type="number" id="hotin" min="1" max="50" step="1"> ¢</label><span class="mut">净优势达到这个值的卡片标红框（和模型的“建议门槛”不是一回事：没超过建议门槛的方向不会被建议）</span></div>
@@ -5707,7 +5714,7 @@ function keep(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
 function stored(k,d,ok){try{const v=JSON.parse(localStorage.getItem(k));return ok(v)?v:d}catch(e){return d}}
 const strs=v=>Array.isArray(v)&&v.every(x=>typeof x==="string");
 let order=stored("order",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Object.values(v).every(strs));
-let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim","levels"],strs);
+let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim","levels"],strs),oneRow=stored("oneRow",[],strs);  // oneRow: ladder sections shown one card per row
 try{if(!localStorage.getItem("simDefault")){if(!hideSec.includes("sim"))hideSec=[...hideSec,"sim"];keep("hideSec",hideSec);localStorage.setItem("simDefault","1")}}catch(e){}  // 模拟交易 starts hidden (show it in 自定义)
 try{if(!localStorage.getItem("levelsDefault")){if(!hideSec.includes("levels"))hideSec=[...hideSec,"levels"];  // 价格阶梯 starts hidden too
   if(localStorage.getItem("ladderDefault")){hideSec=hideSec.filter(x=>x!=="ladder");localStorage.removeItem("ladderDefault")}  // 1.21.5 hid 市值阶梯 instead: undo that once
@@ -5913,6 +5920,7 @@ function ladder(c,it){
   det.append(dl);c.append(det);
   const st=$("div","lstat");  // status lines (missing / errors / prior σ / reached): a fixed band so tables line up
   if(it.missing)st.append($("p","","概率暂缺："+it.missing));else if(L.error)st.append($("div","warn small","⚠️ "+L.error));
+  if(L.waiting)st.append($("div","mut small",L.waiting));  // a spec without levels of its own, before Predict lists them
   const prior=L.sigma_kind==="prior";
   if(prior&&!it.missing){const prog=(L.sigma_note||"").match(/自采价格 ([0-9.]+)/);
     const w=$("div","warn small","⚠️ σ 暂用先验 "+(L.sigma*100).toFixed(0)+"%"+(prog?"（自采 "+prog[1]+"/12 小时）":"")+"，优势仅供参考");
@@ -6130,6 +6138,7 @@ function render(d){
     const fold=!editing&&folded.includes(g);  // 自定义 shows every section open, so cards can be arranged
     grid.replaceChildren(...items.map(it=>card(it,g)));
     h.hidden=!items.length||(off&&!editing);grid.hidden=h.hidden||fold;grid.classList.toggle("off",off);
+    grid.classList.toggle("wide",["levels","ladder","sim"].includes(g)&&!oneRow.includes(g));  // 自定义 "整行显示": one wide card per row, as in the starred section
     const name=$("span","hn",SEC_NAMES[g]+(off?"（已隐藏）":""));let head=name,sum=null;
     if(!editing){head=$("button","fold");head.type="button";head.setAttribute("aria-expanded",fold?"false":"true");
       head.title=fold?"展开这一栏":"折叠这一栏（标题留着，写明张数和红框机会数）";head.append(name);head.addEventListener("click",()=>toggleFold(g))}
@@ -6158,6 +6167,10 @@ function drawPanel(){
     items.forEach(it=>{const k=favKey(it),l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=!hidden.includes(k);i.dataset.card=k;
       i.addEventListener("change",()=>{hidden=i.checked?hidden.filter(x=>x!==k):[...hidden,k];keep("hidden",hidden);drawPanel();if(last)render(last)});
       l.append(i,it.name);grp.append(l)});cl.append(grp)}
+  const orw=document.getElementById("onerow");orw.replaceChildren($("span","mut","整行显示（每行一张卡）："));
+  ["levels","ladder"].forEach(g=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=oneRow.includes(g);i.dataset.row=g;
+    i.addEventListener("change",()=>{oneRow=i.checked?[...oneRow,g]:oneRow.filter(x=>x!==g);keep("oneRow",oneRow);if(last)render(last)});
+    l.append(i,SEC_NAMES[g]);l.title="这一栏每行只放一张卡，表格和收藏栏里一样宽";orw.append(l)});
   const os=document.getElementById("oppsrc");os.replaceChildren($("span","mut","🔥 机会条列出："));
   SECTIONS.filter(g=>g!=="sim").forEach(g=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=!oppOff.includes(g);i.dataset.opp=g;
     i.addEventListener("change",()=>{oppOff=i.checked?oppOff.filter(x=>x!==g):[...oppOff,g];keep("oppOff",oppOff);if(last)render(last)});l.append(i,SEC_NAMES[g]);os.append(l)});
@@ -6182,8 +6195,8 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppTaker=false;folded=[];
-  ["order","hidden","secs","hot","oppOff","oppTaker","folded"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
+  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppTaker=false;folded=[];oneRow=[];
+  ["order","hidden","secs","hot","oppOff","oppTaker","folded","oneRow"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 async function load(){
   try{

@@ -177,6 +177,9 @@ async def run():
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
     bot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(), None)
     assert bot.predict_targets(NOW)["NIULAI"] == NIU.slug and "NIULAI" in bot.predict.ladder_keys
+    assert {"MEME", "CASHCAT", "AI"} <= bot.predict.ladder_keys and bot.predict_targets(NOW)["AI"] == AI.slug
+    meme = bot.cap_payload(bot.caps["MEME"], NOW)["ladder"]  # no levels of its own: the card waits for Predict's titles
+    assert meme["rows"] == [] and meme["waiting"] == "等待 Predict 档位", meme
     markets = [("11", "$200M", "Yes"), ("12", "$300M", "No"), ("13", "$500M", "Yes"), ("14", "$1B", "Yes"), ("15", "Other", "Yes")]
 
     async def fetch(url, payload=None):
@@ -405,13 +408,13 @@ async def browser_check():
     e500 = [edge("挂Yes", True, 0.06, -0.024), edge("挂No", True, 0.932, 0.0318), edge("吃Yes", False, 0.068, -0.033), edge("吃No", False, 0.94, 0.023)]
     e1b = [edge("挂Yes", True, 0.025, -0.021), edge("挂No", True, 0.974, 0.022, True), edge("吃Yes", False, 0.026, -0.022), edge("吃No", False, 0.975, 0.020)]
     item = bot.cap_payload(cap, now)
-    item["ladder"]["rows"] = [row("$200M", 0.304, 0.352, 0.362, e200, 0.067),
-                              row("$500M", 0.036, 0.06, 0.068, e500, 0.0324),
+    item["ladder"]["rows"] = [row("$200M", 0.304, 0.352, 0.362, e200, 0.067, dist=0.52),  # distances of different widths: the columns must still align
+                              row("$500M", 0.036, 0.06, 0.068, e500, 0.0324, dist=2.8),
                               row("$1B", 0.004, 0.025, 0.026, e1b, 0.02, points_active=True, points_ok=True, points_rate=50, points_note="积分已激活",
                                   points_spread=0.06, points_min_shares=100),
                               row("$2B", 0.001, 0.01, 0.02, e1b[:1], 0.02, stale=True, points_active=False, points_ok=False, points_note="积分未激活",
-                                  points_why="积分未激活"),
-                              row("$3B", 0.004, 0.025, 0.026, e1b, 0.02, hold="σ 是先验值，只作参考", fetched_ms=now - 30_000),
+                                  points_why="积分未激活", dist=15),
+                              row("$3B", 0.004, 0.025, 0.026, e1b, 0.02, hold="σ 是先验值，只作参考", fetched_ms=now - 30_000, dist=24),
                               {"label": "$5B", "fair": 0.001, "error": "", "dist": 4.0, "touched": False}]  # no Predict book: cap_payload's bare row
     payload = bot.odds_payload()
     payload["items"] = [item]
@@ -463,15 +466,27 @@ async def browser_check():
         # the filter bar sees every level: 有建议 keeps the card (its $1B level); 3 小时内收盘 drops it (30 days left)
         await page.click("#fchips button:text-is('有建议')")
         assert await page.locator("#g-flat .card.lad").count() == 1
+        await page.click("#fchips button:text-is('有建议')")  # back to the sections: the card in its own 500px grid
         # in its own 500px card the table never sticks out either, points pills included
         wide = """[...document.querySelectorAll('#g-ladder .card *')].filter(e => { const c = e.closest('.card').getBoundingClientRect(),
                   r = e.getBoundingClientRect(); return r.width && (r.right > c.right + 0.5 || r.left < c.left - 0.5) }).length"""
+        lefts = lambda sel: page.eval_on_selector_all(sel, "els => els.map(e => Math.round(e.getBoundingClientRect().left))")
         for width in (1300, 900, 620):
             await page.set_viewport_size({"width": width, "height": 900})
             assert await page.evaluate(wide) == 0, width
+            # on a wide card the level, its distance and its points pill are three aligned columns ($1B / $2B carry pills)
+            pl, dl = await lefts("#g-ladder .pg .ptarget .ppoints"), await lefts("#g-ladder .pg .ptarget .pdist")
+            assert len(pl) == 2 and len(set(pl)) == 1 and len(dl) == 6 and len(set(dl)) == 1 and pl[0] > dl[0], (width, pl, dl)
         assert await page.evaluate("document.querySelector('#g-ladder .ages').compareDocumentPosition(document.querySelector('#g-ladder .pb')) & 2")  # ages after the table
         await page.set_viewport_size({"width": 390, "height": 900})
+        # a phone: the pill sits under the level, at its left edge, on every row (no inline pill on the short labels)
+        rect = "e => { const r = e.getBoundingClientRect(); return [r.left, r.top, r.bottom] }"
+        for label in ("$1B", "$2B"):
+            lt = await page.locator(f"#g-ladder .ptarget:has(.lt:text-is('{label}')) .lt").evaluate(rect)
+            pp = await page.locator(f"#g-ladder .ptarget:has(.lt:text-is('{label}')) .ppoints").evaluate(rect)
+            assert abs(lt[0] - pp[0]) < 1 and pp[1] >= lt[2] - 1, (label, lt, pp)
         # in a grid of ordinary cards (filtered, or starred) a ladder takes the whole row: its table never sticks out
+        await page.click("#fchips button:text-is('有建议')")
         over = """[...document.querySelectorAll('#g-flat .card *')].filter(e => { const c = e.closest('.card').getBoundingClientRect(),
                   r = e.getBoundingClientRect(); return r.width && (r.right > c.right + 0.5 || r.left < c.left - 0.5) }).length"""
         for width in (620, 900, 1300, 390):
@@ -490,6 +505,10 @@ async def browser_check():
         await page.reload(); await page.wait_for_selector("#g-ladder .pg")
         assert await page.locator("#g-ladder .pg .lt").all_inner_texts() == ["$500M", "$1B", "$2B", "$3B", "$5B"]
         assert await page.inner_text("#g-ladder .price-tools button") == "全部 7 档（+2）"
+        item["ladder"]["rows"] = []; item["ladder"]["waiting"] = "等待 Predict 档位"  # a new spec before Predict lists its levels
+        await page.reload(); await page.wait_for_selector("#g-ladder .card")
+        assert "等待 Predict 档位" in await page.inner_text("#g-ladder .lstat") and await page.locator("#g-ladder .pg").count() == 0
+        assert "暂无待触及的档位" not in await page.inner_text("#g-ladder .card")
         await browser.close()
     await web.stop()
 

@@ -121,6 +121,19 @@ async def layout_check(browser, page):
     assert await page.inner_text("#g-crypto .card:nth-child(1) .ctl button:nth-last-child(1)") == "显示"
     await page.check("#cards input[data-card=BNBUSDT]")
     assert await page.locator(".card.off").count() == 2 and await stored("hidden") == '["上证指数","UNITREEUSDT"]'
+    # 整行显示: a ladder section can put one card per row (the wide table of the starred and filtered views); kept across reloads
+    await page.set_viewport_size({"width": 1300, "height": 900})
+    gw = lambda sel: page.evaluate(f"document.querySelector('{sel}').getBoundingClientRect().width")
+    wide = lambda g: page.evaluate(f"document.getElementById('g-{g}').classList.contains('wide')")
+    assert await wide("ladder") and await gw("#g-ladder .card") < await gw("#g-ladder") / 2
+    await page.check("#onerow input[data-row=ladder]")
+    assert not await wide("ladder") and await wide("levels") and abs(await gw("#g-ladder .card") - await gw("#g-ladder")) < 1
+    assert await stored("oneRow") == '["ladder"]'
+    await page.reload(); await page.wait_for_selector("#g-crypto .card")
+    assert not await wide("ladder") and abs(await gw("#g-ladder .card") - await gw("#g-ladder")) < 1
+    await page.click("#edit"); await page.uncheck("#onerow input[data-row=ladder]")
+    assert await wide("ladder") and await gw("#g-ladder .card") < await gw("#g-ladder") / 2 and await stored("oneRow") == "[]"
+    await page.set_viewport_size({"width": 390, "height": 900})
     await page.uncheck("#secs input[data-sec=ladder]")
     assert await page.inner_text("#h-ladder .hn") == "市值阶梯（已隐藏）" and await page.is_visible("#g-ladder.off .card")
     await page.click("#done")
@@ -167,7 +180,7 @@ async def layout_check(browser, page):
     assert await page.eval_on_selector_all("#secs input", "els => els.map(e => e.dataset.sec)") == ["crypto", "levels", "contract", "index", "ladder", "sim"]
     await page.set_viewport_size({"width": 390, "height": 900})
     # 恢复默认布局 takes a second click within 4 s and leaves the stars alone (folded sections open again too)
-    await page.evaluate("keep('folded', ['index'])")
+    await page.evaluate("keep('folded', ['index']); keep('oneRow', ['ladder'])")
     await page.click("#g-crypto .card:nth-child(4) .star")
     await page.click("#reset")
     assert await page.inner_text("#reset") == "再点一次确认" and await names("ladder") == ["$ANSEM FDV", "$牛来 市值", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV"]
@@ -176,6 +189,7 @@ async def layout_check(browser, page):
     assert await page.inner_text("#reset") == "再点一次确认" and await stored("order") is not None
     await page.click("#reset")
     assert await page.inner_text("#reset") == "恢复默认布局" and await heads() == ["fav", "index", "contract", "crypto", "levels", "ladder", "sim"]
+    assert await stored("oneRow") is None and await page.evaluate("document.getElementById('g-ladder').classList.contains('wide')")
     assert await names("ladder") == ["$牛来 市值", "$ANSEM FDV", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV"] and await names("crypto") == [*crypto[:3], *crypto[4:]]
     assert await stored("order") is None and await stored("secs") is None and await stored("favs") == '["BTCUSDT"]'
     assert await stored("folded") is None
