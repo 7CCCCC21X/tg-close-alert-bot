@@ -35,7 +35,7 @@ assert bids == ((D("0.81"), D("110.5")), (D("0.80"), D("400")), (D("0.79"), D("1
 asks = m.predict_levels([["0.99", "2000"], ["0.85", "12"], ["0.94", "157.4"]], False)
 assert asks[0] == (D("0.85"), D("12"))
 assert m.predict_markets({"data": {"markets": {"edges": [{"node": {"id": 7, "conditionId": "0xab", "title": "Up?", "question": "q"}}]}}}) \
-    == [{"id": "7", "conditionId": "0xab", "title": "Up?"}]
+    == [{"id": "7", "conditionId": "0xab", "title": "Up?", "question": "q"}]
 
 # edges: the screenshot's HSI book (买1 81¢, 卖1 85¢) with the model at 涨 78¢
 now = int(time.time() * 1000)

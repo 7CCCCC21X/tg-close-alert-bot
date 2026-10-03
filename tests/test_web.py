@@ -100,7 +100,7 @@ async def layout_check(browser, page):
     await page.evaluate("localStorage.removeItem('favs')"); await page.reload(); await page.wait_for_selector(".card .odds")
     assert not await page.is_visible("#custom") and await page.locator(".ctl").count() == 0
     await page.click("#edit")
-    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == 12
+    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == 16
     lad = "#g-ladder .card"
     assert await page.is_disabled(f"{lad}:nth-child(1) .ctl button[title='前移']") and await page.is_disabled(f"{lad}:nth-child(3) .ctl button[title='后移']")
     await page.click(f"{lad}:nth-child(1) .ctl button[title='后移']")
@@ -133,18 +133,19 @@ async def layout_check(browser, page):
     assert await page.inner_text("#h-ladder .hn") == "市值阶梯" and await stored("hideSec") == '["sim"]'
     # ↑ ↓ beside a section title move the whole section (the tick boxes follow); sections without cards are skipped
     heads = lambda: page.eval_on_selector_all(".wrap > h2:not([hidden])", "els => els.map(e => e.id.slice(2))")
-    assert await heads() == ["index", "contract", "crypto", "ladder", "sim"]
+    assert await heads() == ["index", "contract", "crypto", "levels", "ladder", "sim"]
     assert await page.is_disabled("#h-index button[title='栏目上移']") and await page.is_disabled("#h-sim button[title='栏目下移']")
     await page.click("#h-crypto button[title='栏目上移']"); await page.click("#h-crypto button[title='栏目上移']")
-    assert await heads() == ["crypto", "index", "contract", "ladder", "sim"] and await stored("secs") == '["crypto","index","contract","ladder","sim"]'
-    assert await page.eval_on_selector_all("#secs input", "els => els.map(e => e.dataset.sec)") == ["crypto", "index", "contract", "ladder", "sim"]
+    assert await heads() == ["crypto", "index", "contract", "levels", "ladder", "sim"]
+    assert await stored("secs") == '["crypto","index","contract","levels","ladder","sim"]'
+    assert await page.eval_on_selector_all("#secs input", "els => els.map(e => e.dataset.sec)") == ["crypto", "index", "contract", "levels", "ladder", "sim"]
     await page.click("#g-contract .card .star")  # 合约标的 is now empty: ↓ on 指数 goes straight past it
     await page.click("#h-index button[title='栏目下移']")
-    assert await heads() == ["fav", "crypto", "ladder", "index", "sim"], await heads()
-    assert await stored("secs") == '["crypto","contract","ladder","index","sim"]', await stored("secs")
+    assert await heads() == ["fav", "crypto", "levels", "index", "ladder", "sim"], await heads()
+    assert await stored("secs") == '["crypto","contract","levels","index","ladder","sim"]', await stored("secs")
     await page.click("#g-fav .card .star")
     await page.reload(); await page.wait_for_selector("#g-crypto .card"); await page.click("#edit")
-    assert await heads() == ["crypto", "contract", "ladder", "index", "sim"]
+    assert await heads() == ["crypto", "contract", "levels", "index", "ladder", "sim"]
     # 恢复默认布局 takes a second click within 4 s and leaves the stars alone
     await page.click("#g-crypto .card:nth-child(4) .star")
     await page.click("#reset")
@@ -153,7 +154,7 @@ async def layout_check(browser, page):
     await page.click("#reset")
     assert await page.inner_text("#reset") == "再点一次确认" and await stored("order") is not None
     await page.click("#reset")
-    assert await page.inner_text("#reset") == "恢复默认布局" and await heads() == ["fav", "index", "contract", "crypto", "ladder", "sim"]
+    assert await page.inner_text("#reset") == "恢复默认布局" and await heads() == ["fav", "index", "contract", "crypto", "levels", "ladder", "sim"]
     assert await names("ladder") == ["$牛来 市值", "$ANSEM FDV", "$PONS FDV"] and await names("crypto") == [*crypto[:3], *crypto[4:]]
     assert await stored("order") is None and await stored("secs") is None and await stored("favs") == '["BTCUSDT"]'
     assert await names("fav") == ["BTC 先触 70k/90k"]
@@ -236,7 +237,7 @@ async def run():
     payload = bot.odds_payload()
     names = [i["name"] for i in payload["items"]]
     assert names == ["上证指数", "宇树 UNITREE", "BNB 先触 700/900", "SOL 先触 60/140", "BTC 先触 70k/90k", "ETH 先触 1k/3k", "BTC 10月涨跌", "HYPE 反超 SOL",
-                     "$牛来 市值", "$ANSEM FDV", "$PONS FDV", "模拟交易"], names
+                     "BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格", "$牛来 市值", "$ANSEM FDV", "$PONS FDV", "模拟交易"], names
     bnb = payload["items"][2]
     assert bnb["group"] == "crypto" and bnb["labels"] == ["$900", "$700"] and bnb["missing"].startswith("等待币安行情"), bnb
     assert payload["items"][0]["group"] == "index" and payload["items"][1]["symbol"] == "UNITREEUSDT" and payload["items"][1]["group"] == "contract"

@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.19.0"
+VERSION = "1.20.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -3203,7 +3203,8 @@ def predict_markets(data: Any) -> list[dict]:
         if isinstance(node, dict):
             if node.get("id") is not None and ("conditionId" in node or "question" in node) and "title" in node:
                 found.append({"id": str(node["id"]), "conditionId": str(node.get("conditionId") or ""),
-                              "title": str(node.get("title") or node.get("question") or "")})
+                              "title": str(node.get("title") or node.get("question") or ""),
+                              "question": str(node.get("question") or "")})
                 return
             for value in node.values():
                 walk(value, depth + 1)
@@ -3251,6 +3252,7 @@ class LadderRow:
     title: str
     book: PredictBook | None
     error: str = ""
+    question: str = ""  # the market's question (a price ladder's direction may be spelt there)
 
 
 def cap_target(title: str) -> D | None:
@@ -3492,6 +3494,7 @@ class PredictFeed:
         self.market_lists: dict[str, tuple[list[dict] | None, float]] = {}  # slug -> every market of the category
         self.market_meta: dict[str, tuple[dict, float]] = {}     # market id -> ({"outcomes": [...], "status": str}, when)
         self.ladder_keys: set[str] = set()                       # item keys whose category holds several Yes/No markets
+        self.ladder_parse: dict[str, Any] = {}                   # item key -> its markets' level parser (default cap_target)
         self.ladders: dict[str, list[LadderRow]] = {}            # item key -> one row per market, by threshold
         self.fees: dict[str, tuple[int | None, float]] = {}      # market id -> (feeRateBps or None, when read)
         self.refreshed = -1e9
@@ -3621,7 +3624,9 @@ class PredictFeed:
             stated = int(market.get("feeRateBps"))
             fee = stated if 0 <= stated <= 10_000 else None
         return {"outcomes": [str(o.get("name") or "") for o in rows], "created_ms": created,
-                "status": str(market.get("status") or ""), "fee_bps": fee, "resolved": predict_resolution(market)}
+                "status": str(market.get("status") or ""), "fee_bps": fee, "resolved": predict_resolution(market),
+                "rules": str(market.get("description") or market.get("rules") or "")[:3000],
+                "question": str(market.get("question") or "")}
 
     async def market_fee(self, market_id: str) -> int | None:
         """The market's own taker fee rate (feeRateBps), re-read every 10 minutes; None when it states none (or the
@@ -3640,7 +3645,8 @@ class PredictFeed:
         self.info[slug] = {"outcomes": details["outcomes"], "created_ms": details["created_ms"]}
 
     async def ladder_row(self, key: str, slug: str, market: dict) -> "LadderRow | None":
-        target = cap_target(market.get("title", ""))
+        parse = self.ladder_parse.get(key, cap_target)
+        target = parse(market.get("title", "")) or parse(market.get("question", ""))
         if target is None:
             return None
         meta = self.market_meta.get(market["id"])
@@ -3650,10 +3656,11 @@ class PredictFeed:
         try:
             bids, asks, _ = await self.orderbook(market)
         except (RemoteError, TimeoutError, OSError) as error:
-            return LadderRow(target, market["id"], market["title"], None, clean_error(error) or type(error).__name__)
+            return LadderRow(target, market["id"], market["title"], None, clean_error(error) or type(error).__name__,
+                             market.get("question", ""))
         fee = (self.market_meta.get(market["id"]) or ({}, 0))[0].get("fee_bps")
         book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee)
-        return LadderRow(target, market["id"], market["title"], book, "")
+        return LadderRow(target, market["id"], market["title"], book, "", market.get("question", ""))
 
     async def refresh_ladder(self, key: str, slug: str) -> None:
         """A category of Yes/No markets, one per threshold: every market's book, sorted by threshold."""
@@ -3664,7 +3671,7 @@ class PredictFeed:
             return
         rows = [row for row in await asyncio.gather(*(self.ladder_row(key, slug, m) for m in markets)) if row]
         if not rows:
-            raise RemoteError("Predict 市场标题里没有可识别的市值档位")
+            raise RemoteError("Predict 市场标题里没有可识别的档位")
         self.ladders[key] = sorted(rows, key=lambda row: row.target)
         self.errors.pop(key, None)
 
@@ -4917,6 +4924,286 @@ class CapMarket:
         return hit_probability(float(cap), float(target), self.sigma, years)
 
 
+# --- price ladders ("what price will Bitcoin hit in October?": one Yes/No market per level) ---------------------------
+@dataclass(frozen=True)
+class RangeSpec:
+    """A "what price will X hit in <month>" category: one Yes/No market per price level, Yes as soon as any Binance
+    1-minute candle of the window has a High at or above an upward level (a Low at or below a downward one). Each market's
+    own rules (or its title) say which; the rules for this category's levels name the default."""
+    key: str          # item / book key and the card's favourite key
+    slug: str
+    symbol: str       # the Binance pair the rules name
+    venue: str        # "spot" (BTC/USDT, ETH/USDT, SOL/USDT) or "futures" (HYPEUSDT, a USDⓈ-M perpetual)
+    name: str         # card title
+    start_ms: int     # open of the first candle: 00:00 ET on the 1st
+    end_ms: int       # open of the last candle: 23:59 ET on the last day
+    default_dir: str = "up"  # the direction of the rules the category was added with ("up": High ≥, "down": Low ≤)
+
+    def label(self, ms: int) -> str:
+        et = dt.datetime.fromtimestamp(ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(ms))))
+        return f"{et:%m-%d %H:%M} ET（北京 {stamp(ms, seconds=False)}）"
+
+
+RANGE_MARKETS = (
+    # "from 00:00 AM ET on the first day to 11:59 PM ET on the last" (October: EDT throughout); Binance 1m candles
+    RangeSpec("BTC-HIT-10", "what-price-will-bitcoin-hit-in-october-2026", "BTCUSDT", "spot", "BTC 10月价格",
+              et_ms(2026, 10, 1, 0, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), "down"),
+    RangeSpec("ETH-HIT-10", "what-price-will-ethereum-hit-in-october-2026", "ETHUSDT", "spot", "ETH 10月价格",
+              et_ms(2026, 10, 1, 0, 0, -4), et_ms(2026, 10, 31, 23, 59, -4)),
+    RangeSpec("SOL-HIT-10", "what-price-will-solana-hit-in-october-2026", "SOLUSDT", "spot", "SOL 10月价格",
+              et_ms(2026, 10, 1, 0, 0, -4), et_ms(2026, 10, 31, 23, 59, -4)),
+    # HYPEUSDT on Binance futures (the rules link binance.com/en/futures/HYPEUSDT)
+    RangeSpec("HYPE-HIT-10", "what-price-will-hyperliquid-hit-in-october-2026", "HYPEUSDT", "futures", "HYPE 10月价格",
+              et_ms(2026, 10, 1, 0, 0, -4), et_ms(2026, 10, 31, 23, 59, -4)),
+)
+
+
+def price_level(title: str) -> D | None:
+    """The price a ladder market's title names: '↑ 130,000' / '$4.5K' / '↓ $100k' / 'Will Solana reach $250?' -> the
+    number; a year next to a month name is not a price. None when there is none."""
+    text = re.sub(r"(?i)\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(?:\d{1,2},?\s+)?20\d\d\b", " ", str(title))
+    text = re.sub(r"\b20\d\d\b(?![,.]?\d)", " ", text) if re.search(r"[$↑↓▲▼]|\d\s*[kK]\b", text) else text
+    found = [(m.group(1), m.group(2), m.start()) for m in re.finditer(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*([kKmM]?)(?![\w.])", text)]
+    if not found:
+        return None
+    marked = [f for f in found if f[1] or re.search(r"[$↑↓▲▼]\s*$", text[:f[2]])]
+    number, unit, _ = (marked or found)[0]
+    value = D(number.replace(",", ""))
+    return value * {"": D(1), "k": D(1000), "m": D(10) ** 6}[unit.lower()] if value > 0 else None
+
+
+def level_direction(rules: str, *titles: str) -> tuple[str, str]:
+    """('up' | 'down' | '', where it was read): a market's own rules (High ≥ / Low ≤; rules naming both say nothing about
+    this one market), else an arrow in its title or question, else a word there (reach / dip); '' when nothing says. An
+    arrow against the rules (the rules text may be the whole category's) is returned as the arrow says, marked "冲突"."""
+    text = re.sub(r"\s+", " ", re.sub(r"[\"'“”‘’*]", "", str(rules))).lower()
+    down = re.search(r"\blow(?: price)? (?:is )?(?:equal to or (?:lower|less|below)|at or below|<=|≤)|\bfinal low\b", text)
+    up = re.search(r"\bhigh(?: price)? (?:is )?(?:equal to or (?:greater|higher|above)|at or above|>=|≥)|\bfinal high\b", text)
+    by_rules = ("down" if down else "up") if bool(down) != bool(up) else ""
+    arrow = next((d for t in titles for d, mark in (("down", r"[↓▼]"), ("up", r"[↑▲]")) if re.search(mark, str(t))), "")
+    if by_rules and arrow and arrow != by_rules:
+        return arrow, "冲突"
+    if by_rules:
+        return by_rules, "规则"
+    if arrow:
+        return arrow, "标题"
+    for title in titles:
+        t = str(title).lower()
+        if re.search(r"\bdips?\b|\bdrops?\b|\bfalls?\b|\bbelow\b|跌", t):
+            return "down", "标题"
+        if re.search(r"\breach(?:es)?\b|\babove\b|\brises?\b|\bhigh(?:er)?\b|涨", t):
+            return "up", "标题"
+    return "", ""
+
+
+# a level whose market does not say ↑ or ↓ (or says both ways): the card's note, and the short reason the paper trader keeps
+RANGE_GUESS = {"推断": "这个市场的规则和标题都没写明上破还是下破，按档位在月初价格之上（↑）还是之下（↓）推断；只作参考",
+               "默认": "这个市场的规则和标题都没写明上破还是下破，方向按本类规则默认；只作参考",
+               "冲突": "标题的箭头和规则写的方向相反，按标题显示；请到 Predict 核实后再看"}
+RANGE_GUESS_SHORT = {"推断": "方向是推断的", "默认": "方向按本类规则默认", "冲突": "标题与规则的方向相反"}
+
+
+def low_probability(spot: float, level: float, sigma: float, years: float) -> float:
+    """P(the running minimum reaches ``level`` (below ``spot``) before ``years``) for a zero-drift GBM (log drift −σ²/2):
+    Φ((−a + s²/2)/s) + (S/L)·Φ((−a − s²/2)/s), a = ln(S/L), s = σ√T (the mirror of hit_probability)."""
+    if spot <= level:
+        return 1.0
+    if years <= 0 or sigma <= 0:
+        return 0.0
+    a, s = math.log(spot / level), sigma * math.sqrt(years)
+    return min(1.0, norm_cdf((-a + s * s / 2) / s) + spot / level * norm_cdf((-a - s * s / 2) / s))
+
+
+def level_label(value: D | float) -> str:
+    """130000 -> '$130k', 4500 -> '$4.5k', 250 -> '$250', 62.5 -> '$62.5'."""
+    v = float(value)
+    return f"${v / 1000:,.4g}k" if v >= 1000 else f"${v:,.6g}"
+
+
+async def binance_futures(path: str, **params: Any) -> Any:
+    """GET /fapi/v1/<path> from Binance USDⓈ-M futures (HYPEUSDT's resolution source)."""
+    query = urllib.parse.urlencode(params)
+    data = await http_json(f"https://fapi.binance.com/fapi/v1/{path}" + (f"?{query}" if query else ""))
+    if isinstance(data, dict) and isinstance(data.get("code"), int) and data["code"] < 0:
+        raise RemoteError(f"币安合约错误 {data['code']}: {clean_error(data.get('msg', '请求失败'))}")
+    return data
+
+
+class RangeMarket:
+    """A Binance pair over one month: live price, 30-day σ, and the window's highest High and lowest Low so far. Hourly
+    candles carry exactly the extremes of their minutes, and the window runs from one hour boundary to another, so they
+    decide every level; the running hour's own candle counts at once (a level reached resolves the market at once)."""
+    PRICE_SECONDS = 30
+    VOL_SECONDS = 3600
+    SCAN_SECONDS = 60
+    PRICE_STALE_MS = 5 * 60_000     # a price older than this prices nothing
+    SIGMA_STALE_MS = 24 * 3600_000  # σ not re-measured for a day: shown, not advised on
+    SCAN_STALE_MS = 15 * 60_000     # the window's extremes must be read this close to now before advice is given
+
+    def __init__(self, store: "Store", spec: RangeSpec, futures: Any = None):
+        self.store, self.spec = store, spec
+        self.futures = futures or binance_futures  # the bot passes its own futures feed (base URL, rate-limit cooldown)
+        self.price: D | None = None
+        self.priced_ms = 0
+        self.sigma: float | None = None
+        self.sigma_ms = 0
+        self.running: dict = {}           # the running hour's candle (in the window): {"open", "high", "low"}
+        self.scanned_ms = 0               # when the extremes were last read up to now
+        self.error = ""
+        self.failures = {"price": "", "vol": "", "scan": ""}  # each part's last failure, kept until that part succeeds
+        self.times = {"price": -1e9, "vol": -1e9, "scan": -1e9}
+
+    async def get(self, path: str, **params: Any) -> Any:
+        return await (self.futures if self.spec.venue == "futures" else binance_spot)(path, **params)
+
+    @property
+    def window_end(self) -> int:
+        """The end of the window's last minute."""
+        return self.spec.end_ms + 60_000
+
+    @property
+    def history(self) -> dict:
+        """{'start': ms, 'through': ms (the next hour to read), 'open': the window's first price, 'high'/'low': prices,
+        'high_at'/'low_at': hour opens}."""
+        saved = self.store.get(f"range:{self.spec.slug}", {})
+        return saved if isinstance(saved, dict) and saved.get("start") == self.spec.start_ms else {}
+
+    async def refresh(self, now_ms: int) -> None:
+        mono, why = time.monotonic(), lambda error: clean_error(error) or type(error).__name__
+        if mono - self.times["price"] >= self.PRICE_SECONDS:
+            self.times["price"] = mono
+            try:
+                data = await self.get("ticker/price", symbol=self.spec.symbol)
+                self.price, self.priced_ms = number(data["price"], self.spec.symbol), now_ms
+                self.failures["price"] = ""
+            except Exception as error:
+                self.failures["price"] = f"价格：{why(error)}"
+        if mono - self.times["vol"] >= self.VOL_SECONDS:
+            self.times["vol"] = mono
+            try:  # 722: the newest bar is the running hour, which realized_vol drops
+                self.sigma = realized_vol(await self.get("klines", symbol=self.spec.symbol, interval="1h", limit=722), now_ms)
+                self.sigma_ms = now_ms
+                self.failures["vol"] = ""
+            except Exception as error:
+                self.times["vol"] = mono - self.VOL_SECONDS + (60 if self.sigma is None else 300)  # again in 1 / 5 minutes
+                self.failures["vol"] = f"波动率：{why(error)}"
+        if mono - self.times["scan"] >= self.SCAN_SECONDS:
+            self.times["scan"] = mono
+            try:
+                await self.scan(now_ms)
+                self.failures["scan"] = ""
+            except Exception as error:
+                self.failures["scan"] = f"区间核验：{why(error)}"
+        self.error = "；".join(text for text in self.failures.values() if text)
+
+    async def scan(self, now_ms: int) -> None:
+        """Extend the window's extremes (persisted) with the hours finished since the last scan; keep the running hour's
+        candle apart. Once the window is over and read to its end, "through" reaches window_end: the record is complete."""
+        start, end = self.spec.start_ms, self.window_end
+        if now_ms <= start:
+            return
+        hist = dict(self.history) or {"start": start, "through": start, "high": None, "high_at": 0, "low": None, "low_at": 0}
+        running: dict = {}
+        for _ in range(50):
+            cursor = int(hist["through"])
+            if cursor >= end:
+                break
+            rows = await self.get("klines", symbol=self.spec.symbol, interval="1h", startTime=cursor,
+                                  endTime=min(now_ms, end) - 1, limit=1000)
+            if not isinstance(rows, list):  # an error object is not "no candles" (that would close the window unread)
+                raise RemoteError(f"币安小时 K 格式异常：{str(rows)[:80]}")
+            rows = [r for r in rows if isinstance(r, list) and len(r) > 6 and cursor <= int(r[0]) < end]
+            for row in rows:
+                opened, closed, high, low = int(row[0]), int(row[6]), float(row[2]), float(row[3])
+                if opened == start and hist.get("open") is None:
+                    hist["open"] = float(row[1])  # the window's first price: which side of it a level sits on
+                if closed >= now_ms:  # still running: counts now, persisted once it is over
+                    running = {"open": opened, "high": high, "low": low}
+                    continue
+                if hist["high"] is None or high > hist["high"]:
+                    hist["high"], hist["high_at"] = high, opened
+                if hist["low"] is None or low < hist["low"]:
+                    hist["low"], hist["low_at"] = low, opened
+                hist["through"] = closed + 1
+            if len(rows) < 1000 or running:
+                break
+        if now_ms >= end and not running:
+            hist["through"] = max(int(hist["through"]), end)  # hours without a candle had no trades
+        self.running, self.scanned_ms = running, now_ms
+        self.store.put(f"range:{self.spec.slug}", hist)
+
+    def marks(self) -> dict:
+        """{'high', 'high_at', 'low', 'low_at'}: the highest High and lowest Low inside the window so far, and the hour
+        each was seen in: finished hours, the running hour, the live price (only while it falls inside the window). The
+        earliest hour wins a tie."""
+        hist, run = self.history, self.running
+        highs = [(hist.get("high"), int(hist.get("high_at") or 0)), (run.get("high"), int(run.get("open") or 0))]
+        lows = [(hist.get("low"), int(hist.get("low_at") or 0)), (run.get("low"), int(run.get("open") or 0))]
+        if self.price is not None and self.spec.start_ms <= self.priced_ms < self.window_end:
+            hour = self.priced_ms - self.priced_ms % 3_600_000
+            highs.append((float(self.price), hour))
+            lows.append((float(self.price), hour))
+        high = max((x for x in highs if x[0] is not None), key=lambda x: x[0], default=(None, 0))
+        low = min((x for x in lows if x[0] is not None), key=lambda x: x[0], default=(None, 0))
+        return {"high": high[0], "high_at": high[1], "low": low[0], "low_at": low[1]}
+
+    def extremes(self) -> tuple[float | None, float | None]:
+        """(highest High, lowest Low) inside the window so far (see marks)."""
+        marks = self.marks()
+        return marks["high"], marks["low"]
+
+    def reached(self, level: D, direction: str) -> bool:
+        high, low = self.extremes()
+        if direction == "up":
+            return high is not None and high >= float(level)
+        return low is not None and low <= float(level)
+
+    def probability(self, level: D, direction: str, now_ms: int) -> float | None:
+        """P(Yes) for one level: 1 once reached; 0 once the window is over and read to its end without it; else the touch
+        model from the live price (zero drift, the 30-day σ). None while the price or σ is missing or stale, or while the
+        window's last hours are not read yet."""
+        if self.reached(level, direction):
+            return 1.0
+        if now_ms >= self.window_end:
+            return 0.0 if self.complete() else None
+        if self.price is None or self.sigma is None or now_ms - self.priced_ms > self.PRICE_STALE_MS:
+            return None
+        years = max(0.0, (self.window_end - max(now_ms, self.spec.start_ms)) / YEAR_MS)
+        touch = hit_probability if direction == "up" else low_probability
+        return touch(float(self.price), float(level), self.sigma, years)
+
+    def model_swing(self, level: D, direction: str, now_ms: int, fair: float | None) -> float:
+        """How far P(Yes) moves with σ ×/÷ 1.25: an edge inside that is the model's own error."""
+        if fair is None or fair >= 1.0 or self.price is None or self.sigma is None:
+            return 0.0
+        years = max(0.0, (self.window_end - max(now_ms, self.spec.start_ms)) / YEAR_MS)
+        touch = hit_probability if direction == "up" else low_probability
+        return max(abs(touch(float(self.price), float(level), self.sigma * k, years) - fair)
+                   for k in (MODEL_SIGMA_ERROR, 1 / MODEL_SIGMA_ERROR))
+
+    def advice_problem(self, now_ms: int) -> str:
+        """Why no level may be suggested now ("" when they may): the window's extremes must be read up to now (a level
+        already reached would otherwise look open), σ current, the window still running."""
+        if now_ms >= self.window_end:
+            return "窗口已结束，等待结算"
+        if now_ms > self.spec.start_ms and now_ms - self.scanned_ms > self.SCAN_STALE_MS:
+            through = int(self.history.get("through") or 0)
+            return f"本月最高/最低核验停在 {stamp(through, seconds=False) if through else '开始前'}；暂不给建议"
+        if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
+            return "波动率超过一天未更新；暂不给建议"
+        return ""
+
+    def complete(self) -> bool:
+        """Every hour of the window has been read (so "not reached" is settled)."""
+        return int(self.history.get("through") or 0) >= self.window_end
+
+    def reference(self) -> float | None:
+        """The price a level is above (↑) or below (↓) when nothing else says which: the window's first price, before
+        the window opens the live one."""
+        opening = self.history.get("open")
+        return float(opening) if opening else float(self.price) if self.price is not None else None
+
+
 # --- paper trading (does buying every 10¢ edge make money in the long run?) ------------------------------------------
 @dataclass(frozen=True)
 class SimMarket:
@@ -4924,7 +5211,7 @@ class SimMarket:
     side, the book oriented to that side, the bar a suggestion must clear, and what deciding the result needs."""
     market: str              # unique: the slug, plus "#<market id>" for one level of a ladder
     item: str                # the card's name for it (恒生指数 / BTC 10月涨跌 / $牛来 市值 $200M)
-    kind: str                # close | touch | updown | ladder
+    kind: str                # close | touch | updown | flip | range | ladder
     key: str                 # the card's book key (HSI / UNITREEUSDT / BNB / BTC-2026-10 / NIULAI)
     fair_up: float
     book: PredictBook        # bids / asks price the 涨 / Yes side
@@ -4935,7 +5222,8 @@ class SimMarket:
     evidence: dict = field(default_factory=dict)  # what the odds rest on: model inputs, price sources, proxy / anchor
 
 
-SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": "月度涨跌", "flip": "反超", "ladder": "市值阶梯"}
+SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": "月度涨跌", "flip": "反超", "range": "价格阶梯",
+             "ladder": "市值阶梯"}
 
 
 def edge_watch(st: dict, sides: dict | None, best: "BookEdge | None", now_ms: int, bar: float, confirm_ms: int,
@@ -5256,6 +5544,13 @@ a.simrow{display:grid;grid-template-columns:auto 1fr auto auto;gap:2px 8px;font-
 a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);text-decoration:none;align-self:flex-start}.simj:hover{text-decoration:underline}.panel a.cb{text-decoration:none;color:var(--best)}.lg .lb.pos{color:var(--text)}.lg .lb.pos b{color:var(--best)}.lg .lb.hot,.lg .lb.hot b{color:var(--hot)}.lg .lk b{color:var(--faint)}.lg .lk.pos b{color:var(--best)}.lg .lz{color:var(--faint);font-size:11px;margin-left:3px}
 @media (max-width:560px){.lg{gap:3px 7px;font-size:12px}.lg .ld,.lg .lz,.lg .lp{display:none}.lg{grid-template-columns:auto auto auto auto 1fr}}
 .small{font-size:12px;margin-top:3px}.mut{color:var(--faint)}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
+#opps{display:flex;flex-wrap:wrap;align-items:center;gap:5px 6px;margin:6px 0 2px;font-size:12px}#opps .ok{color:var(--hot);font-weight:650;white-space:nowrap}
+.opp{display:inline-flex;align-items:baseline;gap:4px;max-width:100%;border:1px solid var(--hot);background:var(--hot-bg);color:var(--text);border-radius:999px;padding:2px 9px;font:inherit;font-size:12px;line-height:1.4;cursor:pointer;font-variant-numeric:tabular-nums}
+.opp b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46vw}.opp span{color:var(--muted);white-space:nowrap}.opp i{font-style:normal;color:var(--hot);font-weight:650}
+.opp:hover{border-color:var(--hot);box-shadow:0 0 0 2px var(--hot-bg)}body.olddata #opps{display:none}
+.card.flash{animation:flash 1.4s ease-out}@keyframes flash{from{outline:3px solid var(--best);outline-offset:3px}to{outline:3px solid transparent;outline-offset:3px}}
+.lg .lspot{grid-column:1/-1;display:flex;align-items:center;gap:8px;color:var(--faint);font-size:11px;line-height:1;margin:1px 0;cursor:default}.lg .lspot:before,.lg .lspot:after{content:"";flex:1;border-top:1px dashed var(--line)}
+.lg .lnote{font-size:12px;color:var(--muted);line-height:1.5;cursor:default}.lg .lnote b{color:var(--text)}.lg .lnote .warn{display:block}
 [hidden]{display:none!important}
 .grip{flex:none;border:0;background:none;padding:3px 5px;margin:-3px 0 -3px -6px;font-size:16px;line-height:1;color:var(--muted);cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}.grip:hover{color:var(--text)}
 body.sorting,body.sorting *{cursor:grabbing!important;user-select:none!important}
@@ -5277,6 +5572,7 @@ button.tog{font-family:inherit;padding:2px 9px}.tog.on{border-color:var(--best);
 <label class="fsort">排序 <select id="sortsel"><option value="">默认</option><option value="edge">按净优势</option><option value="time">按剩余时间</option></select></label>
 <span class="famt" title="吃单按这个金额计算成交均价、可买份数、手续费和滑点">试算 <span id="amts"></span><input type="number" id="amtin" min="1" step="1" placeholder="自定" aria-label="自定金额"> U</span></div>
 <div id="stale" hidden><span id="stalemsg"></span><button type="button" class="cb" id="retry">立即重试</button></div>
+<div id="opps" hidden></div>
 <div class="panel" id="custom" hidden>
 <div class="pr"><b>自定义布局</b><span class="mut">拖动 ⠿ 或点 ◀ ▶ 调整卡片顺序（收藏栏平时也能拖），栏目标题旁的 ↑ ↓ 调整栏目顺序；“隐藏”收起不看的卡片。只保存在这个浏览器。</span></div>
 <div class="pr" id="secs"></div>
@@ -5289,6 +5585,7 @@ button.tog{font-family:inherit;padding:2px 9px}.tog.on{border-color:var(--best);
 <h2 id="h-index">指数</h2><div class="grid" id="g-index"></div>
 <h2 id="h-contract">合约标的</h2><div class="grid" id="g-contract"></div>
 <h2 id="h-crypto">加密</h2><div class="grid" id="g-crypto"></div>
+<h2 id="h-levels">价格阶梯</h2><div class="grid wide" id="g-levels"></div>
 <h2 id="h-ladder">市值阶梯</h2><div class="grid wide" id="g-ladder"></div>
 <h2 id="h-sim">模拟交易</h2><div class="grid wide" id="g-sim"></div>
 <footer id="foot">模型参考，非投资建议。</footer>
@@ -5302,7 +5599,7 @@ if(!Array.isArray(favs))favs=[];
 favs=[...new Set(favs.filter(k=>typeof k==="string").map(k=>k.includes("|")?(k.split("|")[1]||k.split("|")[0]):k))];  // old "name|symbol" keys
 function toggleFav(k){favs=favs.includes(k)?favs.filter(x=>x!==k):[...favs,k];keep("favs",favs);if(last)render(last)}
 // the viewer's layout, also in this browser only: card order per section, hidden cards and sections, the red-frame bar
-const SECTIONS=["index","contract","crypto","ladder","sim"],SEC_NAMES={fav:"⭐ 收藏",index:"指数",contract:"合约标的",crypto:"加密",ladder:"市值阶梯",sim:"模拟交易"};
+const SECTIONS=["index","contract","crypto","levels","ladder","sim"],SEC_NAMES={fav:"⭐ 收藏",index:"指数",contract:"合约标的",crypto:"加密",levels:"价格阶梯",ladder:"市值阶梯",sim:"模拟交易"};
 function keep(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
 function stored(k,d,ok){try{const v=JSON.parse(localStorage.getItem(k));return ok(v)?v:d}catch(e){return d}}
 const strs=v=>Array.isArray(v)&&v.every(x=>typeof x==="string");
@@ -5310,7 +5607,9 @@ let order=stored("order",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Obje
 let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim"],strs);
 try{if(!localStorage.getItem("simDefault")){if(!hideSec.includes("sim"))hideSec=[...hideSec,"sim"];keep("hideSec",hideSec);localStorage.setItem("simDefault","1")}}catch(e){}  // 模拟交易 starts hidden (show it in 自定义)
 let hotCents=stored("hot",10,v=>typeof v==="number"&&v>=1&&v<=50),HOT=hotCents/100;  // an edge this large gets the red frame
-let secOrder=stored("secs",SECTIONS,strs);secOrder=[...new Set([...secOrder.filter(g=>SECTIONS.includes(g)),...SECTIONS])];
+let secOrder=stored("secs",SECTIONS,strs);secOrder=[...new Set(secOrder.filter(g=>SECTIONS.includes(g)))];
+SECTIONS.forEach((g,i)=>{if(!secOrder.includes(g)){const prev=SECTIONS.slice(0,i).reverse().find(x=>secOrder.includes(x));  // a new section joins after its default neighbour
+  secOrder.splice(prev?secOrder.indexOf(prev)+1:0,0,g)}});
 let editing=false,drag=null,pending=null;
 function ctlBtn(t,tip,fn,dis){const b=$("button","cb",t);b.type="button";b.title=tip;b.disabled=!!dis;b.addEventListener("click",e=>{e.preventDefault();fn()});return b}
 function arrange(items,g){  // the viewer's order first; cards it has not placed yet follow in the page's own order
@@ -5360,7 +5659,7 @@ let filt=stored("filt",[],strs),sortBy=stored("sort","",v=>["","edge","time"].in
 const FILTERS=[["sug","有建议","只看现在有建议的卡片"],["no","仅 No/跌","只看建议买 No（或 跌、后一个结果）的"],["maker","仅挂单","只看建议挂单的"],
   ["taker","仅吃单","只看建议吃单的"],["soon","3 小时内收盘","只看 3 小时内收盘或截止的"]];
 const SOON_MS=3*3600e3,STALE_MS=60e3;  // no successful refresh for a minute: every highlight comes off
-let openChip={},okAt=0,failMsg="";
+let openChip={},okAt=0,failMsg="",hots=[];  // hots: this render's red-framed suggestions, for the strip on top
 function takerFill(levels,notional){  // [average price, shares, short?] buying `notional` USD across [[price, size]], best first
   if(!levels.length)return[0,0,true];let spent=0,shares=0;
   for(const[p,q]of levels){const take=Math.min(q,(notional-spent)/p);spent+=take*p;shares+=take;if(spent>=notional-1e-9)return[spent/shares,shares,false]}
@@ -5466,6 +5765,7 @@ function ladder(c,it){
   // a market-cap ladder: one Yes/No market per threshold; reached ones fold into one line, open ones get a row each
   const L=it.ladder,det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   const sm=$("summary");sm.title="点开看计算明细";
+  if(L.kind==="price")return priceLadder(c,it,L,det,sm);
   sm.append($("span","rd",L.metric),$("span","v",L.cap),$("span","rd","窗口最高"),$("span","v",L.high));
   if(L.sigma)sm.append($("span","rd","σ"),$("span","v",(L.sigma*100).toFixed(0)+"%"));
   det.append(sm);const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
@@ -5486,15 +5786,38 @@ function ladder(c,it){
     const shown=done.length>3?[{label:"≤ "+done[done.length-1].label+" · "+done.length+" 档"}]:done;  // many levels: one chip
     shown.forEach(r=>{const x=$("span","tchip",r.label);x.title="窗口内"+L.metric+"已达到："+tip;t.append(x)});
     st.append(t)}
-  c.append(st);
+  c.append(st);return ladderBook(c,it,L,live)}
+function priceLadder(c,it,L,det,sm){
+  // a price ladder: one Yes/No market per level, ↑ reached by a 1-minute High, ↓ by a 1-minute Low, inside the month
+  sm.append($("span","rd","现价"),$("span","v",L.price),$("span","rd","本月最高"),$("span","v",L.high),$("span","rd","最低"),$("span","v",L.low));
+  if(L.sigma)sm.append($("span","rd","σ"),$("span","v",(L.sigma*100).toFixed(0)+"%"));
+  det.append(sm);const dl=$("dl"),row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
+  row("窗口",L.window+" → "+it.close_label);row("价格",L.price+"（"+L.venue+" "+L.symbol+"）");
+  row("本月最高 / 最低",L.high+(L.high_at?"（"+L.high_at+" 那一小时）":"")+" / "+L.low+(L.low_at?"（"+L.low_at+" 那一小时）":"")+
+    "：币安小时 K 的最高/最低（与 1 分钟 K 一致）"+(L.through?"，已核至 "+L.through:"")+"，加上正在走的这一小时和现价");
+  if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
+  row("规则","↑ 档：本月任一 1 分钟 K 的最高价 ≥ 档位即 Yes；↓ 档：最低价 ≤ 档位即 Yes。方向按每个市场自己的规则或标题判断");
+  row("模型","零漂移、固定波动率的单边触及概率：↑ Φ((−h−s²/2)/s) + (S/K)·Φ((−h+s²/2)/s)，h = ln(K/S)；↓ Φ((−a+s²/2)/s) + (S/K)·Φ((−a−s²/2)/s)，a = ln(S/K)；s = σ√T");
+  det.append(dl);c.append(det);
+  const st=$("div","lstat");
+  if(it.missing)st.append($("p","","概率暂缺："+it.missing));else if(L.error)st.append($("div","warn small","⚠️ "+L.error));
+  if(L.hold&&!it.missing)st.append($("div","warn small","⚠️ "+L.hold));
+  if(L.waiting)st.append($("div","mut small",L.waiting));
+  const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
+  if(done.length){const t=$("div","touched");t.append($("span","k","✓ 已触及"));
+    done.forEach(r=>{const x=$("span","tchip",r.label);x.title="本月"+(r.dir==="up"?"最高价":"最低价")+"已到 "+r.label.slice(2);t.append(x)});st.append(t)}
+  c.append(st);return ladderBook(c,it,L,live)}
+function ladderBook(c,it,L,live){  // the ladder's Predict block: one row per open level, tap a row for its four directions
   const ag=ages(it);if(ag)c.append(ag);
   const w=$("div","pb"),h=$("div","quote");h.append(it.predict?openLink(it.predict.url):$("span","pt","Predict"));
   if(it.predict&&it.predict.error)h.append($("span","warn qe",it.predict.error));
   w.append(h);let hot=null;const key=favKey(it);
   if(live.length){const g=$("div","lg");
     const hd=(t,cl,tip)=>{const x=$("span","lh"+(cl?" "+cl:""),t);if(tip)x.title=tip;return x};
-    g.append(hd("目标"),hd("距离","ln ld","还要涨多少才碰到"),hd("模型","ln","模型给 Yes 的公平价"),hd("买1 / 卖1","","Yes 的盘口"),hd("最优","","点一行看这一档的四个方向和明细"),hd("吃单","","立即成交的较优一边：吃Yes@卖1 或 吃No@1−买1，× 为能买的份数"));
+    g.append(hd("目标"),hd("距离","ln ld",L.kind==="price"?"现价还要涨（+）或跌（−）多少才碰到":"还要涨多少才碰到"),hd("模型","ln","模型给 Yes 的公平价"),hd("买1 / 卖1","","Yes 的盘口"),hd("最优","","点一行看这一档的四个方向和明细"),hd("吃单","","立即成交的较优一边：吃Yes@卖1 或 吃No@1−买1，× 为能买的份数"));
+    let marked=false;const spotRow=()=>$("div","lspot","现价 "+L.price);  // ↑ levels above the price's own line, ↓ levels below
     live.forEach(r=>{const v=bookView(r),best=v.best,n=x=>x==null?"无":(x*100).toFixed(1),rk=key+"#"+r.label;
+      if(L.kind==="price"&&!marked&&L.spot!=null&&r.level<=L.spot){g.append(spotRow());marked=true}
       const q=r.bid==null&&r.ask==null?(r.error?"—":"…"):n(r.bid)+" / "+n(r.ask);
       const need=r.need||0,b=$("span","lb"+(best?(best.edge>=HOT?" hot":" pos"):""));
       // nothing to suggest: the closest direction, grey (a prior σ always lands here: shown, never suggested)
@@ -5507,14 +5830,40 @@ function ladder(c,it){
       const tk=v.edges.filter(e=>!e.maker).sort((x,y)=>y.edge-x.edge)[0],t=$("span","lb lk"+(tk&&tk.edge>need&&!r.hold&&!r.stale?" pos":""));
       if(tk){t.append(tk.label+" ",$("span","lp",(tk.price*100).toFixed(1)+" "),$("b","",sg(tk.edge)),$("span","lz","×"+qk(tk.size)));t.title=tk.label+" @ "+cent(tk.price)+"，立即成交 "+qty(tk.size)+" 份"+(tk.short?"（深度不足）":"")+"；净优势已扣手续费 "+cent(tk.fee||0)+"、深度 "+cent(tk.slip||0)+(tk.edge>need?"":"；不够大，不建议")+(r.stale?"（盘口过期）":"")}
       else t.textContent="—";
-      const cells=[$("span","lt",r.label),$("span","ln ld",r.dist==null?"—":"+"+(r.dist*100).toFixed(0)+"%"),$("span","ln",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b,t];
-      if(v.edges.length)cells.forEach(x=>{x.title=x.title||"点开看这一档的四个方向";x.addEventListener("click",ev=>{ev.preventDefault();openChip[rk]=openChip[rk]?null:"row";if(last)render(last)})});
+      const dist=r.dist==null?"—":(r.dist>=0?"+":"−")+(Math.abs(r.dist)*100).toFixed(Math.abs(r.dist)<0.1&&L.kind==="price"?1:0)+"%";
+      const cells=[$("span","lt",r.label),$("span","ln ld",dist),$("span","ln",r.fair==null?"—":cent(r.fair)),$("span","lq",q),b,t];
+      if(r.dir_note)cells[0].title=r.dir_note;  // the market does not say ↑ or ↓ (or disputes it): shown, never suggested
+      const tap=v.edges.length>0||!!r.error;  // a level with a warning opens too: the reason has to be readable on a phone
+      if(tap)cells.forEach(x=>{x.title=x.title||(v.edges.length?"点开看这一档的四个方向":"点开看原因");x.addEventListener("click",ev=>{ev.preventDefault();openChip[rk]=openChip[rk]?null:"row";if(last)render(last)})});
       g.append(...cells);
-      if(openChip[rk]&&v.edges.length){const d=$("div","lrow");d.append(chips(rk+"/",v,ctxOf(r)));g.append(d)}});
+      if(openChip[rk]&&tap){const d=$("div","lrow");d.append(rowNote(r,L));if(v.edges.length)d.append(chips(rk+"/",v,ctxOf(r)));g.append(d)}});
+    if(L.kind==="price"&&!marked&&L.spot!=null)g.append(spotRow());
     w.append(g)}
   c.append(w);
-  if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" +"+cent(hot.edge)}
+  if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" +"+cent(hot.edge);
+    hots.push({key,name:it.name,text:hot.row+" "+hot.label+" "+(hot.price*100).toFixed(1),edge:hot.edge})}
   return c}
+function drawOpps(){  // every red-framed suggestion on the page in one strip on top, largest first; tap one to jump to its card
+  const el=document.getElementById("opps"),list=hots.filter((h,i)=>hots.findIndex(x=>x.key===h.key)===i).sort((a,b)=>b.edge-a.edge);
+  el.hidden=editing||!list.length;if(el.hidden){el.replaceChildren();return}
+  el.replaceChildren($("span","ok","🔥 机会 "+list.length));
+  list.slice(0,8).forEach(h=>{const b=$("button","opp");b.type="button";b.title="跳到这张卡";
+    b.append($("b","",h.name),$("span","",h.text),$("i","",sg(h.edge)));
+    b.addEventListener("click",()=>{const c=[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);if(!c)return;
+      c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+8)+"px";c.scrollIntoView({behavior:"smooth",block:"start"});
+      c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")});el.append(b)});
+  if(list.length>8)el.append($("span","mut","还有 "+(list.length-8)+" 个"))}
+function rowNote(r,L){  // one line about a ladder level itself, above its four directions: on a phone nothing hovers
+  const d=$("div","lnote"),parts=[];
+  if(r.dist!=null)parts.push((L.kind==="price"?"现价还要"+(r.dist>=0?"涨 ":"跌 "):L.metric+"还要涨 ")+(Math.abs(r.dist)*100).toFixed(1)+"% 才碰到");
+  if(r.fair!=null)parts.push("模型 Yes "+cent(r.fair));
+  if(r.bid!=null||r.ask!=null)parts.push("Yes 盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1)));
+  d.append($("b","",r.label),$("span","",parts.length?"："+parts.join(" · "):""));
+  if(r.error)d.append($("span","warn","⚠️ "+r.error));
+  if(r.dir_note)d.append($("span","warn",r.dir_note));
+  if(r.hold&&!r.error&&r.hold!==r.dir_note)d.append($("span","warn","暂不建议："+r.hold));
+  else if(r.stale&&!r.error)d.append($("span","warn","盘口过期：不给建议"));
+  return d}
 function card(it,g){
   const c=$("div","card"+(it.missing?" missing":"")),head=$("div","head"),nm=$("div","name",it.name);
   nm.title=it.symbol||it.name;const fk=favKey(it),on=favs.includes(fk),st=$("button","star"+(on?" on":""),on?"★":"☆");
@@ -5540,7 +5889,8 @@ function card(it,g){
   if(it.kind==="sim")return simCard(c,it);
   if(it.kind==="ladder")return ladder(c,it);
   const best=view(it).best;  // for the trade size picked in the bar
-  if(best&&best.edge>=HOT){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge)}
+  if(best&&best.edge>=HOT){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge);
+    hots.push({key:fk,name:it.name,text:best.label+" "+(best.price*100).toFixed(1),edge:best.edge})}
   if(it.missing){c.append($("p","","概率暂缺："+it.missing));tail(c,it);return c}
   const o=$("div","odds"),a=$("b",style==="us"?"d":"u"),b=$("b",style==="us"?"u":"d");
   const lb=it.labels||["涨","跌"];a.append($("span","lbl",lb[0]),pct(it.fair_up)+"¢");b.append(pct(it.fair_down)+"¢",$("span","lbl",lb[1]));
@@ -5604,7 +5954,7 @@ let plan={};  // section -> the card keys it shows, for the ◀ ▶ buttons whil
 function keysOrder(g){return plan[g]||[]}
 function render(d){
   if(drag){pending=d;return}  // never rebuild the cards under a drag; the latest data is drawn when it ends
-  drawBar();
+  drawBar();hots=[];
   const flat=!editing&&(filt.length>0||sortBy!=="");document.body.classList.toggle("flatview",flat);
   const fh=document.getElementById("h-flat"),fg=document.getElementById("g-flat");fh.hidden=fg.hidden=!flat;
   if(flat){  // every visible card that passes the bar, in one list (cards and sections hidden in 自定义 stay hidden)
@@ -5616,7 +5966,7 @@ function render(d){
     const clear=ctlBtn("清除筛选","回到按栏目分组的页面",()=>{filt=[];sortBy="";keep("filt",filt);keep("sort",sortBy);if(last)render(last)});
     fh.replaceChildren($("span","hn",(filt.length?"筛选结果":"全部卡片")+" "+hits.length+" 张"+(sortBy==="edge"?" · 按净优势":sortBy==="time"?" · 按剩余时间":"")),clear);
     fg.replaceChildren(...(hits.length?hits.map(x=>card(x.it,"flat")):[$("p","mut","没有符合条件的卡片")]));
-    tick();return}
+    drawOpps();tick();return}
   // starred cards leave their own section for the one on top, in the order the viewer keeps them (drag ⠿ to change);
   // hidden cards and sections are left out, except in 自定义 where they show faded so they can be brought back
   const shown=i=>editing||!hidden.includes(favKey(i));
@@ -5632,7 +5982,7 @@ function render(d){
       ...(editing&&g!=="fav"?[ctlBtn("↑","栏目上移",()=>moveSec(g,-1),i<=0),ctlBtn("↓","栏目下移",()=>moveSec(g,1),i<0||i>=vis.length-1)]:[]))}
   const now=[...document.querySelectorAll(".wrap>.grid")].map(e=>e.id.slice(2)).filter(g=>g!=="fav");
   if(now.join()!==secOrder.join())for(const g of secOrder)foot.before(document.getElementById("h-"+g),document.getElementById("g-"+g));
-  tick()}
+  drawOpps();tick()}
 function drawLegend(){
   const lg=document.getElementById("legend");const sw=$("span","sw");[["涨",upColor()],["平","var(--flat)"],["跌",downColor()]].forEach(([t,col])=>{const i=$("i");i.style.background=col;sw.append(i,t)});
   const hot=$("span","sw hot");hot.append($("i"),"红框 = 净优势 ≥"+hotCents+"¢（高亮门槛）");hot.title="可在 ✎ 自定义 里修改；和建议门槛不是一回事：没超过建议门槛的方向不会被建议";
@@ -6395,9 +6745,12 @@ class Bot:
         self.updowns = {spec.key: UpDownMarket(store, spec) for spec in UPDOWN_MARKETS}
         self.flips = {spec.key: FlipMarket(store, spec) for spec in FLIP_MARKETS}
         self.caps = {spec.key: CapMarket(store, spec) for spec in CAP_MARKETS}
+        self.ranges = {spec.key: RangeMarket(store, spec, self.binance_futures) for spec in RANGE_MARKETS}
+        self.predict.ladder_parse.update({key: price_level for key in self.ranges})
         if config.touch:
             self.predict.want_info.update(spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *FLIP_MARKETS))
             self.predict.ladder_keys.update(self.caps)
+            self.predict.ladder_keys.update(self.ranges)
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
         self.sim_ran = -1e9  # monotonic time of the paper trader's last look
@@ -7471,6 +7824,7 @@ class Bot:
             items.extend(self.touch_payload(t, now_ms) for t in self.touches.values())
             items.extend(self.updown_payload(u, now_ms) for u in self.updowns.values())
             items.extend(self.flip_payload(f, now_ms) for f in self.flips.values())
+            items.extend(self.range_payload(r, now_ms) for r in self.ranges.values())
             items.extend(self.cap_payload(c, now_ms) for c in self.caps.values())
         if self.config.sim and self.config.predict:
             items.append({"name": "模拟交易", "symbol": "SIM", "group": "sim", "kind": "sim", "sim": self.sim_report()})
@@ -7777,6 +8131,22 @@ class Bot:
                               "ratio": fm.ratio, "sigma": fm.sigma, "window": spec.window(), "path": fm.status(now_ms)},
                     "sources": [price_evidence(coin, "Hyperliquid", coin, "中间价", fm.prices.get(coin), fm.priced_ms, fm.priced_ms)
                                 for coin in (spec.coin, spec.other)], "proxy": None}
+        if kind == "range":
+            rm: RangeMarket = parts["rm"]
+            row, direction = parts["row"], parts["direction"]
+            high, low = rm.extremes()
+            hist = rm.history
+            return {"basis": {"price": float(rm.price or 0), "level": float(row.target), "dir": direction,
+                              "dir_source": parts.get("source", ""), "sigma": rm.sigma, "sigma_ms": rm.sigma_ms,
+                              "years": max(0.0, (rm.window_end - max(now_ms, rm.spec.start_ms)) / YEAR_MS),
+                              "window_high": high, "window_low": low, "through": int(hist.get("through") or 0),
+                              "close_ms": rm.window_end},
+                    "sources": [price_evidence("现价", "币安合约" if rm.spec.venue == "futures" else "币安现货", rm.spec.symbol,
+                                               "最新价", rm.price, rm.priced_ms, rm.priced_ms),
+                                price_evidence("本月最高", "币安小时 K", rm.spec.symbol, "最高价", hist.get("high"),
+                                               int(hist.get("high_at") or 0)),
+                                price_evidence("本月最低", "币安小时 K", rm.spec.symbol, "最低价", hist.get("low"),
+                                               int(hist.get("low_at") or 0))], "proxy": None}
         cap: CapMarket = parts["cap"]
         row = parts["row"]
         high, high_at = cap.window_high()
@@ -7844,6 +8214,24 @@ class Bot:
                 out.append(SimMarket(fm.spec.slug, fm.spec.name, "flip", fm.spec.key, odds, book, self.edge_need(fm.model_swing(now_ms)),
                                      self.flip_hold(fm, odds, book, now_ms), ("Yes", "No"), {"end": fm.spec.end_ms},
                                      self.evidence(lambda fm=fm: self.market_evidence("flip", now_ms, fm=fm))))
+        for rm in self.ranges.values():
+            problem = rm.advice_problem(now_ms)
+            for row in self.predict.ladders.get(rm.spec.key) or []:
+                direction, source = self.range_level(rm, row)
+                fair = self.range_fair(rm, row, direction, now_ms)
+                book, _ = self.predict.yes_book(row) if row.market_id else (None, "")
+                if fair is None or book is None:
+                    continue
+                top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0)
+                hold = ("数据显示已触及，但盘口仍低于 90¢" if fair == 1.0 and top < 0.9 else problem
+                        or ("Predict 已结算" if self.range_settled(row) else "") or RANGE_GUESS_SHORT.get(source, ""))
+                out.append(SimMarket(f"{rm.spec.slug}#{row.market_id}", f"{rm.spec.name} {('↑ ' if direction == 'up' else '↓ ')}"
+                                     f"{level_label(row.target)}", "range", rm.spec.key, fair, book,
+                                     self.edge_need(rm.model_swing(row.target, direction, now_ms, fair)), hold, ("Yes", "No"),
+                                     {"target": str(row.target), "dir": direction, "end": rm.spec.end_ms},
+                                     self.evidence(lambda rm=rm, row=row, direction=direction, source=source:
+                                                   self.market_evidence("range", now_ms, rm=rm, row=row, direction=direction,
+                                                                        source=source))))
         for cap in self.caps.values():
             for row in self.predict.ladders.get(cap.spec.key) or []:
                 fair = self.ladder_fair(cap, row, now_ms)
@@ -7959,6 +8347,23 @@ class Bot:
             end = int(s.get("end") or 0)
             if hist.get("kind") == "clear" and int(hist.get("through") or 0) >= end + 60_000 and now_ms > end + self.SIM_SETTLE_MS:
                 return 0.0, "窗口内没有反超", proof
+            return None
+        if kind == "range":
+            rm = self.ranges.get(trade["key"])
+            if rm is None:
+                return None
+            level, direction = D(str(s["target"])), s.get("dir", "up")
+            marks = rm.marks()
+            high, low = marks["high"], marks["low"]
+            proof = {"rule": f"窗口内任一 1 分钟 K 的{'最高价 ≥' if direction == 'up' else '最低价 ≤'} {level_label(level)} 即 Yes",
+                     "source": ("币安合约" if rm.spec.venue == "futures" else "币安现货") + f" {rm.spec.symbol} 小时 K（与 1 分钟 K 的最高/最低一致）",
+                     **marks, "through": int(rm.history.get("through") or 0)}
+            if rm.reached(level, direction):
+                seen = high if direction == "up" else low
+                return 1.0, (f"{'↑' if direction == 'up' else '↓'} {level_label(level)} 已触及（{rm.spec.symbol} 本月"
+                             f"{'最高' if direction == 'up' else '最低'} {seen:,.6g}）"), proof
+            if rm.complete() and now_ms > rm.window_end + self.SIM_SETTLE_MS:
+                return 0.0, f"整个窗口都没到 {level_label(level)}", proof
             return None
         if kind == "ladder":
             cap = self.caps.get(trade["key"])
@@ -8291,6 +8696,95 @@ class Bot:
             item["missing"] = cap.input_problem(now_ms)  # levels already reached stay settled; the rest wait
         return item
 
+    async def binance_futures(self, path: str, **params: Any) -> Any:
+        """GET /fapi/v1/<path> through the bot's own Binance futures feed (BINANCE_BASE_URL, shared rate-limit cooldown)."""
+        return await self.market.get(f"/fapi/v1/{path}", **params)
+
+    def range_level(self, rm: RangeMarket, row: LadderRow) -> tuple[str, str]:
+        """(direction, where it was read) for one level: the market's own rules, else its title or question; failing
+        both it is guessed ("推断": shown, never suggested) from the side of the window's first price the level sits on
+        (a ↓ level above it would have been reached at once), or, before any price, the category's default ("默认")."""
+        meta = (self.predict.market_meta.get(row.market_id) or ({}, 0))[0] if row.market_id else {}
+        direction, source = level_direction(meta.get("rules", ""), row.title, row.question or meta.get("question", ""))
+        if direction:
+            return direction, source
+        ref = rm.reference()
+        return ("up" if float(row.target) > ref else "down", "推断") if ref else (rm.spec.default_dir, "默认")
+
+    @staticmethod
+    def range_guess(source: str) -> str:
+        """Why a level's direction is only a guess, or disputed ("" when its market says it)."""
+        return RANGE_GUESS.get(source, "")
+
+    def range_settled(self, row: LadderRow) -> bool:
+        """Predict has settled this level's market (nothing is suggested on it any more)."""
+        meta = (self.predict.market_meta.get(row.market_id) or ({}, 0))[0] if row.market_id else {}
+        return "RESOLVED" in str(meta.get("status", "")).upper()
+
+    def range_fair(self, rm: RangeMarket, row: LadderRow, direction: str, now_ms: int) -> float | None:
+        """P(Yes) for one level as its card shows it. A market Predict settled before the window closed: its own result
+        when readable, else reached (only a touch settles one early)."""
+        if self.range_settled(row) and now_ms < rm.window_end:
+            resolved = (self.predict.market_meta.get(row.market_id) or ({}, 0))[0].get("resolved")
+            up = self.resolution_up({"kind": "range", "key": rm.spec.key}, resolved) if resolved else None
+            return 1.0 if up is None else up
+        return rm.probability(row.target, direction, now_ms)
+
+    def range_payload(self, rm: RangeMarket, now_ms: int) -> dict:
+        """Web card for a price ladder: per level its direction, the model's P(Yes), the Yes book and its best edge."""
+        spec, hist = rm.spec, rm.history
+        problem = rm.advice_problem(now_ms)
+        rows = []
+        for row in self.predict.ladders.get(spec.key) or []:
+            direction, source = self.range_level(rm, row)
+            fair = self.range_fair(rm, row, direction, now_ms)
+            book, why = self.predict.yes_book(row) if row.market_id else (None, "")
+            out: dict[str, Any] = {"label": ("↑ " if direction == "up" else "↓ ") + level_label(row.target), "dir": direction,
+                                   "dir_source": source, "dir_note": self.range_guess(source), "level": float(row.target),
+                                   "fair": fair, "error": why,
+                                   "dist": float(row.target / rm.price - 1) if rm.price else None}
+            if book is not None:
+                out.update(bid=float(book.bid[0]) if book.bid else None, ask=float(book.ask[0]) if book.ask else None)
+                top = max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0)
+                if fair == 1.0 and top < 0.9:
+                    # our candles say reached, the market does not: no "sure thing" edge until someone looks
+                    out["error"] = "数据显示已触及，但盘口仍低于 90¢；以币安 1 分钟 K 为准，请核实"
+                priced = fair is not None and not out["error"]
+                swing = rm.model_swing(row.target, direction, now_ms, fair) if priced else 0.0
+                hold = problem or ("Predict 已结算" if self.range_settled(row) else "") or self.range_guess(source)
+                self.book_block(out, book, fair if priced else None, self.edge_need(swing), swing, hold, ("Yes", "No"), now_ms)
+            out["touched"] = fair == 1.0 and "请核实" not in out["error"]
+            rows.append(out)
+        rows.sort(key=lambda r: -r["level"])  # high to low: the price sits between the ↑ and the ↓ levels
+        marks = rm.marks()
+        high, low = marks["high"], marks["low"]
+        price_text = lambda v: f"${v:,.2f}" if v is not None and v < 1000 else f"${v:,.0f}" if v is not None else "—"
+        item: dict[str, Any] = {
+            "name": spec.name, "symbol": spec.key, "group": "levels", "kind": "ladder", "close_ms": spec.end_ms,
+            "quote_ms": rm.priced_ms if rm.price is not None else 0,
+            "source": "币安合约" if spec.venue == "futures" else "币安现货",
+            "close_label": f"{spec.label(spec.end_ms)}这根 1 分钟 K 为止",
+            "ladder": {"kind": "price", "metric": "价格", "price": price_text(float(rm.price) if rm.price is not None else None),
+                       "spot": float(rm.price) if rm.price is not None else None,  # the page draws its line among the levels
+                       "high": price_text(high), "low": price_text(low),
+                       "high_at": stamp(marks["high_at"], seconds=False) if marks["high_at"] else "",
+                       "low_at": stamp(marks["low_at"], seconds=False) if marks["low_at"] else "",
+                       "through": stamp(int(hist["through"]), seconds=False) if hist.get("through") else "",
+                       "sigma": rm.sigma, "sigma_note": "30 日小时收盘", "rows": rows, "error": rm.error, "hold": problem,
+                       "symbol": spec.symbol, "venue": "币安 USDⓈ-M 合约" if spec.venue == "futures" else "币安现货",
+                       "window": f"{spec.label(spec.start_ms)}起",
+                       "years": max(0.0, (rm.window_end - max(now_ms, spec.start_ms)) / YEAR_MS)},
+        }
+        if self.config.predict:
+            item["predict"] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
+        if rm.price is None or rm.sigma is None:
+            item["missing"] = f"等待币安行情（{brief_error(rm.error, 80)}）" if rm.error else "等待币安行情"
+        elif now_ms - rm.priced_ms > rm.PRICE_STALE_MS and now_ms < rm.window_end:
+            item["missing"] = f"币安价格停在 {stamp(rm.priced_ms, seconds=False)}，暂停概率（已触及的档位仍算已触及）"
+        if not rows and self.config.predict:
+            item["ladder"]["waiting"] = "等待 Predict 档位"  # the Predict line of the card says why (not listed yet, an error)
+        return item
+
     def item_market(self, title: str) -> str | None:
         """The exchange an odds item follows: hk / kr / sh for the indices, the ticker's market for contracts."""
         market = {"恒生指数": "hk", "KOSPI": "kr", "上证指数": "sh"}.get(title)
@@ -8490,7 +8984,8 @@ class Bot:
                    else session_remaining(market, now_ms, None, self.config.holidays.get(market, frozenset()))[1])
             targets[key] = predict_slug(stem, day)
         if self.config.touch:
-            targets.update({spec.key: spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *FLIP_MARKETS, *CAP_MARKETS)})
+            targets.update({spec.key: spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *FLIP_MARKETS, *CAP_MARKETS,
+                                                              *RANGE_MARKETS)})
         return targets
 
     def edge_costs(self) -> EdgeCosts:
@@ -9155,6 +9650,7 @@ class Bot:
             jobs.append(("涨跌市场", lambda: self.refresh_updown(now())))
             jobs.append(("反超市场", lambda: self.refresh_flip(now())))
             jobs.append(("市值阶梯", lambda: self.refresh_caps(now())))
+            jobs.append(("价格阶梯", lambda: self.refresh_ranges(now())))
         if self.config.sim and self.config.predict:
             jobs.append(("模拟交易", lambda: self.sim_step(now())))
         if self.config.edge_alert and self.config.predict:
@@ -9168,6 +9664,12 @@ class Bot:
             return False  # neither part was due
         errors = [result.error if isinstance(result, Refreshed) else "", f"恒指日K：{daily}" if daily else ""]
         return refreshed(errors, (isinstance(result, Refreshed) and result.status != "failed") + (daily == ""))
+
+    async def refresh_ranges(self, now_ms: int) -> Refreshed:
+        for rm in self.ranges.values():
+            await rm.refresh(now_ms)
+        failed = [f"{key}：{rm.error}" for key, rm in self.ranges.items() if rm.error]
+        return refreshed(failed, len(self.ranges) - len(failed))
 
     async def refresh_caps(self, now_ms: int) -> Refreshed:
         for cap in self.caps.values():
