@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.20.3"
+VERSION = "1.21.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -418,6 +418,8 @@ class Config:
     sim: bool = True         # paper trading: a simulated buy whenever a suggestion's net edge reaches sim_edge
     sim_edge: float = 0.10   # net edge (per $1 share) that triggers a simulated buy
     sim_shares: float = 100.0  # shares per simulated buy
+    sim_ways: str = "taker"  # which suggestions it takes: taker (吃单), maker (挂单) or both
+    sim_markets: frozenset = frozenset({"close"})  # the market kinds it trades (SIM_KINDS keys); SIM_MARKETS=all for every kind
     touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
     auction_alert: bool = True  # Telegram reminder when a market's closing auction starts
     edge_alert: bool = True  # Telegram: a suggestion reaching edge_alert_edge; later, that suggestion going away or turning
@@ -441,6 +443,13 @@ class Config:
             raise ValueError("WEB_TOKEN 应为 16～64 位字母、数字、- 或 _")
         if mode not in BASELINE_MODES:
             raise ValueError("BASELINE_MODE 只能是 binance_daily、manual 或 exchange_close")
+        sim_ways = (e.get("SIM_WAYS") or "taker").strip().lower()
+        if sim_ways not in {"taker", "maker", "both"}:
+            raise ValueError("SIM_WAYS 只能是 taker（只吃单）、maker（只挂单）或 both（都做）")
+        wanted = {k.strip().lower() for k in (e.get("SIM_MARKETS") or "close").split(",") if k.strip()}
+        sim_markets = frozenset(SIM_KINDS) if "all" in wanted else frozenset(wanted)
+        if not sim_markets or not sim_markets <= set(SIM_KINDS):
+            raise ValueError(f"SIM_MARKETS 只能是 all，或 {'、'.join(SIM_KINDS)} 的组合（逗号分隔）")
         url = e.get("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/")
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.query or parsed.fragment:
@@ -479,6 +488,7 @@ class Config:
             sim=e.get("SIM", "on").strip().lower() not in {"off", "0", "false", "no"},
             sim_edge=parse_bounded(e, "SIM_EDGE_CENTS", "10", 0.5, 50) / 100,
             sim_shares=parse_bounded(e, "SIM_SHARES", "100", 1, 1_000_000),
+            sim_ways=sim_ways, sim_markets=sim_markets,
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
             auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
             edge_alert=e.get("EDGE_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
@@ -5239,6 +5249,13 @@ SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": 
              "ladder": "市值阶梯"}
 
 
+def sim_scope(config: Config) -> tuple[str, str]:
+    """What the paper trader trades, in words: (which suggestions: 只吃单 / 只挂单 / 挂单和吃单, which markets)."""
+    ways = {"taker": "只吃单", "maker": "只挂单", "both": "挂单和吃单"}[config.sim_ways]
+    kinds = "全部市场" if config.sim_markets >= set(SIM_KINDS) else "、".join(n for k, n in SIM_KINDS.items() if k in config.sim_markets)
+    return ways, kinds
+
+
 def edge_watch(st: dict, sides: dict | None, best: "BookEdge | None", now_ms: int, bar: float, confirm_ms: int,
                cooldown_ms: int) -> str:
     """One look at one market for the edge alerts; returns the change to announce ("appear:up", "gone:down", ...) or "".
@@ -5761,7 +5778,8 @@ function simCard(c,it){
   // paper trading: would buying every suggestion of 10¢ or more have made money? Results only, nothing is ever ordered
   const s=it.sim,t=s.total,cents=(s.edge*100).toFixed(0),money=x=>(x>=0?"+$":"−$")+Math.abs(x).toFixed(2),usd=x=>"$"+x.toFixed(2);
   const col=x=>x>0?upColor():x<0?downColor():"var(--muted)";
-  c.append($("div","small mut","净优势 ≥"+cents+"¢ 时按卡片建议买 "+s.shares+" 份，只记账不下单。吃单按这么多份吃到的均价和手续费成交；挂单只按盘口出现的卖单数量推定成交，出结果时没成交的部分作废。先预结算，再以 Predict 结果确认。"));
+  const how=[];if(s.ways!=="只挂单")how.push("吃单按这么多份吃到的均价和手续费成交");if(s.ways!=="只吃单")how.push("挂单只按盘口出现的卖单数量推定成交，出结果时没成交的部分作废");
+  c.append($("div","small mut","净优势 ≥"+cents+"¢ 时按卡片建议买 "+s.shares+" 份，只记账不下单。"+(s.scope?"范围："+s.scope+"；"+s.ways+"。":"")+how.join("；")+"。先预结算，再以 Predict 结果确认。"));
   const jl=$("a","simj","完整复盘（每笔证据、导出）↗");jl.href=location.pathname.replace(/\\/$/,"")+"/journal";c.append(jl);
   if(!t.trades){c.append($("p","","还没有触发过：等有卡片的净优势达到 "+cents+"¢ 就开始记录。"));return c}
   const top=$("div","simtop"),big=$("b","simpnl",money(t.pnl));big.style.color=col(t.pnl);
@@ -6158,7 +6176,7 @@ const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参�
   supply:"供应量",sigma_kind:"σ 类型",window_high:"窗口最高",high_at:"最高时间",coverage:"历史覆盖",
   proxy:"代理",family:"合约来源",contract:"合约",quoted_ms:"报价时间",fetched_ms:"抓取时间",anchor:"锚点价格",anchor_ms:"锚点时间",
   anchor_note:"锚点说明",anchor_family:"锚点合约来源",approx:"锚点是近似值",expiry_day:"A50 到期换月日",exchange_contract:"交易所合约",
-  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",min_edge:"最低净优势",fee_bps:"默认费率（基点）",
+  session:"时段",maps:"映射",code:"代码版本",sim_edge:"买入门槛",sim_shares:"每笔份数",sim_ways:"方式",sim_markets:"范围",min_edge:"最低净优势",fee_bps:"默认费率（基点）",
   trade_usd:"卡片吃单金额",a50_beta:"A50 β",kospi_beta:"KOSPI β",sigma_error:"σ 误差系数",beta_error:"β 误差",rule:"规则",close:"收盘",
   source:"来源",day:"日期",history:"核验记录"};
 const MS_KEYS=new Set(["close_ms","sigma_ms","deadline_ms","start_ms","quoted_ms","fetched_ms","anchor_ms","at"]);
@@ -6259,7 +6277,8 @@ function filters(){
     ...ways.map(([k,t])=>chip(t,wayF===k,()=>{wayF=k;render()})),...(kinds.length>2?[$("span","","　市场"),...kinds.map(([k,t])=>chip(t,kindF===k,()=>{kindF=k;render()}))]:[]))}
 function render(){
   if(!data)return;
-  document.getElementById("intro").textContent="净优势 ≥"+(data.edge*100).toFixed(0)+"¢ 时按卡片建议买 "+data.shares+" 份。吃单按这么多份吃到的均价和手续费判断并成交；挂单排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交。先用机器人数据预结算，再以 Predict 的结果确认，不一致时按 Predict 重新结算并留下修订记录。";
+  const how=[];if(data.ways!=="只挂单")how.push("吃单按这么多份吃到的均价和手续费判断并成交");if(data.ways!=="只吃单")how.push("挂单排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交");
+  document.getElementById("intro").textContent="净优势 ≥"+(data.edge*100).toFixed(0)+"¢ 时按卡片建议买 "+data.shares+" 份。"+(data.scope?"范围："+data.scope+"；"+data.ways+"。":"")+how.join("；")+"。先用机器人数据预结算，再以 Predict 的结果确认，不一致时按 Predict 重新结算并留下修订记录。";
   tiles();groups();filters();
   const list=document.getElementById("list"),shown=data.trades.filter(t=>(stateF==="all"||cat(t)===stateF)&&(wayF==="all"||(wayF==="maker")===t.maker)&&(kindF==="all"||t.kind===kindF));
   list.replaceChildren(...(shown.length?shown.map(row):[$("p","mut",data.trades.length?"没有符合条件的交易":"还没有模拟交易")]))}
@@ -8199,7 +8218,9 @@ class Bot:
     def sim_version(self) -> dict:
         """The code and the settings a trade was made under, so a change in results can be traced to a change here."""
         c = self.config
-        return {"code": VERSION, "sim_edge": c.sim_edge, "sim_shares": c.sim_shares, "min_edge": c.predict_min_edge,
+        ways, kinds = sim_scope(c)
+        return {"code": VERSION, "sim_edge": c.sim_edge, "sim_shares": c.sim_shares, "sim_ways": ways, "sim_markets": kinds,
+                "min_edge": c.predict_min_edge,
                 "fee_bps": c.predict_fee_bps, "trade_usd": c.predict_trade_usd, "a50_beta": c.a50_beta,
                 "kospi_beta": c.kospi_beta, "sigma_error": MODEL_SIGMA_ERROR, "beta_error": MODEL_BETA_ERROR}
 
@@ -8528,10 +8549,12 @@ class Bot:
         markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
         trades = self.sim_trades()
         costs, bar = self.edge_costs(), self.config.sim_edge
+        ways, kinds = self.config.sim_ways, self.config.sim_markets
         for mk in markets.values():
-            if mk.hold or mk.book.stale(now_ms):
-                continue
-            maker = best_edge([e for e in book_edges(mk.fair_up, mk.book, costs) if e.maker], mk.need) if mk.makers else None
+            if mk.hold or mk.book.stale(now_ms) or mk.kind not in kinds:
+                continue  # positions already open in other kinds (SIM_MARKETS narrowed) still fill and settle below
+            maker = (best_edge([e for e in book_edges(mk.fair_up, mk.book, costs) if e.maker], mk.need)
+                     if mk.makers and ways != "taker" else None)
             if maker is not None and maker.edge >= bar - 1e-9:
                 side = "up" if maker.side == "涨" else "down"
                 tid = f"{mk.market}|{side}|挂"
@@ -8540,7 +8563,7 @@ class Bot:
                     self.store.put(f"sim:{tid}", trades[tid])
             bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
             quotes = []
-            for side in ("up", "down"):
+            for side in ("up", "down") if ways != "maker" else ():
                 q = taker_quote(mk.book, side, self.config.sim_shares, bps)
                 fair = mk.fair_up if side == "up" else 1 - mk.fair_up
                 if q and fair - q["cost"] > mk.need and fair - q["cost"] >= bar - 1e-9:  # checked on the fill itself
@@ -8583,7 +8606,8 @@ class Bot:
                  "note": t.get("note", ""), "url": self.sim_url(t)}
                 for tid, t in reversed(trades[-recent:])]
         values = [t for _, t in trades]
-        return {"edge": self.config.sim_edge, "shares": self.config.sim_shares, "total": sim_stats(values),
+        ways, kinds = sim_scope(self.config)
+        return {"edge": self.config.sim_edge, "shares": self.config.sim_shares, "ways": ways, "scope": kinds, "total": sim_stats(values),
                 "kinds": [{"name": name, **sim_stats([t for t in values if t["kind"] == kind])}
                           for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in values)],
                 "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
@@ -8593,9 +8617,11 @@ class Bot:
     def sim_text(self) -> str:
         r = self.sim_report(recent=10)
         t, edge, shares = r["total"], r["edge"] * 100, f"{r['shares']:g}"
+        how = [f"吃单按 {shares} 份吃到的均价和手续费判断并成交"] if r["ways"] != "只挂单" else []
+        if r["ways"] != "只吃单":
+            how.append("挂单排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交，出结果时没成交的部分作废")
         lines = [f"🧪 {bold('模拟交易')}（净优势 ≥{edge:g}¢ 时按卡片建议买 {shares} 份，只记账不下单）",
-                 f"吃单按 {shares} 份吃到的均价和手续费判断并成交；挂单排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单"
-                 "才按看到的数量推定成交，出结果时没成交的部分作废。先按机器人数据预结算，再以 Predict 的结果确认。"]
+                 f"范围：{r['scope']}；{r['ways']}。" + "；".join(how) + "。先按机器人数据预结算，再以 Predict 的结果确认。"]
         if not t["trades"]:
             lines.append(f"\n还没有触发过：等有卡片的净优势达到 {edge:g}¢ 就开始记录。")
             return "\n".join(lines)
@@ -8629,7 +8655,8 @@ class Bot:
                 for tid, t in trades]
         return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）",
                 "enabled": self.config.sim and self.config.predict, "edge": self.config.sim_edge,
-                "shares": self.config.sim_shares, "total": sim_stats(values),
+                "shares": self.config.sim_shares, "ways": sim_scope(self.config)[0], "scope": sim_scope(self.config)[1],
+                "total": sim_stats(values),
                 "kinds": [{"key": kind, "name": name, **sim_stats([t for t in values if t["kind"] == kind])}
                           for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in values)],
                 "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}

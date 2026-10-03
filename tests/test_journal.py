@@ -33,7 +33,8 @@ EVIDENCE = {"basis": {"fair_up": 0.70, "ref": 24600.0, "ref_note": "10-02 收盘
 
 
 async def build():
-    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
+    cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                             "SIM_WAYS": "both", "SIM_MARKETS": "all"})  # the review page is checked with maker trades too
     bot = m.Bot(cfg, m.Store(":memory:"), FM(NOW), None)
     world = {"markets": []}
     bot.sim_markets = lambda now: world["markets"]

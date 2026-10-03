@@ -425,6 +425,11 @@ async def run():
     assert all(not mk.makers for mk in sims.values()) and sims[f"{BTC.slug}#30"].hold == ""
     # the paper trader buys the taker at ↑ $120k (+25¢) and never the far level's 挂No at 0.2¢; the alerts say the same
     await bot.sim_step(NOW)
+    assert bot.sim_trades() == {}  # price ladders are outside the paper trader's default scope (SIM_MARKETS=close)
+    bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                    "SIM_MARKETS": "range", "SIM_WAYS": "both"})  # even with makers allowed: a ladder level takes none
+    bot.sim_ran = -1e9
+    await bot.sim_step(NOW)
     trades = bot.sim_trades()
     assert set(trades) == {f"{BTC.slug}#21|up|吃"}, sorted(trades)
     assert trades[f"{BTC.slug}#21|up|吃"]["maker"] is False and trades[f"{BTC.slug}#21|up|吃"]["edge"] > 0.2
