@@ -126,7 +126,10 @@ async def layout_check(browser, page):
     gw = lambda sel: page.evaluate(f"document.querySelector('{sel}').getBoundingClientRect().width")
     wide = lambda g: page.evaluate(f"document.getElementById('g-{g}').classList.contains('wide')")
     assert await wide("ladder") and await gw("#g-ladder .card") < await gw("#g-ladder") / 2
+    hs = lambda: page.eval_on_selector_all("#g-ladder .card", "els => els.map(e => Math.round(e.getBoundingClientRect().height))")
+    assert len(await hs()) == 6 and len(set(await hs())) == 1 and 0 < (await hs())[0] <= 460, await hs()  # two-up: one height for every cap card
     await page.check("#onerow input[data-row=ladder]")
+    assert len(set(await hs())) > 1, await hs()  # one per row: each card its own height again
     assert not await wide("ladder") and await wide("levels") and abs(await gw("#g-ladder .card") - await gw("#g-ladder")) < 1
     assert await stored("oneRow") == '["ladder"]'
     await page.reload(); await page.wait_for_selector("#g-crypto .card")

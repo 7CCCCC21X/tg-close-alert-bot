@@ -505,6 +505,20 @@ async def browser_check():
         await page.reload(); await page.wait_for_selector("#g-ladder .pg")
         assert await page.locator("#g-ladder .pg .lt").all_inner_texts() == ["$500M", "$1B", "$2B", "$3B", "$5B"]
         assert await page.inner_text("#g-ladder .price-tools button") == "全部 7 档（+2）"
+        # two or more cards to a row: every card the same height, capped; a long table scrolls inside the card under a sticky header
+        await page.set_viewport_size({"width": 1300, "height": 900})
+        item["ladder"]["rows"] = [row(f"${n}M", 0.3, 0.352, 0.362, e200, 0.067, dist=n / 10) for n in range(1, 15)]
+        await page.reload(); await page.wait_for_selector("#g-ladder .pg")
+        await page.click("#g-ladder .price-tools button")  # all 14 levels
+        pg = "document.querySelector('#g-ladder .pg')"
+        card_h = await page.evaluate("document.querySelector('#g-ladder .card').getBoundingClientRect().height")
+        assert card_h <= 460 and await page.evaluate(f"{pg}.querySelectorAll('.ptarget').length") == 14, card_h
+        assert await page.evaluate(f"{pg}.scrollHeight > {pg}.clientHeight + 40") and await page.evaluate(f"getComputedStyle({pg}).overflowY") == "auto"
+        await page.evaluate(f"{pg}.scrollTop = 150")
+        assert await page.evaluate(f"Math.abs({pg}.querySelector('.lh').getBoundingClientRect().top - {pg}.getBoundingClientRect().top) < 1")  # the header stays
+        assert await page.evaluate("document.querySelector('#g-ladder .ages').getBoundingClientRect().top") > await page.evaluate(f"{pg}.getBoundingClientRect().bottom") - 1
+        await page.set_viewport_size({"width": 390, "height": 900})
+        assert await page.evaluate(f"getComputedStyle({pg}).overflowY") == "visible"  # a phone: the page scrolls, not the card
         item["ladder"]["rows"] = []; item["ladder"]["waiting"] = "等待 Predict 档位"  # a new spec before Predict lists its levels
         await page.reload(); await page.wait_for_selector("#g-ladder .card")
         assert "等待 Predict 档位" in await page.inner_text("#g-ladder .lstat") and await page.locator("#g-ladder .pg").count() == 0

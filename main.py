@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.22.1"
+VERSION = "1.22.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5616,7 +5616,12 @@ body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){displ
 .edge.hot{border-color:var(--hot);background:var(--hot-bg)}.edge.hot b{color:var(--hot)}
 .quote .qe{white-space:normal;word-break:break-all}
 .grid.wide{grid-template-columns:repeat(auto-fill,minmax(min(100%,500px),500px));align-items:start}
-.card.lad .pb{margin-top:0}.grid:not(.wide)>.card.lad{grid-column:1/-1}.lstat{display:flex;flex-direction:column;gap:4px}.lstat:empty{display:none}
+.card.lad .pb{margin-top:0}.grid:not(.wide)>.card.lad{grid-column:1/-1}
+/* 市值阶梯 two or more to a row: every card the same height (the tallest, up to a cap); a longer table scrolls inside the card under a sticky header */
+@media(min-width:1042px){#g-ladder.wide{grid-auto-rows:1fr;align-items:stretch}#g-ladder.wide>.card.lad{max-height:460px}
+#g-ladder.wide>.card.lad .pb{display:flex;flex-direction:column;flex:0 1 auto;min-height:0}#g-ladder.wide>.card.lad .pg{overflow-y:auto;min-height:0;overscroll-behavior:contain}
+#g-ladder.wide>.card.lad .pg .lh{position:sticky;top:0;background:var(--card);z-index:1}#g-ladder.wide>.card.lad .ages{margin-top:0}}
+.lstat{display:flex;flex-direction:column;gap:4px}.lstat:empty{display:none}
 .card.lad .name{flex:0 1 auto}.card.lad .cd{margin-left:6px}
 .touched{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font-size:12px}.touched .k{color:var(--down);font-weight:600}
 .tchip{border-radius:6px;padding:0 6px;background:var(--chip);color:var(--muted);font-variant-numeric:tabular-nums}
