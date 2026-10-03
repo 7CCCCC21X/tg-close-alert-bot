@@ -570,22 +570,46 @@ async def browser_check(bot):
         await card.locator(".pg .lt:text-is('↑ $125k')").click()
         # the strip on top lists every red-framed suggestion; tapping one jumps to its card (hidden while customising)
         strip = await page.inner_text("#opps")
-        assert strip.startswith("🔥 机会 2") and "甲挂跌 5.0+45.0¢" in strip.replace("\n", "") and f"↑ $120k {tk['label']} {tk['price'] * 100:.1f}" in strip, strip
-        assert strip.index("甲") < strip.index("BTC 10月价格") and m.cents(tk["edge"], True) in strip
+        # makers (挂单) and takers (吃单) are listed apart: 甲's maker under 挂单, then BTC's taker under 吃单
+        assert strip.startswith("🔥 机会 2") and "挂单 1" in strip and "吃单 1" in strip, strip
+        assert "甲挂跌 5.0+45.0¢" in strip.replace("\n", "") and f"↑ $120k {tk['label']} {tk['price'] * 100:.1f}" in strip, strip
+        assert strip.index("挂单 1") < strip.index("甲") < strip.index("吃单 1") < strip.index("BTC 10月价格") and m.cents(tk["edge"], True) in strip
         await page.click("#opps .opp:nth-of-type(2)"); await page.wait_for_timeout(300)
         assert await card.evaluate("c => c.classList.contains('flash') && c.style.scrollMarginTop !== ''")
-        # 自定义: takers only drops 甲 (its edges are maker ones); a section can be left out; hidden while customising
+        # 自定义: leaving makers out drops 甲 (its edges are maker ones); a section can be left out; takers can go too; hidden while customising
         await page.click("#edit"); assert await page.is_hidden("#opps")
-        await page.check("#opptaker"); await page.click("#done")
-        assert (await page.inner_text("#opps")).startswith("🔥 机会 1（只列吃单）") and "甲" not in await page.inner_text("#opps")
-        assert await page.evaluate("localStorage.getItem('oppTaker')") == "true"
+        await page.uncheck("#opp-maker"); await page.click("#done")
+        strip = await page.inner_text("#opps")
+        assert strip.startswith("🔥 机会 1") and "挂单" not in strip and "甲" not in strip and "吃单 1" in strip, strip
+        assert await page.evaluate("localStorage.getItem('oppMakers')") == "false"
         await page.click("#edit"); await page.uncheck("#oppsrc input[data-opp=levels]"); await page.click("#done")
         assert await page.is_hidden("#opps") and await page.evaluate("localStorage.getItem('oppOff')") == '["levels"]'
-        await page.click("#edit"); await page.uncheck("#opptaker"); await page.click("#done")
+        await page.click("#edit"); await page.check("#opp-maker"); await page.click("#done")
         assert (await page.inner_text("#opps")).startswith("🔥 机会 1") and "甲" in await page.inner_text("#opps")
+        await page.click("#edit"); await page.uncheck("#opp-taker"); await page.check("#oppsrc input[data-opp=levels]"); await page.click("#done")
+        strip = await page.inner_text("#opps")
+        assert strip.startswith("🔥 机会 1") and "吃单" not in strip and "BTC 10月价格" not in strip, strip
+        assert await page.evaluate("localStorage.getItem('oppTakers')") == "false"
         await page.click("#edit"); await page.click("#reset"); await page.click("#reset")
         await page.check("#secs input[data-sec=levels]"); await page.click("#done")  # the reset hides 价格阶梯 again (its default)
-        assert (await page.inner_text("#opps")).startswith("🔥 机会 2") and await page.evaluate("localStorage.getItem('oppOff')") is None
+        assert (await page.inner_text("#opps")).startswith("🔥 机会 2")
+        assert await page.evaluate("['oppOff', 'oppMakers', 'oppTakers', 'oppPoints'].map(k => localStorage.getItem(k))") == [None] * 4
+        # a maker whose market does not earn points now stays out of the strip (the card keeps its red frame); 自定义 can list it anyway
+        jia["predict"].update(points_ok=False, points_why="价差 34.0¢ 超过积分上限 6.0¢")
+        await page.reload(); await page.wait_for_selector("#g-levels .pg")
+        strip = await page.inner_text("#opps")
+        assert strip.startswith("🔥 机会 1") and "挂单" not in strip and "甲" not in strip and await page.locator(".card.hot:has-text('甲')").count() == 1, strip
+        await page.click("#edit"); await page.uncheck("#opp-points"); await page.click("#done")
+        strip = await page.inner_text("#opps")
+        assert strip.startswith("🔥 机会 2") and "挂单 1" in strip and "甲" in strip and await page.evaluate("localStorage.getItem('oppPoints')") == "false", strip
+        await page.click("#edit"); await page.check("#opp-points"); await page.click("#done")
+        jia["predict"].update(points_ok=True, points_why="")
+        # the "只列吃单" switch of earlier builds carries over as "no makers", once
+        await page.evaluate("localStorage.setItem('oppTaker', 'true'); localStorage.removeItem('oppMakers')")
+        await page.reload(); await page.wait_for_selector("#g-levels .pg")
+        assert "甲" not in await page.inner_text("#opps") and await page.evaluate("[localStorage.getItem('oppMakers'), localStorage.getItem('oppTaker')]") == ["false", None]
+        await page.click("#edit"); await page.check("#opp-maker"); await page.click("#done")
+        assert (await page.inner_text("#opps")).startswith("🔥 机会 2")
         # a folded section still counts its red-framed cards in its title; the strip unfolds it before jumping in
         await page.click("#h-levels .fold")
         assert not await page.is_visible("#g-levels") and await page.inner_text("#h-levels .fs") == "4 张 · 🔥 1"

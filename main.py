@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.22.2"
+VERSION = "1.23.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5632,7 +5632,7 @@ body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){displ
 a.simrow{display:grid;grid-template-columns:auto 1fr auto auto;gap:2px 8px;font-size:12.5px;color:inherit;text-decoration:none;font-variant-numeric:tabular-nums;padding:2px 0;border-top:1px dashed var(--line)}
 a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);text-decoration:none;align-self:flex-start}.simj:hover{text-decoration:underline}.panel a.cb{text-decoration:none;color:var(--best)}
 .small{font-size:12px;margin-top:3px}.mut{color:var(--faint)}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
-#opps{display:flex;flex-wrap:wrap;align-items:center;gap:5px 6px;margin:6px 0 2px;font-size:12px}#opps .ok{color:var(--hot);font-weight:650;white-space:nowrap}
+#opps{display:flex;flex-wrap:wrap;align-items:center;gap:5px 6px;margin:6px 0 2px;font-size:12px}#opps .ok{color:var(--hot);font-weight:650;white-space:nowrap}#opps .og{color:var(--muted);font-weight:600;white-space:nowrap;margin-left:2px}
 .opp{display:inline-flex;align-items:baseline;gap:4px;max-width:100%;border:1px solid var(--hot);background:var(--hot-bg);color:var(--text);border-radius:999px;padding:2px 9px;font:inherit;font-size:12px;line-height:1.4;cursor:pointer;font-variant-numeric:tabular-nums}
 .opp b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46vw}.opp span{color:var(--muted);white-space:nowrap}.opp i{font-style:normal;color:var(--hot);font-weight:650}
 .opp:hover{border-color:var(--hot);box-shadow:0 0 0 2px var(--hot-bg)}body.olddata #opps{display:none}
@@ -5691,6 +5691,7 @@ button.tog{font-family:inherit;padding:2px 9px}.tog.on{border-color:var(--best);
 <div class="pr" id="cards"></div>
 <div class="pr" id="onerow"></div>
 <div class="pr" id="oppsrc"></div>
+<div class="pr" id="oppway"></div>
 <div class="pr"><span class="mut">“价格阶梯”和“模拟交易”栏默认不显示，勾上才出现；每笔交易的证据和导出在</span><a class="cb" id="journal" href="#">模拟交易复盘 ↗</a></div>
 <div class="pr"><label>高亮门槛 <input type="number" id="hotin" min="1" max="50" step="1"> ¢</label><span class="mut">净优势达到这个值的卡片标红框（和模型的“建议门槛”不是一回事：没超过建议门槛的方向不会被建议）</span></div>
 <div class="pr"><span class="mut" id="hidn"></span><span class="sp"></span><button type="button" class="cb" id="showall">全部显示</button><button type="button" class="cb" id="reset" title="还原卡片和栏目顺序、隐藏与高亮门槛（收藏保留）">恢复默认布局</button><button type="button" class="cb pri" id="done">完成</button></div>
@@ -5725,7 +5726,9 @@ try{if(!localStorage.getItem("levelsDefault")){if(!hideSec.includes("levels"))hi
   if(localStorage.getItem("ladderDefault")){hideSec=hideSec.filter(x=>x!=="ladder");localStorage.removeItem("ladderDefault")}  // 1.21.5 hid 市值阶梯 instead: undo that once
   keep("hideSec",hideSec);localStorage.setItem("levelsDefault","1")}}catch(e){}
 let hotCents=stored("hot",10,v=>typeof v==="number"&&v>=1&&v<=50),HOT=hotCents/100;  // an edge this large gets the red frame
-let oppOff=stored("oppOff",[],strs),oppTaker=stored("oppTaker",false,v=>typeof v==="boolean");  // the strip on top: sections left out, takers only
+const isBool=v=>typeof v==="boolean";
+let oppOff=stored("oppOff",[],strs),oppMakers=stored("oppMakers",true,isBool),oppTakers=stored("oppTakers",true,isBool),oppPoints=stored("oppPoints",true,isBool);  // the strip on top: sections left out, which sides, makers only where points are earned
+try{if(localStorage.getItem("oppTaker")==="true"){oppMakers=false;keep("oppMakers",false)}localStorage.removeItem("oppTaker")}catch(e){}  // the old "只列吃单" switch carries over, once
 let folded=stored("folded",[],strs);  // sections folded away: the title stays, with how many cards it holds and how many are red-framed
 function toggleFold(g){folded=folded.includes(g)?folded.filter(x=>x!==g):[...folded,g];keep("folded",folded);if(last)render(last)}
 let secOrder=stored("secs",SECTIONS,strs);secOrder=[...new Set(secOrder.filter(g=>SECTIONS.includes(g)))];
@@ -5963,9 +5966,10 @@ function priceLadder(c,it,L,det,sm){
 function priceLadderBook(c,it,L,live){
   const w=$("div","pb"),h=$("div","quote"),key=favKey(it);h.append(it.predict?openLink(it.predict.url):$("span","pt","Predict"));
   if(it.predict&&it.predict.error)h.append($("span","warn qe",it.predict.error));
-  w.append(h);const views=new Map(live.map(r=>[r,bookView(r)]));let hot=null,hotTk=null;
-  // Compute opportunities from every level, including those folded out of the compact table.
-  for(const r of live){const v=views.get(r);for(const e of v.ok){if(e.edge>=HOT){if(!hot||e.edge>hot.edge)hot={...e,row:r.label};if(!e.maker&&(!hotTk||e.edge>hotTk.edge))hotTk={...e,row:r.label}}}}
+  w.append(h);const views=new Map(live.map(r=>[r,bookView(r)]));let hot=null,hotTk=null,hotMk=null;
+  // Compute opportunities from every level, including those folded out of the compact table: the best maker and the best taker.
+  for(const r of live){const v=views.get(r);for(const e of v.ok){if(e.edge>=HOT){if(!hot||e.edge>hot.edge)hot={...e,row:r.label};
+    if(e.maker){if(!hotMk||e.edge>hotMk.edge)hotMk={...e,row:r.label,points:r.points_ok===true}}else if(!hotTk||e.edge>hotTk.edge)hotTk={...e,row:r.label}}}}
   if(live.length){
     // the compact view: every level whose quote earns points now or that has a suggestion, the two around the price, then the nearest up to five
     const allKey=it.name+"#all-levels",all=open.has(allKey),focus=new Set(live.filter(r=>r.points_ok===true||views.get(r).ok.length));
@@ -5999,21 +6003,28 @@ function priceLadderBook(c,it,L,live){
   }else if(!L.waiting)w.append($("div","price-empty","暂无待触及的档位"));
   c.append(w);const ag=ages(it);if(ag)c.append(ag);
   if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" "+sg(hot.edge);
-    const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);hots.push({key,name:it.name,group:it.group||"levels",best:{text:text(hot),edge:hot.edge},taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
+    const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);
+    hots.push({key,name:it.name,group:it.group||"levels",maker:hotMk?{text:text(hotMk),edge:hotMk.edge,points:hotMk.points}:null,taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
   return c}
-function drawOpps(){  // every red-framed suggestion on the page in one strip on top, largest first; tap one to jump to its card.
-  // 自定义 leaves sections out of it, or lists taker (吃单) suggestions only: a maker's edge is only real once it fills
-  const el=document.getElementById("opps"),seen=new Set();
-  const list=hots.map(h=>({...h,pick:oppTaker?h.taker:h.best})).filter(h=>h.pick&&!oppOff.includes(h.group)&&!seen.has(h.key)&&seen.add(h.key)).sort((a,b)=>b.pick.edge-a.pick.edge);
-  el.hidden=editing||!list.length;if(el.hidden){el.replaceChildren();return}
-  el.replaceChildren($("span","ok","🔥 机会 "+list.length+(oppTaker?"（只列吃单）":"")));
-  list.slice(0,8).forEach(h=>{const b=$("button","opp");b.type="button";b.title="跳到这张卡";
-    b.append($("b","",h.name),$("span","",h.pick.text),$("i","",sg(h.pick.edge)));
-    b.addEventListener("click",()=>{const find=()=>[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);let c=find();if(!c)return;
-      const g=c.parentElement.id.slice(2);if(folded.includes(g)){folded=folded.filter(x=>x!==g);keep("folded",folded);if(last)render(last);c=find()}
-      c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+8)+"px";c.scrollIntoView({behavior:"smooth",block:"start"});
-      c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")});el.append(b)});
-  if(list.length>8)el.append($("span","mut","还有 "+(list.length-8)+" 个"))}
+function drawOpps(){  // every red-framed suggestion on the page in one strip on top: makers (挂单) first, then takers (吃单), largest first; tap one to jump to its card.
+  // 自定义 leaves sections out, drops either side, or lists makers whatever their points; by default a maker is listed only where a
+  // quote placed now earns points (a maker's edge is only real once it fills: the points are what makes the wait pay)
+  const el=document.getElementById("opps"),seen=new Set(),byEdge=(a,b)=>b.pick.edge-a.pick.edge;
+  const pool=hots.filter(h=>!oppOff.includes(h.group)&&!seen.has(h.key)&&seen.add(h.key));
+  const makers=oppMakers?pool.filter(h=>h.maker&&(!oppPoints||h.maker.points)).map(h=>({...h,pick:h.maker})).sort(byEdge):[];
+  const takers=oppTakers?pool.filter(h=>h.taker).map(h=>({...h,pick:h.taker})).sort(byEdge):[];
+  const n=makers.length+takers.length;el.hidden=editing||!n;if(el.hidden){el.replaceChildren();return}
+  el.replaceChildren($("span","ok","🔥 机会 "+n));
+  const jump=h=>{const find=()=>[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);let c=find();if(!c)return;
+    const g=c.parentElement.id.slice(2);if(folded.includes(g)){folded=folded.filter(x=>x!==g);keep("folded",folded);if(last)render(last);c=find()}
+    c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+8)+"px";c.scrollIntoView({behavior:"smooth",block:"start"});
+    c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")};
+  const group=(label,list,title)=>{if(!list.length)return;const t=$("span","og",label+" "+list.length);t.title=title;el.append(t);
+    list.slice(0,6).forEach(h=>{const b=$("button","opp");b.type="button";b.title="跳到这张卡";b.append($("b","",h.name),$("span","",h.pick.text),$("i","",sg(h.pick.edge)));
+      b.addEventListener("click",()=>jump(h));el.append(b)});
+    if(list.length>6)el.append($("span","mut","还有 "+(list.length-6)+" 个"))};
+  group("挂单",makers,"挂单机会：排队等成交，不保证成交"+(oppPoints?"；只列现在挂单能拿积分的市场":""));
+  group("吃单",takers,"吃单机会：立即成交，已扣手续费与滑点")}
 function rowNote(r,L){  // one line about a ladder level itself, above its four directions: on a phone nothing hovers
   const d=$("div","lnote"),parts=[];
   if(r.dist!=null)parts.push((L.kind==="price"?"现价还要"+(r.dist>=0?"涨 ":"跌 "):L.metric+"还要涨 ")+(Math.abs(r.dist)*100).toFixed(1)+"% 才碰到");
@@ -6053,8 +6064,9 @@ function card(it,g){
   if(it.kind==="ladder")return ladder(c,it);
   const v=view(it),best=v.best;  // for the trade size picked in the bar
   if(best&&best.edge>=HOT){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge);
-    const tk=v.ok.filter(e=>!e.maker).sort((a,b)=>b.edge-a.edge)[0],text=e=>e.label+" "+(e.price*100).toFixed(1);
-    hots.push({key:fk,name:it.name,group:it.group||"contract",best:{text:text(best),edge:best.edge},taker:tk&&tk.edge>=HOT?{text:text(tk),edge:tk.edge}:null})}
+    const by=(a,b)=>b.edge-a.edge,mk=v.ok.filter(e=>e.maker).sort(by)[0],tk=v.ok.filter(e=>!e.maker).sort(by)[0],text=e=>e.label+" "+(e.price*100).toFixed(1);
+    hots.push({key:fk,name:it.name,group:it.group||"contract",maker:mk&&mk.edge>=HOT?{text:text(mk),edge:mk.edge,points:!!(it.predict&&it.predict.points_ok===true)}:null,
+               taker:tk&&tk.edge>=HOT?{text:text(tk),edge:tk.edge}:null})}
   if(it.missing){c.append($("p","","概率暂缺："+it.missing));tail(c,it);return c}
   const o=$("div","odds"),a=$("b",style==="us"?"d":"u"),b=$("b",style==="us"?"u":"d");
   const lb=it.labels||["涨","跌"];a.append($("span","lbl",lb[0]),pct(it.fair_up)+"¢");b.append(pct(it.fair_down)+"¢",$("span","lbl",lb[1]));
@@ -6179,9 +6191,12 @@ function drawPanel(){
   const os=document.getElementById("oppsrc");os.replaceChildren($("span","mut","🔥 机会条列出："));
   SECTIONS.filter(g=>g!=="sim").forEach(g=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=!oppOff.includes(g);i.dataset.opp=g;
     i.addEventListener("change",()=>{oppOff=i.checked?oppOff.filter(x=>x!==g):[...oppOff,g];keep("oppOff",oppOff);if(last)render(last)});l.append(i,SEC_NAMES[g]);os.append(l)});
-  const lt=$("label","tog"),ti=$("input");ti.type="checkbox";ti.id="opptaker";ti.checked=oppTaker;
-  ti.addEventListener("change",()=>{oppTaker=ti.checked;keep("oppTaker",oppTaker);if(last)render(last)});
-  lt.append(ti,"只列吃单（挂单不算）");lt.title="只展示立即成交方向，挂单方向从机会条中隐藏";os.append(lt);
+  const ow=document.getElementById("oppway");ow.replaceChildren($("span","mut","机会条的方向："));
+  [["opp-maker","挂单",oppMakers,v=>{oppMakers=v;keep("oppMakers",v)},"列出挂单机会（排队等成交，不保证成交）"],
+   ["opp-taker","吃单",oppTakers,v=>{oppTakers=v;keep("oppTakers",v)},"列出吃单机会（立即成交，已扣手续费与滑点）"],
+   ["opp-points","挂单只列积分可得的",oppPoints,v=>{oppPoints=v;keep("oppPoints",v)},"挂单机会只列现在挂单能拿积分的市场（蓝色 ● 的那些）；勾掉则所有标红框的挂单都列"]
+  ].forEach(([id,label,on,set,title])=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.id=id;i.checked=on;l.title=title;
+    i.addEventListener("change",()=>{set(i.checked);if(last)render(last)});l.append(i,label);ow.append(l)});
   document.getElementById("hotin").value=hotCents;
   document.getElementById("hidn").textContent=hidden.length?"已隐藏 "+hidden.length+" 张卡片（变淡显示，点“显示”恢复）":"没有隐藏的卡片";
   document.getElementById("showall").disabled=!hidden.length}
@@ -6200,8 +6215,8 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppTaker=false;folded=[];oneRow=[];
-  ["order","hidden","secs","hot","oppOff","oppTaker","folded","oneRow"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
+  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;folded=[];oneRow=[];
+  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","folded","oneRow"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 async function load(){
   try{
