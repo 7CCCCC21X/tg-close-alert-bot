@@ -506,52 +506,61 @@ async def browser_check(bot):
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         page = await browser.new_page(viewport={"width": 390, "height": 900})
         await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
-        await page.wait_for_selector("#g-levels .lg")
+        await page.wait_for_selector("#g-levels .pg")
         assert await page.inner_text("#h-levels .hn") == "价格阶梯"
         card = page.locator("#g-levels .card").first
         assert await card.locator(".name").inner_text() == "BTC 10月价格"
-        summary = await card.locator("summary").inner_text()
-        assert re.sub(r"\s+", " ", summary).strip() == "现价 $112,050 本月最高 $119,200 最低 $108,000 σ " + f"{rm_sigma(bot) * 100:.0f}%", summary
-        labels = await card.locator(".lg .lt").all_inner_texts()
+        assert re.sub(r"\s+", " ", await card.locator(".price-top").inner_text()).strip() == "现价 $112,050"
+        assert re.sub(r"\s+", " ", await card.locator(".price-range").inner_text()).strip() == "本月最高 $119,200 最低 $108,000"
+        assert await card.locator(".price-model summary").inner_text() == "规则与计算明细"
+        assert not await card.locator(".price-model").evaluate("e => e.open")
+        labels = await card.locator(".pg .lt").all_inner_texts()
         assert labels == ["↑ $160k", "↑ $125k", "↑ $120k", "↓ $108.5k", "↓ $105k", "↓ $100k"], labels  # ↑ $118k, ↑ $110k reached: chips
         # the price's own line sits between the ↑ levels and the ↓ levels
-        assert await card.locator(".lg .lt, .lg .lspot").all_inner_texts() == ["↑ $160k", "↑ $125k", "↑ $120k", "现价 $112,050", "↓ $108.5k",
+        assert await card.locator(".pg .lt, .pg .lspot").all_inner_texts() == ["↑ $160k", "↑ $125k", "↑ $120k", "现价 $112,050", "↓ $108.5k",
                                                                                "↓ $105k", "↓ $100k"]
-        # signed distance to each level (a decimal under 10%); the column itself is hidden on a phone
-        dists = await card.locator(".lg .ln.ld").evaluate_all("els => els.map(e => e.textContent)")
-        assert dists == ["距离", "+43%", "+12%", "+7.1%", "−3.2%", "−6.3%", "−11%"], dists
+        # Distances and points state stay with each target, including on a phone.
+        dists = await card.locator(".pg .pdist").all_inner_texts()
+        assert dists == ["+43%", "+12%", "+7.1%", "−3.2%", "−6.3%", "−11%"], dists
+        assert await card.locator(".pg .ppoints").count() == 6
+        assert await card.locator(".pg .lh").all_inner_texts() == ["目标 / 积分", "模型 Yes", "挂单", "吃单"]
+        assert not await card.locator(".touched").evaluate("e => e.open")
+        await card.locator(".touched summary").click()
         assert await card.locator(".touched .tchip").all_inner_texts() == ["↑ $118k", "↑ $110k"]
         assert await card.locator(".touched .tchip").first.get_attribute("title") == "本月最高价已到 $118k"
-        assert await card.locator(".lg .lt:text-is('↓ $100k')").get_attribute("title") == \
+        await card.locator(".touched summary").click()
+        assert await card.locator(".pg .ptarget:has(.lt:text-is('↓ $100k'))").get_attribute("title") == \
             "这个市场的规则和标题都没写明上破还是下破，按档位在月初价格之上（↑）还是之下（↓）推断；只作参考"
-        cells = await card.locator(".lg .lb:not(.lk)").evaluate_all("els => els.map(e => [e.className, e.title, e.innerText])")
-        assert cells[3][1].startswith("数据显示已触及，但盘口仍低于 90¢") and "pos" not in cells[5][0] and "hot" not in cells[5][0], cells
-        assert "hot" in cells[2][0] and "miss" in cells[1][0], cells  # ↑ $120k's taker at 24¢ against a fair price near 50¢; ↑ $125k disputed
-        # the far level: its 挂No at 0.2¢ is not a suggestion; the closest counted direction (the taker) shows grey
-        assert cells[0][0] == "lb miss" and cells[0][2].startswith("吃Yes 99.8 ") and "不够大，不建议" in cells[0][1], cells[0]
-        await card.locator(".lg .lt:text-is('↑ $160k')").click()
+        cells = await card.locator(".pg .paction").evaluate_all("els => els.map(e => [e.className, e.title, e.innerText])")
+        assert "pos" not in cells[11][0] and "hot" not in cells[11][0], cells
+        assert "hot" in cells[5][0] and "pos" not in cells[3][0], cells  # ↑ $120k's taker at 24¢; ↑ $125k disputed
+        # An unqualified maker does not fill the overview with a hypothetical 99¢ advantage.
+        assert "disabled" in cells[0][0] and "99." not in cells[0][2], cells[0]
+        assert "Yes" in cells[1][2] and "99.8¢" in cells[1][2] and "未过建议门槛" in cells[1][1], cells[1]
+        await card.locator(".pg .lt:text-is('↑ $160k')").click()
         chips = card.locator(".lrow .edge")
         assert await chips.count() == 2 and await card.locator(".lrow .edge.best, .lrow .edge.pos").count() == 0
         assert (await chips.nth(0).inner_text()).startswith("挂No 0.2\n+99.")
         await chips.nth(0).click()
         det = await card.locator(".lrow .edet").inner_text()
-        assert "这类档位的挂单不算建议" in det and "→ 不计入" in det, det
-        await card.locator(".lg .lt:text-is('↑ $160k')").click()
+        far = next(r for r in btc["ladder"]["rows"] if r["label"] == "↑ $160k")
+        assert (far.get("maker_note") or "这类档位的挂单不算建议") in det and "→ 不计入" in det, det
+        await card.locator(".pg .lt:text-is('↑ $160k')").click()
         # tap the ⚠️ level: its note says why (a tooltip is no use on a phone); no directions are offered on it
-        await card.locator(".lg .lt:text-is('↓ $108.5k')").click()
+        await card.locator(".pg .lt:text-is('↓ $108.5k')").click()
         note = await card.locator(".lrow .lnote").inner_text()
         assert note.startswith("↓ $108.5k：现价还要跌 3.2% 才碰到 · 模型 Yes 100.0¢ · Yes 盘口 30.0 / 35.0") and "⚠️ 数据显示已触及，但盘口仍低于 90¢" in note, note
         assert await card.locator(".lrow .edge").count() == 0
-        await card.locator(".lg .lt:text-is('↓ $108.5k')").click()
+        await card.locator(".pg .lt:text-is('↓ $108.5k')").click()
         assert await card.locator(".lrow").count() == 0
         # the disputed level: its note, then its four directions, none of them suggested
-        await card.locator(".lg .lt:text-is('↑ $125k')").click()
+        await card.locator(".pg .lt:text-is('↑ $125k')").click()
         note = await card.locator(".lrow .lnote").inner_text()
         assert "现价还要涨 11.6% 才碰到" in note and "标题的箭头和规则写的方向相反" in note, note
         assert await card.locator(".lrow .edge").count() == 4 and await card.locator(".lrow .edge.best").count() == 0
         await card.locator(".lrow .edge").nth(0).click()
         assert "暂不建议：标题的箭头和规则写的方向相反" in await card.locator(".lrow .edet").inner_text()
-        await card.locator(".lg .lt:text-is('↑ $125k')").click()
+        await card.locator(".pg .lt:text-is('↑ $125k')").click()
         # the strip on top lists every red-framed suggestion; tapping one jumps to its card (hidden while customising)
         strip = await page.inner_text("#opps")
         assert strip.startswith("🔥 机会 2") and "甲挂跌 5.0+45.0¢" in strip.replace("\n", "") and f"↑ $120k {tk['label']} {tk['price'] * 100:.1f}" in strip, strip
@@ -575,8 +584,8 @@ async def browser_check(bot):
         await page.click("#opps .opp:nth-of-type(2)"); await page.wait_for_timeout(300)
         assert await page.is_visible("#g-levels .card") and await card.evaluate("c => c.classList.contains('flash')")
         assert await page.evaluate("localStorage.getItem('folded')") == "[]"
-        await card.locator("summary").click()
-        text = await card.locator("dl").inner_text()
+        await card.locator(".price-model summary").click()
+        text = await card.locator(".price-model dl").inner_text()
         assert "币安现货 BTCUSDT" in text and "最低价 ≤ 档位即 Yes" in text and "已核至" in text, text
         over = """[...document.querySelectorAll('#g-levels .card *')].filter(e => { const c = e.closest('.card').getBoundingClientRect(),
                   r = e.getBoundingClientRect(); return r.width && (r.right > c.right + 0.5 || r.left < c.left - 0.5) }).length"""
@@ -585,8 +594,69 @@ async def browser_check(bot):
             assert await page.evaluate(over) == 0, width
             assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), width
         if os.environ.get("WEB_SCREENSHOT"):
+            path = __import__("pathlib").Path(os.environ["WEB_SCREENSHOT"])
+            for width, suffix in ((390, "markets-mobile"), (1300, "markets-desktop")):
+                await page.set_viewport_size({"width": width, "height": 900})
+                await page.locator("#g-levels").screenshot(path=str(path.with_name(path.stem + "-" + suffix + path.suffix)))
+        # Active, inactive and unknown points states: only the eligible maker enters filters, highlights and the strip.
+        # Many ordinary levels fold out, but every suggestion stays in the compact view.
+        copy = __import__("copy").deepcopy
+        stress = copy(btc)
+        template = next(r for r in btc["ladder"]["rows"] if r["label"] == "↑ $120k")
+        def uirow(label, level, **extra):
+            r = copy(template)
+            r.update(label=label, level=level, dir="up", dist=level / 112050 - 1, fair=.8, bid=.5, ask=.52,
+                     bids=[[.5, 5000]], asks=[[.52, 5000]], need=.285, swing=.285, error="", hold="", dir_note="",
+                     stale=False, touched=False, points_active=None, points_note="积分状态暂缺", makers=False,
+                     maker_note="积分状态暂缺：不给挂单建议")
+            r.update(extra)
+            return r
+        stress["ladder"]["rows"] = [uirow("↑ $200k", 200000, points_active=True, points_note="积分已激活", points_rate=200,
+                                         makers=True, maker_note=""),
+                                   uirow("↑ $190k", 190000, points_active=False, points_note="积分未激活", maker_note="积分未激活：不给挂单建议"),
+                                   uirow("↑ $180k", 180000),
+                                   *[uirow("↑ $" + str(n) + "k", n * 1000) for n in range(170, 115, -5)],
+                                   uirow("↑ $114k", 114000, fair=.74, bid=.49, ask=.50, bids=[[.49, 5000]], asks=[[.50, 5000]], need=.02, swing=.02)]
+        payload["items"] = [stress]
+        await page.reload()
+        await page.wait_for_selector("#g-levels .pg")
+        card = page.locator("#g-levels .card").first
+        assert await card.locator(".pg .ptarget").count() == 5
+        visible = await card.locator(".pg .lt").all_inner_texts()
+        assert "↑ $200k" in visible and "↑ $114k" in visible and "↑ $190k" not in visible, visible
+        assert "挂Yes 50.0" in await page.inner_text("#opps")
+        active = card.locator(".ptarget:has(.lt:text-is('↑ $200k'))")
+        assert await active.locator(".ppoints.active").inner_text() == "● 积分激活"
+        await active.click()
+        await card.locator(".lrow .edge.best").click()
+        assert "→ 满足" in await card.locator(".lrow .edet").inner_text()
+        assert "200 PP/小时" in await card.locator(".lrow .lnote").inner_text()
+        await active.click()
+        await card.locator(".price-tools button").click()
+        assert await card.locator(".pg .ptarget").count() == len(stress["ladder"]["rows"])
+        await card.locator(".ptarget:has(.lt:text-is('↑ $190k'))").click()
+        assert "积分未激活" in await card.locator(".lrow .lnote").inner_text()
+        assert await card.locator(".lrow .edge.best").count() == 0
+        await card.locator(".lrow .edge").first.click()
+        assert "积分未激活：不给挂单建议" in await card.locator(".lrow .edet").inner_text()
+        await card.locator(".ptarget:has(.lt:text-is('↑ $190k'))").click()
+        assert "待确认" in await card.locator(".ptarget:has(.lt:text-is('↑ $180k')) + .pmodel + .paction").inner_text()
+        await page.click("#fchips button:text-is('仅挂单')")
+        assert await page.locator("#g-flat .card.price-lad").count() == 1
+        assert "↑ $200k" in await page.locator("#g-flat .pg").inner_text()
+        await page.click("#fchips button:text-is('仅挂单')")
+        await card.locator(".price-tools button").click()
+        assert await card.locator(".pg .ptarget").count() == 5
+        for width in (320, 390, 900, 1300):
+            await page.set_viewport_size({"width": width, "height": 900})
+            assert await page.evaluate(over) == 0, width
+            assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), width
+        if os.environ.get("WEB_SCREENSHOT"):
             await page.set_viewport_size({"width": 390, "height": 900})
             await page.screenshot(path=os.environ["WEB_SCREENSHOT"], full_page=True)
+            await page.set_viewport_size({"width": 1300, "height": 900})
+            path = __import__("pathlib").Path(os.environ["WEB_SCREENSHOT"])
+            await page.screenshot(path=str(path.with_name(path.stem + "-desktop" + path.suffix)), full_page=True)
         await browser.close()
     await web.stop()
 
