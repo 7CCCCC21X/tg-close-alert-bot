@@ -44,7 +44,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.27.0"
+VERSION = "1.28.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -8384,11 +8384,12 @@ class Bot:
                 toast = self.apply_cooldown(value)
                 text, markup = cooldown_card(int(self.settings()["cooldown"]))
             elif kind == "mode":
-                toast = self.apply_mode(value).splitlines()[0]
+                full = self.apply_mode(value)
+                toast = full.splitlines()[0]
                 text, markup = mode_card(self.settings()["mode"])
-                if self.settings()["mode"] == "manual":  # the template to fill in is worth a message of its own
+                if self.settings()["mode"] == "manual" and message.get("chat"):  # the template to fill in is worth a message of its own
                     await self.reply(Request("/mode", [], int(message["chat"]["id"]), int(message.get("message_thread_id") or 0),
-                                             int((query.get("from") or {}).get("id") or 0)), self.apply_mode("manual"))
+                                             int((query.get("from") or {}).get("id") or 0)), full)
             else:
                 raise ValueError("未知操作，请重新发送命令")
         except (ValueError, decimal.InvalidOperation) as error:
