@@ -41,7 +41,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.26.2"
+VERSION = "1.26.3"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -6093,7 +6093,7 @@ button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,s
 @keyframes pulse{0%,100%{box-shadow:0 0 0 3px var(--down-bg)}50%{box-shadow:0 0 0 6px transparent}}
 @keyframes shimmer{from{background-position:100% 0}to{background-position:0 0}}
 @keyframes chgr{from{background:var(--up-bg)}to{background:transparent}}@keyframes chgg{from{background:var(--down-bg)}to{background:transparent}}
-@media (prefers-reduced-motion:reduce){.card.flash{animation:none;outline:3px solid var(--best);outline-offset:3px}h1:before,.skel,.odds.chg-r,.odds.chg-g{animation:none!important}.fbar:after,.bar i,#totop{transition:none!important}}
+@media (prefers-reduced-motion:reduce){.card.flash{animation:none;outline:3px solid var(--best);outline-offset:3px}h1:before,.skel,.odds.chg-r,.odds.chg-g{animation:none!important}.bar i,#totop{transition:none!important}}
 .wrap{max-width:1560px;margin:0 auto;padding:12px 16px 28px}
 header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 16px;padding:4px 0 8px}
 .ttl{display:flex;flex-direction:column;gap:2px;min-width:0}
@@ -6147,8 +6147,6 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:7px 0 3px;fon
 .ages+.pb{margin-top:0}
 .fbar{position:sticky;top:0;z-index:5;background:var(--bg);display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:7px 0;margin-bottom:4px;font-size:12.5px;border-bottom:1px solid var(--line);transition:box-shadow .2s}
 .fbar.stuck{box-shadow:0 10px 18px -14px rgba(0,0,0,.35)}
-.fbar:after{content:"";position:absolute;left:0;bottom:-1px;height:2px;width:var(--prog,0%);background:var(--best);border-radius:0 2px 2px 0;transition:width 1s linear;pointer-events:none}
-body.olddata .fbar:after{background:var(--warn)}
 .fchips{display:flex;flex-wrap:wrap;gap:5px}.fchips .tog.on,.famt .tog.on{border-color:var(--best);color:#fff;background:var(--best)}
 button.tog{font-family:inherit}.fsort select{font:inherit;font-size:12.5px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);padding:3px 6px}
 .famt{display:inline-flex;align-items:center;gap:4px;color:var(--muted)}.famt input{width:64px;font:inherit;font-size:12.5px;padding:3px 6px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}
@@ -6693,7 +6691,6 @@ function tick(){
   const ago=document.getElementById("ago");if(ago&&fetchedAt)ago.textContent=Math.max(0,Math.round((Date.now()-fetchedAt)/1000))+" 秒前刷新";
   document.querySelectorAll(".age").forEach(el=>{const a=Math.max(0,now-Number(el.dataset.ms));
     el.textContent=a<60e3?Math.round(a/1000)+" 秒前":a<3600e3?Math.floor(a/60e3)+" 分钟前":Math.floor(a/3600e3)+" 小时前";el.classList.toggle("old",a>Number(el.dataset.old))});
-  document.getElementById("fbar").style.setProperty("--prog",(fetchedAt?Math.min(100,(Date.now()-fetchedAt)/100):0)+"%");  // the thin line under the bar: time to the next refresh
   drawStale()}
 function drawStale(){  // a failed refresh says the cards are old; past STALE_MS their suggestions stop being highlighted
   const el=document.getElementById("stale"),gone=okAt?Date.now()-okAt:Infinity,old=gone>STALE_MS,bad=!!failMsg||old&&!!okAt;
