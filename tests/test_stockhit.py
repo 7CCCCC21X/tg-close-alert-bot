@@ -138,7 +138,11 @@ async def run():
         assert abs(rm.sigma - m.realised_vol(closes)[0] * math.sqrt(252)) < 1e-12 and 0.03 < rm.sigma < 0.08, rm.sigma
         assert rm.sigma_ms == NOW and rm.advice_problem(NOW) == "" and rm.missing_note(NOW) == ""
         fair = rm.probability(D("100"), "up", NOW)
-        assert fair == m.hit_probability(99.6, 100.0, rm.sigma, m.us_trading_years(NOW, dec31 + 60_000)) and 0.5 < fair < 1, fair
+        # the running session's remainder counts only the in-session share of the daily variance (its opening gap is behind it)
+        share, days_ = rm.share
+        assert 0.3 <= share <= 1 and days_ >= 10 and rm.remaining_years(NOW) == m.us_trading_years(NOW, dec31 + 60_000, share), rm.share
+        assert rm.remaining_years(NOW) < m.us_trading_years(NOW, dec31 + 60_000) and rm.remaining_years(NOW) > m.us_trading_years(NOW, dec31 + 60_000, 0.0)
+        assert fair == m.hit_probability(99.6, 100.0, rm.sigma, rm.remaining_years(NOW)) and 0.5 < fair < 1, fair
         assert rm.model_swing(D("100"), "up", NOW, fair) > 0
         # the live price is the last trade: valid while the market is closed, stale only when Yahoo stops answering
         assert not rm.price_stale(NOW + 4 * 60_000) and rm.price_stale(NOW + 5 * 60_000 + 1)
@@ -148,7 +152,8 @@ async def run():
         assert rm.missing_note(sat + 6 * 60_000).startswith("Yahoo 行情停在 ") and rm.probability(D("100"), "up", sat + 6 * 60_000) is None
         rm.fetched_ms = NOW
         extras = rm.card_extras(NOW)
-        assert extras["range_word"] == "窗口内" and extras["session"] == "美股交易中（常规时段 09:30–16:00 ET）" and "TradingView" in extras["rule_note"]
+        assert extras["range_word"] == "窗口内" and "TradingView" in extras["rule_note"]
+        assert extras["session"] == f"美股交易中（常规时段 09:30–16:00 ET）；今日剩余时段按 {share * 100:.0f}% 方差计（{days_} 日开盘跳空已扣除）", extras["session"]
         assert rm.card_extras(sat)["session"] == "美股已收盘，10-12 09:30 ET（北京 10-12 21:30）开盘；收盘期间现价为最后成交价，概率按剩余交易时段计算"
         assert rm.close_label() == "12-31 23:59 ET（北京 01-01 12:59）前触及即 Yes，到期未触及为 No（TradingView 1 分钟 K 的最高价 ≥ 档位算触及）"
         assert rm.window_label() == "市场创建 06-17 20:16 ET（北京 06-18 08:16）起" and rm.sigma_note() == "60 个交易日收盘，按 252 个交易日年化"
@@ -253,9 +258,9 @@ async def run():
         "kind": "price", "price": "$99.60", "high": "$99.95", "low": f"${min(99.5 * 0.996, 99.3):,.2f}", "symbol": "STRC", "venue": "Yahoo 行情，NASDAQ:",
         "window": "市场创建 06-17 20:16 ET（北京 06-18 08:16）起", "hold": "", "error": "", "range_word": "窗口内",
         "sigma_note": "60 个交易日收盘，按 252 个交易日年化"}, L
-    assert L["session"] == "美股交易中（常规时段 09:30–16:00 ET）" and "TradingView" in L["rule_note"] and "创建当日按整日计" in L["extremes_note"]
+    assert L["session"].startswith("美股交易中（常规时段 09:30–16:00 ET）；今日剩余时段按 ") and "TradingView" in L["rule_note"] and "创建当日按整日计" in L["extremes_note"]
     assert L["question"] == "STRC 在 12-31 23:59 ET（北京 01-01 12:59）之前是否触及 $100：窗口内任一 1 分钟 K 的最高价达到即 Yes，到期没碰到为 No", L["question"]
-    assert L["spot"] == 99.6 and abs(L["years"] - m.us_trading_years(NOW, dec31 + 60_000)) < 1e-12 and L["sigma"] == srm.sigma
+    assert L["spot"] == 99.6 and abs(L["years"] - srm.remaining_years(NOW)) < 1e-12 and L["sigma"] == srm.sigma and srm.share
     r100, = L["rows"]
     assert r100["label"] == "↑ $100" and (r100["dir"], r100["dir_source"]) == ("up", "规则") and r100["dir_note"] == ""
     assert r100["fair"] == srm.probability(D("100"), "up", NOW) and abs(r100["dist"] - (100 / 99.6 - 1)) < 1e-12 and r100["touched"] is False

@@ -27,6 +27,7 @@ import re
 import secrets
 import signal
 import sqlite3
+import ssl
 import sys
 import time
 import urllib.error
@@ -44,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.28.2"
+VERSION = "1.29.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -228,6 +229,7 @@ STOCK_MARKETS = {
 # The others are USD-denominated, so their exchange closes are converted with the FX rate first.
 DEFAULT_TICKERS = "UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:688825,SKHYNIXUSDT=kr:000660"
 NOTICE_GRACE_SECONDS = 30  # a data fault must last this long before subscribers hear of it (one failed request is not an outage)
+WATCHDOG_SECONDS = 600     # the sampling loop not starting a cycle for this long means it is stuck: the process exits, Railway restarts it
 SHUTDOWN_GRACE_SECONDS = 8  # at shutdown, how long messages already on their way may take to finish
 REFERENCE_TICK = 5        # seconds between checks in each reference task (each feed has its own cadence)
 REFERENCE_TIMEOUT = 300   # one reference refresh may take this long before it is abandoned
@@ -646,6 +648,9 @@ class RemoteError(Exception):
 
 BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
 MAX_BODY = 8_000_000  # bytes per response, before and after decompression
+# One TLS context for the process: urlopen without one builds a fresh context, CA bundle parsed and all, for every
+# connection, which at a few requests a second is most of the CPU the HTTP layer burns.
+SSL_CONTEXT = ssl.create_default_context()
 # What an HTTP status means for the operator. Binance's geo / ban codes and their long cool-downs mean nothing on
 # Telegram, whose answers carry their own description (and retry_after); a 409 there is the two-instances conflict.
 HTTP_HINTS = {451: "部署所在地或接口访问受限；请核对官方地区规则",
@@ -680,7 +685,7 @@ def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
     host = urllib.parse.urlsplit(url).hostname or ""
     telegram = host.endswith("telegram.org")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as response:
             raw = response.read(MAX_BODY + 1)
             if len(raw) > MAX_BODY:
                 raise RemoteError("接口返回的数据过大")
@@ -3094,6 +3099,10 @@ def session_remaining(market: str, now_ms: int, close_date: dt.date | None = Non
     if trading_today and not finalised and (close_date is None or close_date < today):
         remaining = sum(max(0.0, (dt.datetime.combine(today, b, tz) - max(dt.datetime.combine(today, a, tz), local)).total_seconds())
                         for a, b in CALENDAR.sessions(market, today)) / 60  # a half day has less of it ahead
+        if auction_running(market, now_ms, holidays):
+            # the closing auction is still finding the close: HK's runs after continuous trading, so the minutes left
+            # would be none and the close look all but decided from a 0.1% lead; it is worth a fixed share instead
+            remaining = max(remaining, AUCTION_VARIANCE_MINUTES.get(market, 0.0))
         return max(remaining, 1.0) / total, today
     target, skipped = today + dt.timedelta(days=1), 0
     while target.weekday() >= 5 or target in holidays:
@@ -3199,6 +3208,8 @@ def close_odds(name: str, ref: D, effective: D, sigma_daily: float, remaining: f
 
 MODEL_SIGMA_ERROR = 1.25  # σ is an estimate: a suggested edge must survive σ × or ÷ this
 MODEL_BETA_ERROR = 0.25   # a proxy's coefficient (β) is uncertain by about this much
+LOG_DRIFT_VARIANT = 0.0   # the other drift convention a touch model's error allows for: a driftless log price (the
+#                           default, drift −½σ², is a driftless price); the point estimate keeps the default
 
 
 def model_swing(odds: CloseOdds) -> float:
@@ -3260,6 +3271,7 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
                 bins.append(f"{lo * 100:.0f}–{lo * 100 + 20:.0f}%：预测 {sum(r['up'] for r in sel) / len(sel) * 100:.0f}% "
                             f"实际 {sum(r['hit'] for r in sel) / len(sel) * 100:.0f}%（{len(sel)} 条/{len({r['target'] for r in sel})} 日）")
         lines.append("  校准：" + "；".join(bins))
+        lines.extend(residual_lines(done))
         if mode != "盘后" or len(days) < 3:
             continue
         fit = fit_proxy(done)
@@ -3287,6 +3299,42 @@ def calibration_report(preds: list[dict], outcomes: dict[str, float]) -> list[st
             lines.append(f"  逐日向前检验（{len({r['target'] for r in tested})} 日 {len(tested)} 条）：拟合模型 Brier {new[0]:.3f} / "
                          f"对数损失 {new[1]:.3f}，现行 {old[0]:.3f} / {old[1]:.3f}")
     return lines or ["📐 还没有保存的预测快照（每个指数每 30 分钟存一条，需要概率功能开启）"]
+
+
+CALIB_BUCKETS = ((0.0, 0.25, "R<0.25"), (0.25, 0.5, "0.25–0.5"), (0.5, 1.0, "0.5–1"), (1.0, math.inf, "R≥1"))
+
+
+def residual_lines(done: list[dict]) -> list[str]:
+    """The model's own scale against the outcomes: the standardised residual z = (ln(close/ref) − β·move) / (σ·√R) of each
+    scored snapshot, which is N(0, 1) when σ, β and the remaining share R are right. Its root mean square k says how far
+    σ is off (k > 1: too small), its mean whether the proxy mapping leans one way; the same by bucket of R (a session
+    nearly over, mid-session, after hours, a holiday ahead), since each of those rests on a different constant. Each
+    target day carries one unit of weight (its snapshots share one outcome)."""
+    rows = [r for r in done if r.get("sigma") and r.get("R") and r["sigma"] > 0 and r["R"] > 0]
+    if not rows:
+        return []
+    per_day: dict[str, int] = {}
+    for r in rows:
+        per_day[r["target"]] = per_day.get(r["target"], 0) + 1
+
+    def summary(sel: list[dict]) -> tuple[float, float, int]:
+        ws = [1 / per_day[r["target"]] for r in sel]
+        zs = [(r["y"] - r["beta"] * r["move"]) / (r["sigma"] * math.sqrt(r["R"])) for r in sel]
+        total = sum(ws)
+        return (sum(w * z for w, z in zip(ws, zs)) / total, math.sqrt(sum(w * z * z for w, z in zip(ws, zs)) / total),
+                len({r["target"] for r in sel}))
+    mean, rms, days = summary(rows)
+    lines = [f"  标准化残差 z=(实际−预测)/σ剩余：均值 {mean:+.2f}，均方根 {rms:.2f}（校准为 1；>1 表示 σ 偏小）｜{len(rows)} 条/{days} 日"]
+    parts = []
+    for low, high, label in CALIB_BUCKETS:
+        sel = [r for r in rows if low <= r["R"] < high]
+        if sel:
+            mean, rms, days = summary(sel)
+            parts.append(f"{label}：{len(sel)} 条/{days} 日，预测 {sum(r['up'] for r in sel) / len(sel) * 100:.0f}% "
+                         f"实际 {sum(r['hit'] for r in sel) / len(sel) * 100:.0f}%，残差均方根 {rms:.2f}")
+    if len(parts) > 1:
+        lines.append("  按剩余方差份额 R 分桶：" + "；".join(parts))
+    return lines
 
 
 def fit_proxy(rows: list[dict]) -> tuple[float, float, float] | None:
@@ -3406,7 +3454,9 @@ PREDICT_REWARD_STALE_SECONDS = 120  # allows the normal refresh to finish across
 PREDICT_POINTS_STALE_SECONDS = 3 * PREDICT_META_SECONDS  # other markets' points (read with the fee) are shown this long
 PREDICT_STRIKE_SECONDS = 300   # a known target price is re-read this often (the site may correct it)
 PREDICT_MISS_SECONDS = 60      # an unknown slug is looked up again after this long (new markets show up within a minute)
-PREDICT_DEPTH = 5
+PREDICT_DEPTH = 20            # levels kept per side: a fill for the trade size is judged on these (a book "too thin" at
+#                               5 levels was often only cut off there), the page and the evidence show the top of them
+PREDICT_SHOW_DEPTH = 10       # levels sent to the page per side (it recomputes the edges for the viewer's trade size)
 MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
           "november", "december")
 
@@ -3623,6 +3673,10 @@ AUCTIONS = {
     "sh": (dt.time(14, 57), dt.time(15, 0), "沪深收盘集合竞价（14:57–15:00）"),
 }
 AUCTIONS["sz"] = AUCTIONS["sh"]
+# How much of a session's variance a running closing auction is still worth, in minutes of continuous trading: the
+# indicative price keeps moving until the match (HSI: a 0.1–0.2% move against the 16:00 level is usual, about the
+# variance of 5 continuous minutes at σ 1.3% a day), so the odds must not treat the 16:00 print as the close.
+AUCTION_VARIANCE_MINUTES = {"hk": 5.0, "kr": 5.0, "sh": 3.0, "sz": 3.0}
 
 
 def auction_window(market: str, now_ms: int) -> tuple[dt.time, dt.time, str] | None:
@@ -3944,14 +3998,18 @@ class PredictFeed:
         try:
             bids, asks, _ = await self.orderbook(market)
         except (RemoteError, TimeoutError, OSError) as error:
-            return LadderRow(target, market["id"], market["title"], None, clean_error(error) or type(error).__name__,
+            # one timed-out request must not blank the level (its edge, its alerts, its paper trades) for a whole round:
+            # the book it had last time stays, aging as it does (stale after PREDICT_STALE_MS), with the failure noted
+            kept = next((row.book for row in self.ladders.get(key) or () if row.market_id == market["id"] and row.book), None)
+            return LadderRow(target, market["id"], market["title"], kept, clean_error(error) or type(error).__name__,
                              market.get("question", ""))
         fee = (self.market_meta.get(market["id"]) or ({}, 0))[0].get("fee_bps")
         book = PredictBook(key, slug, market["id"], market["title"], bids, asks, int(time.time() * 1000), fee)
         return LadderRow(target, market["id"], market["title"], book, "", market.get("question", ""))
 
     async def refresh_ladder(self, key: str, slug: str) -> None:
-        """A category of Yes/No markets, one per threshold: every market's book, sorted by threshold."""
+        """A category of Yes/No markets, one per threshold: every market's book, sorted by threshold. A level whose book
+        could not be read keeps its previous one; the failures are recorded for the card and /status."""
         markets = await self.resolve_all(slug)
         if not markets:
             self.ladders.pop(key, None)
@@ -3963,7 +4021,11 @@ class PredictFeed:
         if key in self.ladder_pick:
             rows = self.ladder_pick[key](rows, self.market_meta)
         self.ladders[key] = sorted(rows, key=lambda row: row.target)
-        self.errors.pop(key, None)
+        failed = [row for row in rows if row.error and "HTTP 404" not in row.error]  # 404: this market has no book (an answer)
+        if failed:
+            self.errors[key] = f"{len(failed)}/{len(rows)} 档盘口刷新失败（{brief_error(failed[0].error, 60)}）；显示上次盘口"
+        else:
+            self.errors.pop(key, None)
 
     def yes_book(self, row: "LadderRow") -> tuple["PredictBook | None", str]:
         """The row's book priced as "Yes", whatever the market's outcome order."""
@@ -4073,16 +4135,30 @@ TOUCH_SPOT = ("https://data-api.binance.vision", "https://api.binance.com", "htt
 YEAR_MS = 365 * 24 * 3600 * 1000
 
 
+SPOT_BACKOFF = {"until": 0.0}  # monotonic: after a 418 / 429 from Binance spot no spot request goes out before this
+
+
 async def binance_spot(path: str, **params: Any) -> Any:
-    """GET /api/v3/<path> from Binance spot (the crypto markets' resolution source), each public host in turn."""
+    """GET /api/v3/<path> from Binance spot (the crypto markets' resolution source): the public hosts in turn, those in
+    cooldown last. A rate-limit answer (retry_after) pauses every spot request for that long instead of trying the next
+    host at once: the api*.binance.com hosts share one IP-based limit, and a 429 ignored escalates to a 418 ban."""
+    left = SPOT_BACKOFF["until"] - time.monotonic()
+    if left > 0:
+        raise RemoteError(f"币安现货接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
     query = urllib.parse.urlencode(params)
-    failures = []
-    for base in TOUCH_SPOT:
+    failures, retry = [], 0
+    for _, base in SOURCE_HEALTH.order([(host, host) for host in TOUCH_SPOT]):
         try:
             return json.loads(await fetch_source(f"{base}/api/v3/{path}?{query}"))
+        except RemoteError as error:
+            failures.append(f"{urllib.parse.urlsplit(base).hostname}: {clean_error(error)}")
+            if error.retry_after:
+                retry = error.retry_after
+                SPOT_BACKOFF["until"] = max(SPOT_BACKOFF["until"], time.monotonic() + retry)
+                break
         except Exception as error:
             failures.append(f"{urllib.parse.urlsplit(base).hostname}: {clean_error(error)}")
-    raise RemoteError("；".join(failures))
+    raise RemoteError("；".join(failures), retry)
 
 
 def _log_erfc_pos(z: float) -> float:
@@ -4374,13 +4450,17 @@ class TouchMarket:
                            max(0.0, (self.spec.deadline_ms - max(now_ms, self.start_ms)) / YEAR_MS))
 
     def model_swing(self, now_ms: int) -> float:
-        """How far the fair "high first" price moves with σ ×/÷ 1.25 (σ is a 30-day estimate)."""
+        """How far the fair "high first" price moves with σ ×/÷ 1.25 (σ is a 30-day estimate), or with a driftless log
+        price (μ = σ²/2) instead of a driftless price (each varied alone): over months the drift convention alone moves
+        the barrier odds by cents, as it does on the BTC up/down card."""
         odds = self.odds(now_ms)
         if not isinstance(odds, TouchOdds) or self.history.get("kind") in {"low", "high"}:
             return 0.0
         years = max(0.0, (self.spec.deadline_ms - max(now_ms, self.start_ms)) / YEAR_MS)
-        return max(abs(first_touch(float(self.price), float(self.spec.low), float(self.spec.high), self.sigma * k, 0.0,
-                                   years).fair_upper - odds.fair_upper) for k in (MODEL_SIGMA_ERROR, 1 / MODEL_SIGMA_ERROR))
+        spot, low, high = float(self.price), float(self.spec.low), float(self.spec.high)
+        variants = [(self.sigma * MODEL_SIGMA_ERROR, 0.0), (self.sigma / MODEL_SIGMA_ERROR, 0.0),
+                    (self.sigma, (LOG_DRIFT_VARIANT + 0.5) * self.sigma * self.sigma)]
+        return max(abs(first_touch(spot, low, high, sigma, mu, years).fair_upper - odds.fair_upper) for sigma, mu in variants)
 
     def advice_problem(self, now_ms: int) -> str:
         """Why the model's edge must not be recommended now ("" when it may): the path since the window opened has
@@ -4787,12 +4867,14 @@ class FlipMarket:
         return hit_probability(self.ratio, 1.0, self.sigma, years)
 
     def model_swing(self, now_ms: int) -> float:
-        """How far P(Yes) moves with σ ×/÷ 1.25 (σ is a 30-day estimate)."""
+        """How far P(Yes) moves with σ ×/÷ 1.25 (σ is a 30-day estimate), or with a driftless log ratio instead of a
+        driftless ratio (each varied alone)."""
         odds = self.odds(now_ms)
         if not isinstance(odds, float) or odds >= 1.0 or not self.sigma or self.ratio is None:
             return 0.0
         years = max(0.0, (self.spec.end_ms + 60_000 - max(now_ms, self.spec.start_ms)) / YEAR_MS)
-        return max(abs(hit_probability(self.ratio, 1.0, self.sigma * k, years) - odds) for k in (MODEL_SIGMA_ERROR, 1 / MODEL_SIGMA_ERROR))
+        variants = [(self.sigma * MODEL_SIGMA_ERROR, -0.5), (self.sigma / MODEL_SIGMA_ERROR, -0.5), (self.sigma, LOG_DRIFT_VARIANT)]
+        return max(abs(hit_probability(self.ratio, 1.0, sigma, years, drift) - odds) for sigma, drift in variants)
 
     def advice_problem(self, now_ms: int) -> str:
         """Why the model's edge must not be suggested now ("" when it may): the window's path must be checked up to
@@ -4895,15 +4977,17 @@ BURN_ADDRESSES = ("0x000000000000000000000000000000000000dead", "0x0000000000000
 GECKO = "https://api.geckoterminal.com/api/v2/networks"
 
 
-def hit_probability(spot: float, level: float, sigma: float, years: float) -> float:
-    """P(the running maximum reaches ``level`` before ``years``) for a zero-drift GBM (log drift −σ²/2):
-    Φ((−h − s²/2)/s) + (S/K)·Φ((−h + s²/2)/s), h = ln(K/S), s = σ√T."""
+def hit_probability(spot: float, level: float, sigma: float, years: float, drift: float = -0.5) -> float:
+    """P(the running maximum reaches ``level`` before ``years``) for a GBM whose log drift is drift·σ² (−½: a driftless
+    price, the median σ²T/2 below today's; 0: a driftless log price): Φ((−h + bT)/s) + e^{2bh/σ²}·Φ((−h − bT)/s),
+    h = ln(K/S), b = drift·σ², s = σ√T. With drift −½ this is Φ((−h − s²/2)/s) + (S/K)·Φ((−h + s²/2)/s)."""
     if spot >= level:
         return 1.0
     if years <= 0 or sigma <= 0:
         return 0.0
     h, s = math.log(level / spot), sigma * math.sqrt(years)
-    return min(1.0, norm_cdf((-h - s * s / 2) / s) + spot / level * norm_cdf((-h + s * s / 2) / s))
+    b = drift * sigma * sigma
+    return min(1.0, norm_cdf((-h + b * years) / s) + math.exp(2 * b * h / (sigma * sigma)) * norm_cdf((-h - b * years) / s))
 
 
 def sampled_coverage(samples: list) -> tuple[float, float]:
@@ -4915,6 +4999,21 @@ def sampled_coverage(samples: list) -> tuple[float, float]:
             squares += math.log(p1 / p0) ** 2
             seconds += t1 - t0
     return squares, seconds
+
+
+def bars_sigma(bars: list) -> tuple[float, float, int]:
+    """(annualised σ, hours covered, bars missing) from hourly bars [(open s, o, h, l, close)] oldest first, weighting
+    each close-to-close return by the time it spans: GeckoTerminal serves no bar for an hour without a trade, so two
+    neighbouring bars may be 2–6 hours apart, and taking every return as one hour's would overstate σ by up to 80%.
+    σ² = Σ (r − μ·Δt)² / Δt ÷ (n − 1), μ = Σr / ΣΔt (the hourly-sample formula when no bar is missing)."""
+    pts = [(int(b[0]), float(b[4])) for b in bars if float(b[4]) > 0]
+    steps = [(t1 - t0, math.log(p1 / p0)) for (t0, p0), (t1, p1) in zip(pts, pts[1:]) if t1 > t0]
+    if len(steps) < 2:
+        raise ValueError("小时 K 线不足 2 根")
+    span = sum(s for s, _ in steps)
+    mu = sum(r for _, r in steps) / span
+    var = sum((r - mu * s) ** 2 / s for s, r in steps) / (len(steps) - 1) * 365 * 86400
+    return math.sqrt(var), span / 3600, round(span / 3600) - len(steps)
 
 
 def sampled_sigma(samples: list) -> tuple[float, float] | None:
@@ -5266,13 +5365,14 @@ class CapMarket:
             self.times["vol"] = mono
             self.pool = ""  # look the most liquid pool up again (a token can move pools)
             try:
-                bars = [b for b in await self.ohlcv("hour", now_ms // 1000, 1000) if b[0] + 3600 <= now_ms // 1000][-721:]
+                now_s = now_ms // 1000
+                # the last 30 days of finished hours (hours without a trade have no bar: a bar count is not a time span)
+                bars = [b for b in await self.ohlcv("hour", now_s, 1000) if b[0] + 3600 <= now_s and b[0] >= now_s - 721 * 3600]
                 if len(bars) < 49:
                     raise ValueError(f"小时 K 线只有 {len(bars)} 根，不足 2 天")
-                rets = [math.log(bars[i][4] / bars[i - 1][4]) for i in range(1, len(bars)) if bars[i][4] > 0 and bars[i - 1][4] > 0]
-                mean = sum(rets) / len(rets)
-                self.sigma = math.sqrt(sum((r - mean) ** 2 for r in rets) / (len(rets) - 1) * 24 * 365)
-                self.sigma_note, self.sigma_kind, self.vol_error = f"{len(rets) / 24:.0f} 日小时收盘", "bars", ""
+                self.sigma, hours, missing = bars_sigma(bars)
+                self.sigma_note = f"{hours / 24:.0f} 日小时收盘" + (f"（缺 {missing} 根，按实际间隔计）" if missing > 0 else "")
+                self.sigma_kind, self.vol_error = "bars", ""
                 self.store.put(f"capsigma:{self.spec.slug}", [self.sigma, self.sigma_note, now_ms])
             except Exception as error:
                 self.times["vol"] = mono - self.VOL_SECONDS + self.RETRY_SECONDS  # try again in 5 minutes
@@ -5405,12 +5505,14 @@ class CapMarket:
         return (D(str(top)) * supply if top and supply else None), at
 
     def model_swing(self, target: D, now_ms: int, fair: float | None) -> float:
-        """How far P(hit ``target``) moves with σ ×/÷ 1.25: an edge inside that is the model's own error."""
+        """How far P(hit ``target``) moves with σ ×/÷ 1.25, or with a driftless log price instead of a driftless price
+        (each varied alone): an edge inside that is the model's own error. At σ of 300% a year the drift convention
+        alone is worth several times the σ variation."""
         if fair is None or fair >= 1.0 or self.cap is None or self.sigma is None:
             return 0.0
         years = max(0.0, (self.spec.end_ms - max(now_ms, self.spec.start_ms)) / YEAR_MS)
-        return max(abs(hit_probability(float(self.cap), float(target), self.sigma * k, years) - fair)
-                   for k in (MODEL_SIGMA_ERROR, 1 / MODEL_SIGMA_ERROR))
+        variants = [(self.sigma * MODEL_SIGMA_ERROR, -0.5), (self.sigma / MODEL_SIGMA_ERROR, -0.5), (self.sigma, LOG_DRIFT_VARIANT)]
+        return max(abs(hit_probability(float(self.cap), float(target), sigma, years, drift) - fair) for sigma, drift in variants)
 
     def probability(self, target: D, now_ms: int) -> float | None:
         cap, (high, _) = self.cap, self.window_high()
@@ -5509,16 +5611,20 @@ def us_session_state(now_ms: int) -> tuple[str, int]:
     return "已收盘", 0
 
 
-def us_trading_years(now_ms: int, end_ms: int) -> float:
+def us_trading_years(now_ms: int, end_ms: int, intraday: float = 1.0) -> float:
     """Trading time left before end_ms, in years of US_TRADING_DAYS full sessions: the rest of the running session and every
-    later one through the deadline's date (an early close is its share of a full day). Nothing can be hit between sessions."""
+    later one through the deadline's date (an early close is its share of a full day). Nothing can be hit between sessions.
+    ``intraday``: the share of a day's close-to-close variance that happens inside the session (intraday_share). The
+    running session's remainder is worth only that share: its opening gap has already happened, while every later
+    session still has its own gap ahead and counts whole."""
     if end_ms <= now_ms:
         return 0.0
     total, day, last = 0.0, et_date(now_ms), et_date(end_ms)
     while day <= last:
         session = us_session(day)
         if session:
-            total += max(0, min(session[1], end_ms) - max(session[0], now_ms)) / US_SESSION_MS
+            left = max(0, min(session[1], end_ms) - max(session[0], now_ms)) / US_SESSION_MS
+            total += left * (intraday if session[0] <= now_ms < session[1] else 1.0)
         day += dt.timedelta(days=1)
     return total / US_TRADING_DAYS
 
@@ -5679,15 +5785,17 @@ def predict_reward_status(meta: dict, now_ms: int) -> dict:
     return {"points_active": active, "points_note": note, "points_rate": rate_float, "points_end_ms": end_ms}
 
 
-def low_probability(spot: float, level: float, sigma: float, years: float) -> float:
-    """P(the running minimum reaches ``level`` (below ``spot``) before ``years``) for a zero-drift GBM (log drift −σ²/2):
-    Φ((−a + s²/2)/s) + (S/L)·Φ((−a − s²/2)/s), a = ln(S/L), s = σ√T (the mirror of hit_probability)."""
+def low_probability(spot: float, level: float, sigma: float, years: float, drift: float = -0.5) -> float:
+    """P(the running minimum reaches ``level`` (below ``spot``) before ``years``) for a GBM whose log drift is drift·σ²
+    (the mirror of hit_probability: the log price's drift changes sign): Φ((−a − bT)/s) + e^{−2ba/σ²}·Φ((−a + bT)/s),
+    a = ln(S/L), b = drift·σ², s = σ√T. With drift −½ this is Φ((−a + s²/2)/s) + (S/L)·Φ((−a − s²/2)/s)."""
     if spot <= level:
         return 1.0
     if years <= 0 or sigma <= 0:
         return 0.0
     a, s = math.log(spot / level), sigma * math.sqrt(years)
-    return min(1.0, norm_cdf((-a + s * s / 2) / s) + spot / level * norm_cdf((-a - s * s / 2) / s))
+    b = drift * sigma * sigma
+    return min(1.0, norm_cdf((-a - b * years) / s) + math.exp(-2 * b * a / (sigma * sigma)) * norm_cdf((-a + b * years) / s))
 
 
 def level_label(value: D | float) -> str:
@@ -5924,13 +6032,14 @@ class RangeMarket:
         return touch(float(self.price), float(level), self.sigma, years)
 
     def model_swing(self, level: D, direction: str, now_ms: int, fair: float | None) -> float:
-        """How far P(Yes) moves with σ ×/÷ 1.25: an edge inside that is the model's own error."""
+        """How far P(Yes) moves with σ ×/÷ 1.25, or with a driftless log price instead of a driftless price (each varied
+        alone): an edge inside that is the model's own error."""
         if fair is None or fair >= 1.0 or self.price is None or self.sigma is None:
             return 0.0
         years = self.remaining_years(now_ms)
         touch = hit_probability if direction == "up" else low_probability
-        return max(abs(touch(float(self.price), float(level), self.sigma * k, years) - fair)
-                   for k in (MODEL_SIGMA_ERROR, 1 / MODEL_SIGMA_ERROR))
+        variants = [(self.sigma * MODEL_SIGMA_ERROR, -0.5), (self.sigma / MODEL_SIGMA_ERROR, -0.5), (self.sigma, LOG_DRIFT_VARIANT)]
+        return max(abs(touch(float(self.price), float(level), sigma, years, drift) - fair) for sigma, drift in variants)
 
     def advice_problem(self, now_ms: int) -> str:
         """Why no level may be suggested now ("" when they may): the window's extremes must be read up to now (a level
@@ -5962,6 +6071,8 @@ class StockRangeMarket(RangeMarket):
     its title names. Time passes in sessions only: σ is from daily closes, annualised over 252 sessions, and the time left
     is the trading time left; the last trade is the live price and stays valid while the market is closed."""
     PRICE_SECONDS = 30
+    CLOSED_PRICE_SECONDS = 120  # between sessions the last trade does not change: a quarter of the requests (still well inside PRICE_STALE_MS)
+    CLOSE_PRINT_MS = 15 * 60_000  # the closing print may still be corrected this long after the bell: keep the session cadence
     SCAN_SECONDS = 300          # daily bars: σ and the finished days' extremes from one request
     SIGMA_STALE_MS = 3 * 24 * 3600_000  # a long weekend changes nothing: the daily bars are re-read every 5 minutes anyway
     VOL_DAYS = 60
@@ -5972,6 +6083,7 @@ class StockRangeMarket(RangeMarket):
         self.deadline_override = deadline_override
         self.level_names: list[str] = []  # "$100": the levels Predict lists, for the question line (set with each payload)
         self.fetched_ms = 0  # when the live price was last read (the trade itself may be hours old while closed)
+        self.share: tuple[float, int] | None = None  # (in-session share of the daily variance, days), from the daily bars
         saved = store.get(f"range:{spec.slug}:window", {})
         saved = saved if isinstance(saved, dict) else {}
         self._start, self._end, self.title = int(saved.get("start") or 0), int(saved.get("end") or 0), str(saved.get("title") or "")
@@ -6032,9 +6144,19 @@ class StockRangeMarket(RangeMarket):
                 errors.append(clean_error(error) or type(error).__name__)
         raise RemoteError("；".join(dict.fromkeys(errors)))
 
+    def price_seconds(self, now_ms: int) -> int:
+        """How often the live price is read: every 30 s while the regular session runs (and shortly after its close, while
+        the closing print may still be corrected), every 2 minutes while the market is closed and nothing can change."""
+        if us_session_state(now_ms)[0] == "交易中":
+            return self.PRICE_SECONDS
+        session = us_session(et_date(now_ms))
+        if session and session[1] <= now_ms < session[1] + self.CLOSE_PRINT_MS:
+            return self.PRICE_SECONDS
+        return self.CLOSED_PRICE_SECONDS
+
     async def refresh(self, now_ms: int) -> None:
         mono, why = time.monotonic(), lambda error: clean_error(error) or type(error).__name__
-        if mono - self.times["price"] >= self.PRICE_SECONDS:
+        if mono - self.times["price"] >= self.price_seconds(now_ms):
             self.times["price"] = mono
             try:
                 meta, bars = await self.chart(interval="1m", range="1d", includePrePost="false")
@@ -6050,6 +6172,7 @@ class StockRangeMarket(RangeMarket):
             try:
                 _, bars = await self.chart(interval="1d", range="1y")
                 self.sigma, self.sigma_ms = self.daily_sigma(bars, now_ms), now_ms
+                self.share = self.session_share(bars, now_ms)
                 self.scan_days(bars, now_ms)
                 self.failures["scan"] = ""
             except Exception as error:
@@ -6078,6 +6201,14 @@ class StockRangeMarket(RangeMarket):
             raise RemoteError(f"日 K 只有 {count} 个收益，不够估 σ")
         return sigma * math.sqrt(US_TRADING_DAYS)
 
+    def session_share(self, bars: list, now_ms: int) -> tuple[float, int] | None:
+        """The share of the daily variance that happens inside the session, from the same finished days as σ: the close
+        model's intraday_share. None when too few days carry an open (the running session then counts whole)."""
+        today = et_date(now_ms)
+        done = [b for b in bars if et_date(b[0]) < today and b[4] is not None][-(self.VOL_DAYS + 1):]
+        opens = [D(str(b[1])) if b[1] is not None and b[1] > 0 else None for b in done]
+        return intraday_share(opens, [D(str(b[4])) for b in done])
+
     def scan_days(self, bars: list, now_ms: int) -> None:
         """The window's extremes from the daily bars of its finished sessions (the creation day counted whole), persisted;
         "through" reaches the start of today once every session before today is read, the window's end once its last one is."""
@@ -6104,7 +6235,12 @@ class StockRangeMarket(RangeMarket):
         return now_ms - self.fetched_ms > self.PRICE_STALE_MS
 
     def remaining_years(self, now_ms: int) -> float:
-        return us_trading_years(max(now_ms, self.start_ms), self.window_end) if self.known() else 0.0
+        """Trading time left, the running session's remainder scaled by the in-session share of the daily variance (its
+        opening gap is behind it; σ, from close-to-close returns, holds a gap for every day). On the deadline day that
+        is the whole difference between a level a few cents away looking reachable and not."""
+        if not self.known():
+            return 0.0
+        return us_trading_years(max(now_ms, self.start_ms), self.window_end, self.share[0] if self.share else 1.0)
 
     def probability(self, level: D, direction: str, now_ms: int) -> float | None:
         return super().probability(level, direction, now_ms) if self.known() else None
@@ -6148,7 +6284,8 @@ class StockRangeMarket(RangeMarket):
 
     def card_extras(self, now_ms: int) -> dict:
         state, opens = us_session_state(now_ms)
-        session = "美股交易中（常规时段 09:30–16:00 ET）" if state == "交易中" else \
+        share = f"；今日剩余时段按 {self.share[0] * 100:.0f}% 方差计（{self.share[1]} 日开盘跳空已扣除）" if self.share else ""
+        session = f"美股交易中（常规时段 09:30–16:00 ET）{share}" if state == "交易中" else \
             f"美股已收盘，{self.et_label(opens)}开盘；收盘期间现价为最后成交价，概率按剩余交易时段计算" if opens else "美股已收盘"
         return {"range_word": self.range_word, "session": session, "question": self.question(self.level_names),
                 "extremes_note": "Yahoo 日 K 的最高/最低（常规交易时段，与 TradingView 的 1 分钟 K 同口径；创建当日按整日计）",
@@ -6840,7 +6977,7 @@ const rank=e=>Math.round(e.edge*1e4);
 function bestOf(edges,need){  // the largest net edge above the bar; a maker wins a tie (as on the server)
   return edges.filter(e=>e.edge>need).reduce((a,b)=>!a||rank(b)>rank(a)||(rank(b)===rank(a)&&b.maker&&!a.maker)?b:a,null)}
 function bookView(p){  // a book block's edges for the chosen size, its suggestion, and every direction that may be suggested
-  if(!p||!p.edges||p.fair==null)return{edges:[],pool:[],best:null,ok:[]};
+  if(!p||p.fair==null||p.need==null)return{edges:[],pool:[],best:null,ok:[]};  // priced blocks carry need; the chips are computed here from the depth (data.json carries no edges)
   const edges=edgesFor(p,p.fair),pool=p.makers===false?edges.filter(e=>!e.maker):edges,blocked=!!(p.stale||p.hold),need=p.need||0;
   return{edges,pool,best:blocked?null:bestOf(pool,need),ok:blocked?[]:pool.filter(e=>e.edge>need)}}  // pool: the directions that may be suggested
 function view(it){  // a card's suggestions (a ladder: every level's) and its best one, for highlights, filters and sorting
@@ -7537,6 +7674,24 @@ def accepts_gzip(header_block: str) -> bool:
     return False
 
 
+def page_payload(payload: dict) -> dict:
+    """odds_payload() as data.json carries it: the server's edge chips (four per book, eleven fields each) are left out of
+    every book block. The page computes its own from the depth for the trade size the viewer picks and never reads them;
+    /book, the alerts, the paper trader and the tests use the server's. Fetched every 10 seconds by every open tab, the
+    file is about 40% smaller without them (a quarter smaller after gzip). The payload given is left as it is."""
+    without = lambda block: {k: v for k, v in block.items() if k != "edges"}
+    items = []
+    for item in payload.get("items") or []:
+        item = dict(item)
+        if isinstance(item.get("predict"), dict):
+            item["predict"] = without(item["predict"])
+        ladder = item.get("ladder")
+        if isinstance(ladder, dict) and isinstance(ladder.get("rows"), list):
+            item["ladder"] = {**ladder, "rows": [without(row) if isinstance(row, dict) else row for row in ladder["rows"]]}
+        items.append(item)
+    return {**payload, "items": items}
+
+
 class WebServer:
     """Tiny read-only HTTP server (stdlib asyncio) for the probability page.
 
@@ -7594,7 +7749,7 @@ class WebServer:
                 return 200, "text/html; charset=utf-8", self.pages["page"]
             if parts[2] == "data.json":
                 return 200, "application/json; charset=utf-8", self.cached(
-                    "data.json", lambda: json.dumps(self.bot.odds_payload(), ensure_ascii=False, default=str).encode("utf-8"))
+                    "data.json", lambda: json.dumps(page_payload(self.bot.odds_payload()), ensure_ascii=False, default=str).encode("utf-8"))
             if parts[2] == "journal":
                 return 200, "text/html; charset=utf-8", self.pages["journal"]
             if parts[2] == "journal.json":
@@ -7777,10 +7932,12 @@ class StaleMessage(Exception):
 class Telegram:
     CHAT_GAP = 1.1    # seconds between two messages to the same chat (Telegram allows about one per second there)
     GLOBAL_GAP = 0.1  # seconds between any two messages (Telegram's overall limit is about 30 per second)
+    PARALLEL = 4      # requests in flight at once: one chat's slow or hanging sendMessage never holds the others' back
 
     def __init__(self, token: str):
         self.root = f"https://api.telegram.org/bot{token}/"
-        self.lock = asyncio.Lock()                     # one request in flight; the global spacing
+        self.lock = asyncio.Lock()                     # hands out the global send slots (held for a moment, never across a request)
+        self.sends = asyncio.Semaphore(self.PARALLEL)  # requests in flight
         self.next_send = 0.0                           # no message to anyone before this (monotonic)
         self.chat_next: dict[Any, float] = {}          # chat -> no message to it before this (its 429 cool-down)
         self.chat_locks: dict[Any, asyncio.Lock] = {}  # chat -> its messages keep their order
@@ -7795,23 +7952,28 @@ class Telegram:
 
     async def paced(self, method: str, payload: dict) -> Any:
         """Serialize outgoing messages per chat and respect Telegram's send rates: about one message per second to a
-        chat (a 429 cool-down holds only that chat), a small gap between any two. A message with a freshness check is
-        re-validated after the wait, right before it is sent (StaleMessage when its data no longer holds); one with a
-        renderer is rebuilt then."""
+        chat (a 429 cool-down holds only that chat), a small gap between any two. The global lock only hands out the
+        next send slot; the request itself runs outside it, up to PARALLEL at a time, so one chat's send that hangs
+        for its 15-second timeout does not stall every other chat's alerts, command replies and card edits behind it.
+        A message with a freshness check is re-validated after the wait, right before it is sent (StaleMessage when its
+        data no longer holds); one with a renderer is rebuilt then."""
         chat = payload.get("chat_id")
         if len(self.chat_locks) > 2000:
             self.chat_locks = {c: lock for c, lock in self.chat_locks.items() if lock.locked()}
             self.chat_next = {c: t for c, t in self.chat_next.items() if t > time.monotonic()}
         async with self.chat_locks.setdefault(chat, asyncio.Lock()):
             await asyncio.sleep(max(0, self.chat_next.get(chat, 0) - time.monotonic()))
-            async with self.lock:
-                await asyncio.sleep(max(0, self.next_send - time.monotonic()))
-                check = SEND_CHECK.get()
+            async with self.lock:  # reserve the slot; the wait for it happens with the lock released
+                slot = max(self.next_send, time.monotonic())
+                self.next_send = slot + self.GLOBAL_GAP
+            await asyncio.sleep(max(0, slot - time.monotonic()))
+            async with self.sends:
+                check = SEND_CHECK.get()  # right before the request goes out, after every wait
                 if check is not None and not check():
                     raise StaleMessage("排队等待发送期间数据已失效，未发送")
                 render = SEND_RENDER.get()
                 if render is not None and "text" in payload:
-                    payload = {**payload, "text": split_text(render())[0]}
+                    payload = {**payload, "text": split_text(render(), html_mode=payload.get("parse_mode") == "HTML")[0]}
                     SEND_RENDER.set(None)
                 try:
                     return await self.call(method, payload)
@@ -7819,14 +7981,12 @@ class Telegram:
                     self.chat_next[chat] = time.monotonic() + max(self.CHAT_GAP, error.retry_after)
                     raise
                 finally:
-                    now = time.monotonic()
-                    self.next_send = max(self.next_send, now + self.GLOBAL_GAP)
-                    self.chat_next[chat] = max(self.chat_next.get(chat, 0), now + self.CHAT_GAP)
+                    self.chat_next[chat] = max(self.chat_next.get(chat, 0), time.monotonic() + self.CHAT_GAP)
 
     async def send(self, chat: int, thread: int, text: str, reply_markup: dict | None = None,
                    parse_mode: str | None = None) -> None:
         # Plain text by default; HTML only for messages that were escaped with to_html().
-        chunks = split_text(text)
+        chunks = split_text(text, html_mode=parse_mode == "HTML")
         if len(chunks) > 1:
             SEND_RENDER.set(None)  # a long message is sent as queued: its parts must come from one rendering
             if parse_mode == "HTML":
@@ -7852,18 +8012,45 @@ class Telegram:
         await self.paced("editMessageText", payload)
 
 
-def split_text(text: str, limit: int = 3400) -> list[str]:
+HTML_TAG = re.compile(r"<[^<>]*>")
+
+
+def rendered_len(text: str, html_mode: bool = False) -> int:
+    """How long Telegram counts a message: with HTML parsing the tags are gone and entities are single characters, so
+    a card full of <b> spans is a good deal shorter than its markup (counting the markup split /prob in two every time)."""
+    return len(html.unescape(HTML_TAG.sub("", text))) if html_mode else len(text)
+
+
+def split_text(text: str, limit: int = 3400, html_mode: bool = False) -> list[str]:
+    """Parts of at most ``limit`` characters as Telegram counts them (rendered_len). A part ends at a blank line (the gap
+    between two cards' blocks) when one falls in its last 40%, else at the last line end, else at the limit, never
+    through an HTML entity (&amp; → &am + p;) or a tag."""
     chunks: list[str] = []
     remaining = text
     while remaining:
-        if len(remaining) <= limit:
+        if rendered_len(remaining, html_mode) <= limit:
             chunks.append(remaining)
             break
-        cut = remaining.rfind("\n", 0, limit)
-        cut = cut if cut > 0 else limit
-        amp = remaining.rfind("&", max(0, cut - 8), cut)  # never cut through an HTML entity (&amp; → &am + p;)
+        cut = limit
+        if html_mode:  # the longest prefix that renders within the limit
+            low, high = 0, len(remaining)
+            while low < high:
+                mid = (low + high + 1) // 2
+                if rendered_len(remaining[:mid], True) <= limit:
+                    low = mid
+                else:
+                    high = mid - 1
+            cut = low
+        block = remaining.rfind("\n\n", 0, cut + 1)
+        line = remaining.rfind("\n", 0, cut + 1)
+        cut = block if block >= cut * 0.6 else line if line > 0 else cut
+        amp = remaining.rfind("&", max(0, cut - 8), cut)
         if amp >= 0 and remaining.find(";", amp, cut) < 0:
             cut = amp
+        tag = remaining.rfind("<", max(0, cut - 8), cut)
+        if html_mode and tag >= 0 and remaining.find(">", tag, cut) < 0:
+            cut = tag
+        cut = max(cut, 1)  # always progress
         chunks.append(remaining[:cut])
         remaining = remaining[cut:].lstrip("\n")
     return chunks or [""]
@@ -8472,12 +8659,16 @@ class Bot:
         """Answer a command. While the background loops run the answer is queued like any other message, so a
         Telegram cool-down never stalls the command poll (the next command is read at once); one-off runs and tests
         send inline."""
-        job = functools.partial(self.tell, req.chat, req.thread, text, markup, html_mode)
+        await self.background("reply", functools.partial(self.tell, req.chat, req.thread, text, markup, html_mode))
+
+    async def background(self, kind: str, job: Any) -> None:
+        """Run one Telegram request from the command poll: queued (a delivery of its own) while the background loops run,
+        so a chat's cool-down or a slow send never holds getUpdates; inline in one-off runs and tests."""
         if not self.reference_tasks:
             await job()
             return
         self.reply_seq += 1
-        self.deliver(f"reply:{self.reply_seq}", job)
+        self.deliver(f"{kind}:{self.reply_seq}", job)
 
     async def process_callback(self, query: dict) -> None:
         """Handle a tap on a card button (callback_query)."""
@@ -8514,12 +8705,14 @@ class Bot:
             return
         await answer(toast)
         if message.get("message_id") and message.get("chat"):
-            try:
-                await self.telegram.edit(int(message["chat"]["id"]), int(message["message_id"]), text, markup)
-            except RemoteError as error:
-                # "message is not modified" when re-selecting the current preset is harmless.
-                if "not modified" not in str(error):
-                    self.log_limited("telegram_edit", f"卡片更新失败：{clean_error(error)}")
+            async def edit(chat: int = int(message["chat"]["id"]), message_id: int = int(message["message_id"])) -> None:
+                try:
+                    await self.telegram.edit(chat, message_id, text, markup)
+                except RemoteError as error:
+                    # "message is not modified" when re-selecting the current preset is harmless.
+                    if "not modified" not in str(error):
+                        self.log_limited("telegram_edit", f"卡片更新失败：{clean_error(error)}")
+            await self.background("edit", edit)
 
     async def public_id_notice(self, req: Request) -> None:
         now = time.monotonic()
@@ -8529,8 +8722,9 @@ class Bot:
             self.command_notice.clear()
         self.command_notice[req.user_id] = now
         intro = ("ℹ️ 这是一个合约涨跌提醒机器人：订阅、查看状态和修改设置只有管理员能做。\n" if req.command == "/help" else "")
-        await self.tell(req.chat, req.thread, intro + id_text(req.user_id, req.chat, req.thread) +
-                        "\n如果你是部署者：把你的用户 ID 填入 Railway 的 ADMIN_USER_ID 后重新部署，再发 /subscribe。")
+        await self.background("reply", functools.partial(
+            self.tell, req.chat, req.thread, intro + id_text(req.user_id, req.chat, req.thread) +
+            "\n如果你是部署者：把你的用户 ID 填入 Railway 的 ADMIN_USER_ID 后重新部署，再发 /subscribe。"))
 
     # --- command handlers: each returns the reply text or raises ValueError with the usage hint ---
 
@@ -10185,7 +10379,9 @@ class Bot:
                 why = self.sim_withdraw_reason(trade, mk)
                 if why:
                     self.sim_withdraw(trade, why, now_ms)
-                elif mk is not None and not mk.book.stale(now_ms):
+                elif mk is not None and not mk.book.stale(now_ms) and not book_crossed(mk.book):
+                    # a crossed snapshot opens nothing (above) and fills nothing either: its "sellers through the price"
+                    # are a feed caught mid-update, and a presumed fill is never taken back
                     self.sim_fill(trade, mk, now_ms)
             if not trade.get("final") and (trade["status"] in {"resting", "filled"} or trade.get("confirm") == "local"):
                 result = self.sim_result(trade, now_ms)
@@ -10972,7 +11168,8 @@ class Bot:
         the bar a suggestion must clear and why none is made, and the four edges for PREDICT_TRADE_USD. The page
         recomputes the edges from the same depth for the trade size the viewer picks. ``makers`` False: only the taker
         edges may be suggested (the maker ones are shown, never best)."""
-        out.update(bids=[[float(p), float(q)] for p, q in book.bids], asks=[[float(p), float(q)] for p, q in book.asks],
+        out.update(bids=[[float(p), float(q)] for p, q in book.bids[:PREDICT_SHOW_DEPTH]],
+                   asks=[[float(p), float(q)] for p, q in book.asks[:PREDICT_SHOW_DEPTH]],
                    age=max(0, (now_ms - book.fetched_ms) // 1000), stale=book.stale(now_ms), fetched_ms=book.fetched_ms,
                    fee_bps=book.fee_bps if book.fee_bps is not None else self.config.predict_fee_bps, sides=list(sides),
                    notional=self.config.predict_trade_usd, makers=makers)
@@ -11778,6 +11975,19 @@ class Bot:
                 self.log_limited("monitor", "监控轮次异常：" + clean_error(error))
             await self.wait(max(0.1, self.config.poll - (time.monotonic() - started)))
 
+    WATCHDOG_TICK = 30  # seconds between the watchdog's looks
+
+    async def watchdog(self) -> None:
+        """Ends, and with it run() (exit 1, so Railway restarts the process), when the sampling loop has not begun a
+        cycle for WATCHDOG_SECONDS: a request that never returns or a deadlock would otherwise leave a bot that still
+        answers commands but no longer watches prices, which no "loop ended" check can see."""
+        while not self.stopping.is_set():
+            await self.wait(self.WATCHDOG_TICK)
+            idle = time.time() - max(self.last_cycle, self.started)
+            if not self.stopping.is_set() and idle > WATCHDOG_SECONDS:
+                LOG.error("监控循环已 %s 秒没有开始新一轮采样：退出，等待 Railway 重启", int(idle))
+                return
+
     def heartbeat(self) -> None:
         if time.monotonic() - self.last_log.get("heartbeat", -1e9) >= 60:
             ok = sum("quote" in value for value in self.snapshots.values())
@@ -11864,7 +12074,8 @@ class Bot:
         loop.set_default_executor(ThreadPoolExecutor(max_workers=16, thread_name_prefix="io"))
         self.start_reference_tasks()
         core = [asyncio.create_task(self.monitor_loop(), name="monitor"),
-                asyncio.create_task(self.commands_loop(), name="commands")]
+                asyncio.create_task(self.commands_loop(), name="commands"),
+                asyncio.create_task(self.watchdog(), name="watchdog")]
         tasks = [*core, *self.reference_tasks]
         if self.config.web_port:
             try:
@@ -11883,7 +12094,7 @@ class Bot:
                 if task.done() and not task.cancelled():  # a core loop never ends on its own: let Railway restart us
                     error = task.exception()
                     LOG.error("核心循环 %s 意外结束：%s；进程退出等待重启", task.get_name(),
-                              clean_error(error) if error else "无异常")
+                              clean_error(error) if error else "监控循环卡住" if task.get_name() == "watchdog" else "无异常")
                     exit_code = 1
         finally:
             self.stopping.set()
