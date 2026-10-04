@@ -41,7 +41,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.24.1"
+VERSION = "1.25.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -335,6 +335,23 @@ def parse_ref_code(value: str) -> str:
     return code
 
 
+def parse_deadlines(spec: str) -> dict[str, int]:
+    """LADDER_DEADLINES="STRC-100=2026-12-31;OTHER=2027-01-15": a STOCK_HIT_MARKETS key -> 23:59 ET of that date, in ms."""
+    out: dict[str, int] = {}
+    for part in re.split(r"[;,\s]+", spec.strip()):
+        if not part:
+            continue
+        key, sep, day = part.partition("=")
+        try:
+            date = dt.date.fromisoformat(day.strip())
+        except ValueError:
+            raise ValueError(f"LADDER_DEADLINES 里 {part!r} 不是 键=YYYY-MM-DD") from None
+        if not sep or not key.strip():
+            raise ValueError(f"LADDER_DEADLINES 里 {part!r} 缺少键")
+        out[key.strip().upper()] = et_wall_ms(date, 23, 59)
+    return out
+
+
 def parse_hl_tickers(spec: str, symbols: tuple[str, ...]) -> dict[str, tuple[str, str]]:
     """HL_TICKERS="SYMBOL=dex:COIN,..." (dex omitted = the main Hyperliquid perp dex); "off" disables."""
     tickers: dict[str, tuple[str, str]] = {}
@@ -406,6 +423,7 @@ class Config:
     web_token: str = ""      # Secret path segment; generated and persisted when empty.
     web_base: str = ""       # Public base URL, e.g. https://xxx.up.railway.app
     hl_tickers: dict[str, tuple[str, str]] = field(default_factory=dict)  # symbol -> (dex, coin) on Hyperliquid
+    ladder_deadlines: dict[str, int] = field(default_factory=dict)  # STOCK_HIT_MARKETS key -> deadline (23:59 ET, ms) pinned by hand
     kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
@@ -491,6 +509,7 @@ class Config:
             sim_shares=parse_bounded(e, "SIM_SHARES", "100", 1, 1_000_000),
             sim_ways=sim_ways, sim_markets=sim_markets,
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
+            ladder_deadlines=parse_deadlines(e.get("LADDER_DEADLINES", "")),
             auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
             edge_alert=e.get("EDGE_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
             edge_alert_edge=parse_bounded(e, "EDGE_ALERT_CENTS", "10", 1, 50) / 100,
@@ -4542,6 +4561,7 @@ class CapSpec:
     metric: str = "市值"
     settle: str = "Flap.sh"
     prior_sigma: float = 3.0  # annualised σ assumed when there are no bars to measure it
+    gecko_pool: str = ""  # the GeckoTerminal pool for the bars; "" = the token's most liquid pool, looked up by its address
 
 
 CAP_MARKETS = (
@@ -4579,10 +4599,11 @@ CAP_MARKETS = (
             metric="FDV", settle="DexScreener"),
     # "between market creation on September 6 at 04:00 AM ET, 2026 to October 31, 2026 at 11:59 PM ET" (STONK/SOL on Solana);
     # the rules' own DexScreener pair settles it, FDV = (total − burned) × price; the pair is spelt as the rules' link spells it
-    # (DexScreener reads it either way), which GeckoTerminal would not accept, so no hourly bars: σ prior, live-observed high
+    # (DexScreener reads it either way), which GeckoTerminal would not accept, so the hourly bars (σ, the window's high since
+    # 09-06) come from the mint's most liquid Solana pool on GeckoTerminal instead: the same token, all but surely the same pool
     CapSpec("STONK", "what-fdv-will-stonk-hit-before-november-2026", "$STONK FDV", "6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
             et_ms(2026, 9, 6, 4, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
-            chain="solana", pair="afrddtgywcveqb1gxcahr8i48o6qtxyqksdvkeludehg", supply="fdv", gecko="", metric="FDV", settle="DexScreener"),
+            chain="solana", pair="afrddtgywcveqb1gxcahr8i48o6qtxyqksdvkeludehg", supply="fdv", gecko="solana", metric="FDV", settle="DexScreener"),
     # "between market creation on September 1, 2026 at 3:45 AM ET to October 31, 2026 at 11:59 PM ET" (STONKBROKER/WETH)
     CapSpec("STONKBROKER", "what-fdv-will-stonkbroker-hit-by-november-2026", "$STONKBROKER FDV", "0xe934e36A439C94017B64a3FecE66AF12099aBF50",
             et_ms(2026, 9, 1, 3, 45, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
@@ -4706,6 +4727,10 @@ class CapMarket:
 
     Settlement reads the rules' own chart (Flap.sh, pump.fun, DexScreener); these feeds are a close stand-in."""
     PRICE_SECONDS = 30
+    FAST_PRICE_SECONDS = 10  # without bars the bot's own samples are the only record of the window: sample three times as often
+    GAP_S = 120           # without bars, an unobserved stretch of the window longer than this is recorded (a touch inside it is unknown)
+    GAPS_KEEP = 40        # the longest such stretches kept per window
+    SEEN_WRITE_S = 60     # the "last sampled" mark is persisted this often (a restart then sees at most a minute too much gap)
     SUPPLY_SECONDS = 600
     VOL_SECONDS = 3600
     SCAN_SECONDS = 300
@@ -4732,8 +4757,14 @@ class CapMarket:
         self.vol_error = ""               # why hourly bars could not be read (shown with a prior σ)
         self.sampled_ms = 0
         self.priced_ms = 0                # when the price was last read successfully
+        self.seen_written_s = 0           # when the "last sampled" mark was last persisted
         self.error = ""
         self.times = {"price": -1e9, "supply": -1e9, "vol": -1e9, "scan": -1e9}
+
+    @property
+    def price_seconds(self) -> int:
+        """How often the price is read: every 10 s where the bot's own samples are the window's only record."""
+        return self.PRICE_SECONDS if self.spec.gecko else self.FAST_PRICE_SECONDS
 
     PRICE_STALE_MS = 5 * 60_000  # a price older than this prices nothing (only a level already reached stays settled)
 
@@ -4781,7 +4812,7 @@ class CapMarket:
     async def ohlcv(self, frame: str, before_s: int, limit: int) -> list[tuple[int, float, float, float, float]]:
         base = f"{GECKO}/{self.spec.gecko}"
         if not self.pool:
-            self.pool = self.spec.pair or gecko_pool(await self.get(f"{base}/tokens/{self.spec.token}/pools?page=1"))
+            self.pool = self.spec.gecko_pool or gecko_pool(await self.get(f"{base}/tokens/{self.spec.token}/pools?page=1"))
         return gecko_bars(await self.get(f"{base}/pools/{self.pool}/ohlcv/{frame}?aggregate=1&limit={limit}"
                                          f"&before_timestamp={before_s}&currency=usd&token={self.spec.token}"))
 
@@ -4815,13 +4846,37 @@ class CapMarket:
         self.store.put(f"capsamples:{self.spec.slug}", rows)
 
     def observe(self, now_ms: int) -> None:
-        """Keep the highest price the bot itself has seen inside the window (persisted with the scan)."""
+        """Keep the highest price the bot itself has seen inside the window (persisted with the scan). Without bars, also
+        keep where the window went unobserved: from its opening to the first sample, and every later stretch longer than
+        GAP_S between samples (the bot down, the feed failing). A touch inside those cannot be known."""
         if self.price is None or not self.spec.start_ms <= now_ms <= self.spec.end_ms:
             return
         hist = dict(self.history) or {"start": self.spec.start_ms, "high": 0.0, "at": 0}
+        now_s, changed = now_ms // 1000, False
         if float(self.price) > float(hist.get("high") or 0):
-            hist["high"], hist["at"] = float(self.price), now_ms // 1000
+            hist["high"], hist["at"], changed = float(self.price), now_s, True
+        if not self.spec.gecko:
+            since = int(hist.get("seen") or 0) or self.spec.start_ms // 1000
+            if now_s - since > self.GAP_S:
+                gaps = [g for g in hist.get("gaps") or [] if isinstance(g, list) and len(g) == 2] + [[since, now_s]]
+                hist["gaps"] = sorted(sorted(gaps, key=lambda g: g[1] - g[0])[-self.GAPS_KEEP:])  # the longest kept, in time order
+                hist["gap_s"] = int(hist.get("gap_s") or 0) + (now_s - since)
+                changed = True
+            if changed or now_s - self.seen_written_s >= self.SEEN_WRITE_S:
+                hist["seen"], changed, self.seen_written_s = now_s, True, now_s
+        if changed:
             self.store.put(f"cap:{self.spec.slug}", hist)
+
+    def gaps_note(self) -> str:
+        """Without bars: the window's unobserved stretches so far, in words ("" when none, or when bars cover the window)."""
+        hist = self.history
+        gaps = sorted(g for g in hist.get("gaps") or [] if isinstance(g, list) and len(g) == 2)
+        if self.spec.gecko or not gaps:
+            return ""
+        span = lambda seconds: f"{seconds / 3600:.1f} 小时" if seconds >= 3600 else f"{seconds // 60} 分钟"
+        longest = max(gaps, key=lambda g: g[1] - g[0])
+        return (f"窗口内有 {len(gaps)} 段没有采样，共 {span(int(hist.get('gap_s') or 0))}（最长 {span(longest[1] - longest[0])}："
+                f"{stamp(longest[0] * 1000, seconds=False)} → {stamp(longest[1] * 1000, seconds=False)}）；这些时段碰没碰到档位无法判断")
 
     @property
     def cap(self) -> D | None:
@@ -4837,7 +4892,7 @@ class CapMarket:
 
     async def refresh(self, now_ms: int) -> None:
         mono, failures = time.monotonic(), []
-        if mono - self.times["price"] >= self.PRICE_SECONDS:
+        if mono - self.times["price"] >= self.price_seconds:
             self.times["price"] = mono
             try:
                 url = (f"https://api.dexscreener.com/latest/dex/pairs/{self.spec.chain}/{self.spec.pair}" if self.spec.pair
@@ -5009,6 +5064,131 @@ RANGE_MARKETS = (
 )
 
 
+# --- a US stock's "hits $X by <date>" market: TradingView 1-minute candles of the regular session, read from Yahoo -----------
+STOCK_HIT_MARKETS = (
+    # "any TradingView 1 minute candle for STRC between market creation and the listed date, 11:59 PM ET, has a final
+    # High of at least $100" (NASDAQ:STRC). The window is read from Predict: the market's createdAt and the date its title
+    # names (start_ms / end_ms = 0 here); LADDER_DEADLINES=STRC-100=2026-12-31 pins the deadline by hand.
+    RangeSpec("STRC-100", "strc-hits-100-by-20260618001620693", "STRC", "nasdaq", "STRC 触及 $100", 0, 0),
+)
+YAHOO_CHART = ("https://query1.finance.yahoo.com/v8/finance/chart/", "https://query2.finance.yahoo.com/v8/finance/chart/")
+# NYSE / Nasdaq closures and 13:00 ET early closes, 2026–2027 (weekends are never sessions)
+US_MARKET_HOLIDAYS = frozenset({
+    dt.date(2026, 1, 1), dt.date(2026, 1, 19), dt.date(2026, 2, 16), dt.date(2026, 4, 3), dt.date(2026, 5, 25), dt.date(2026, 6, 19),
+    dt.date(2026, 7, 3), dt.date(2026, 9, 7), dt.date(2026, 11, 26), dt.date(2026, 12, 25),
+    dt.date(2027, 1, 1), dt.date(2027, 1, 18), dt.date(2027, 2, 15), dt.date(2027, 3, 26), dt.date(2027, 5, 31), dt.date(2027, 6, 18),
+    dt.date(2027, 7, 5), dt.date(2027, 9, 6), dt.date(2027, 11, 25), dt.date(2027, 12, 24)})
+US_HALF_DAYS = frozenset({dt.date(2026, 11, 27), dt.date(2026, 12, 24), dt.date(2027, 11, 26)})
+US_SESSION_MS = 390 * 60_000  # 09:30–16:00 ET
+US_TRADING_DAYS = 252
+MONTH_NAMES = {name: i + 1 for i, name in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))}
+
+
+def et_date(ms: int) -> dt.date:
+    """The US Eastern calendar date of an instant."""
+    return dt.datetime.fromtimestamp(ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(ms)))).date()
+
+
+def et_wall_ms(day: dt.date, hour: int, minute: int) -> int:
+    """US Eastern wall time on a date -> epoch ms, with that date's own offset (DST switches at 02:00; 17:00 UTC is the
+    same civil day either side of the switch)."""
+    probe = int(dt.datetime(day.year, day.month, day.day, 17, tzinfo=dt.timezone.utc).timestamp() * 1000)
+    return et_ms(day.year, day.month, day.day, hour, minute, us_eastern_offset(probe))
+
+
+def us_session(day: dt.date) -> tuple[int, int] | None:
+    """(open, close) in ms of the regular session on a date: 09:30–16:00 ET, 13:00 on an early close; None when closed."""
+    if day.weekday() >= 5 or day in US_MARKET_HOLIDAYS:
+        return None
+    return et_wall_ms(day, 9, 30), et_wall_ms(day, 13 if day in US_HALF_DAYS else 16, 0)
+
+
+def us_session_state(now_ms: int) -> tuple[str, int]:
+    """("交易中" | "已收盘", when the next session opens; 0 while one is running)."""
+    day = et_date(now_ms)
+    for i in range(14):
+        session = us_session(day + dt.timedelta(days=i))
+        if session and session[0] <= now_ms < session[1]:
+            return "交易中", 0
+        if session and session[0] > now_ms:
+            return "已收盘", session[0]
+    return "已收盘", 0
+
+
+def us_trading_years(now_ms: int, end_ms: int) -> float:
+    """Trading time left before end_ms, in years of US_TRADING_DAYS full sessions: the rest of the running session and every
+    later one through the deadline's date (an early close is its share of a full day). Nothing can be hit between sessions."""
+    if end_ms <= now_ms:
+        return 0.0
+    total, day, last = 0.0, et_date(now_ms), et_date(end_ms)
+    while day <= last:
+        session = us_session(day)
+        if session:
+            total += max(0, min(session[1], end_ms) - max(session[0], now_ms)) / US_SESSION_MS
+        day += dt.timedelta(days=1)
+    return total / US_TRADING_DAYS
+
+
+def deadline_from_text(texts: list[str], after_ms: int) -> int:
+    """The deadline a market's title names, as 23:59 ET of that date: "by December 31", "by Dec. 31, 2026", "by (the end
+    of) December", "截止于 12 月 31 日", "2026-12-31". A date without a year is the first such date on or after after_ms (the
+    market's creation). The first text that names one wins; 0 when none does."""
+    since = et_date(after_ms) if after_ms else dt.date.today()
+    month = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+    patterns = [
+        (r"(20\d\d)-(\d\d)-(\d\d)", lambda g: (int(g[0]), int(g[1]), int(g[2]))),
+        (r"(20\d\d)\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", lambda g: (int(g[0]), int(g[1]), int(g[2]))),
+        (r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", lambda g: (0, int(g[0]), int(g[1]))),
+        (r"(?i)\b(?:by|before|until|through)\s+(?:the\s+)?(?:end\s+of\s+)?" + month + r"\s*(\d{1,2})?(?:st|nd|rd|th)?,?\s*(20\d\d)?",
+         lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()], int(g[1]) if g[1] else 0)),
+        (r"(?i)\b" + month + r"\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(20\d\d)?",
+         lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()], int(g[1]))),
+    ]
+    for text in texts:
+        for pattern, pick in patterns:
+            found = re.search(pattern, str(text or ""))
+            if not found:
+                continue
+            try:
+                year, mon, day = pick(found.groups())
+                if not day:  # "by December": the month's last day
+                    nxt = dt.date(year or since.year, mon, 1) + dt.timedelta(days=32)
+                    day = (nxt.replace(day=1) - dt.timedelta(days=1)).day
+                date = dt.date(year or since.year, mon, day)
+                if not year and date < since:
+                    date = dt.date(since.year + 1, mon, day)
+            except ValueError:
+                continue
+            return et_wall_ms(date, 23, 59)
+    return 0
+
+
+def parse_yahoo_chart(raw: bytes) -> tuple[dict, list[tuple[int, float | None, float | None, float | None, float | None]]]:
+    """Yahoo v8 chart -> ({"price": regularMarketPrice, "time_ms": its trade time, "offset": gmtoffset},
+    bars (open ms, open, high, low, close) oldest first, those with no close dropped). A chart error is a ValueError."""
+    try:
+        chart = json.loads(raw)["chart"]
+        if chart.get("error"):
+            raise ValueError(str((chart["error"] or {}).get("description") or chart["error"])[:80])
+        result = chart["result"][0]
+        meta = result["meta"]
+        quote = ((result.get("indicators") or {}).get("quote") or [{}])[0] or {}
+        stamps = result.get("timestamp") or []
+    except (ValueError, KeyError, IndexError, TypeError) as error:
+        raise ValueError(f"Yahoo 行情返回格式异常：{clean_error(error)[:60]}" if str(error) else "Yahoo 行情返回格式异常") from None
+    price, when = meta.get("regularMarketPrice"), meta.get("regularMarketTime")
+    out = {"price": float(price) if isinstance(price, (int, float)) else None,
+           "time_ms": int(when) * 1000 if isinstance(when, (int, float)) else 0, "offset": int(meta.get("gmtoffset") or 0)}
+    col = lambda key: quote.get(key) or []
+    bars = []
+    for i, ts in enumerate(stamps):
+        values = [c[i] if i < len(c) and isinstance(c[i], (int, float)) else None for c in (col("open"), col("high"), col("low"), col("close"))]
+        if values[3] is None:
+            continue
+        bars.append((int(ts) * 1000, *values))
+    return out, sorted(bars)
+
+
 def price_level(title: str) -> D | None:
     """The price a ladder market's title names: '↑ 130,000' / '$4.5K' / '↓ $100k' / 'Will Solana reach $250?' -> the
     number; a year next to a month name is not a price. None when there is none."""
@@ -5151,14 +5331,68 @@ class RangeMarket:
     @property
     def window_end(self) -> int:
         """The end of the window's last minute."""
-        return self.spec.end_ms + 60_000
+        return self.end_ms + 60_000
 
     @property
     def history(self) -> dict:
         """{'start': ms, 'through': ms (the next hour to read), 'open': the window's first price, 'high'/'low': prices,
         'high_at'/'low_at': hour opens}."""
         saved = self.store.get(f"range:{self.spec.slug}", {})
-        return saved if isinstance(saved, dict) and saved.get("start") == self.spec.start_ms else {}
+        return saved if isinstance(saved, dict) and saved.get("start") == self.start_ms else {}
+
+    # the window and the card's wording: a stock market (StockRangeMarket) answers these differently
+    range_word = "本月"
+
+    @property
+    def start_ms(self) -> int:
+        return self.spec.start_ms
+
+    @property
+    def end_ms(self) -> int:
+        return self.spec.end_ms
+
+    def price_stale(self, now_ms: int) -> bool:
+        return now_ms - self.priced_ms > self.PRICE_STALE_MS
+
+    def remaining_years(self, now_ms: int) -> float:
+        return max(0.0, (self.window_end - max(now_ms, self.start_ms)) / YEAR_MS)
+
+    def source_name(self) -> str:
+        return "币安合约" if self.spec.venue == "futures" else "币安现货"
+
+    def venue_name(self) -> str:
+        return "币安 USDⓈ-M 合约" if self.spec.venue == "futures" else "币安现货"
+
+    def extremes_source(self) -> str:
+        return f"{self.source_name()} {self.spec.symbol} 小时 K（与 1 分钟 K 的最高/最低一致）"
+
+    def extremes_name(self) -> str:
+        """The candles the window's extremes are read from, short (the evidence's source column)."""
+        return "币安小时 K"
+
+    def sigma_note(self) -> str:
+        return "30 日小时收盘"
+
+    def close_label(self) -> str:
+        return f"{self.spec.label(self.end_ms)}这根 1 分钟 K 为止"
+
+    def window_label(self) -> str:
+        return f"{self.spec.label(self.start_ms)}起"
+
+    def card_extras(self, now_ms: int) -> dict:
+        """Extra ladder fields for the card (none for a Binance pair)."""
+        return {}
+
+    def missing_note(self, now_ms: int) -> str:
+        """Why the card prices nothing now ("" when it does)."""
+        if self.price is None or self.sigma is None:
+            return f"等待币安行情（{brief_error(self.error, 80)}）" if self.error else "等待币安行情"
+        if self.price_stale(now_ms) and now_ms < self.window_end:
+            return f"币安价格停在 {stamp(self.priced_ms, seconds=False)}，暂停概率（已触及的档位仍算已触及）"
+        return ""
+
+    def learn(self, rows: list, meta: dict) -> None:
+        """What Predict's own listing says about the window (nothing for a Binance pair: the rules fix it)."""
 
     async def refresh(self, now_ms: int) -> None:
         mono, why = time.monotonic(), lambda error: clean_error(error) or type(error).__name__
@@ -5191,7 +5425,7 @@ class RangeMarket:
     async def scan(self, now_ms: int) -> None:
         """Extend the window's extremes (persisted) with the hours finished since the last scan; keep the running hour's
         candle apart. Once the window is over and read to its end, "through" reaches window_end: the record is complete."""
-        start, end = self.spec.start_ms, self.window_end
+        start, end = self.start_ms, self.window_end
         if now_ms <= start:
             return
         hist = dict(self.history) or {"start": start, "through": start, "high": None, "high_at": 0, "low": None, "low_at": 0}
@@ -5231,7 +5465,7 @@ class RangeMarket:
         hist, run = self.history, self.running
         highs = [(hist.get("high"), int(hist.get("high_at") or 0)), (run.get("high"), int(run.get("open") or 0))]
         lows = [(hist.get("low"), int(hist.get("low_at") or 0)), (run.get("low"), int(run.get("open") or 0))]
-        if self.price is not None and self.spec.start_ms <= self.priced_ms < self.window_end:
+        if self.price is not None and self.start_ms <= self.priced_ms < self.window_end:
             hour = self.priced_ms - self.priced_ms % 3_600_000
             highs.append((float(self.price), hour))
             lows.append((float(self.price), hour))
@@ -5258,9 +5492,9 @@ class RangeMarket:
             return 1.0
         if now_ms >= self.window_end:
             return 0.0 if self.complete() else None
-        if self.price is None or self.sigma is None or now_ms - self.priced_ms > self.PRICE_STALE_MS:
+        if self.price is None or self.sigma is None or self.price_stale(now_ms):
             return None
-        years = max(0.0, (self.window_end - max(now_ms, self.spec.start_ms)) / YEAR_MS)
+        years = self.remaining_years(now_ms)
         touch = hit_probability if direction == "up" else low_probability
         return touch(float(self.price), float(level), self.sigma, years)
 
@@ -5268,7 +5502,7 @@ class RangeMarket:
         """How far P(Yes) moves with σ ×/÷ 1.25: an edge inside that is the model's own error."""
         if fair is None or fair >= 1.0 or self.price is None or self.sigma is None:
             return 0.0
-        years = max(0.0, (self.window_end - max(now_ms, self.spec.start_ms)) / YEAR_MS)
+        years = self.remaining_years(now_ms)
         touch = hit_probability if direction == "up" else low_probability
         return max(abs(touch(float(self.price), float(level), self.sigma * k, years) - fair)
                    for k in (MODEL_SIGMA_ERROR, 1 / MODEL_SIGMA_ERROR))
@@ -5278,9 +5512,9 @@ class RangeMarket:
         already reached would otherwise look open), σ current, the window still running."""
         if now_ms >= self.window_end:
             return "窗口已结束，等待结算"
-        if now_ms > self.spec.start_ms and now_ms - self.scanned_ms > self.SCAN_STALE_MS:
+        if now_ms > self.start_ms and now_ms - self.scanned_ms > self.SCAN_STALE_MS:
             through = int(self.history.get("through") or 0)
-            return f"本月最高/最低核验停在 {stamp(through, seconds=False) if through else '开始前'}；暂不给建议"
+            return f"{self.range_word}最高/最低核验停在 {stamp(through, seconds=False) if through else '开始前'}；暂不给建议"
         if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
             return "波动率超过一天未更新；暂不给建议"
         return ""
@@ -5294,6 +5528,198 @@ class RangeMarket:
         the window opens the live one."""
         opening = self.history.get("open")
         return float(opening) if opening else float(self.price) if self.price is not None else None
+
+
+class StockRangeMarket(RangeMarket):
+    """A US stock's "hits $X by <date>" market (STOCK_HIT_MARKETS). TradingView's 1-minute High of the regular session is the
+    resolution source; Yahoo's chart feed stands in for it (the same session, consolidated prints: a touch by a few cents is
+    worth checking on Predict). The window runs from the market's creation (Predict's createdAt) to 23:59 ET of the date
+    its title names. Time passes in sessions only: σ is from daily closes, annualised over 252 sessions, and the time left
+    is the trading time left; the last trade is the live price and stays valid while the market is closed."""
+    PRICE_SECONDS = 30
+    SCAN_SECONDS = 300          # daily bars: σ and the finished days' extremes from one request
+    SIGMA_STALE_MS = 3 * 24 * 3600_000  # a long weekend changes nothing: the daily bars are re-read every 5 minutes anyway
+    VOL_DAYS = 60
+    range_word = "窗口内"
+
+    def __init__(self, store: "Store", spec: RangeSpec, deadline_override: int = 0):
+        super().__init__(store, spec)
+        self.deadline_override = deadline_override
+        self.fetched_ms = 0  # when the live price was last read (the trade itself may be hours old while closed)
+        saved = store.get(f"range:{spec.slug}:window", {})
+        saved = saved if isinstance(saved, dict) else {}
+        self._start, self._end, self.title = int(saved.get("start") or 0), int(saved.get("end") or 0), str(saved.get("title") or "")
+        self.failures = {"price": "", "scan": ""}
+        self.times = {"price": -1e9, "scan": -1e9}
+
+    @property
+    def start_ms(self) -> int:
+        return self._start
+
+    @property
+    def end_ms(self) -> int:
+        return self.deadline_override or self._end
+
+    def known(self) -> bool:
+        return bool(self.start_ms and self.end_ms)
+
+    def learn(self, rows: list, meta: dict) -> None:
+        """The window from Predict's listing: createdAt (the start) and the date the title / question names (the end),
+        kept in SQLite so a restart prices at once."""
+        for row in rows:
+            details = (meta.get(row.market_id) or ({}, 0))[0] if row.market_id else {}
+            created = int(details.get("created_ms") or 0)
+            deadline = deadline_from_text([row.title, row.question, details.get("question", ""), details.get("rules", "")],
+                                          created or int(time.time() * 1000))
+            title = row.title or row.question or ""
+            start, end, title = created or self._start, deadline or self._end, title or self.title
+            if (start, end, title) != (self._start, self._end, self.title):
+                self._start, self._end, self.title = start, end, title
+                self.store.put(f"range:{self.spec.slug}:window", {"start": start, "end": end, "title": title})
+            return
+
+    async def chart(self, **params: Any) -> tuple[dict, list]:
+        errors = []
+        for host in YAHOO_CHART:
+            url = host + urllib.parse.quote(self.spec.symbol) + "?" + urllib.parse.urlencode(params)
+            try:
+                return parse_yahoo_chart(await fetch_source(url))
+            except (RemoteError, TimeoutError, OSError, ValueError) as error:
+                errors.append(clean_error(error) or type(error).__name__)
+        raise RemoteError("；".join(dict.fromkeys(errors)))
+
+    async def refresh(self, now_ms: int) -> None:
+        mono, why = time.monotonic(), lambda error: clean_error(error) or type(error).__name__
+        if mono - self.times["price"] >= self.PRICE_SECONDS:
+            self.times["price"] = mono
+            try:
+                meta, bars = await self.chart(interval="1m", range="1d", includePrePost="false")
+                if meta["price"] is None:
+                    raise RemoteError("Yahoo 没有返回 regularMarketPrice")
+                self.price, self.priced_ms, self.fetched_ms = D(f"{meta['price']:.4f}"), meta["time_ms"] or now_ms, now_ms
+                self.running = self.day_candle(bars)
+                self.failures["price"] = ""
+            except Exception as error:
+                self.failures["price"] = f"价格：{why(error)}"
+        if mono - self.times["scan"] >= self.SCAN_SECONDS:
+            self.times["scan"] = mono
+            try:
+                _, bars = await self.chart(interval="1d", range="1y")
+                self.sigma, self.sigma_ms = self.daily_sigma(bars, now_ms), now_ms
+                self.scan_days(bars, now_ms)
+                self.failures["scan"] = ""
+            except Exception as error:
+                self.times["scan"] = mono - self.SCAN_SECONDS + 60  # again in a minute
+                self.failures["scan"] = f"日 K：{why(error)}"
+        self.error = "；".join(text for text in self.failures.values() if text)
+
+    def day_candle(self, bars: list) -> dict:
+        """The latest session's extremes from its 1-minute bars, as far as they fall inside the window (the creation minute
+        counts); {} when none do. Finished sessions are persisted by scan_days; this one counts at once."""
+        if not self.known() or not bars:
+            return {}
+        day = et_date(bars[-1][0])
+        inside = [b for b in bars if et_date(b[0]) == day and b[0] + 60_000 > self.start_ms and b[0] < self.window_end
+                  and b[2] is not None and b[3] is not None]
+        if not inside:
+            return {}
+        return {"open": inside[0][0], "high": max(b[2] for b in inside), "low": min(b[3] for b in inside)}
+
+    def daily_sigma(self, bars: list, now_ms: int) -> float:
+        """Annualised σ from the last VOL_DAYS close-to-close log returns of finished sessions."""
+        today = et_date(now_ms)
+        closes = [D(str(b[4])) for b in bars if et_date(b[0]) < today][-(self.VOL_DAYS + 1):]
+        sigma, count = realised_vol(closes)
+        if count < 10:
+            raise RemoteError(f"日 K 只有 {count} 个收益，不够估 σ")
+        return sigma * math.sqrt(US_TRADING_DAYS)
+
+    def scan_days(self, bars: list, now_ms: int) -> None:
+        """The window's extremes from the daily bars of its finished sessions (the creation day counted whole), persisted;
+        "through" reaches the start of today once every session before today is read, the window's end once its last one is."""
+        if not self.known():
+            return
+        today, first, last = et_date(now_ms), et_date(self.start_ms), et_date(self.end_ms)
+        hist = dict(self.history) or {"start": self.start_ms, "through": self.start_ms, "high": None, "high_at": 0, "low": None, "low_at": 0}
+        done = [b for b in bars if first <= et_date(b[0]) <= last and et_date(b[0]) < today and b[2] is not None and b[3] is not None]
+        for opened, open_, high, low, _ in done:
+            if hist.get("open") is None and et_date(opened) == first and open_ is not None:
+                hist["open"] = open_
+            if hist["high"] is None or high > hist["high"]:
+                hist["high"], hist["high_at"] = high, opened
+            if hist["low"] is None or low < hist["low"]:
+                hist["low"], hist["low_at"] = low, opened
+        need = max((d for d in (first + dt.timedelta(days=i) for i in range((min(last, today - dt.timedelta(days=1)) - first).days + 1))
+                    if us_session(d)), default=None)  # the last session before today the window needs read
+        if need is None or (done and et_date(done[-1][0]) >= need):
+            hist["through"] = max(int(hist["through"]), min(et_wall_ms(today, 0, 0), self.window_end))
+        self.scanned_ms = now_ms
+        self.store.put(f"range:{self.spec.slug}", hist)
+
+    def price_stale(self, now_ms: int) -> bool:
+        return now_ms - self.fetched_ms > self.PRICE_STALE_MS
+
+    def remaining_years(self, now_ms: int) -> float:
+        return us_trading_years(max(now_ms, self.start_ms), self.window_end) if self.known() else 0.0
+
+    def probability(self, level: D, direction: str, now_ms: int) -> float | None:
+        return super().probability(level, direction, now_ms) if self.known() else None
+
+    def advice_problem(self, now_ms: int) -> str:
+        if not self.known():
+            return "等待 Predict 的创建时间和截止日期；暂不给建议"
+        return super().advice_problem(now_ms)
+
+    def source_name(self) -> str:
+        return f"Yahoo 行情（NASDAQ:{self.spec.symbol}）"
+
+    def venue_name(self) -> str:
+        return "Yahoo 行情，NASDAQ:"
+
+    def extremes_source(self) -> str:
+        return f"Yahoo 日 K + 1 分钟 K（NASDAQ:{self.spec.symbol} 常规时段，与 TradingView 的 1 分钟 K 同口径）"
+
+    def sigma_note(self) -> str:
+        return f"{self.VOL_DAYS} 个交易日收盘，按 {US_TRADING_DAYS} 个交易日年化"
+
+    def extremes_name(self) -> str:
+        return "Yahoo 日 K（常规时段）"
+
+    def et_label(self, ms: int) -> str:
+        return self.spec.label(ms)
+
+    def close_label(self) -> str:
+        if not self.end_ms:
+            return "截止日期待 Predict 确认（标题里的日期，当天 23:59 ET）"
+        return f"{self.et_label(self.end_ms)}截止；TradingView 1 分钟 K 的最高价 ≥ 档位即 Yes"
+
+    def window_label(self) -> str:
+        return f"市场创建 {self.et_label(self.start_ms)}起" if self.start_ms else "市场创建起（时间待 Predict 确认）"
+
+    def card_extras(self, now_ms: int) -> dict:
+        state, opens = us_session_state(now_ms)
+        session = "美股交易中（常规时段 09:30–16:00 ET）" if state == "交易中" else \
+            f"美股已收盘，{self.et_label(opens)}开盘；收盘期间现价为最后成交价，概率按剩余交易时段计算" if opens else "美股已收盘"
+        return {"range_word": self.range_word, "session": session,
+                "extremes_note": "Yahoo 日 K 的最高/最低（常规交易时段，与 TradingView 的 1 分钟 K 同口径；创建当日按整日计）",
+                "rule_note": f"↑ 档：创建后任一 TradingView 1 分钟 K（NASDAQ:{self.spec.symbol}，常规时段）的最高价 ≥ 档位即 Yes；"
+                             "数据源不同，差几分钱的触及请到 Predict 核实"}
+
+    def missing_note(self, now_ms: int) -> str:
+        if not self.known():
+            return "等待 Predict 的创建时间和截止日期" + (f"（标题：{brief_error(self.title, 60)}）" if self.title else "")
+        if self.price is None or self.sigma is None:
+            return f"等待 Yahoo 行情（{brief_error(self.error, 80)}）" if self.error else "等待 Yahoo 行情"
+        if self.price_stale(now_ms) and now_ms < self.window_end:
+            return f"Yahoo 行情停在 {stamp(self.fetched_ms, seconds=False)}，暂停概率（已触及的档位仍算已触及）"
+        return ""
+
+
+def range_market(store: "Store", spec: RangeSpec, futures: Any, config: "Config") -> RangeMarket:
+    """The market object for a price-ladder spec: a Binance pair, or a US stock read from Yahoo."""
+    if spec.venue == "nasdaq":
+        return StockRangeMarket(store, spec, config.ladder_deadlines.get(spec.key, 0))
+    return RangeMarket(store, spec, futures)
 
 
 # --- paper trading (does buying every 10¢ edge make money in the long run?) ------------------------------------------
@@ -5941,13 +6367,14 @@ function ladder(c,it){
   if(L.sigma)sm.append($("span","rd","σ"),$("span","v",(L.sigma*100).toFixed(0)+"%"));
   det.append(sm);const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("窗口",L.window+" → "+it.close_label);row("价格",L.price+" USD（"+L.source+"）");row("供应量",L.supply+"（"+L.supply_note+"）");
-  row("窗口最高",L.high+(L.high_at?"（"+L.high_at+"）":"")+"："+(L.bars?"GeckoTerminal 小时 K 近似":"只含机器人运行以来看到的价格")+"，结算以 "+L.settle+" 1 分钟 K 为准；Predict 已结算的档位算已触及"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
+  row("窗口最高",L.high+(L.high_at?"（"+L.high_at+"）":"")+"："+(L.bars?"GeckoTerminal 小时 K 近似（最活跃的池子）":"只含机器人运行以来每 10 秒看到的价格")+(L.gaps?"；"+L.gaps:"")+"，结算以 "+L.settle+" 1 分钟 K 为准；Predict 已结算的档位算已触及"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
   if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
   row("模型",(L.sigma_kind==="prior"?"σ 为先验值，仅供参考。":"")+"碰到即 Yes：零漂移、固定波动率的单边触及概率 Φ((−h−s²/2)/s) + (M/K)·Φ((−h+s²/2)/s)，h = ln(K/M)，s = σ√T");
   det.append(dl);c.append(det);
   const st=$("div","lstat");  // status lines (missing / errors / prior σ / reached): a fixed band so tables line up
   if(it.missing)st.append($("p","","概率暂缺："+it.missing));else if(L.error)st.append($("div","warn small","⚠️ "+L.error));
   if(L.waiting)st.append($("div","mut small",L.waiting));  // a spec without levels of its own, before Predict lists them
+  if(L.gaps&&!it.missing){const g=$("div","warn small","⚠️ "+L.gaps);g.title="这张卡没有 K 线来源，窗口最高只含机器人自己采到的价格；没采到的时段里碰到档位不会被发现，以 Predict 为准";st.append(g)}
   const prior=L.sigma_kind==="prior";
   if(prior&&!it.missing){const prog=(L.sigma_note||"").match(/自采价格 ([0-9.]+)/);
     const w=$("div","warn small","⚠️ σ 暂用先验 "+(L.sigma*100).toFixed(0)+"%"+(prog?"（自采 "+prog[1]+"/12 小时）":"")+"，优势仅供参考");
@@ -5963,19 +6390,20 @@ function priceLadder(c,it,L,det,sm){
   // a price ladder: one Yes/No market per level, ↑ reached by a 1-minute High, ↓ by a 1-minute Low, inside the month
   c.classList.add("price-lad");det.classList.add("price-model");
   const top=$("div","price-top");top.append($("span","plabel","现价"),$("b","",L.price));c.append(top);
-  const range=$("div","price-range"),high=$("span","","本月最高 "),low=$("span","","最低 ");high.append($("b","",L.high));low.append($("b","",L.low));range.append(high,low);c.append(range);
+  const rw=L.range_word||"本月",range=$("div","price-range"),high=$("span","",rw+"最高 "),low=$("span","","最低 ");high.append($("b","",L.high));low.append($("b","",L.low));range.append(high,low);c.append(range);
   sm.textContent="规则与计算明细";
   det.append(sm);const dl=$("dl"),row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("窗口",L.window+" → "+it.close_label);row("价格",L.price+"（"+L.venue+" "+L.symbol+"）");
-  row("本月最高 / 最低",L.high+(L.high_at?"（"+L.high_at+" 那一小时）":"")+" / "+L.low+(L.low_at?"（"+L.low_at+" 那一小时）":"")+
-    "：币安小时 K 的最高/最低（与 1 分钟 K 一致）"+(L.through?"，已核至 "+L.through:"")+"，加上正在走的这一小时和现价");
+  row(rw+"最高 / 最低",L.high+(L.high_at?"（"+L.high_at+(L.range_word?"）":" 那一小时）"):"")+" / "+L.low+(L.low_at?"（"+L.low_at+(L.range_word?"）":" 那一小时）"):"")+
+    "："+(L.extremes_note||"币安小时 K 的最高/最低（与 1 分钟 K 一致）")+(L.through?"，已核至 "+L.through:"")+(L.range_word?"，加上今天的 1 分钟 K 和现价":"，加上正在走的这一小时和现价"));
   if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
-  row("规则","↑ 档：本月任一 1 分钟 K 的最高价 ≥ 档位即 Yes；↓ 档：最低价 ≤ 档位即 Yes。方向按每个市场自己的规则或标题判断");
+  row("规则",L.rule_note||"↑ 档：本月任一 1 分钟 K 的最高价 ≥ 档位即 Yes；↓ 档：最低价 ≤ 档位即 Yes。方向按每个市场自己的规则或标题判断");
   row("模型","零漂移、固定波动率的单边触及概率：↑ Φ((−h−s²/2)/s) + (S/K)·Φ((−h+s²/2)/s)，h = ln(K/S)；↓ Φ((−a+s²/2)/s) + (S/K)·Φ((−a−s²/2)/s)，a = ln(S/K)；s = σ√T");
   det.append(dl);c.append(det);
   const st=$("div","lstat");
   if(it.missing)st.append($("p","","概率暂缺："+it.missing));else if(L.error)st.append($("div","warn small","⚠️ "+L.error));
   if(L.hold&&!it.missing)st.append($("div","warn small","⚠️ "+L.hold));
+  if(L.session)st.append($("div","mut small",L.session));  // a stock: trading now, or closed until the next open
   if(L.waiting)st.append($("div","mut small",L.waiting));
   const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
   if(done.length){const t=$("details","touched"),dk=it.name+"#touched";t.open=open.has(dk);t.addEventListener("toggle",()=>{t.open?open.add(dk):open.delete(dk)});
@@ -6048,6 +6476,7 @@ function drawOpps(){  // every red-framed suggestion on the page in one strip on
 function rowNote(r,L){  // one line about a ladder level itself, above its four directions: on a phone nothing hovers
   const d=$("div","lnote"),parts=[];
   if(r.dist!=null)parts.push((L.kind==="price"?"现价还要"+(r.dist>=0?"涨 ":"跌 "):L.metric+"还要涨 ")+(Math.abs(r.dist)*100).toFixed(1)+"% 才碰到");
+  if(L.kind==="price"&&r.dist!=null&&Math.abs(r.dist)<0.02&&L.range_word)parts.push("离档位很近，差几分钱的触及以 Predict 为准");
   if(r.fair!=null)parts.push("模型 Yes "+cent(r.fair));
   if(r.bid!=null||r.ask!=null)parts.push("Yes 盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1)));
   d.append($("b","",r.label),$("span","",parts.length?"："+parts.join(" · "):""));
@@ -6344,7 +6773,7 @@ const num=x=>x==null||x===""?"—":typeof x==="number"?x.toLocaleString("en-US",
 const when=ms=>ms?new Date(ms).toLocaleString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false,month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}):"—";
 const span=ms=>{if(ms==null||!isFinite(ms))return"—";const a=Math.abs(ms),s=Math.round(a/1000);
   const t=s<90?s+" 秒":s<5400?Math.round(s/60)+" 分钟":s<172800?(s/3600).toFixed(1)+" 小时":(s/86400).toFixed(1)+" 天";return ms<0?t+"后":t};
-const KINDS={close:"指数/个股日涨跌",touch:"先触价",updown:"月度涨跌",flip:"反超",ladder:"市值阶梯"};
+const KINDS={close:"指数/个股日涨跌",touch:"先触价",updown:"月度涨跌",flip:"反超",range:"价格阶梯",ladder:"市值阶梯"};
 const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参考说明",effective:"有效价",sigma_daily:"σ（日）",sigma_note:"σ 来源",
   remaining:"剩余方差占比",sigma:"σ（剩余）",z:"z",beta:"β",mode:"口径",direct:"直接用现货",proxy_note:"代理换算",target:"目标日",warn:"提示",
   close_ms:"收盘/截止",price:"现价",low:"低线",high:"高线",sigma_ms:"σ 计算时间",deadline_ms:"截止",years:"剩余年数",path:"路径核验",start_ms:"窗口开始",
@@ -7002,7 +7431,7 @@ class Bot:
         self.updowns = {spec.key: UpDownMarket(store, spec) for spec in UPDOWN_MARKETS}
         self.flips = {spec.key: FlipMarket(store, spec) for spec in FLIP_MARKETS}
         self.caps = {spec.key: CapMarket(store, spec) for spec in CAP_MARKETS}
-        self.ranges = {spec.key: RangeMarket(store, spec, self.binance_futures) for spec in RANGE_MARKETS}
+        self.ranges = {spec.key: range_market(store, spec, self.binance_futures, config) for spec in (*RANGE_MARKETS, *STOCK_HIT_MARKETS)}
         self.predict.ladder_parse.update({key: price_level for key in self.ranges})
         self.predict.reward_keys.update(self.ranges)
         if config.touch:
@@ -8394,14 +8823,13 @@ class Bot:
             hist = rm.history
             return {"basis": {"price": float(rm.price or 0), "level": float(row.target), "dir": direction,
                               "dir_source": parts.get("source", ""), "sigma": rm.sigma, "sigma_ms": rm.sigma_ms,
-                              "years": max(0.0, (rm.window_end - max(now_ms, rm.spec.start_ms)) / YEAR_MS),
+                              "years": rm.remaining_years(now_ms),
                               "window_high": high, "window_low": low, "through": int(hist.get("through") or 0),
                               "close_ms": rm.window_end},
-                    "sources": [price_evidence("现价", "币安合约" if rm.spec.venue == "futures" else "币安现货", rm.spec.symbol,
-                                               "最新价", rm.price, rm.priced_ms, rm.priced_ms),
-                                price_evidence("本月最高", "币安小时 K", rm.spec.symbol, "最高价", hist.get("high"),
+                    "sources": [price_evidence("现价", rm.source_name(), rm.spec.symbol, "最新价", rm.price, rm.priced_ms, rm.priced_ms),
+                                price_evidence(f"{rm.range_word}最高", rm.extremes_name(), rm.spec.symbol, "最高价", hist.get("high"),
                                                int(hist.get("high_at") or 0)),
-                                price_evidence("本月最低", "币安小时 K", rm.spec.symbol, "最低价", hist.get("low"),
+                                price_evidence(f"{rm.range_word}最低", rm.extremes_name(), rm.spec.symbol, "最低价", hist.get("low"),
                                                int(hist.get("low_at") or 0))], "proxy": None}
         cap: CapMarket = parts["cap"]
         row = parts["row"]
@@ -8486,7 +8914,7 @@ class Bot:
                 out.append(SimMarket(f"{rm.spec.slug}#{row.market_id}", f"{rm.spec.name} {('↑ ' if direction == 'up' else '↓ ')}"
                                      f"{level_label(row.target)}", "range", rm.spec.key, fair, book,
                                      self.edge_need(rm.model_swing(row.target, direction, now_ms, fair)), hold, ("Yes", "No"),
-                                     {"target": str(row.target), "dir": direction, "end": rm.spec.end_ms},
+                                     {"target": str(row.target), "dir": direction, "end": rm.end_ms},
                                      self.evidence(lambda rm=rm, row=row, direction=direction, source=source:
                                                    self.market_evidence("range", now_ms, rm=rm, row=row, direction=direction,
                                                                         source=source)), makers=RANGE_SIM_MAKERS,
@@ -8614,7 +9042,7 @@ class Bot:
             marks = rm.marks()
             high, low = marks["high"], marks["low"]
             proof = {"rule": f"窗口内任一 1 分钟 K 的{'最高价 ≥' if direction == 'up' else '最低价 ≤'} {level_label(level)} 即 Yes",
-                     "source": ("币安合约" if rm.spec.venue == "futures" else "币安现货") + f" {rm.spec.symbol} 小时 K（与 1 分钟 K 的最高/最低一致）",
+                     "source": rm.extremes_source(),
                      **marks, "through": int(rm.history.get("through") or 0)}
             if rm.reached(level, direction):
                 mid = trade["market"].partition("#")[2]
@@ -8622,7 +9050,7 @@ class Bot:
                 if book_disputes(self.predict.yes_book(row)[0] if row else None):
                     return None  # the book still trades it as open: Predict's own result settles it
                 seen = high if direction == "up" else low
-                return 1.0, (f"{'↑' if direction == 'up' else '↓'} {level_label(level)} 已触及（{rm.spec.symbol} 本月"
+                return 1.0, (f"{'↑' if direction == 'up' else '↓'} {level_label(level)} 已触及（{rm.spec.symbol} {rm.range_word}"
                              f"{'最高' if direction == 'up' else '最低'} {seen:,.6g}）"), proof
             if rm.complete() and now_ms > rm.window_end + self.SIM_SETTLE_MS:
                 return 0.0, f"整个窗口都没到 {level_label(level)}", proof
@@ -8950,7 +9378,7 @@ class Bot:
                        "supply": fmt(cap.supply.quantize(D(1))) if cap.supply else "—",
                        "window": f"{start:%m-%d %H:%M} ET（北京 {bj(spec.start_ms)}）起",
                        "years": max(0.0, (spec.end_ms - max(now_ms, spec.start_ms)) / YEAR_MS),
-                       "first_skipped": cap.history.get("first") == "skipped",
+                       "first_skipped": cap.history.get("first") == "skipped", "gaps": cap.gaps_note(),
                        "metric": spec.metric, "settle": spec.settle, "bars": bool(spec.gecko),
                        "sigma_kind": cap.sigma_kind, "vol_error": cap.vol_error,
                        "supply_note": "总量 − 销毁" if spec.supply == "rpc" else f"DexScreener {spec.metric} ÷ 价格"},
@@ -9072,27 +9500,25 @@ class Bot:
         high, low = marks["high"], marks["low"]
         price_text = lambda v: f"${v:,.2f}" if v is not None and v < 1000 else f"${v:,.0f}" if v is not None else "—"
         item: dict[str, Any] = {
-            "name": spec.name, "symbol": spec.key, "group": "levels", "kind": "ladder", "close_ms": spec.end_ms,
+            "name": spec.name, "symbol": spec.key, "group": "levels", "kind": "ladder", "close_ms": rm.end_ms,
             "quote_ms": rm.priced_ms if rm.price is not None else 0,
-            "source": "币安合约" if spec.venue == "futures" else "币安现货",
-            "close_label": f"{spec.label(spec.end_ms)}这根 1 分钟 K 为止",
+            "source": rm.source_name(),
+            "close_label": rm.close_label(),
             "ladder": {"kind": "price", "metric": "价格", "price": price_text(float(rm.price) if rm.price is not None else None),
                        "spot": float(rm.price) if rm.price is not None else None,  # the page draws its line among the levels
                        "high": price_text(high), "low": price_text(low),
                        "high_at": stamp(marks["high_at"], seconds=False) if marks["high_at"] else "",
                        "low_at": stamp(marks["low_at"], seconds=False) if marks["low_at"] else "",
                        "through": stamp(int(hist["through"]), seconds=False) if hist.get("through") else "",
-                       "sigma": rm.sigma, "sigma_note": "30 日小时收盘", "rows": rows, "error": rm.error, "hold": problem,
-                       "symbol": spec.symbol, "venue": "币安 USDⓈ-M 合约" if spec.venue == "futures" else "币安现货",
-                       "window": f"{spec.label(spec.start_ms)}起",
-                       "years": max(0.0, (rm.window_end - max(now_ms, spec.start_ms)) / YEAR_MS)},
+                       "sigma": rm.sigma, "sigma_note": rm.sigma_note(), "rows": rows, "error": rm.error, "hold": problem,
+                       "symbol": spec.symbol, "venue": rm.venue_name(),
+                       "window": rm.window_label(),
+                       "years": rm.remaining_years(now_ms), **rm.card_extras(now_ms)},
         }
         if self.config.predict:
             item["predict"] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
-        if rm.price is None or rm.sigma is None:
-            item["missing"] = f"等待币安行情（{brief_error(rm.error, 80)}）" if rm.error else "等待币安行情"
-        elif now_ms - rm.priced_ms > rm.PRICE_STALE_MS and now_ms < rm.window_end:
-            item["missing"] = f"币安价格停在 {stamp(rm.priced_ms, seconds=False)}，暂停概率（已触及的档位仍算已触及）"
+        if missing := rm.missing_note(now_ms):
+            item["missing"] = missing
         if not rows and self.config.predict:
             item["ladder"]["waiting"] = "等待 Predict 档位"  # the Predict line of the card says why (not listed yet, an error)
         return item
@@ -9381,7 +9807,7 @@ class Bot:
             targets[key] = predict_slug(stem, day)
         if self.config.touch:
             targets.update({spec.key: spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *FLIP_MARKETS, *CAP_MARKETS,
-                                                              *RANGE_MARKETS)})
+                                                              *RANGE_MARKETS, *STOCK_HIT_MARKETS)})
         return targets
 
     def edge_costs(self) -> EdgeCosts:
@@ -9794,6 +10220,21 @@ class Bot:
                     return f"{day.strftime('%m-%d') if day else '上一交易日（无日期）'} 收盘 {fmt(close)} {info.currency}{note}"
                 probes.append((f"交易所收盘·{short_name(symbol)}", f"{name} {ticker.market}:{ticker.code}", get(url, extra), check_stock))
 
+        if self.config.touch:
+            for rm in self.ranges.values():
+                if not isinstance(rm, StockRangeMarket):
+                    continue
+                def check_chart(raw: bytes, rm=rm) -> str:
+                    meta, bars = parse_yahoo_chart(raw)
+                    if meta["price"] is None:
+                        raise ValueError("没有 regularMarketPrice")
+                    state, opens = us_session_state(now_ms)
+                    return (f"{rm.spec.symbol} {meta['price']:,.2f}（成交 {when(meta['time_ms'])}；今日 {len(bars)} 根 1 分钟 K；{state}"
+                            + (f"，{rm.et_label(opens)}开盘" if opens else "") + "）")
+                url = YAHOO_CHART[0] + urllib.parse.quote(rm.spec.symbol) + "?" + urllib.parse.urlencode(
+                    {"interval": "1m", "range": "1d", "includePrePost": "false"})
+                probes.append((f"美股触及·{rm.spec.symbol}", "Yahoo 1 分钟 K", get(url, {}), check_chart))
+
         if self.config.sse_index:
             for name, url, extra in CnIndex.SSE_SOURCES:
                 def check_sse(raw: bytes, name=name) -> str:
@@ -10066,6 +10507,7 @@ class Bot:
 
     async def refresh_ranges(self, now_ms: int) -> Refreshed:
         for rm in self.ranges.values():
+            rm.learn(self.predict.ladders.get(rm.spec.key) or [], self.predict.market_meta)  # a stock's window comes from Predict
             await rm.refresh(now_ms)
         failed = [f"{key}：{rm.error}" for key, rm in self.ranges.items() if rm.error]
         return refreshed(failed, len(self.ranges) - len(failed))
