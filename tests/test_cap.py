@@ -444,6 +444,24 @@ async def run():
     later = NOW + (3 * H + 1200) * 1000
     assert cap.backfill_note(later) == f"已核验到 {m.stamp(((NOW_S - NOW_S % H) + H) * 1000, seconds=False)}，之后 2 小时尚未读取", cap.backfill_note(later)
     assert pons.backfill_note(NOW) == "" and bot.cap_payload(pons, NOW)["ladder"]["pool"] == ""  # no bars: the sampling gaps say it instead
+    # the bars' high and the bot's own samples' high are kept apart: a changed pool drops the other pool's bars (and reads the
+    # window again), the samples stay; a record from an older build keeps its high as the bars' until then
+    moved = m.CapMarket(m.Store(":memory:"), NIU); moved.get, mcalls = world(peak_hour=FIRST_HOUR + 5 * H, peak_price=0.4)
+    moved.store.put(f"cap:{NIU.slug}", {"start": NIU.start_ms, "high": 9.9, "at": 123, "through": NOW_S - NOW_S % H, "first": "done", "pool": "0xOLDPOOL",
+                                        "bars_from": FIRST_HOUR - 800 * H, "spike": [123, 9.9, 1.0]})
+    moved.price = D("0.5"); moved.observe(NOW)
+    assert moved.history["seen_high"] == 0.5 and moved.history["bar_high"] == 9.9 and moved.history["high"] == 9.9
+    await moved.scan(NOW)
+    h = moved.history
+    assert h["pool"] == "0xPOOLB" and h["bar_high"] == 0.4 and h["bar_at"] == FIRST_HOUR + 5 * H and h["seen_high"] == 0.5, h
+    assert h["high"] == 0.5 and h["at"] == NOW_S and h["first"] == "done" and sum("/ohlcv/hour" in x for x, _ in mcalls) == 2, h  # read from the opening again
+    assert cap.history["pool"] == "0xPOOLB" and cap.history["bar_high"] == 0.25 and cap.history["high"] == 0.25
+    # a high set by a wick (more than double the bar's open and close) is said so; a tamer peak is not
+    assert cap.spike_note().startswith(f"窗口最高来自 {m.stamp(peak * 1000, seconds=False)} 那一小时的插针（最高 0.25，开收盘最高 0.08"), cap.spike_note()
+    assert bot.cap_payload(cap, NOW)["ladder"]["spike"] == cap.spike_note()
+    tame = m.CapMarket(m.Store(":memory:"), NIU); tame.get, _ = world(peak_hour=peak, peak_price=0.15)
+    await tame.scan(NOW); assert tame.history["bar_high"] == 0.15 and "spike" not in tame.history and tame.spike_note() == ""
+    assert pons.spike_note() == "" and bot.cap_payload(pons, NOW)["ladder"]["spike"] == ""
 
 
 

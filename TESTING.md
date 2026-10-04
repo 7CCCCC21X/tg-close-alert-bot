@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.26.3
+版本：1.26.4
 
 ## 已完成
 
+- 1.26.4（市值阶梯换池子后的旧高点、插针）：`cap:<slug>` 记录新增 `pool`、`bar_high`/`bar_at`（K 线的高点）、`seen_high`/`seen_at`（自采的高点），`high`/`at` 由 `top_high()` 取两者之高；`CapMarket.resolve_pool()` 从 `ohlcv()` 拆出，`scan()` 先定池子，和记录里的不同就清掉 `through`/`first`/`bars_from`/`spike` 与 K 线高点、从开窗重读（旧版记录没有 `bar_high` 时先把原 `high` 当 K 线高点）。某根已结束的小时 K 最高价 > 2 × max(开, 收) 且刷新了 K 线高点时记 `spike=[时间, 最高, 开收盘最高]`，`spike_note()` 在它仍是窗口最高时写出来，随 `ladder.spike` 显示在状态栏和明细里。tests/test_cap.py 覆盖换池子重读、自采高点保留、旧记录升级、插针文案。
 - 1.26.3：去掉筛选条下沿的刷新进度线（`.fbar:after` 与 `--prog`）。
 - 1.26.2（STRC 选错市场、已观测最高）：Predict 把 “STRC hits $100” 按截止日列成多个市场（标题只写 “June 30” / “December 31”），旧版把每个标题里的日期数字当成档位（$30、$31），并用第一个（已过期的 6 月 30 日）当截止，卡片显示“窗口已结束”。新增 `hit_level_parser(slug)`（只认带 $ 的价格，否则用 slug 里的 100）和 `StockRangeMarket.choose(rows, meta)`（钉了 `LADDER_DEADLINES` 取那个日期的市场，否则取截止日最晚且未过期的），`Predict.ladder_pick[key]` 在 `refresh_ladder` 里应用，所以盘口、模拟交易、提醒都只看这一个市场。市值阶梯 / 价格阶梯的行多了 `settled`（Predict 已结算），“已触及”里标“· 已结算”；没有 K 线来源的卡一律写“已观测最高”。tests/test_stockhit.py 覆盖解析和选择。
 - 1.26.1（市值阶梯回填进度、STRC 问题行）：`CapMarket.scan()` 以前只要读到几根已结束的小时 K 就把 `through` 推到最新一小时，之后只接受这之后的 K 线；接口第一次只给一小段（或选到的池子历史很短）时，开窗到那段之间的小时永远不会再读，早期高点漏掉。现在记录里加 `bars_from`（接口给过的最早一根 K 线），某次翻页读到比它更早的 K 线就把下限改回开窗那一小时、整个窗口重读（没有 `bars_from` 的旧记录升级后也重读一次），`through` 照旧只按已结束的小时推进。新增 `backfill_note(now_ms)`：没回填过写“历史 K 线尚未回填（启动后约 5 分钟内读取）”，K 线最早在开窗一小时之后写“K 线最早到 …，开窗到那时的 N 小时没有记录”，最新结束的小时在两个扫描周期后还没读到写“已核验到 …，之后 N 小时尚未读取”；没有 K 线来源的卡返回空（采样空档另有说明）。`cap_payload` 多了 `ladder.coverage` 和 `ladder.pool`，页面在 coverage 非空时把“窗口最高”写成“已观测最高”、状态栏加“⚠️ 历史未补齐：…”，明细里写出 GeckoTerminal 池子地址的首尾。STRC 卡：`StockRangeMarket.question(levels)` 生成“STRC 在 12-31 23:59 ET（北京 01-01 12:59）之前是否触及 $100：窗口内任一 1 分钟 K 的最高价达到即 Yes，到期没碰到为 No”，`range_payload` 把 Predict 列出的档位名交给它，页面在状态栏第一行显示（`.qline`）；`close_label` 改为“…前触及即 Yes，到期未触及为 No（TradingView 1 分钟 K 的最高价 ≥ 档位算触及）”。`gecko_pool(data, prefer)` 优先返回地址（忽略大小写）等于规则交易对的池子，`ohlcv()` 把 `spec.pair` 传进去，所以 $STONK 的小时 K 来自规则交易对本身的池子（GeckoTerminal 没列出时才退回最活跃的）；`pool_note()` 写明“规则交易对的池子 …”或“最活跃的池子 …”，随 `ladder.pool_note` 显示在明细里。tests/test_cap.py 覆盖短历史后再读全窗口、旧记录升级重读、三种说明文案、payload 字段；tests/test_stockhit.py 覆盖问题行和新标签。

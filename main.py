@@ -41,7 +41,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.26.3"
+VERSION = "1.26.4"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4709,6 +4709,15 @@ def gecko_pool(data: Any, prefer: str = "") -> str:
     return best[1]
 
 
+def top_high(hist: dict) -> None:
+    """A cap record's "high"/"at": the higher of the bars' high and the bot's own samples' high. A record from an older
+    build (one "high" for both) keeps that high as the bars' until the pool changes."""
+    if "bar_high" not in hist:
+        hist["bar_high"], hist["bar_at"] = float(hist.get("high") or 0), int(hist.get("at") or 0)
+    hist["high"], hist["at"] = max((float(hist.get("bar_high") or 0), int(hist.get("bar_at") or 0)),
+                                   (float(hist.get("seen_high") or 0), int(hist.get("seen_at") or 0)))
+
+
 def gecko_bars(data: Any) -> list[tuple[int, float, float, float, float]]:
     """GeckoTerminal OHLCV answer -> [(open time s, open, high, low, close)] oldest first."""
     rows = (((data or {}).get("data") or {}).get("attributes") or {}).get("ohlcv_list") if isinstance(data, dict) else None
@@ -4815,12 +4824,17 @@ class CapMarket:
                 failures.append(f"{urllib.parse.urlsplit(url).hostname}: {clean_error(error)}")
         raise RemoteError("；".join(failures))
 
+    async def resolve_pool(self) -> str:
+        """The GeckoTerminal pool the bars come from: the one the spec names; else the rules' own pair when GeckoTerminal
+        lists it (so the bars come from the pool the market settles on); else the token's most liquid pool."""
+        if not self.pool:
+            base = f"{GECKO}/{self.spec.gecko}"
+            self.pool = self.spec.gecko_pool or gecko_pool(await self.get(f"{base}/tokens/{self.spec.token}/pools?page=1"), self.spec.pair)
+        return self.pool
+
     async def ohlcv(self, frame: str, before_s: int, limit: int) -> list[tuple[int, float, float, float, float]]:
         base = f"{GECKO}/{self.spec.gecko}"
-        if not self.pool:
-            # the pool named by the spec; else the rules' own pair when GeckoTerminal lists it (so the bars come from the
-            # pool the market settles on); else the token's most liquid pool
-            self.pool = self.spec.gecko_pool or gecko_pool(await self.get(f"{base}/tokens/{self.spec.token}/pools?page=1"), self.spec.pair)
+        await self.resolve_pool()
         return gecko_bars(await self.get(f"{base}/pools/{self.pool}/ohlcv/{frame}?aggregate=1&limit={limit}"
                                          f"&before_timestamp={before_s}&currency=usd&token={self.spec.token}"))
 
@@ -4861,8 +4875,9 @@ class CapMarket:
             return
         hist = dict(self.history) or {"start": self.spec.start_ms, "high": 0.0, "at": 0}
         now_s, changed = now_ms // 1000, False
-        if float(self.price) > float(hist.get("high") or 0):
-            hist["high"], hist["at"], changed = float(self.price), now_s, True
+        if float(self.price) > float(hist.get("seen_high") or 0):
+            hist["seen_high"], hist["seen_at"], changed = float(self.price), now_s, True
+            top_high(hist)
         if not self.spec.gecko:
             since = int(hist.get("seen") or 0) or self.spec.start_ms // 1000
             if now_s - since > self.GAP_S:
@@ -4874,6 +4889,15 @@ class CapMarket:
                 hist["seen"], changed, self.seen_written_s = now_s, True, now_s
         if changed:
             self.store.put(f"cap:{self.spec.slug}", hist)
+
+    def spike_note(self) -> str:
+        """The window's high came from a wick: an hourly bar whose high is more than double its open and close ("" when
+        not). A wick on the bars' pool may be a mispriced fill the rules' own chart never printed: worth checking there."""
+        spike = self.history.get("spike")
+        if not (isinstance(spike, list) and len(spike) == 3) or float(self.history.get("bar_high") or 0) != float(spike[1]):
+            return ""
+        return (f"窗口最高来自 {stamp(int(spike[0]) * 1000, seconds=False)} 那一小时的插针（最高 {spike[1]:.6g}，开收盘最高 {spike[2]:.6g} USD）："
+                "K 线池子里的一笔异常成交也会留下这样的影子，结算图上是否真有这根请核实")
 
     def gaps_note(self) -> str:
         """Without bars: the window's unobserved stretches so far, in words ("" when none, or when bars cover the window)."""
@@ -4968,6 +4992,14 @@ class CapMarket:
             return
         hist = dict(self.history) or {"start": self.spec.start_ms, "high": 0.0, "at": 0}
         start_hour = start_s - start_s % 3600 + (3600 if start_s % 3600 else 0)
+        top_high(hist)  # an older build's record gets its bar_high here
+        pool = await self.resolve_pool()
+        if hist.get("pool") and hist["pool"] != pool:
+            # another pool's bars are not this pool's record: its high and progress go, the window is read again from the opening
+            for key in ("through", "first", "bars_from", "spike"):
+                hist.pop(key, None)
+            hist["bar_high"], hist["bar_at"] = 0.0, 0
+        hist["pool"] = pool
         hist.setdefault("through", start_hour)
         if start_s % 3600 and "first" not in hist:
             # the window opens mid-hour: that hour counts only from the opening minute
@@ -4975,8 +5007,8 @@ class CapMarket:
                 bars = [b for b in await self.ohlcv("minute", start_s - start_s % 3600 + 3600, 60) if b[0] >= start_s]
                 hist["first"] = "done" if bars else "skipped"
                 for bar in bars:
-                    if bar[2] > hist["high"]:
-                        hist["high"], hist["at"] = bar[2], bar[0]
+                    if bar[2] > hist["bar_high"]:
+                        hist["bar_high"], hist["bar_at"] = bar[2], bar[0]
             except Exception:
                 hist["first"] = "skipped"
         rows: list[tuple[int, float, float, float, float]] = []
@@ -4995,12 +5027,16 @@ class CapMarket:
         finished = [b for b in inside if b[0] + 3600 <= now_s]
         running = [b for b in inside if b[0] + 3600 > now_s]
         for bar in finished:
-            if bar[2] > hist["high"]:
-                hist["high"], hist["at"] = bar[2], bar[0]
+            if bar[2] > hist["bar_high"]:
+                hist["bar_high"], hist["bar_at"] = bar[2], bar[0]
+                body = max(bar[1], bar[4])
+                if body > 0 and bar[2] > 2 * body:  # a wick more than double the bar's open and close: remembered, shown
+                    hist["spike"] = [bar[0], bar[2], body]
         if finished:
             hist["through"] = max(b[0] for b in finished) + 3600
         if now_s >= self.window_end_s and not running:
             hist["through"] = max(hist["through"], self.window_end_s)  # hours without a bar had no trades
+        top_high(hist)
         self.hour_high = max((b[2] for b in running), default=0.0)
         self.store.put(f"cap:{self.spec.slug}", hist)
 
@@ -6488,7 +6524,7 @@ function ladder(c,it){
   if(L.sigma)sm.append($("span","rd","σ"),$("span","v",(L.sigma*100).toFixed(0)+"%"));
   det.append(sm);const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("窗口",L.window+" → "+it.close_label);row("价格",L.price+" USD（"+L.source+"）");row("供应量",L.supply+"（"+L.supply_note+"）");
-  row(highWord,L.high+(L.high_at?"（"+L.high_at+"）":"")+"："+(L.bars?"GeckoTerminal 小时 K 近似（"+(L.pool_note||"最活跃的池子")+"）":"只含机器人运行以来每 10 秒看到的价格")+(L.coverage?"；"+L.coverage:"")+(L.gaps?"；"+L.gaps:"")+"，结算以 "+L.settle+" 1 分钟 K 为准；Predict 已结算的档位算已触及"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
+  row(highWord,L.high+(L.high_at?"（"+L.high_at+"）":"")+"："+(L.bars?"GeckoTerminal 小时 K 近似（"+(L.pool_note||"最活跃的池子")+"）":"只含机器人运行以来每 10 秒看到的价格")+(L.coverage?"；"+L.coverage:"")+(L.spike?"；"+L.spike:"")+(L.gaps?"；"+L.gaps:"")+"，结算以 "+L.settle+" 1 分钟 K 为准；Predict 已结算的档位算已触及"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
   if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
   row("模型",(L.sigma_kind==="prior"?"σ 为先验值，仅供参考。":"")+"碰到即 Yes：零漂移、固定波动率的单边触及概率 Φ((−h−s²/2)/s) + (M/K)·Φ((−h+s²/2)/s)，h = ln(K/M)，s = σ√T");
   det.append(dl);c.append(det);
@@ -6497,6 +6533,7 @@ function ladder(c,it){
   if(L.waiting)st.append($("div","mut small",L.waiting));  // a spec without levels of its own, before Predict lists them
   if(L.gaps&&!it.missing){const g=$("div","warn small","⚠️ "+L.gaps);g.title="这张卡没有 K 线来源，窗口最高只含机器人自己采到的价格；没采到的时段里碰到档位不会被发现，以 Predict 为准";st.append(g)}
   if(L.coverage&&!it.missing){const g=$("div","warn small","⚠️ 历史未补齐："+L.coverage);g.title="已观测最高只含已读到的小时 K 和机器人自己看到的价格；没读到的时段里碰到档位不会被发现，以 Predict 为准";st.append(g)}
+  if(L.spike&&!it.missing){const g=$("div","warn small","⚠️ "+L.spike);g.title="按这个高点算已触及的档位，盘口不认同时会标“请核实”；以结算图为准";st.append(g)}
   const prior=L.sigma_kind==="prior";
   if(prior&&!it.missing){const prog=(L.sigma_note||"").match(/自采价格 ([0-9.]+)/);
     const w=$("div","warn small","⚠️ σ 暂用先验 "+(L.sigma*100).toFixed(0)+"%"+(prog?"（自采 "+prog[1]+"/12 小时）":"")+"，优势仅供参考");
@@ -9525,7 +9562,7 @@ class Bot:
                        "window": f"{start:%m-%d %H:%M} ET（北京 {bj(spec.start_ms)}）起",
                        "years": max(0.0, (spec.end_ms - max(now_ms, spec.start_ms)) / YEAR_MS),
                        "first_skipped": cap.history.get("first") == "skipped", "gaps": cap.gaps_note(),
-                       "coverage": cap.backfill_note(now_ms), "pool": cap.pool if spec.gecko else "",
+                       "coverage": cap.backfill_note(now_ms), "pool": cap.pool if spec.gecko else "", "spike": cap.spike_note(),
                        "pool_note": cap.pool_note(),
                        "metric": spec.metric, "settle": spec.settle, "bars": bool(spec.gecko),
                        "sigma_kind": cap.sigma_kind, "vol_error": cap.vol_error,
