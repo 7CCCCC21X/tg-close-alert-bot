@@ -191,17 +191,20 @@ async def browser_check():
         assert re.fullmatch(r"⚠️ 刷新失败（HTTP 500），当前为旧数据：最后成功 \d\d:\d\d:\d\d（\d+ 秒前），\d+ 秒后撤掉建议高亮", msg), msg
         assert not await page.evaluate("document.body.classList.contains('olddata')")
         assert await page.locator("#g-index .card").count() == 6
-        hot = page.locator("#g-index .card.hot").first
-        assert await hot.evaluate("e => getComputedStyle(e).boxShadow") != "none"
+        hot, plain = page.locator("#g-index .card.hot").first, page.locator("#g-index .card:not(.hot)").first
+        look = lambda el: el.evaluate("e => getComputedStyle(e).boxShadow + ' ' + getComputedStyle(e).borderTopColor + ' ' + getComputedStyle(e).borderTopWidth")
+        await page.mouse.move(0, 0)  # off the cards: a hovered card has a deeper shadow
+        assert await look(hot) != await look(plain)  # the red frame and its glow
         await page.evaluate("okAt -= 61000; drawStale()")
         assert await page.evaluate("document.body.classList.contains('olddata')")
+        await page.wait_for_timeout(300)  # the frame fades over 0.2 s
         assert (await page.inner_text("#stalemsg")).endswith("；建议高亮已撤掉")
-        assert await hot.evaluate("e => getComputedStyle(e).boxShadow") == "none"
+        assert await look(hot) == await look(plain), (await look(hot), await look(plain))  # the frame is gone: the card looks like any other
         await page.unroute("**/data.json")
         await page.click("#retry")
         await page.wait_for_selector("#stale", state="hidden")
         assert not await page.evaluate("document.body.classList.contains('olddata')")
-        assert await page.locator("#g-index .card.hot").first.evaluate("e => getComputedStyle(e).boxShadow") != "none"
+        assert await look(page.locator("#g-index .card.hot").first) != await look(plain)
 
         # never loaded at all: the header says so, the banner too
         page2 = await browser.new_page(viewport={"width": 390, "height": 700})
