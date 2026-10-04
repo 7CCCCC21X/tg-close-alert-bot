@@ -6457,9 +6457,9 @@ WEB_PAGE = """<!doctype html>
 <title>收盘涨跌概率</title>
 <script>try{var t=JSON.parse(localStorage.getItem("theme"));if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}catch(e){}</script>
 <style>
-:root{color-scheme:light;--bg:#f2f4f8;--card:#fff;--text:#161a20;--muted:#636b77;--faint:#98a0ab;--line:#e2e6ec;--line2:#edf0f4;--chip:#eef1f5;--chip2:#e2e6ed;--best:#2a66e0;--best-bg:#e8f0fe;--best-soft:#cfdefb;--warn:#b86e00;--warn-bg:#fff4df;--up:#dd3a40;--down:#17a05b;--up-bg:#fdeaea;--down-bg:#e3f6ec;--flat:#c6ccd4;--hot:#e4262d;--hot-bg:#fdeaea;--hot-soft:#f6c4c6;--star:#f3b304;--shadow:0 1px 2px rgba(18,26,40,.05),0 2px 8px rgba(18,26,40,.05);--shadow2:0 8px 24px rgba(18,26,40,.12);--r:14px}
-@media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--up-bg:#3a1b1f;--down-bg:#11301f;--flat:#3a424c;--hot:#ff5a60;--hot-bg:#3a1b1f;--hot-soft:#5c2a2f;--star:#f5c518;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}}
-:root[data-theme=dark]{color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--up-bg:#3a1b1f;--down-bg:#11301f;--flat:#3a424c;--hot:#ff5a60;--hot-bg:#3a1b1f;--hot-soft:#5c2a2f;--star:#f5c518;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}
+:root{color-scheme:light;--bg:#f2f4f8;--card:#fff;--text:#161a20;--muted:#636b77;--faint:#98a0ab;--line:#e2e6ec;--line2:#edf0f4;--chip:#eef1f5;--chip2:#e2e6ed;--best:#2a66e0;--on-accent:#fff;--best-bg:#e8f0fe;--best-soft:#cfdefb;--warn:#b86e00;--warn-bg:#fff4df;--up:#dd3a40;--down:#17a05b;--up-bg:#fdeaea;--down-bg:#e3f6ec;--flat:#c6ccd4;--hot:#e4262d;--hot-bg:#fdeaea;--hot-soft:#f6c4c6;--star:#f3b304;--shadow:0 1px 2px rgba(18,26,40,.05),0 2px 8px rgba(18,26,40,.05);--shadow2:0 8px 24px rgba(18,26,40,.12);--r:14px}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--on-accent:#0d1014;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--up-bg:#3a1b1f;--down-bg:#11301f;--flat:#3a424c;--hot:#ff5a60;--hot-bg:#3a1b1f;--hot-soft:#5c2a2f;--star:#f5c518;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}}
+:root[data-theme=dark]{color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--on-accent:#0d1014;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--up-bg:#3a1b1f;--down-bg:#11301f;--flat:#3a424c;--hot:#ff5a60;--hot-bg:#3a1b1f;--hot-soft:#5c2a2f;--star:#f5c518;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
 button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--best);outline-offset:2px}
@@ -6492,7 +6492,7 @@ h2{font-size:13px;font-weight:700;color:var(--text);letter-spacing:.02em;margin:
 @media (pointer:coarse){.star{padding:8px;margin:-8px -6px -8px -9px}.grip{padding:8px 8px;margin:-8px 0 -8px -10px}}.star.on{color:var(--star)}.star:hover{color:var(--star);transform:scale(1.15)}
 .name{font-weight:700;font-size:15px;min-width:0;max-width:calc(100% - 20px);flex:1 0 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:-.005em}
 .tag{border-radius:999px;padding:2px 8px;font-size:11.5px;font-weight:600;line-height:1.35;background:var(--chip);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
-.tag.next{background:var(--best-bg);color:var(--best)}.tag.auc{background:var(--warn);color:#fff}.tag.open{background:var(--down-bg);color:var(--down)}.tag.new{background:var(--best);color:#fff}.tag.hotk{background:var(--hot);color:#fff}
+.tag.next{background:var(--best-bg);color:var(--best)}.tag.auc{background:var(--warn);color:var(--on-accent)}.tag.open{background:var(--down-bg);color:var(--down)}.tag.new{background:var(--best);color:var(--on-accent)}.tag.hotk{background:var(--hot);color:var(--on-accent)}
 .cd{font-size:11.5px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;background:var(--chip);border-radius:999px;padding:2px 8px;line-height:1.35}
 .cd.done{color:var(--muted);font-weight:500}.cd.soon{color:var(--warn);background:var(--warn-bg)}
 .odds{display:flex;align-items:center;gap:10px;font-variant-numeric:tabular-nums;margin:2px -4px 0;padding:2px 4px;border-radius:8px}
@@ -6520,7 +6520,7 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:7px 0 3px;fon
 .ages+.pb{margin-top:0}
 .fbar{position:sticky;top:0;z-index:5;background:var(--bg);display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:7px 0;margin-bottom:4px;font-size:12.5px;border-bottom:1px solid var(--line);transition:box-shadow .2s}
 .fbar.stuck{box-shadow:0 10px 18px -14px rgba(0,0,0,.35)}
-.fchips{display:flex;flex-wrap:wrap;gap:5px}.fchips .tog.on,.famt .tog.on{border-color:var(--best);color:#fff;background:var(--best)}
+.fchips{display:flex;flex-wrap:wrap;gap:5px}.fchips .tog.on,.famt .tog.on{border-color:var(--best);color:var(--on-accent);background:var(--best)}
 button.tog{font-family:inherit}.fsort select{font:inherit;font-size:12.5px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);padding:3px 6px}
 .famt{display:inline-flex;align-items:center;gap:4px;color:var(--muted)}.famt input{width:64px;font:inherit;font-size:12.5px;padding:3px 6px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}
 /* a phone: the bar is one rail that scrolls sideways (chips, sort, size), so it does not stack three rows on top of every screen */
@@ -6552,7 +6552,7 @@ body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){displ
 .simg{display:grid;grid-template-columns:auto auto auto 1fr;gap:3px 12px;font-size:12.5px;font-variant-numeric:tabular-nums;margin-top:4px;padding:8px 10px;border-radius:10px;background:var(--chip)}.simg .lh{color:var(--faint);font-size:11px}.simg .ln{text-align:right}
 .simrows{display:flex;flex-direction:column;gap:2px;margin-top:4px}
 a.simrow{display:grid;grid-template-columns:auto 1fr auto auto;gap:2px 8px;font-size:12.5px;color:inherit;text-decoration:none;font-variant-numeric:tabular-nums;padding:4px 6px;margin:0 -6px;border-radius:8px;border-top:1px dashed var(--line)}
-a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);text-decoration:none;align-self:flex-start}.simj:hover{text-decoration:underline}.panel a.cb{text-decoration:none;color:var(--best)}
+a.simrow>*{min-width:0}a.simrow>:nth-child(2){overflow:hidden;text-overflow:ellipsis;white-space:nowrap}a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);text-decoration:none;align-self:flex-start}.simj:hover{text-decoration:underline}.panel a.cb{text-decoration:none;color:var(--best)}
 .small{font-size:12px;margin-top:3px}.mut{color:var(--faint)}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:22px;padding-top:12px;border-top:1px solid var(--line);line-height:1.6;max-width:760px}
 #opps{display:flex;flex-direction:column;align-items:stretch;gap:5px;margin:8px 0 4px;padding:8px 11px;font-size:12px;border-radius:12px;border:1px solid var(--hot-soft);background:linear-gradient(90deg,var(--hot-bg),var(--card) 85%)}
 #opps .orow{display:flex;flex-wrap:wrap;align-items:center;gap:5px 6px}#opps .ok{color:var(--hot);font-weight:700;white-space:nowrap}#opps .og{color:var(--muted);font-weight:600;white-space:nowrap;margin-left:2px}
@@ -6591,7 +6591,7 @@ body.sorting,body.sorting *{cursor:grabbing!important;user-select:none!important
 .ctl{display:flex;align-items:center;gap:6px;font-size:12px;padding-bottom:6px;border-bottom:1px dashed var(--line)}.ctl .sp,.panel .sp{flex:1}
 .ctl .grip{font-size:16px;margin:0;padding:1px 6px;border:1px solid var(--line);border-radius:6px;background:var(--chip)}
 .cb{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:8px;padding:2px 10px;font:inherit;font-size:12px;line-height:1.6;cursor:pointer;box-shadow:var(--shadow);transition:border-color .15s,color .15s,background .15s}.cb:hover{border-color:var(--best);color:var(--best)}
-.cb.pri{background:var(--best);border-color:var(--best);color:#fff}.cb.pri:hover{color:#fff;filter:brightness(1.08)}.cb.arm{border-color:var(--warn);color:var(--warn)}.cb:disabled{opacity:.4;cursor:default}
+.cb.pri{background:var(--best);border-color:var(--best);color:var(--on-accent)}.cb.pri:hover{color:var(--on-accent);filter:brightness(1.08)}.cb.arm{border-color:var(--warn);color:var(--warn)}.cb:disabled{opacity:.4;cursor:default}
 h2 .cb{margin-left:6px;padding:0 8px;letter-spacing:0;font-weight:400}
 h2 .fold{border:0;background:none;font:inherit;color:inherit;letter-spacing:inherit;padding:4px 8px 4px 0;margin:-4px 0;cursor:pointer;display:inline-flex;align-items:center;gap:5px;border-radius:6px}
 h2 .fold:before{content:"▾";color:var(--faint);font-size:11px;width:10px}h2 .fold[aria-expanded=false]:before{content:"▸"}h2 .fold:hover .hn{color:var(--best)}
@@ -7224,9 +7224,9 @@ JOURNAL_PAGE = r"""<!doctype html>
 <title>模拟交易复盘</title>
 <script>try{var t=JSON.parse(localStorage.getItem("theme"));if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}catch(e){}</script>
 <style>
-:root{color-scheme:light;--bg:#f2f4f8;--card:#fff;--text:#161a20;--muted:#636b77;--faint:#98a0ab;--line:#e2e6ec;--line2:#edf0f4;--chip:#eef1f5;--chip2:#e2e6ed;--best:#2a66e0;--best-bg:#e8f0fe;--best-soft:#cfdefb;--warn:#b86e00;--warn-bg:#fff4df;--up:#dd3a40;--down:#17a05b;--hot:#e4262d;--hot-bg:#fdeaea;--shadow:0 1px 2px rgba(18,26,40,.05),0 2px 8px rgba(18,26,40,.05);--shadow2:0 8px 24px rgba(18,26,40,.12);--r:14px}
-@media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--hot:#ff5a60;--hot-bg:#3a1b1f;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}}
-:root[data-theme=dark]{color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--hot:#ff5a60;--hot-bg:#3a1b1f;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}
+:root{color-scheme:light;--bg:#f2f4f8;--card:#fff;--text:#161a20;--muted:#636b77;--faint:#98a0ab;--line:#e2e6ec;--line2:#edf0f4;--chip:#eef1f5;--chip2:#e2e6ed;--best:#2a66e0;--on-accent:#fff;--best-bg:#e8f0fe;--best-soft:#cfdefb;--warn:#b86e00;--warn-bg:#fff4df;--up:#dd3a40;--down:#17a05b;--hot:#e4262d;--hot-bg:#fdeaea;--shadow:0 1px 2px rgba(18,26,40,.05),0 2px 8px rgba(18,26,40,.05);--shadow2:0 8px 24px rgba(18,26,40,.12);--r:14px}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--on-accent:#0d1014;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--hot:#ff5a60;--hot-bg:#3a1b1f;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}}
+:root[data-theme=dark]{color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--on-accent:#0d1014;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--hot:#ff5a60;--hot-bg:#3a1b1f;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
 button:focus-visible,a:focus-visible{outline:2px solid var(--best);outline-offset:2px}
@@ -7249,7 +7249,7 @@ td,th{border-bottom:1px solid var(--line2);padding:6px 10px;text-align:left;vert
 th{color:var(--faint);font-weight:600;font-size:11.5px;letter-spacing:.03em;background:var(--chip)}tr:last-child td{border-bottom:0}tr:hover td{background:var(--chip)}td.wrap{white-space:normal;min-width:140px}
 .filters{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0;font-size:12.5px;color:var(--muted)}
 .chip{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:4px 11px;font:inherit;font-size:12.5px;color:var(--muted);cursor:pointer;transition:border-color .15s,color .15s,background .15s}
-.chip:hover{border-color:var(--best-soft);color:var(--text)}.chip.on{border-color:var(--best);color:#fff;background:var(--best)}
+.chip:hover{border-color:var(--best-soft);color:var(--text)}.chip.on{border-color:var(--best);color:var(--on-accent);background:var(--best)}
 .list{display:flex;flex-direction:column;gap:8px}
 .tr{background:var(--card);border:1px solid var(--line);border-radius:var(--r);min-width:0;box-shadow:var(--shadow);transition:box-shadow .2s,border-color .2s}
 .tr:hover{box-shadow:var(--shadow2)}.tr.open{border-color:var(--best);box-shadow:0 0 0 1px var(--best),var(--shadow)}
@@ -7259,7 +7259,7 @@ th{color:var(--faint);font-weight:600;font-size:11.5px;letter-spacing:.03em;back
 .row .t3{font-size:12px;color:var(--warn);margin-top:3px;line-height:1.4}
 .row .r{text-align:right;font-variant-numeric:tabular-nums;flex:0 0 auto}.row .r b{display:block;font-size:16px;font-weight:750}
 .badge{font-size:11.5px;border-radius:999px;padding:1px 8px;background:var(--chip);color:var(--muted);white-space:nowrap;font-weight:600}
-.badge.ok{color:var(--best);background:var(--best-bg)}.badge.bad{color:#fff;background:var(--hot)}.badge.pre{color:var(--warn);background:var(--warn-bg)}
+.badge.ok{color:var(--best);background:var(--best-bg)}.badge.bad{color:var(--on-accent);background:var(--hot)}.badge.pre{color:var(--warn);background:var(--warn-bg)}
 .det{border-top:1px solid var(--line2);padding:10px 14px 14px;display:flex;flex-direction:column;gap:14px;min-width:0}
 .sec h3{font-size:13px;margin:0 0 6px;display:flex;align-items:center;gap:8px}.sec h3:before{content:"";width:3px;height:14px;border-radius:2px;background:var(--best)}
 .sec .sub{font-size:12px;color:var(--muted);margin:8px 0 4px}
@@ -7806,9 +7806,9 @@ COMMANDS: tuple[Command, ...] = (
     Command("unsubscribe", "取消当前订阅"),
     Command("status", "查看合约、基准与数据状态"),
     Command("threshold", "改为严格超过 ±1% 提醒", "1", "不带数字则弹出档位按钮卡片，点选即可"),
-    Command("cooldown", "持续超标每 300 秒提醒（0=关闭周期提醒）", "300"),
+    Command("cooldown", "持续超标每 300 秒提醒（0=关闭周期提醒）", "300", "不带数字则弹出档位按钮卡片，点选即可"),
     Command("mode", "daily=币安上一 UTC 日日 K 收盘；exchange=币安合约在证券交易所收盘时刻的价格；manual=手动参考价",
-            "daily|exchange|manual"),
+            "daily|exchange|manual", "不带参数则弹出模式按钮卡片，点选即可"),
     Command("setclose", "设置手动参考价，可一次发多条", "UNITREE 75 09-17 16:00",
             "示例：75 是基准，09-17 16:00 是它的收盘时间（北京，可省略）\n"
             "  末尾再写 YYYY-MM-DD 可指定适用日（默认今天）；批量：每行一组，首行可写统一适用日"),
@@ -7839,6 +7839,28 @@ def threshold_card(current: D) -> tuple[str, dict]:
     text = (f"📏 提醒阈值：跟上一日收盘价（基准）偏离多少才提醒\n当前：严格超过 ±{fmt(current)}%\n\n"
             "点选下方档位即时生效；其他数值请发送 /threshold 0.8。")
     return text, {"inline_keyboard": [buttons[i:i + 4] for i in range(0, len(buttons), 4)]}
+
+
+COOLDOWN_PRESETS = (0, 60, 300, 600, 1800, 3600)  # seconds; 0 = no repeat while the deviation persists
+
+
+def cooldown_card(current: int) -> tuple[str, dict]:
+    """Card text + inline keyboard for the repeat interval; the active preset is ticked."""
+    label = lambda s: "关闭" if s == 0 else f"{s // 60} 分钟" if s % 60 == 0 and s >= 60 else f"{s} 秒"
+    buttons = [{"text": ("✅ " if s == current else "") + label(s), "callback_data": f"cooldown:{s}"} for s in COOLDOWN_PRESETS]
+    text = (f"🔁 周期重复提醒：偏离持续超过阈值时，每隔多久再提醒一次\n当前：{label(current)}"
+            f"{'' if current else '（只在首次超过、档位扩大、方向反转时提醒）'}\n\n点选下方档位即时生效；其他秒数请发送 /cooldown 900。")
+    return text, {"inline_keyboard": [buttons[i:i + 3] for i in range(0, len(buttons), 3)]}
+
+
+def mode_card(current: str) -> tuple[str, dict]:
+    """Card text + inline keyboard for the baseline mode; the active one is ticked."""
+    names = (("binance_daily", "daily 日K"), ("exchange_close", "exchange 交易所收盘"), ("manual", "manual 手动"))
+    buttons = [{"text": ("✅ " if mode == current else "") + name, "callback_data": f"mode:{mode}"} for mode, name in names]
+    text = ("🧭 基准模式：涨跌幅相对哪个价格计算\n当前：" + BASELINE_MODES.get(current, current) + "\n\n"
+            + "\n".join(f"· {name}：{BASELINE_MODES[mode]}" for mode, name in names)
+            + "\n\n点选即时生效（切换后重新判断当前偏离，30 秒最短间隔仍然有效）。")
+    return text, {"inline_keyboard": [buttons]}
 
 HELP = "📡 合约昨收偏离提醒\n\n" + "\n".join(c.help_line() for c in COMMANDS) + """
 
@@ -8041,6 +8063,7 @@ class Bot:
         self.deliveries: dict[str, asyncio.Task] = {}  # Telegram sends in flight, by alert / notice key
         self.faults: dict[tuple[str, str], float] = {}  # (subscription, data item) -> when its current fault began
         self.reply_seq = 0  # command replies get their own delivery keys
+        self.last_send_error = ""  # the latest Telegram send failure, for /status
         self.sim_cache: dict[str, dict] | None = None  # in-memory view of the sim: records (sim_trades)
         self.sim_gen = -1
         self.notice_cache: dict[str, dict] | None = None  # in-memory view of the notice: records
@@ -8191,6 +8214,7 @@ class Bot:
             gone = chat_gone(error)
             if gone:
                 self.suspend_target(chat, thread, gone)
+            self.last_send_error = f"{stamp(time.time() * 1000, seconds=False)} chat {chat}：{brief_error(clean_error(error), 80)}"
             self.log_limited(f"telegram_send:{chat}", f"Telegram 发送失败（chat {chat}）：{clean_error(error)}")
             return False
         finally:
@@ -8353,10 +8377,20 @@ class Bot:
             return
         kind, _, value = str(query.get("data", "")).partition(":")
         try:
-            if kind != "threshold":
+            if kind == "threshold":
+                toast = self.apply_threshold(value)
+                text, markup = threshold_card(D(self.settings()["threshold"]))
+            elif kind == "cooldown":
+                toast = self.apply_cooldown(value)
+                text, markup = cooldown_card(int(self.settings()["cooldown"]))
+            elif kind == "mode":
+                toast = self.apply_mode(value).splitlines()[0]
+                text, markup = mode_card(self.settings()["mode"])
+                if self.settings()["mode"] == "manual":  # the template to fill in is worth a message of its own
+                    await self.reply(Request("/mode", [], int(message["chat"]["id"]), int(message.get("message_thread_id") or 0),
+                                             int((query.get("from") or {}).get("id") or 0)), self.apply_mode("manual"))
+            else:
                 raise ValueError("未知操作，请重新发送命令")
-            toast = self.apply_threshold(value)
-            text, markup = threshold_card(D(self.settings()["threshold"]))
         except (ValueError, decimal.InvalidOperation) as error:
             await answer("❌ " + clean_error(error), alert=True)
             return
@@ -8376,8 +8410,9 @@ class Bot:
         if len(self.command_notice) > 2000:
             self.command_notice.clear()
         self.command_notice[req.user_id] = now
-        await self.tell(req.chat, req.thread, id_text(req.user_id, req.chat, req.thread) +
-                        "\n把你的用户 ID 填入 Railway 的 ADMIN_USER_ID 后重新部署，再发 /subscribe。")
+        intro = ("ℹ️ 这是一个合约涨跌提醒机器人：订阅、查看状态和修改设置只有管理员能做。\n" if req.command == "/help" else "")
+        await self.tell(req.chat, req.thread, intro + id_text(req.user_id, req.chat, req.thread) +
+                        "\n如果你是部署者：把你的用户 ID 填入 Railway 的 ADMIN_USER_ID 后重新部署，再发 /subscribe。")
 
     # --- command handlers: each returns the reply text or raises ValueError with the usage hint ---
 
@@ -8393,10 +8428,10 @@ class Bot:
     def cmd_test(self, req: Request) -> str:
         return "✅ TG 测试消息发送成功。\n此测试仅验证推送，行情是否正常请看 /status。"
 
-    def cmd_subscribe(self, req: Request) -> str:
+    def cmd_subscribe(self, req: Request) -> "Reply":
         self.set_subscription(req, active=True)
-        return ("✅ 当前私聊/话题已订阅。\n" + self.config_summary() +
-                "\n首次观察就超过阈值，也会提醒；请用 /status 核对基准和行情。")
+        return Reply("✅ 当前私聊/话题已订阅。首次观察就超过阈值，也会提醒。\n下面是当前状态（随时可发 /status 再看）：\n\n"
+                     + self.status(req.sub_id), html=True)
 
     def cmd_resume(self, req: Request) -> str:
         sub = self.subscriptions().get(req.sub_id)
@@ -8449,15 +8484,30 @@ class Bot:
         self.store.put_many((key, {"last_sent": value.get("last_sent", 0)})
                             for key, value in self.store.items("alert:") if isinstance(value, dict))
 
-    def cmd_cooldown(self, req: Request) -> str:
-        if len(req.args) != 1 or not req.args[0].isdigit() or not 0 <= int(req.args[0]) <= 86400:
+    def cmd_cooldown(self, req: Request) -> str | tuple[str, dict]:
+        if not req.args:
+            return cooldown_card(int(self.settings()["cooldown"]))
+        if len(req.args) != 1:
+            raise ValueError("用法：/cooldown 300，范围 0～86400 秒；0 关闭周期重复提醒；不带数字弹出档位卡片")
+        return self.apply_cooldown(req.args[0])
+
+    def apply_cooldown(self, raw: str) -> str:
+        if not raw.isdigit() or not 0 <= int(raw) <= 86400:
             raise ValueError("用法：/cooldown 300，范围 0～86400 秒；0 关闭周期重复提醒")
-        seconds = int(req.args[0])
+        seconds = int(raw)
         self.update_settings(cooldown=seconds)
         return f"✅ 周期重复提醒间隔：{seconds} 秒（0 表示关闭）。"
 
-    def cmd_mode(self, req: Request) -> str:
-        choice = req.args[0].lower() if len(req.args) == 1 else ""
+    def cmd_mode(self, req: Request) -> str | tuple[str, dict]:
+        if not req.args:
+            return mode_card(self.settings()["mode"])
+        if len(req.args) != 1:
+            raise ValueError("用法：/mode daily、/mode exchange 或 /mode manual；不带参数弹出模式卡片")
+        return self.apply_mode(req.args[0])
+
+    def apply_mode(self, choice: str) -> str:
+        """Validate and persist the baseline mode; shared by the command and the card buttons."""
+        choice = choice.lower()
         aliases = {"daily": "binance_daily", "binance_daily": "binance_daily", "manual": "manual",
                    "exchange": "exchange_close", "exchange_close": "exchange_close", "stock": "exchange_close"}
         if choice not in aliases:
@@ -10068,12 +10118,23 @@ class Bot:
         for group in (r["kinds"], r["modes"]):
             if len(group) > 1:
                 lines.append("｜".join(f"{g['name']} {g['settled']} 笔 {money(g['pnl'])}" for g in group))
+        lines.append("｜".join(f"{label} {s['settled']} 笔 {money(s['pnl'])}（预期 {money(s['expected'])}）"
+                               for label, s in self.sim_recent_stats().items()))  # is the model holding up lately?
         lines.append("\n最近：")
-        lines += [f"{x['opened']} {x['item']} {x['label']} {x['price'] * 100:.1f}¢×{x['shares']:g}"
-                  f"（净优势 {x['edge'] * 100:+.1f}¢）→ {x['text']}" + (f"·{x['state']}" if x["state"] else "") for x in r["rows"]]
+        lines += [f"{x['opened']} {x['item']} {x['label']} {x['price'] * 100:.1f}¢×{x['shares']:g} → {x['text']}"
+                  + (f"·{x['state']}" if x["state"] else "") for x in r["rows"]]
         if self.config.web_port and self.web_token:
             lines.append(f"\n完整复盘（每笔的判断依据、来源、成交与结算证据，可导出）：{self.web_url()}/journal")
         return "\n".join(lines)
+
+    def sim_recent_stats(self) -> dict[str, dict]:
+        """{'今天': stats, '近 7 天': stats} over the trades settled in those windows (Beijing days): the lifetime total
+        cannot say whether the model has stopped working lately."""
+        now_ms = self.market.now_ms()
+        today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).replace(hour=0, minute=0, second=0, microsecond=0)
+        windows = {"今天": int(today.timestamp() * 1000), "近 7 天": int((today - dt.timedelta(days=6)).timestamp() * 1000)}
+        trades = [t for t in self.sim_trades().values() if t["status"] == "settled" and t.get("settled")]
+        return {label: sim_stats([t for t in trades if int(t["settled"]) >= since]) for label, since in windows.items()}
 
     def journal_payload(self) -> dict:
         """Every paper trade with its whole record (entry and fill snapshots, fills, local and final settlement,
@@ -10791,6 +10852,13 @@ class Bot:
         """A ready-to-edit batch /setclose covering every monitored symbol."""
         return f"/setclose {day}\n" + "\n".join(f"{short_name(s)} 价格 MM-DD HH:MM" for s in self.config.symbols)
 
+    def health_line(self) -> str:
+        """How the bot itself is doing: when it last sampled, what is still on its way to Telegram, the last send failure."""
+        sampled = f"{int(time.time() - self.last_cycle)} 秒前" if self.last_cycle else "尚未开始"
+        in_flight = sum(not task.done() for task in self.deliveries.values())
+        line = f"⏱ 最近采样 {sampled}｜运行 {int((time.time() - self.started) // 60)} 分钟｜Telegram 投递中 {in_flight} 条"
+        return line + (f"｜最近发送失败：{self.last_send_error}" if self.last_send_error else "")
+
     def config_summary(self) -> str:
         settings = self.settings()
         mode = BASELINE_SHORT.get(settings["mode"], settings["mode"])
@@ -10804,7 +10872,7 @@ class Bot:
         active = ("🟢 已订阅" if sub and sub.get("active") else f"⏸ 已自动暂停（{sub['suspended']}）→ /resume 恢复"
                   if sub and sub.get("suspended") else "⏸ 未订阅/已暂停")
         style = self.config.color_style
-        lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(),
+        lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(), self.health_line(),
                  f"📊 {legend(style)}｜→ 后为币安现价相对该行价格",
                  calendar_warning(self.config.holidays, dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date())]
         if self.settings()["mode"] == "binance_daily" and self.config.tickers:
@@ -11282,10 +11350,15 @@ class Bot:
         partial = [r for r in failed if r.group not in broken]
         if partial and len(failed) < len(results):
             lines.append("⚠️ 其余失败的源（同组有别的源顶上）：" + "、".join(f"{r.group}·{r.name}" for r in partial))
+        # what the bot runs on comes first (that is what a phone screen shows); a group with nothing wrong is one line
+        lines += ["", *state, ""]
         for group, rs in groups.items():
             lines.append(f"\n【{group}】")
-            lines.extend(f"{'✅' if r.ok else '❌'} {r.name}（{r.ms} ms）：{r.detail}" for r in rs)
-        return "\n".join(lines + [""] + state)
+            if all(r.ok for r in rs) and len(rs) > 1:
+                lines.append(f"✅ 全部正常（{len(rs)} 项）：" + "；".join(f"{r.name} {r.ms} ms" for r in rs))
+            else:
+                lines.extend(f"{'✅' if r.ok else '❌'} {r.name}（{r.ms} ms）：{r.detail}" for r in rs)
+        return "\n".join(lines)
 
     async def cmd_diag(self, req: Request) -> str:
         """Probe every source. With the background loops running the probes run beside the command poll (they can

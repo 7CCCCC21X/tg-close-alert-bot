@@ -47,7 +47,8 @@ async def run():
     assert "📏" in await ask("/threshold"); assert "❌" in await ask("/threshold 0")
     assert "±2.5%" in await ask("/threshold 2.5%") and bot.settings()["threshold"] == "2.5"
     assert "❌" in await ask("/cooldown x"); assert "600 秒" in await ask("/cooldown 600") and bot.settings()["cooldown"] == 600
-    assert "❌" in await ask("/mode"); assert "❌" in await ask("/mode foo")
+    assert "🧭 基准模式" in await ask("/mode"); assert "❌" in await ask("/mode foo")
+    assert "🔁 周期重复提醒" in await ask("/cooldown") and "❌" in await ask("/cooldown 1 2")
     assert "UNITREE 价格" in await ask("/mode manual") and bot.settings()["mode"] == "manual"
     assert "❌" in await ask("/setclose UNITREE"); assert "❌" in await ask("/setclose XXX 1")
     r = await ask("/setclose 宇树 75 2026-09-18"); assert "UNITREEUSDT 手动参考价：75" in r and "不是手动模式" not in r, r
