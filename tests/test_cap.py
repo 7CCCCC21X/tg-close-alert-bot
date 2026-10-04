@@ -38,6 +38,7 @@ for bad in ([], {"pairs": None}, [pair("0xother", "1", 1)]):
 pools = {"data": [{"attributes": {"address": "0xPOOLA", "reserve_in_usd": "1000"}},
                   {"attributes": {"address": "0xPOOLB", "reserve_in_usd": "250000.5"}}, {"attributes": {}}]}
 assert m.gecko_pool(pools) == "0xPOOLB"  # kept as given: Solana addresses are case-sensitive
+assert m.gecko_pool(pools, "0XPOOLA") == "0xPOOLA" and m.gecko_pool(pools, "0xnone") == "0xPOOLB"  # the rules' pair wins, spelt either way
 bars = {"data": {"attributes": {"ohlcv_list": [[7200, "1", "2", "0.5", "1.5", "9"], [3600, 1, 1.2, 0.9, 1.1, 3], ["x"]]}}}
 assert m.gecko_bars(bars) == [(3600, 1.0, 1.2, 0.9, 1.1), (7200, 1.0, 2.0, 0.5, 1.5)]
 assert m.gecko_bars({"data": {}}) == [] and m.gecko_bars(None) == []
@@ -423,6 +424,10 @@ async def run():
     assert note == f"K 线最早到 {m.stamp((NOW_S - NOW_S % H - H) * 1000, seconds=False)}，开窗到那时的 {(NOW_S - NOW_S % H - H - START_S) / H:.0f} 小时没有记录", note
     short_item = bot.cap_payload(short, NOW)["ladder"]
     assert short_item["coverage"] == note and short_item["pool"] == "0xPOOLB" and short_item["bars"] is True
+    assert short_item["pool_note"] == "最活跃的池子 0xPOOL…OOLB" and pons.pool_note() == ""  # NIULAI names no pair; STONK's lower-case pair is matched below
+    stonk = m.CapMarket(m.Store(":memory:"), STONK); stonk.pool = "AfrDdTgYwCvEqB1GxCaHr8i48O6QtXyQkSdVkELuDeHg"  # the rules' pair, spelt as GeckoTerminal does
+    assert stonk.pool_note() == "规则交易对的池子 AfrDdT…DeHg"
+    stonk.pool = "SomeOtherPool1111"; assert stonk.pool_note() == "最活跃的池子 SomeOt…1111（GeckoTerminal 没列出规则交易对）"
     short.get = full_get
     await short.scan(NOW)
     assert short.history["high"] == 0.4 and short.history["bars_from"] == FIRST_HOUR - 800 * H and short.backfill_note(NOW) == "", short.history

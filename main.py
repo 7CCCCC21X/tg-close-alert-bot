@@ -4599,8 +4599,8 @@ CAP_MARKETS = (
             metric="FDV", settle="DexScreener"),
     # "between market creation on September 6 at 04:00 AM ET, 2026 to October 31, 2026 at 11:59 PM ET" (STONK/SOL on Solana);
     # the rules' own DexScreener pair settles it, FDV = (total − burned) × price; the pair is spelt as the rules' link spells it
-    # (DexScreener reads it either way), which GeckoTerminal would not accept, so the hourly bars (σ, the window's high since
-    # 09-06) come from the mint's most liquid Solana pool on GeckoTerminal instead: the same token, all but surely the same pool
+    # (DexScreener reads it either way), which GeckoTerminal would not accept as a pool path; the hourly bars (σ, the window's
+    # high since 09-06) come from the mint's pool whose address matches it without regard to case, else its most liquid pool
     CapSpec("STONK", "what-fdv-will-stonk-hit-before-november-2026", "$STONK FDV", "6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
             et_ms(2026, 9, 6, 4, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
             chain="solana", pair="afrddtgywcveqb1gxcahr8i48o6qtxyqksdvkeludehg", supply="fdv", gecko="solana", metric="FDV", settle="DexScreener"),
@@ -4686,12 +4686,15 @@ def dex_price(data: Any, token: str) -> tuple[D, D | None, D | None, str]:
     return best[1], best[2], best[3], best[4]
 
 
-def gecko_pool(data: Any) -> str:
-    """GeckoTerminal token-pools answer -> the address of the pool with the most liquidity."""
+def gecko_pool(data: Any, prefer: str = "") -> str:
+    """GeckoTerminal token-pools answer -> the address of the pool ``prefer`` names (matched without regard to case: a
+    rules page may spell a Solana address in lower case), else of the pool with the most liquidity."""
     rows = (data or {}).get("data") if isinstance(data, dict) else None
     best = None
     for row in rows or []:
         attrs = (row or {}).get("attributes") or {}
+        if prefer and str(attrs.get("address") or "").lower() == prefer.lower():
+            return str(attrs["address"])
         try:
             reserve = float(attrs.get("reserve_in_usd") or 0)
         except (TypeError, ValueError):
@@ -4812,7 +4815,9 @@ class CapMarket:
     async def ohlcv(self, frame: str, before_s: int, limit: int) -> list[tuple[int, float, float, float, float]]:
         base = f"{GECKO}/{self.spec.gecko}"
         if not self.pool:
-            self.pool = self.spec.gecko_pool or gecko_pool(await self.get(f"{base}/tokens/{self.spec.token}/pools?page=1"))
+            # the pool named by the spec; else the rules' own pair when GeckoTerminal lists it (so the bars come from the
+            # pool the market settles on); else the token's most liquid pool
+            self.pool = self.spec.gecko_pool or gecko_pool(await self.get(f"{base}/tokens/{self.spec.token}/pools?page=1"), self.spec.pair)
         return gecko_bars(await self.get(f"{base}/pools/{self.pool}/ohlcv/{frame}?aggregate=1&limit={limit}"
                                          f"&before_timestamp={before_s}&currency=usd&token={self.spec.token}"))
 
@@ -4995,6 +5000,15 @@ class CapMarket:
             hist["through"] = max(hist["through"], self.window_end_s)  # hours without a bar had no trades
         self.hour_high = max((b[2] for b in running), default=0.0)
         self.store.put(f"cap:{self.spec.slug}", hist)
+
+    def pool_note(self) -> str:
+        """Where the bars come from: the rules' own pair, or the most liquid pool of the token ("" without bars)."""
+        if not self.spec.gecko or not self.pool:
+            return ""
+        short = f"{self.pool[:6]}…{self.pool[-4:]}"
+        if self.spec.gecko_pool and self.pool == self.spec.gecko_pool or self.spec.pair and self.pool.lower() == self.spec.pair.lower():
+            return f"规则交易对的池子 {short}"
+        return f"最活跃的池子 {short}" + ("（GeckoTerminal 没列出规则交易对）" if self.spec.pair else "")
 
     def backfill_note(self, now_ms: int) -> str:
         """A bars card: what the window's high may still be missing ("" once every finished hour since the opening is
@@ -6439,7 +6453,7 @@ function ladder(c,it){
   if(L.sigma)sm.append($("span","rd","σ"),$("span","v",(L.sigma*100).toFixed(0)+"%"));
   det.append(sm);const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("窗口",L.window+" → "+it.close_label);row("价格",L.price+" USD（"+L.source+"）");row("供应量",L.supply+"（"+L.supply_note+"）");
-  row(highWord,L.high+(L.high_at?"（"+L.high_at+"）":"")+"："+(L.bars?"GeckoTerminal 小时 K 近似（最活跃的池子"+(L.pool?" "+L.pool.slice(0,6)+"…"+L.pool.slice(-4):"")+"）":"只含机器人运行以来每 10 秒看到的价格")+(L.coverage?"；"+L.coverage:"")+(L.gaps?"；"+L.gaps:"")+"，结算以 "+L.settle+" 1 分钟 K 为准；Predict 已结算的档位算已触及"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
+  row(highWord,L.high+(L.high_at?"（"+L.high_at+"）":"")+"："+(L.bars?"GeckoTerminal 小时 K 近似（"+(L.pool_note||"最活跃的池子")+"）":"只含机器人运行以来每 10 秒看到的价格")+(L.coverage?"；"+L.coverage:"")+(L.gaps?"；"+L.gaps:"")+"，结算以 "+L.settle+" 1 分钟 K 为准；Predict 已结算的档位算已触及"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
   if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
   row("模型",(L.sigma_kind==="prior"?"σ 为先验值，仅供参考。":"")+"碰到即 Yes：零漂移、固定波动率的单边触及概率 Φ((−h−s²/2)/s) + (M/K)·Φ((−h+s²/2)/s)，h = ln(K/M)，s = σ√T");
   det.append(dl);c.append(det);
@@ -9470,6 +9484,7 @@ class Bot:
                        "years": max(0.0, (spec.end_ms - max(now_ms, spec.start_ms)) / YEAR_MS),
                        "first_skipped": cap.history.get("first") == "skipped", "gaps": cap.gaps_note(),
                        "coverage": cap.backfill_note(now_ms), "pool": cap.pool if spec.gecko else "",
+                       "pool_note": cap.pool_note(),
                        "metric": spec.metric, "settle": spec.settle, "bars": bool(spec.gecko),
                        "sigma_kind": cap.sigma_kind, "vol_error": cap.vol_error,
                        "supply_note": "总量 − 销毁" if spec.supply == "rpc" else f"DexScreener {spec.metric} ÷ 价格"},
