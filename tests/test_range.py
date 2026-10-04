@@ -404,11 +404,11 @@ async def run():
     sol.error = "价格：网络错误 (URLError)"
     assert bot.range_payload(sol, NOW)["missing"] == "等待币安行情（价格：网络错误 (URLError)）"
 
-    # the page's list: the four cards in their own section, between 加密 and 市值阶梯
+    # the page's list: the four cards (and the STRC stock market) in their own section, between 加密 and 市值阶梯
     payload = bot.odds_payload()
     groups = [i["group"] for i in payload["items"]]
     names = [i["name"] for i in payload["items"] if i["group"] == "levels"]
-    assert names == ["BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格"] and groups.index("levels") > groups.index("crypto"), groups
+    assert names == ["BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格", "STRC 触及 $100"] and groups.index("levels") > groups.index("crypto"), groups
     assert max(i for i, g in enumerate(groups) if g == "levels") < groups.index("ladder")
     m.json.dumps(payload)
     # BNB_TOUCH=off switches them off with the other crypto markets
@@ -617,7 +617,7 @@ async def browser_check(bot):
         assert (await page.inner_text("#opps")).startswith("🔥 机会 2")
         # a folded section still counts its red-framed cards in its title; the strip unfolds it before jumping in
         await page.click("#h-levels .fold")
-        assert not await page.is_visible("#g-levels") and await page.inner_text("#h-levels .fs") == "4 张 · 🔥 1"
+        assert not await page.is_visible("#g-levels") and await page.inner_text("#h-levels .fs") == "5 张 · 🔥 1"
         await page.locator("#opps .opp").nth(1).click(); await page.wait_for_timeout(300)
         assert await page.is_visible("#g-levels .card") and await card.evaluate("c => c.classList.contains('flash')")
         assert await page.evaluate("localStorage.getItem('folded')") == "[]"

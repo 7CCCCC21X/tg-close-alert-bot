@@ -61,7 +61,9 @@ async def run():
     results = await bot.diagnose()
     by = {(r.group, r.name.split(" ")[0]): r for r in results}
     groups = {r.group for r in results}
-    assert groups == {"币安", "交易所收盘·UNITREE", "上证实时", "上证日K", "A50实时", "A50锚点", "Hyperliquid", "汇率"}, groups
+    assert groups == {"币安", "交易所收盘·UNITREE", "上证实时", "上证日K", "A50实时", "A50锚点", "Hyperliquid", "汇率", "美股触及·STRC"}, groups
+    strc = by[("美股触及·STRC", "Yahoo")]  # the stock market's feed is probed too; offline it fails like any other request
+    assert strc.name == "Yahoo 1 分钟 K" and not strc.ok and strc.detail.startswith("请求失败："), strc
 
     assert by[("币安", "服务器时间")].ok and "+1.2 秒" in by[("币安", "服务器时间")].detail
     assert by[("币安", "合约最新价")].detail == "UNITREE 73.5"
@@ -84,7 +86,7 @@ async def run():
 
     # report: groups that lost every source are called out first
     text = m.Bot.diag_text(results, bot.diag_state(NOW), "T")
-    assert "🚨 整组全部失败（该数据当前拿不到）：交易所收盘·UNITREE、Hyperliquid、汇率" in text, text
+    assert "🚨 整组全部失败（该数据当前拿不到）：交易所收盘·UNITREE、美股触及·STRC、Hyperliquid、汇率" in text, text
     partial = [l for l in text.splitlines() if l.startswith("⚠️ 其余失败的源")][0]
     assert partial == ("⚠️ 其余失败的源（同组有别的源顶上）：上证实时·新浪、上证实时·东方财富、上证日K·东方财富日K、"
                        "A50实时·东方财富、A50实时·新浪CFD、A50锚点·东方财富1分钟K 09-24 15:00、A50锚点·新浪5分钟K 09-24 15:00"), partial
