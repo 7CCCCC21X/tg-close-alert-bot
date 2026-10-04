@@ -380,10 +380,12 @@ async def run():
         st, _, _ = await request(port, raw); assert st == 404, raw
     st, _, _ = await request(port, f"POST /p/{token} HTTP/1.1\r\n\r\n".encode()); assert st == 405
     st, _, _ = await request(port, b"GARBAGE\r\n\r\n"); assert st == 400
-    # a payload crash returns 500 without killing the server
+    # within the cache interval the last good answer is served; a payload crash after it returns 500 without killing the server
     orig = bot.odds_payload; bot.odds_payload = lambda: 1 / 0
+    st, _, _ = await request(port, f"GET /p/{token}/data.json HTTP/1.1\r\n\r\n".encode()); assert st == 200
+    web.cache.pop("data.json", None)
     st, _, _ = await request(port, f"GET /p/{token}/data.json HTTP/1.1\r\n\r\n".encode()); assert st == 500
-    bot.odds_payload = orig
+    bot.odds_payload = orig; web.cache.pop("data.json", None)
     st, _, _ = await request(port, b"GET /health HTTP/1.1\r\n\r\n"); assert st == 200
     # /web via Telegram command
     tg.sent.clear(); await bot.process_message({"text": "/web", "chat": {"id": 1}, "from": {"id": 42}, "date": time.time()})

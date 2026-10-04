@@ -33,6 +33,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 from dataclasses import dataclass, field
@@ -576,6 +577,11 @@ class Store:
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.execute("CREATE TABLE IF NOT EXISTS records (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
         self.conn.commit()
+        self.touched: dict[str, int] = {}  # key family ("sim", "notice"...) -> how many writes it has seen: in-memory views check this
+
+    def _bump(self, key: str) -> None:
+        family = key.partition(":")[0]
+        self.touched[family] = self.touched.get(family, 0) + 1
 
     def get(self, key: str, default: Any = None) -> Any:
         row = self.conn.execute("SELECT v FROM records WHERE k=?", (key,)).fetchone()
@@ -586,6 +592,7 @@ class Store:
     def put(self, key: str, value: Any) -> None:
         with self.conn:
             self.conn.execute(self.UPSERT, (key, json.dumps(value, ensure_ascii=False)))
+        self._bump(key)
 
     def put_many(self, pairs: Any) -> None:
         """Several records in one transaction (one fsync instead of one per record)."""
@@ -593,6 +600,11 @@ class Store:
         if rows:
             with self.conn:
                 self.conn.executemany(self.UPSERT, rows)
+            for key, _ in rows:
+                self._bump(key)
+
+    def keys(self, prefix: str) -> list[str]:
+        return [k for (k,) in self.conn.execute("SELECT k FROM records WHERE k >= ? AND k < ? ORDER BY k", self._bounds(prefix))]
 
     @staticmethod
     def _bounds(prefix: str) -> tuple[str, str]:
@@ -609,11 +621,14 @@ class Store:
     def delete_prefix(self, prefix: str) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM records WHERE k >= ? AND k < ?", self._bounds(prefix))
+        self._bump(prefix)
 
     def delete_keys(self, keys: list[str]) -> None:
         if keys:
             with self.conn:
                 self.conn.executemany("DELETE FROM records WHERE k=?", [(k,) for k in keys])
+            for key in keys:
+                self._bump(key)
 
     def close(self) -> None:
         self.conn.close()
@@ -3199,6 +3214,7 @@ def model_swing(odds: CloseOdds) -> float:
 
 
 PRED_EVERY_MS = 30 * 60_000   # one saved prediction snapshot per index per 30 minutes
+PRED_KEEP_DAYS = 400          # snapshots older than this are pruned (a year of /calib history, not an ever-growing table)
 CALIB_MIN_DAYS = 10           # walk-forward: target days used only for training before the first test day
 
 
@@ -3382,6 +3398,8 @@ PREDICT_SITE = "https://predict.fun/zh-cn/market/"
 PREDICT_ITEMS = (("HSI", "恒生指数", "hk"), ("KOSPI", "KOSPI", "kr"), ("SSE", "上证指数", "sh"))
 PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
 PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and never recommended
+PREDICT_PARALLEL = 6            # Predict requests in flight at once (a hundred ladder books share the feeds' thread pool)
+PREDICT_BACKOFF_SECONDS = 20    # after a 429 without retry_after: how long every Predict request waits
 PREDICT_META_SECONDS = 600     # outcome names / status of a ladder market are re-read this often
 PREDICT_REWARD_SECONDS = 60    # price-ladder reward metadata is refreshed every minute
 PREDICT_REWARD_STALE_SECONDS = 120  # allows the normal refresh to finish across a 60-second alert confirmation
@@ -3743,12 +3761,24 @@ class PredictFeed:
         self.ladders: dict[str, list[LadderRow]] = {}            # item key -> one row per market, by threshold
         self.fees: dict[str, tuple[int | None, float]] = {}      # market id -> (feeRateBps or None, when read)
         self.refreshed = -1e9
+        self.gate = asyncio.Semaphore(PREDICT_PARALLEL)          # requests in flight: the other feeds share the thread pool
+        self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
 
     def headers(self) -> dict[str, str]:
         return {"x-api-key": self.config.predict_api_key} if self.config.predict_api_key else {}
 
     async def fetch(self, url: str, payload: dict | None = None) -> Any:
-        raw = await _blocking(_http_get, url, payload, SOURCE_TIMEOUT, self.headers() if url.startswith(PREDICT_REST) else {})
+        """One Predict request, at most PREDICT_PARALLEL at a time; a 429 (or any retry_after) pauses them all."""
+        left = self.blocked_until - time.monotonic()
+        if left > 0:
+            raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
+        async with self.gate:
+            try:
+                raw = await _blocking(_http_get, url, payload, SOURCE_TIMEOUT, self.headers() if url.startswith(PREDICT_REST) else {})
+            except RemoteError as error:
+                if error.retry_after or "429" in str(error):
+                    self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, PREDICT_BACKOFF_SECONDS))
+                raise
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -3969,6 +3999,8 @@ class PredictFeed:
         """targets: item key -> slug. False = not due yet."""
         if not force and time.monotonic() - self.refreshed < self.config.predict_poll:
             return False
+        if (left := self.blocked_until - time.monotonic()) > 0:
+            return Refreshed("failed", f"Predict 接口限流，冷却 {int(left) + 1} 秒后再试（盘口暂按上次结果显示）")
         self.refreshed = time.monotonic()
         for key in list(self.books):
             if targets.get(key) != self.books[key].slug:
@@ -6110,10 +6142,40 @@ class SimMarket:
     hold: str                # why the card suggests nothing now ("" = it may)
     sides: tuple[str, str]   # the card's names for the two sides: (涨, 跌), (Yes, No), ($3k, $1k)
     settle: dict             # what deciding the result needs
-    evidence: dict = field(default_factory=dict)  # what the odds rest on: model inputs, price sources, proxy / anchor
+    evidence: Mapping = field(default_factory=dict)  # what the odds rest on (model inputs, price sources, proxy / anchor); a
+    # LazyEvidence builds it on first access, i.e. when a trade is opened or filled, not on every look at every market
     makers: bool = True      # paper-trading maker orders (price ladders remain taker-only)
     maker_alerts: bool = False  # price ladders: separately gated maker opportunities, independent of taker alerts
     maker_note: str = ""     # why a price-ladder maker suggestion is unavailable
+
+
+class LazyEvidence(Mapping):
+    """A read-only mapping whose contents are built by ``build`` on first access. A failure never stops a trade: it is
+    kept as the record ({"error": ...})."""
+
+    def __init__(self, build: Any):
+        self._build, self._data = build, None
+
+    def _load(self) -> dict:
+        if self._data is None:
+            try:
+                built = self._build()
+                self._data = built if isinstance(built, dict) else {}
+            except Exception as error:
+                self._data = {"error": clean_error(error) or type(error).__name__}
+        return self._data
+
+    def __getitem__(self, key: str) -> Any:
+        return self._load()[key]
+
+    def __iter__(self) -> Any:
+        return iter(self._load())
+
+    def __len__(self) -> int:
+        return len(self._load())
+
+    def __repr__(self) -> str:
+        return repr(self._load())
 
 
 SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": "月度涨跌", "flip": "反超", "range": "价格阶梯",
@@ -7105,10 +7167,10 @@ document.getElementById("reset").addEventListener("click",e=>{const b=e.currentT
   order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;folded=[];oneRow=[];
   ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","folded","oneRow"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
-let loading=null;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
+let loading=null,lastSig="",dead=false;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
 const LOAD_TIMEOUT_MS=8000;
 function load(){
-  if(loading)return loading;
+  if(loading||dead)return loading;
   const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),LOAD_TIMEOUT_MS);
   loading=(async()=>{try{
     const r=await fetch(location.pathname.replace(/\\/$/,"")+"/data.json",{cache:"no-store",signal:ctl.signal});
@@ -7116,13 +7178,15 @@ function load(){
     const d=await r.json();if(d.server_ms)skew=d.server_ms-Date.now();fetchedAt=okAt=Date.now();failMsg="";style=d.color_style||"cn";
     if(last)for(const it of d.items){const k=favKey(it),o=last.items.find(x=>favKey(x)===k);  // a fair price that moved since the last refresh
       if(o&&o.fair_up!=null&&it.fair_up!=null&&Math.abs(o.fair_up-it.fair_up)>=5e-4)changedAt[k]={at:Date.now(),up:it.fair_up>o.fair_up}}
-    last=d;render(d);
+    const sig=JSON.stringify(d.items),same=!!last&&sig===lastSig;lastSig=sig;  // books move every 15 s, quotes every 30 s: most 10-second
+    last=d;if(!same)render(d);                                                  // answers repeat the last one, and a repeat rebuilds nothing
     const ago=$("span","","");ago.id="ago";
     document.getElementById("meta").replaceChildren(...(d.today?[$("span","","今天 "+d.today)]:[]),$("span","","数据 "+d.generated_at),ago,$("span","","基准 "+d.mode),$("span","","v"+d.version));
-    drawLegend();
+    if(!same)drawLegend();
     document.getElementById("foot").textContent=d.note;tick();
   }catch(e){failMsg=e.name==="AbortError"?"超过 "+LOAD_TIMEOUT_MS/1000+" 秒没有响应":(e.message||"网络错误");
-    if(!okAt){document.getElementById("meta").replaceChildren($("span","warn","刷新失败："+failMsg+"，稍后自动重试"));document.querySelectorAll(".skel").forEach(e=>e.remove())}drawStale()}
+    if(e.message==="HTTP 404"){dead=true;failMsg="这个链接已失效（令牌已更换或网页已关闭）：请在 Telegram 重新发送 /web 取得新链接；本页不再自动刷新"}
+    if(!okAt){document.getElementById("meta").replaceChildren($("span","warn","刷新失败："+failMsg+(dead?"":"，稍后自动重试")));document.querySelectorAll(".skel").forEach(e=>e.remove())}drawStale()}
   finally{clearTimeout(timer);loading=null}})();
   return loading}
 function drawBar(){  // the filter chips, the sort and the trade size, as this browser keeps them
@@ -7237,6 +7301,7 @@ const CENT_KEYS=new Set(["fair_up"]);
 let data=null,stateF="all",wayF="all",kindF="all",openId=decodeURIComponent(location.hash.slice(1)||"");
 const base=location.pathname.replace(/\/journal\/?$/,"");
 document.getElementById("back").href=base;
+document.getElementById("csv").href=base+"/journal.csv";document.getElementById("json").href=base+"/journal.json";  // also right under /journal/
 function val(k,v){if(v==null||v==="")return"—";if(typeof v==="boolean")return v?"是":"否";
   if(MS_KEYS.has(k))return v?when(v):"—";if(k==="high_at")return v?when(v*1000):"—";if(CENT_KEYS.has(k))return cent(v);
   if(k==="sigma_daily"||k==="sigma")return (v*100).toFixed(2)+"%";if(k==="history")return JSON.stringify(v);
@@ -7338,11 +7403,19 @@ function render(){
   tiles();groups();filters();
   const list=document.getElementById("list"),shown=data.trades.filter(t=>(stateF==="all"||cat(t)===stateF)&&(wayF==="all"||(wayF==="maker")===t.maker)&&(kindF==="all"||t.kind===kindF));
   list.replaceChildren(...(shown.length?shown.map(row):[$("p","mut",data.trades.length?"没有符合条件的交易":"还没有模拟交易")]))}
+let okAt=0,dead=false;
+function two(n){return String(n).padStart(2,"0")}
 async function load(){
-  try{const r=await fetch(base+"/journal.json",{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();
+  if(dead||load.busy)return;load.busy=true;
+  try{const r=await fetch(base+"/journal.json",{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();okAt=Date.now();
     document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"));
     render();const o=openId&&document.querySelector(".tr.open");if(o&&!load.done)o.scrollIntoView({block:"start"});load.done=true}
-  catch(e){document.getElementById("meta").replaceChildren($("span","bad","读取失败："+e.message))}}
+  catch(e){const at=okAt?new Date(okAt):null,hms=at?two(at.getHours())+":"+two(at.getMinutes())+":"+two(at.getSeconds()):"";
+    if(e.message==="HTTP 404")dead=true;
+    document.getElementById("meta").replaceChildren($("span","bad","⚠️ 读取失败："+(dead?"链接已失效，请在 Telegram 重新发送 /web；本页不再自动刷新":e.message)+
+      (okAt?"；下面显示的是 "+hms+" 的旧数据":"")))}
+  finally{load.busy=false}}
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once
 const THEMES={auto:["◐","自动"],light:["☀","浅色"],dark:["☾","深色"]};let theme="auto";try{const t=JSON.parse(localStorage.getItem("theme"));if(typeof t==="string"&&Object.prototype.hasOwnProperty.call(THEMES,t))theme=t}catch(e){}
 function applyTheme(){const r=document.documentElement;if(theme==="auto")delete r.dataset.theme;else r.dataset.theme=theme;const b=document.getElementById("theme");b.textContent=THEMES[theme][0]+" "+THEMES[theme][1];b.title="主题："+THEMES[theme][1]+"（点击切换）"}
 document.getElementById("theme").addEventListener("click",()=>{const ks=Object.keys(THEMES);theme=ks[(ks.indexOf(theme)+1)%ks.length];try{localStorage.setItem("theme",JSON.stringify(theme))}catch(e){}applyTheme()});applyTheme();
@@ -7376,10 +7449,29 @@ class WebServer:
     """
     MAX_HEADER_BYTES = 8192
     GZIP_MIN_BYTES = 512  # below this a gzip header costs about as much as it saves
+    CACHE_SECONDS = {"data.json": 2.0, "journal.json": 5.0}  # several tabs (or a scanner) share one build per interval
 
     def __init__(self, bot: "Bot", port: int, token: str):
         self.bot, self.port, self.token = bot, port, token
         self.server: asyncio.base_events.Server | None = None
+        self.pages = {"page": WEB_PAGE.encode("utf-8"), "journal": JOURNAL_PAGE.encode("utf-8")}
+        self.cache: dict[str, tuple[float, bytes]] = {}  # name -> (expires, body): the JSON is built once per interval
+        self.gzipped: dict[bytes, bytes] = {body: gzip.compress(body, compresslevel=9) for body in self.pages.values()}
+
+    def cached(self, name: str, build: Any) -> bytes:
+        entry = self.cache.get(name)
+        if entry is None or time.monotonic() >= entry[0]:
+            entry = self.cache[name] = (time.monotonic() + self.CACHE_SECONDS.get(name, 0.0), build())
+        return entry[1]
+
+    def compressed(self, body: bytes) -> bytes:
+        """gzip of ``body``, computed once per distinct body (the pages forever, a JSON answer for its cache interval)."""
+        found = self.gzipped.get(body)
+        if found is None:
+            if len(self.gzipped) > 8:
+                self.gzipped = {page: self.gzipped[page] for page in self.pages.values()}
+            found = self.gzipped[body] = gzip.compress(body, compresslevel=6)
+        return found
 
     async def start(self) -> int:
         self.server = await asyncio.start_server(self.handle, "0.0.0.0", self.port)
@@ -7398,17 +7490,18 @@ class WebServer:
         if path in {"/", "/health"}:
             return 200, "text/plain; charset=utf-8", b"ok"
         parts = path.strip("/").split("/")
-        if len(parts) in {2, 3} and parts[0] == "p" and hmac.compare_digest(parts[1], self.token):
+        # (compare_digest needs ASCII on both sides: a scanner's odd bytes are simply not the token)
+        if len(parts) in {2, 3} and parts[0] == "p" and parts[1].isascii() and hmac.compare_digest(parts[1], self.token):
             if len(parts) == 2:
-                return 200, "text/html; charset=utf-8", WEB_PAGE.encode("utf-8")
+                return 200, "text/html; charset=utf-8", self.pages["page"]
             if parts[2] == "data.json":
-                body = json.dumps(self.bot.odds_payload(), ensure_ascii=False, default=str).encode("utf-8")
-                return 200, "application/json; charset=utf-8", body
+                return 200, "application/json; charset=utf-8", self.cached(
+                    "data.json", lambda: json.dumps(self.bot.odds_payload(), ensure_ascii=False, default=str).encode("utf-8"))
             if parts[2] == "journal":
-                return 200, "text/html; charset=utf-8", JOURNAL_PAGE.encode("utf-8")
+                return 200, "text/html; charset=utf-8", self.pages["journal"]
             if parts[2] == "journal.json":
-                body = json.dumps(self.bot.journal_payload(), ensure_ascii=False, default=str).encode("utf-8")
-                return 200, "application/json; charset=utf-8", body
+                return 200, "application/json; charset=utf-8", self.cached(
+                    "journal.json", lambda: json.dumps(self.bot.journal_payload(), ensure_ascii=False, default=str).encode("utf-8"))
             if parts[2] == "journal.csv":
                 return 200, "text/csv; charset=utf-8", self.bot.journal_csv().encode("utf-8")
         return 404, "text/plain; charset=utf-8", b"not found"
@@ -7429,7 +7522,7 @@ class WebServer:
             status, ctype, body, method, gzip_ok = 500, "text/plain; charset=utf-8", b"error", "GET", False
         encoding = ""
         if gzip_ok and status == 200 and len(body) >= self.GZIP_MIN_BYTES:
-            body, encoding = gzip.compress(body, compresslevel=6), "Content-Encoding: gzip\r\n"
+            body, encoding = self.compressed(body), "Content-Encoding: gzip\r\n"
         reason = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed", 500: "Internal Server Error"}[status]
         headers = (f"HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n{encoding}"
                    "Vary: Accept-Encoding\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
@@ -7948,6 +8041,11 @@ class Bot:
         self.deliveries: dict[str, asyncio.Task] = {}  # Telegram sends in flight, by alert / notice key
         self.faults: dict[tuple[str, str], float] = {}  # (subscription, data item) -> when its current fault began
         self.reply_seq = 0  # command replies get their own delivery keys
+        self.sim_cache: dict[str, dict] | None = None  # in-memory view of the sim: records (sim_trades)
+        self.sim_gen = -1
+        self.notice_cache: dict[str, dict] | None = None  # in-memory view of the notice: records
+        self.notice_gen = -1
+        self.pred_pruned = 0.0  # when old prediction snapshots were last pruned
         self.vol_errors: dict[str, str] = {}  # symbol -> why its exchange daily bars could not be read (σ is the prior)
         self.stopping = asyncio.Event()
         self.started = time.time()
@@ -8155,7 +8253,7 @@ class Bot:
             since = self.faults.setdefault((sub_id, key), now)
             if now - since < NOTICE_GRACE_SECONDS:
                 return
-            old = self.store.get(record_key, {})
+            old = self.notice_records().get(record_key, {})
             if old.get("active") and now - old.get("sent", 0) < 1800:
                 return
             lasting = f"已持续 {int((now - since) // 60)} 分钟｜" if now - since >= 60 else ""
@@ -8163,7 +8261,7 @@ class Bot:
             state = {"active": True, "sent": now}
         else:
             self.faults.pop((sub_id, key), None)
-            old = self.store.get(record_key, {})
+            old = self.notice_records().get(record_key, {})
             if not old.get("active"):
                 return
             text, state = f"✅ 数据恢复｜{key}\n后续按当前基准继续监控。", {"active": False, "sent": now}
@@ -8172,6 +8270,15 @@ class Bot:
             if await self.tell(sub["chat"], sub["thread"], text):
                 self.store.put(record_key, state)
         self.deliver(record_key, send)
+
+    def notice_records(self) -> dict[str, dict]:
+        """notice:* records as an in-memory view (read every cycle for every subscription and contract), refreshed
+        whenever one is written or deleted."""
+        generation = self.store.touched.get("notice", 0)
+        if self.notice_cache is None or self.notice_gen != generation:
+            self.notice_cache = {k: v for k, v in self.store.items("notice:") if isinstance(v, dict)}
+            self.notice_gen = generation
+        return self.notice_cache
 
     def parse_request(self, message: dict) -> Request | None:
         """Return the command in ``message`` when it is addressed to this bot, else None."""
@@ -8588,6 +8695,13 @@ class Bot:
                 "ref_raw": float(raw.ref), "up_raw": raw.fair_up, "strike": float(shown.ref) if shown.ref != raw.ref else None,
                 "move": raw.move, "beta": raw.beta, "sigma": raw.sigma_daily, "R": raw.remaining, "proxy": raw.proxy_note,
                 "slug": slug, "url": predict_url(slug, self.config.predict_ref) if slug else ""})
+        if time.time() - self.pred_pruned > 86400:  # the snapshots are kept PRED_KEEP_DAYS, not forever
+            self.pred_pruned = time.time()
+            cutoff = now_ms - PRED_KEEP_DAYS * DAY_MS
+            old = [k for k in self.store.keys("pred:") if k.rsplit(":", 1)[-1].isdigit() and int(k.rsplit(":", 1)[-1]) < cutoff]
+            if old:
+                self.store.delete_keys(old)
+                LOG.info("pruned %s prediction snapshots older than %s days", len(old), PRED_KEEP_DAYS)
         if self.cn.close:
             self.note_outcome("SSE", self.cn.close.day.isoformat(), self.cn.close.value, self.cn.close.source)
         k = self.kospi.quote
@@ -9276,7 +9390,22 @@ class Bot:
     SIM_SETTLE_MS = 60 * 60_000       # a daily market is settled this long after its close: the official close is in
 
     def sim_trades(self) -> dict[str, dict]:
-        return {k.removeprefix("sim:"): sim_upgrade(v) for k, v in self.store.items("sim:") if isinstance(v, dict) and "status" in v}
+        """Every paper trade, from an in-memory view of the store (the journal page and the sim step would otherwise parse
+        every record's JSON on every look); any write to a sim: record, by whoever, refreshes the view."""
+        generation = self.store.touched.get("sim", 0)
+        if self.sim_cache is None or self.sim_gen != generation:
+            self.sim_cache = {k.removeprefix("sim:"): sim_upgrade(v) for k, v in self.store.items("sim:")
+                              if isinstance(v, dict) and "status" in v}
+            self.sim_gen = generation
+        return dict(self.sim_cache)
+
+    def sim_save(self, pairs: Any) -> None:
+        """Persist (trade id, trade) pairs in one transaction and keep the in-memory view current."""
+        pairs = list(pairs)
+        self.store.put_many((f"sim:{tid}", trade) for tid, trade in pairs)
+        if self.sim_cache is not None:
+            self.sim_cache.update(pairs)
+        self.sim_gen = self.store.touched.get("sim", 0)
 
     def note_outcome(self, key: str, day: str, value: Any, source: str) -> None:
         """An official close as it becomes known (scored by /calib, settles the paper trades), with where it came from."""
@@ -9441,12 +9570,14 @@ class Bot:
                 "fee_bps": c.predict_fee_bps, "trade_usd": c.predict_trade_usd, "a50_beta": c.a50_beta,
                 "kospi_beta": c.kospi_beta, "sigma_error": MODEL_SIGMA_ERROR, "beta_error": MODEL_BETA_ERROR}
 
-    def evidence(self, build: Any) -> dict:
-        """An evidence record never stops a trade: a failure is kept as the record."""
-        try:
-            return build()
-        except Exception as error:
-            return {"error": clean_error(error) or type(error).__name__}
+    def evidence(self, build: Any) -> "LazyEvidence":
+        """A SimMarket's evidence, built on first access: when a trade is opened or filled, not for every market on
+        every look of the paper trader, the alerts and the journal page."""
+        return LazyEvidence(build)
+
+    @staticmethod
+    def evidence_of(mk: SimMarket) -> dict:
+        return dict(mk.evidence)
 
     def sim_markets(self, now_ms: int) -> list[SimMarket]:
         """Every Predict market a card prices right now, with the bar its suggestion must clear and why it holds back."""
@@ -9548,7 +9679,7 @@ class Bot:
                  "order": self.config.sim_shares, "fills": [], "revisions": [],
                  "entry": {"at": now_ms, "fair": fair, "fair_up": mk.fair_up, "need": mk.need, "book": book_snapshot(mk.book),
                            "card": [edge_json(e, shown, e.label.replace("涨", mk.sides[0]).replace("跌", mk.sides[1]))
-                                    for e in edges], **mk.evidence},
+                                    for e in edges], **self.evidence_of(mk)},
                  "version": self.sim_version()}
         if maker is not None:
             queue = next((q for p, q in own_levels(mk.book, side) if abs(p - maker.price) < 1e-9), 0.0)
@@ -9572,7 +9703,7 @@ class Bot:
             return
         fair = mk.fair_up if trade["side"] == "up" else 1 - mk.fair_up
         trade["fills"].append({"at": now_ms, "shares": credited - float(trade["shares"]), "fair": fair, "fair_up": mk.fair_up,
-                               "how": "推定成交", "seen": seen, "book": book_snapshot(mk.book), **mk.evidence})
+                               "how": "推定成交", "seen": seen, "book": book_snapshot(mk.book), **self.evidence_of(mk)})
         trade["shares"] = credited
         if trade.get("filled") is None:
             trade["filled"], trade["fill_fair"] = now_ms, fair
@@ -9801,7 +9932,7 @@ class Bot:
             except Exception as error:
                 for tid in tids:
                     trades[tid]["final_error"] = clean_error(error) or type(error).__name__
-                    self.store.put(f"sim:{tid}", trades[tid])
+                self.sim_save((tid, trades[tid]) for tid in tids)
                 continue
             resolved = details.get("resolved")
             for tid in tids:
@@ -9810,7 +9941,7 @@ class Bot:
                 up = self.resolution_up(trade, resolved) if resolved else None
                 if up is None:
                     trade["final_check"] = {"at": now_ms, "status": details.get("status", ""), "resolved": resolved}
-                    self.store.put(f"sim:{tid}", trade)
+                    self.sim_save([(tid, trade)])
                     continue
                 trade["final"] = {"up": up, "name": resolved.get("name", ""), "how": resolved.get("how", ""), "at": now_ms,
                                   "status": details.get("status", ""), "outcomes": details.get("outcomes", [])}
@@ -9819,7 +9950,7 @@ class Bot:
                 self.sim_settle(trade, up, f"Predict 结算：{resolved.get('name', '')}"
                                 + (f"（本地预结算为 {local['note']}）" if mismatch else ""), now_ms, "Predict 最终结果")
                 trade["confirm"] = "mismatch" if mismatch else "confirmed"
-                self.store.put(f"sim:{tid}", trade)
+                self.sim_save([(tid, trade)])
 
     async def sim_step(self, now_ms: int) -> "Refreshed | bool":
         """Paper trading: whenever a card suggests a trade whose net edge reaches SIM_EDGE_CENTS, buy SIM_SHARES of it.
@@ -9837,6 +9968,7 @@ class Bot:
         trades = self.sim_trades()
         costs, bar = self.edge_costs(), self.config.sim_edge
         ways, kinds = self.config.sim_ways, self.config.sim_markets
+        changed: list[tuple[str, dict]] = []  # written once, in one transaction
         for mk in markets.values():
             if mk.hold or mk.book.stale(now_ms) or mk.kind not in kinds or book_crossed(mk.book):
                 continue  # positions filled in other kinds (SIM_MARKETS narrowed) still settle below; resting ones are withdrawn
@@ -9847,7 +9979,7 @@ class Bot:
                 tid = f"{mk.market}|{side}|挂"
                 if tid not in trades:  # one position per market, side and way of trading, however long the edge lasts
                     trades[tid] = self.sim_open(mk, side, now_ms, maker=maker)
-                    self.store.put(f"sim:{tid}", trades[tid])
+                    changed.append((tid, trades[tid]))
             bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
             quotes = []
             for side in ("up", "down") if ways != "maker" else ():
@@ -9863,8 +9995,11 @@ class Bot:
                 tid = f"{mk.market}|{side}|吃"
                 if tid not in trades:
                     trades[tid] = self.sim_open(mk, side, now_ms, taker=q)
-                    self.store.put(f"sim:{tid}", trades[tid])
+                    changed.append((tid, trades[tid]))
+        opened = {tid for tid, _ in changed}
         for tid, trade in trades.items():
+            if trade.get("final") or tid in opened:
+                continue  # settled and confirmed: nothing below applies (and no JSON round trip for it every 10 seconds)
             before = json.dumps(trade, sort_keys=True, default=str)
             mk = markets.get(trade["market"])
             if trade["status"] == "resting":
@@ -9883,7 +10018,9 @@ class Bot:
                     self.sim_settle(trade, up, note, now_ms, "本地数据更正" if local else "本地预结算")
                     trade["confirm"] = "local"
             if json.dumps(trade, sort_keys=True, default=str) != before:
-                self.store.put(f"sim:{tid}", trade)
+                changed.append((tid, trade))
+        if changed:
+            self.sim_save(changed)
         await self.sim_confirm(trades, now_ms)
         return Refreshed("ok")
 
@@ -10692,7 +10829,6 @@ class Bot:
                                           self.a50_anchor_note))
             lines.append(self.odds_row(self.sse_odds(now_ms), "上证"))
         lines = [line for line in lines if line]
-        lines = [line for line in lines if line]
         for symbol in self.config.symbols:
             snapshot = self.snapshots.get(symbol)
             lines.append("\n" + bold(f"📍 {NAMES.get(symbol, symbol)}｜{symbol}"))
@@ -10716,8 +10852,7 @@ class Bot:
                 rows.append(self.hl_line(symbol, quote.price))
             rows.append(self.odds_row(self.contract_odds(symbol, quote.price, now_ms)))
             lines.extend(tree(rows))
-        used = tuple(dict.fromkeys(STOCK_MARKETS[t.market].currency for t in self.config.tickers.values()
-                                   if not t.same_unit or True))
+        used = tuple(dict.fromkeys(STOCK_MARKETS[t.market].currency for t in self.config.tickers.values()))
         lines.append("\n💱 " + self.fx.summary(used or ("CNY", "HKD", "KRW")))
         lines.append("仅价格提醒；不会自动撤单/交易。")
         return "\n".join(lines)
@@ -10800,11 +10935,8 @@ class Bot:
                     self.notice(sub_id, sub, symbol, error)
                     continue
                 self.notice(sub_id, sub, symbol, None)
-                if self.settings() != settings:
-                    return
-                current_sub = self.subscriptions().get(sub_id)
-                if not current_sub or not current_sub.get("active"):
-                    break
+                # (nothing here awaits: the settings and subscriptions read at the start still hold; the delivery re-checks
+                # both right before it sends)
                 quote: Quote = snapshot["quote"]
                 base: Baseline = snapshot["baseline"]
                 current_ms = self.market.now_ms()
@@ -11381,6 +11513,9 @@ class Bot:
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, self.stopping.set)
+        # Binance, Telegram and the long poll share the default pool; on a one-core box Python gives it 5 threads, and at
+        # a day change several contracts' candle requests would then queue the Telegram sends behind them.
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=16, thread_name_prefix="io"))
         self.start_reference_tasks()
         core = [asyncio.create_task(self.monitor_loop(), name="monitor"),
                 asyncio.create_task(self.commands_loop(), name="commands")]
