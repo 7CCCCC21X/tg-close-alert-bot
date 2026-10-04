@@ -156,10 +156,17 @@ async def run():
     # the best level alone clears the bar, the 100 shares do not (10 at 58¢, 90 at 69¢): no trade
     await step(bot, NOW + 80_000, same([("0.58", "10"), ("0.69", "1000")], NOW + 80_000, "shallow"))
     assert "shallow|up|吃" not in bot.sim_trades()
-    # a thin book fills what it holds, and says so
-    await step(bot, NOW + 90_000, same([("0.58", "40")], NOW + 90_000, "thin"))
+    # a thin book fills what it holds (at least half the order), and says so
+    await step(bot, NOW + 90_000, same([("0.58", "60")], NOW + 90_000, "thin"))
     t = bot.sim_trades()["thin|up|吃"]
-    assert t["shares"] == 40 and t["order"] == 100 and t["fills"][0]["short"], t
+    assert t["shares"] == 60 and t["order"] == 100 and t["fills"][0]["short"], t
+    # a few dust shares at a stray price are not the trade: nothing is bought, the slot stays free for the real one
+    await step(bot, NOW + 95_000, same([("0.58", "5")], NOW + 95_000, "dust"))
+    assert "dust|up|吃" not in bot.sim_trades()
+    # a crossed snapshot (bid at or above ask) is not a book anyone could trade: neither way opens on it
+    crossed = m.SimMarket("x", "x", "close", "X", 0.70, book([("0.60", "100")], [("0.58", "100")], NOW + 97_000, "x", mid="x"), 0.03, "", ("涨", "跌"), {})
+    await step(bot, NOW + 97_000, crossed)
+    assert not [k for k in bot.sim_trades() if k.startswith("x|")] and m.book_crossed(crossed.book)
     # a stale book or a card that holds back: no new trade and no fill read from it
     await step(bot, NOW + 100_000, m.dataclasses.replace(same([("0.40", "100")], NOW - 200_000, "stale"), market="stale"),
                m.dataclasses.replace(hsi(0.80, [("0.50", "100")], [("0.52", "100")], NOW + 100_000, hold="期货锚点是近似值"), market="held"))
@@ -467,6 +474,7 @@ async def run():
     assert m.SIM_MAKER_SPREAD == 0.10 and m.sim_maker_block(book([("0.55", "100")], [("0.58", "100")])) == ""
     assert m.sim_maker_block(book([("0.55", "100")], [])) == "盘口只有一边" and m.sim_maker_block(book([], [("0.58", "100")])) == "盘口只有一边"
     assert m.sim_maker_block(book([("0.003", "50")], [("0.80", "100")])) == "买卖价差 79.7¢ 超过 10.0¢"
+    assert m.sim_maker_block(book([("0.60", "50")], [("0.58", "100")])).startswith("盘口交叉") and not m.book_crossed(book([("0.55", "1")], [("0.58", "1")]))
     gbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
                                     "SIM_WAYS": "both", "SIM_MARKETS": "all"}), m.Store(":memory:"), FM(NOW), None)
     gbot.sim_markets = lambda now: world["markets"]

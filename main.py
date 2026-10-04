@@ -4205,6 +4205,8 @@ class TouchMarket:
                 self.times["price"] = mono
                 data = await self.get("ticker/price", symbol=self.spec.symbol)
                 self.price, self.priced_ms = number(data["price"], "BNB"), now_ms
+                if (self.price <= self.spec.low or self.price >= self.spec.high) and self.history.get("kind") in {None, "clear"}:
+                    self.times["scan"] = -1e9  # the price is at a line right now: check the path at once, not in 5 minutes
             if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
                 self.times["vol"] = mono
                 # 722: the newest bar is the hour still running, which realized_vol drops; 721 finished bars remain
@@ -4250,6 +4252,14 @@ class TouchMarket:
             cursor = int(done[-1][6]) + 1
             if len(rows) < 1000:
                 break
+        if end == now_ms and cursor <= now_ms:
+            # The hour still running: its closed minutes are checked as well, so a spike is seen within SCAN_SECONDS of
+            # its minute rather than up to an hour later when the bar closes (Predict settles at once). The "through"
+            # mark stays at the hour's start: the hourly pass covers the hour once it has closed.
+            result = await self.peek(cursor, now_ms)
+            if result:
+                self.store.put(f"touch:{self.spec.slug}", {**result, "start": self.start_ms})
+                return
         if now_ms >= self.window_end and cursor < self.window_end:
             # past the deadline: the rest of the window, minute by minute, through the deadline's minute
             rows = await self.get("klines", symbol=self.spec.symbol, interval="1m", startTime=cursor,
@@ -4271,6 +4281,23 @@ class TouchMarket:
             elif minutes:
                 cursor = max(cursor, max(int(r[6]) for r in minutes) + 1)  # read this far; the rest next time
         self.store.put(f"touch:{self.spec.slug}", {"kind": "clear", "through": cursor, "start": self.start_ms})
+
+    async def peek(self, start: int, now_ms: int) -> dict | None:
+        """The closed minutes from ``start`` (inside the hour still running) up to now: a line reached in one of them
+        is a hit like any other; the minute still forming decides nothing."""
+        rows = await self.get("klines", symbol=self.spec.symbol, interval="1m", startTime=start, endTime=now_ms, limit=60)
+        low, high = float(self.spec.low), float(self.spec.high)
+        for row in rows:
+            if not (isinstance(row, list) and len(row) > 6):
+                continue
+            opened, closed, hi, lo = int(row[0]), int(row[6]), float(row[2]), float(row[3])
+            if closed > now_ms or closed < start or opened > self.spec.deadline_ms:
+                continue
+            hit_low, hit_high = lo <= low, hi >= high
+            if hit_low or hit_high:
+                kind = "ambiguous" if (hit_low and hit_high) or opened < self.start_ms else "low" if hit_low else "high"
+                return {"kind": kind, "time": opened, "hi": hi, "lo": lo}
+        return None
 
     def verified_clear(self) -> bool:
         """The whole window, through the deadline's minute, has been read and neither line was reached."""
@@ -5424,15 +5451,17 @@ def deadline_from_text(texts: list[str], after_ms: int) -> int:
     of) December", "截止于 12 月 31 日", "2026-12-31". A date without a year is the first such date on or after after_ms (the
     market's creation). The first text that names one wins; 0 when none does."""
     since = et_date(after_ms) if after_ms else dt.date.today()
-    month = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+    # whole month words only: "before MARket close" and "by DECision of the committee" name no month
+    month = (r"(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|"
+             r"october|oct|november|nov|december|dec)\b\.?")
     patterns = [
         (r"(20\d\d)-(\d\d)-(\d\d)", lambda g: (int(g[0]), int(g[1]), int(g[2]))),
         (r"(20\d\d)\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", lambda g: (int(g[0]), int(g[1]), int(g[2]))),
         (r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", lambda g: (0, int(g[0]), int(g[1]))),
         (r"(?i)\b(?:by|before|until|through)\s+(?:the\s+)?(?:end\s+of\s+)?" + month + r"\s*(\d{1,2})?(?:st|nd|rd|th)?,?\s*(20\d\d)?",
-         lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()], int(g[1]) if g[1] else 0)),
+         lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()[:3]], int(g[1]) if g[1] else 0)),
         (r"(?i)\b" + month + r"\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(20\d\d)?",
-         lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()], int(g[1]))),
+         lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()[:3]], int(g[1]))),
     ]
     for text in texts:
         for pattern, pick in patterns:
@@ -5596,6 +5625,19 @@ def book_disputes(book: "PredictBook | None") -> bool:
     if book is None or not (book.bids or book.asks):
         return False
     return max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0) < 0.9
+
+
+def book_decided(book: "PredictBook | None") -> str:
+    """The market is trading as if its question were already answered: "up" when the Yes side is bid at 90¢ or more,
+    "down" when it is offered at 10¢ or less, else "". Against a model that still sees an open question, that is the
+    market knowing something (a spike the path check has not reached yet), not a 49¢ edge."""
+    if book is None:
+        return ""
+    if book.bid and float(book.bid[0]) >= 0.9:
+        return "up"
+    if book.ask and float(book.ask[0]) <= 0.1:
+        return "down"
+    return ""
 
 
 async def binance_futures(path: str, **params: Any) -> Any:
@@ -6080,12 +6122,21 @@ SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": 
 # 0.2¢ bid under an 80¢ ask is not a quote anyone sells into: an order joining it would rest until the result and tell
 # nothing (10-03: 54 such price-ladder orders sat as 挂单中 0/100 for weeks).
 SIM_MAKER_SPREAD = 0.10
+SIM_MIN_FILL = 0.5  # a taker buys only when the book fills at least this share of SIM_SHARES (dust is not a trade)
+
+
+def book_crossed(book: PredictBook) -> bool:
+    """Bid at or above ask: a snapshot caught mid-update (or a broken feed), not a book anyone could trade."""
+    return bool(book.bid and book.ask and float(book.bid[0]) >= float(book.ask[0]) - 1e-9)
 
 
 def sim_maker_block(book: PredictBook, spread: float = SIM_MAKER_SPREAD) -> str:
-    """Why no resting paper order is placed on this book (one-sided, or a spread wider than ``spread``); "" when it may be."""
+    """Why no resting paper order is placed on this book (one-sided, crossed, or a spread wider than ``spread``); ""
+    when it may be."""
     if not book.bid or not book.ask:
         return "盘口只有一边"
+    if book_crossed(book):
+        return "盘口交叉（买价不低于卖价），快照不可信"
     gap = float(book.ask[0]) - float(book.bid[0])
     if gap > spread + 1e-9:
         return f"买卖价差 {cents(gap)} 超过 {cents(spread)}"
@@ -7351,7 +7402,7 @@ class WebServer:
             if len(parts) == 2:
                 return 200, "text/html; charset=utf-8", WEB_PAGE.encode("utf-8")
             if parts[2] == "data.json":
-                body = json.dumps(self.bot.odds_payload(), ensure_ascii=False).encode("utf-8")
+                body = json.dumps(self.bot.odds_payload(), ensure_ascii=False, default=str).encode("utf-8")
                 return 200, "application/json; charset=utf-8", body
             if parts[2] == "journal":
                 return 200, "text/html; charset=utf-8", JOURNAL_PAGE.encode("utf-8")
@@ -7374,7 +7425,7 @@ class WebServer:
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ValueError):
             status, ctype, body, method, gzip_ok = 400, "text/plain; charset=utf-8", b"bad request", "GET", False
         except Exception as error:  # Never let a page request touch the bot's loops.
-            LOG.warning("web request failed: %s", clean_error(error))
+            self.bot.log_limited("web", f"web request failed: {clean_error(error) or type(error).__name__}")
             status, ctype, body, method, gzip_ok = 500, "text/plain; charset=utf-8", b"error", "GET", False
         encoding = ""
         if gzip_ok and status == 200 and len(body) >= self.GZIP_MIN_BYTES:
@@ -9024,14 +9075,16 @@ class Bot:
                 "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down,
             })
-        if self.config.touch:
-            items.extend(self.touch_payload(t, now_ms) for t in self.touches.values())
-            items.extend(self.updown_payload(u, now_ms) for u in self.updowns.values())
-            items.extend(self.flip_payload(f, now_ms) for f in self.flips.values())
-            items.extend(self.range_payload(r, now_ms) for r in self.ranges.values())
-            items.extend(self.cap_payload(c, now_ms) for c in self.caps.values())
+        if self.config.touch:  # one broken card must not take the whole page down with it
+            items.extend(self.safe_card(f"{t.spec.symbol.removesuffix('USDT')} 先触", t.spec.key, "crypto", self.touch_payload, t, now_ms)
+                         for t in self.touches.values())
+            items.extend(self.safe_card(u.spec.name, u.spec.key, "crypto", self.updown_payload, u, now_ms) for u in self.updowns.values())
+            items.extend(self.safe_card(f.spec.name, f.spec.key, "crypto", self.flip_payload, f, now_ms) for f in self.flips.values())
+            items.extend(self.safe_card(r.spec.name, r.spec.key, "crypto", self.range_payload, r, now_ms) for r in self.ranges.values())
+            items.extend(self.safe_card(c.spec.name, c.spec.key, "crypto", self.cap_payload, c, now_ms) for c in self.caps.values())
         if self.config.sim and self.config.predict:
-            items.append({"name": "模拟交易", "symbol": "SIM", "group": "sim", "kind": "sim", "sim": self.sim_report()})
+            items.append(self.safe_card("模拟交易", "SIM", "sim", lambda: {"name": "模拟交易", "symbol": "SIM", "group": "sim",
+                                                                          "kind": "sim", "sim": self.sim_report()}))
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION, "server_ms": now_ms,
                 "today": f"{today:%m-%d} {WEEKDAYS[today.weekday()]}",
@@ -9040,6 +9093,15 @@ class Bot:
                 "note": ("模型参考，非投资建议。有效价 = 参考收盘 × 代理现价 ÷ 代理在参考收盘时刻的价格；"
                          "P(涨) = 1 − Φ(ln((参考+半跳)/有效)/σ剩余)，平盘两边各计一半。目标日跳过周末和已配置的交易所假期。"
                          if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")}
+
+    def safe_card(self, name: str, key: str, group: str, build: Any, *args: Any) -> dict:
+        """One card's payload, or a placeholder saying it could not be built (logged, rate-limited): a feed changing
+        shape under one card must not turn the whole page into an HTTP 500."""
+        try:
+            return build(*args)
+        except Exception as error:
+            self.log_limited(f"card:{key}", f"网页卡片 {name} 构建失败：{clean_error(error) or type(error).__name__}")
+            return {"name": name, "symbol": key, "group": group, "missing": f"卡片构建失败：{brief_error(clean_error(error) or type(error).__name__, 80)}"}
 
     def touch_book(self, spec: TouchSpec) -> tuple[PredictBook | None, str]:
         """The book priced as "high barrier first" (the card's 涨 side), whatever the market's outcome order."""
@@ -9063,11 +9125,16 @@ class Bot:
         out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
         book, why = self.touch_book(spec)
         odds = touch.odds(now_ms)
+        hold = touch.advice_problem(now_ms) if isinstance(odds, TouchOdds) else ""
+        if isinstance(odds, TouchOdds) and not hold and book is not None and not book.stale(now_ms):
+            decided = book_decided(book)
+            if (decided == "up" and odds.fair_upper < 0.9) or (decided == "down" and odds.fair_upper > 0.1):
+                hold = (f"盘口已把 {high if decided == 'up' else low} 先触当作定局（{'买价 ≥90¢' if decided == 'up' else '卖价 ≤10¢'}），"
+                        "模型尚未核验到这次触线；待核验，暂不给建议")
         if book is not None:
             ok = isinstance(odds, TouchOdds)
             swing = touch.model_swing(now_ms) if ok else 0.0
-            self.book_block(out, book, odds.fair_upper if ok else None, self.edge_need(swing), swing,
-                            touch.advice_problem(now_ms) if ok else "", (high, low), now_ms)
+            self.book_block(out, book, odds.fair_upper if ok else None, self.edge_need(swing), swing, hold, (high, low), now_ms)
         elif why and spec.key in self.predict.books:
             out["error"] = why
         if self.config.predict:
@@ -9084,7 +9151,7 @@ class Bot:
                     "to_high": float(percent(spec.high, price)) if price else 0.0,
                     "sigma": touch.sigma or 0.0, "years": years, "status": touch.status(),
                     "p_low": odds.lower, "p_high": odds.upper, "p_none": odds.none,
-                    "error": touch.error, "hold": touch.advice_problem(now_ms)}}
+                    "error": touch.error, "hold": hold}}
 
     def updown_book(self, spec: UpDownSpec) -> tuple[PredictBook | None, str]:
         """The book priced as "Up" (the card's 涨 side), whatever the market's outcome order."""
@@ -9771,7 +9838,7 @@ class Bot:
         costs, bar = self.edge_costs(), self.config.sim_edge
         ways, kinds = self.config.sim_ways, self.config.sim_markets
         for mk in markets.values():
-            if mk.hold or mk.book.stale(now_ms) or mk.kind not in kinds:
+            if mk.hold or mk.book.stale(now_ms) or mk.kind not in kinds or book_crossed(mk.book):
                 continue  # positions filled in other kinds (SIM_MARKETS narrowed) still settle below; resting ones are withdrawn
             maker = (best_edge([e for e in book_edges(mk.fair_up, mk.book, costs) if e.maker], mk.need)
                      if mk.makers and ways != "taker" else None)
@@ -9786,7 +9853,10 @@ class Bot:
             for side in ("up", "down") if ways != "maker" else ():
                 q = taker_quote(mk.book, side, self.config.sim_shares, bps)
                 fair = mk.fair_up if side == "up" else 1 - mk.fair_up
-                if q and fair - q["cost"] > mk.need and fair - q["cost"] >= bar - 1e-9:  # checked on the fill itself
+                # checked on the fill itself; a few dust shares at a stray price are not the trade the edge is about,
+                # and would hold the market's one position slot against the real opportunity
+                if (q and q["got"] >= self.config.sim_shares * SIM_MIN_FILL - 1e-9
+                        and fair - q["cost"] > mk.need and fair - q["cost"] >= bar - 1e-9):
                     quotes.append((round(fair - q["cost"], 4), side, q))
             if quotes:
                 _, side, q = max(quotes, key=lambda x: x[0])
