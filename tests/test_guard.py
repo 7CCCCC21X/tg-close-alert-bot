@@ -98,3 +98,14 @@ async def run():
 
 
 asyncio.run(run())
+
+# --- small guards: entities and bold tags survive splitting, a thousands separator is not a separator -----------------
+long = "&amp;".join(["x" * 7] * 600)  # cuts would otherwise land inside an entity
+for chunk in m.split_text(long, 100):
+    assert not __import__("re").search(r"&[a-z]*$", chunk) or chunk.endswith(";"), chunk[-10:]
+assert "".join(m.split_text(long, 100)) == long
+assert m.balance_bold(["<b>open", "still open", "closed</b> tail"]) == ["<b>open</b>", "<b>still open</b>", "<b>closed</b> tail"]
+assert m.balance_bold(["<b>a</b>", "b"]) == ["<b>a</b>", "b"]
+entries = m.parse_close_entries("SKHYNIX 258,000 KRW", NOW)
+assert len(entries) == 1 and entries[0].value == D("258000") and entries[0].currency == "KRW", entries
+print("GUARD2_OK")

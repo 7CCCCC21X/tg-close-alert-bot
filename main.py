@@ -2663,7 +2663,7 @@ class CnIndex:
             if self.close is None or day >= self.close.day:  # never step back to an older session
                 self.close = DailyClose(day, close, prev, name, now_ms)
             self.bars = sorted({**dict(self.bars), **dict(bars)}.items())[-60:]
-            self.opens = {**self.opens, **{d: o for d, o, _ in ohlc if o}}
+            self.opens = dict(sorted({**self.opens, **{d: o for d, o, _ in ohlc if o}}.items())[-120:])
             if day >= expected:
                 break  # this answer has the expected close: the next source is not needed
         # a source that answered but lags is not a failure (the bar may simply not be out yet)
@@ -4012,6 +4012,10 @@ class PredictFeed:
             if key not in targets:
                 self.ladders.pop(key)
         self.slugs = dict(targets)
+        keep = set(targets.values())  # yesterday's daily slugs are not kept around for ever
+        for table in (self.markets, self.market_lists, self.strikes, self.types, self.info):
+            for slug in [s for s in table if s not in keep]:
+                table.pop(slug, None)
         await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in targets.items()))
         # a market not listed yet is an answer, not a failure
         failed = [f"{key}：{error}" for key, error in self.errors.items() if key in targets and "还没有这个市场" not in error]
@@ -7731,6 +7735,8 @@ class Telegram:
         chunks = split_text(text)
         if len(chunks) > 1:
             SEND_RENDER.set(None)  # a long message is sent as queued: its parts must come from one rendering
+            if parse_mode == "HTML":
+                chunks = balance_bold(chunks)
         for index, chunk in enumerate(chunks):
             payload: dict[str, Any] = {"chat_id": chat, "text": chunk,
                                       "link_preview_options": {"is_disabled": True}}
@@ -7761,9 +7767,23 @@ def split_text(text: str, limit: int = 3400) -> list[str]:
             break
         cut = remaining.rfind("\n", 0, limit)
         cut = cut if cut > 0 else limit
+        amp = remaining.rfind("&", max(0, cut - 8), cut)  # never cut through an HTML entity (&amp; → &am + p;)
+        if amp >= 0 and remaining.find(";", amp, cut) < 0:
+            cut = amp
         chunks.append(remaining[:cut])
         remaining = remaining[cut:].lstrip("\n")
     return chunks or [""]
+
+
+def balance_bold(chunks: list[str]) -> list[str]:
+    """Close a <b> left open at the end of a chunk and reopen it in the next: Telegram rejects a part with an unmatched tag."""
+    out, open_tag = [], False
+    for chunk in chunks:
+        if open_tag:
+            chunk = "<b>" + chunk
+        open_tag = chunk.count("<b>") > chunk.count("</b>")
+        out.append(chunk + "</b>" if open_tag else chunk)
+    return out
 
 
 def target_from_message(message: dict) -> tuple[int, int]:
@@ -7984,6 +8004,7 @@ def parse_close_entries(raw: str, now_ms: int, command: str = "/setclose") -> li
     Qualifiers before the first symbol apply to every entry that has none of its own.
     Nothing is stored here, so a bad line rejects the whole batch.
     """
+    raw = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", raw)  # 258,000 is one price, not two entries
     today = beijing_day(now_ms / 1000)
     usage = (f"用法：{command} UNITREE 75 [货币 如 HKD] [收盘时间 MM-DD HH:MM] [适用日期 YYYY-MM-DD]\n"
              "批量：每行（或用逗号分隔）一组「合约 价格 [货币] [收盘时间]」，最前面可写统一适用日/收盘时间/货币，例如\n"
@@ -8777,10 +8798,14 @@ class Bot:
             if close is not None:
                 self.note_outcome("HSI", local.date().isoformat(), close, source)
 
+    PRED_FIELDS = frozenset({"key", "t", "target", "mode", "ref", "up", "move", "R", "beta", "sigma"})
+
     def calibration_text(self) -> str:
-        preds = [v for _, v in self.store.items("pred:")]
+        saved = [v for _, v in self.store.items("pred:") if isinstance(v, dict)]
+        preds = [v for v in saved if self.PRED_FIELDS <= v.keys()]  # snapshots from before 1.14 lack the fit's inputs
         outcomes = {k.removeprefix("outcome:"): float(v) for k, v in self.store.items("outcome:")}
-        return "\n".join(["📐 概率模型回测（只评估，不会自动改参数）"] + calibration_report(preds, outcomes))
+        skipped = f"（忽略 {len(saved) - len(preds)} 条旧格式快照）" if len(saved) > len(preds) else ""
+        return "\n".join([f"📐 概率模型回测（只评估，不会自动改参数）{skipped}"] + calibration_report(preds, outcomes))
 
     async def cmd_calib(self, req: Request) -> str:
         return self.calibration_text()
@@ -9931,11 +9956,14 @@ class Bot:
         trade.update(status="settled", payout=payout, note=note, settled=trade.get("settled") or now_ms)
 
     SIM_CONFIRM_SECONDS = 600  # each market's final result is asked of Predict at most this often
+    SIM_GIVE_UP_MS = 7 * DAY_MS  # ...and no longer than this after the local settlement
 
     def sim_due(self, trade: dict, now_ms: int) -> bool:
         """Should Predict have a final result for this trade's market by now (or has the local data decided it)?"""
         if trade.get("final") or trade["status"] in {"expired", "cancelled"} and not float(trade.get("shares") or 0):
             return False
+        if (trade.get("final_check") or {}).get("gave_up"):
+            return False  # Predict never gave a readable result for this market: the local settlement stands
         if trade.get("local"):
             return True
         s = trade.get("settle") or {}
@@ -9992,6 +10020,10 @@ class Bot:
                 up = self.resolution_up(trade, resolved) if resolved else None
                 if up is None:
                     trade["final_check"] = {"at": now_ms, "status": details.get("status", ""), "resolved": resolved}
+                    since = int((trade.get("local") or {}).get("at") or now_ms)
+                    if now_ms - since > self.SIM_GIVE_UP_MS:  # a result name the bot cannot read, or a market taken down
+                        trade["final_check"]["gave_up"] = True
+                        trade["note"] = (trade.get("note") or "") + "；Predict 结果 7 天内无法识别或未公布，已停止核对，以本地预结算为准"
                     self.sim_save([(tid, trade)])
                     continue
                 trade["final"] = {"up": up, "name": resolved.get("name", ""), "how": resolved.get("how", ""), "at": now_ms,
@@ -10214,8 +10246,8 @@ class Bot:
     def cap_payload(self, cap: "CapMarket", now_ms: int) -> dict:
         """Web card for a market-cap ladder: per threshold the model's P(Yes), the Yes book and its best edge."""
         spec = cap.spec
-        start = dt.datetime.fromtimestamp(spec.start_ms / 1000, dt.timezone(dt.timedelta(hours=-4)))
-        end = dt.datetime.fromtimestamp(spec.end_ms / 1000, dt.timezone(dt.timedelta(hours=-4)))
+        start = dt.datetime.fromtimestamp(spec.start_ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(spec.start_ms))))
+        end = dt.datetime.fromtimestamp(spec.end_ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(spec.end_ms))))
         bj = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING).strftime("%m-%d %H:%M")
         rows_in = self.predict.ladders.get(spec.key) or [LadderRow(t, "", "", None, "") for t in spec.targets]
         rows = []
