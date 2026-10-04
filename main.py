@@ -41,7 +41,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.26.0"
+VERSION = "1.26.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4950,13 +4950,17 @@ class CapMarket:
     async def scan(self, now_ms: int) -> None:
         """Extend the window's highest price (persisted) with the hours finished since the last scan. An hour counts
         once it is over; only hours that start inside the window count (the last one ends with the window's own last
-        minute). Once the window is over and read to its end, "through" reaches window_end_s: the record is complete."""
+        minute). Once the window is over and read to its end, "through" reaches window_end_s: the record is complete.
+        "bars_from" is the earliest bar the feed has ever served. A scan that meets older bars than that (a short page,
+        or a pool with little history, had been served before; a record from an older build has no mark at all) reads the
+        whole window again instead of only the hours after "through", so an early high is never left behind."""
         now_s = now_ms // 1000
         start_s, end_s = self.spec.start_ms // 1000, min(now_s, self.window_end_s)
         if end_s <= start_s:
             return
         hist = dict(self.history) or {"start": self.spec.start_ms, "high": 0.0, "at": 0}
-        hist.setdefault("through", start_s - start_s % 3600 + (3600 if start_s % 3600 else 0))
+        start_hour = start_s - start_s % 3600 + (3600 if start_s % 3600 else 0)
+        hist.setdefault("through", start_hour)
         if start_s % 3600 and "first" not in hist:
             # the window opens mid-hour: that hour counts only from the opening minute
             try:
@@ -4968,14 +4972,18 @@ class CapMarket:
             except Exception:
                 hist["first"] = "skipped"
         rows: list[tuple[int, float, float, float, float]] = []
-        before = end_s
+        before, floor, known = end_s, int(hist["through"]), int(hist.get("bars_from") or 1 << 62)
         for _ in range(10):  # 1000 hours per page, newest first
             page = await self.ohlcv("hour", before, 1000)
             rows += page
-            if not page or page[0][0] <= hist["through"] or len(page) < 1000:
+            if page and page[0][0] < known:
+                floor = start_hour  # older bars than ever seen: read the window from its opening again
+            if not page or page[0][0] <= floor or len(page) < 1000:
                 break
             before = page[0][0]
-        inside = [b for b in rows if b[0] >= hist["through"] and b[0] < self.window_end_s]
+        if rows and min(b[0] for b in rows) < known:
+            hist["bars_from"] = min(b[0] for b in rows)
+        inside = [b for b in rows if b[0] >= floor and b[0] < self.window_end_s]
         finished = [b for b in inside if b[0] + 3600 <= now_s]
         running = [b for b in inside if b[0] + 3600 > now_s]
         for bar in finished:
@@ -4987,6 +4995,26 @@ class CapMarket:
             hist["through"] = max(hist["through"], self.window_end_s)  # hours without a bar had no trades
         self.hour_high = max((b[2] for b in running), default=0.0)
         self.store.put(f"cap:{self.spec.slug}", hist)
+
+    def backfill_note(self, now_ms: int) -> str:
+        """A bars card: what the window's high may still be missing ("" once every finished hour since the opening is
+        in, when the card may call it 窗口最高 rather than 已观测最高). Without bars the sampling gaps say it instead."""
+        if not self.spec.gecko:
+            return ""
+        hist, now_s, start_s = self.history, now_ms // 1000, self.spec.start_ms // 1000
+        if now_s <= start_s:
+            return ""
+        through = int(hist.get("through") or 0)
+        if not through:
+            return "历史 K 线尚未回填（启动后约 5 分钟内读取）"
+        parts = []
+        bars_from = int(hist.get("bars_from") or 0)
+        if bars_from and bars_from >= start_s + 3600:
+            parts.append(f"K 线最早到 {stamp(bars_from * 1000, seconds=False)}，开窗到那时的 {(bars_from - start_s) / 3600:.0f} 小时没有记录")
+        last_done = min(now_s - now_s % 3600, self.window_end_s)  # the latest hour that has finished
+        if through < last_done and now_s - last_done > 2 * self.SCAN_SECONDS:
+            parts.append(f"已核验到 {stamp(through * 1000, seconds=False)}，之后 {(last_done - through) / 3600:.0f} 小时尚未读取")
+        return "；".join(parts)
 
     def coverage(self) -> str:
         """Why the window's history is not complete yet ("" once every hour of it has been read)."""
@@ -5545,6 +5573,7 @@ class StockRangeMarket(RangeMarket):
     def __init__(self, store: "Store", spec: RangeSpec, deadline_override: int = 0):
         super().__init__(store, spec)
         self.deadline_override = deadline_override
+        self.level_names: list[str] = []  # "$100": the levels Predict lists, for the question line (set with each payload)
         self.fetched_ms = 0  # when the live price was last read (the trade itself may be hours old while closed)
         saved = store.get(f"range:{spec.slug}:window", {})
         saved = saved if isinstance(saved, dict) else {}
@@ -5691,7 +5720,13 @@ class StockRangeMarket(RangeMarket):
     def close_label(self) -> str:
         if not self.end_ms:
             return "截止日期待 Predict 确认（标题里的日期，当天 23:59 ET）"
-        return f"{self.et_label(self.end_ms)}截止；TradingView 1 分钟 K 的最高价 ≥ 档位即 Yes"
+        return f"{self.et_label(self.end_ms)}前触及即 Yes，到期未触及为 No（TradingView 1 分钟 K 的最高价 ≥ 档位算触及）"
+
+    def question(self, levels: list[str]) -> str:
+        """The market's question in one line: 'STRC 在 12-31 23:59 ET 之前是否触及 $100'."""
+        price = "、".join(levels) if levels else "标题里的价格"
+        when = f"在 {self.et_label(self.end_ms)}之前" if self.end_ms else "在截止日（待 Predict 确认）之前"
+        return f"{self.spec.symbol} {when}是否触及 {price}：窗口内任一 1 分钟 K 的最高价达到即 Yes，到期没碰到为 No"
 
     def window_label(self) -> str:
         return f"市场创建 {self.et_label(self.start_ms)}起" if self.start_ms else "市场创建起（时间待 Predict 确认）"
@@ -5700,7 +5735,7 @@ class StockRangeMarket(RangeMarket):
         state, opens = us_session_state(now_ms)
         session = "美股交易中（常规时段 09:30–16:00 ET）" if state == "交易中" else \
             f"美股已收盘，{self.et_label(opens)}开盘；收盘期间现价为最后成交价，概率按剩余交易时段计算" if opens else "美股已收盘"
-        return {"range_word": self.range_word, "session": session,
+        return {"range_word": self.range_word, "session": session, "question": self.question(self.level_names),
                 "extremes_note": "Yahoo 日 K 的最高/最低（常规交易时段，与 TradingView 的 1 分钟 K 同口径；创建当日按整日计）",
                 "rule_note": f"↑ 档：创建后任一 TradingView 1 分钟 K（NASDAQ:{self.spec.symbol}，常规时段）的最高价 ≥ 档位即 Yes；"
                              "数据源不同，差几分钱的触及请到 Predict 核实"}
@@ -6086,7 +6121,7 @@ body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){displ
 @media(min-width:1042px){#g-ladder.wide{grid-auto-rows:1fr;align-items:stretch}#g-ladder.wide>.card.lad{max-height:460px}
 #g-ladder.wide>.card.lad .pb{display:flex;flex-direction:column;flex:0 1 auto;min-height:0}#g-ladder.wide>.card.lad .pg{overflow-y:auto;min-height:0;overscroll-behavior:contain}
 #g-ladder.wide>.card.lad .pg .lh{position:sticky;top:0;background:var(--card);z-index:1}#g-ladder.wide>.card.lad .ages{margin-top:0}}
-.lstat{display:flex;flex-direction:column;gap:4px}.lstat:empty{display:none}
+.lstat{display:flex;flex-direction:column;gap:4px}.lstat:empty{display:none}.qline{font-size:12.5px;line-height:1.5;padding:7px 10px;border-radius:10px;background:var(--chip);border-left:3px solid var(--best)}
 .card.lad .name{flex:0 1 auto}.card.lad .cd{margin-left:6px}
 .touched{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font-size:12px}.touched .k{color:var(--down);font-weight:600}
 .tchip{border-radius:999px;padding:1px 8px;background:var(--down-bg);color:var(--down);font-weight:600;font-variant-numeric:tabular-nums}
@@ -6399,11 +6434,12 @@ function ladder(c,it){
   const L=it.ladder,det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   const sm=$("summary");sm.title="点开看计算明细";
   if(L.kind==="price")return priceLadder(c,it,L,det,sm);
-  sm.append($("span","rd",L.metric),$("span","v",L.cap),$("span","rd","窗口最高"),$("span","v",L.high));
+  const highWord=L.coverage?"已观测最高":"窗口最高";  // "窗口最高" only once every finished hour since the opening has been read
+  sm.append($("span","rd",L.metric),$("span","v",L.cap),$("span","rd",highWord),$("span","v",L.high));
   if(L.sigma)sm.append($("span","rd","σ"),$("span","v",(L.sigma*100).toFixed(0)+"%"));
   det.append(sm);const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("窗口",L.window+" → "+it.close_label);row("价格",L.price+" USD（"+L.source+"）");row("供应量",L.supply+"（"+L.supply_note+"）");
-  row("窗口最高",L.high+(L.high_at?"（"+L.high_at+"）":"")+"："+(L.bars?"GeckoTerminal 小时 K 近似（最活跃的池子）":"只含机器人运行以来每 10 秒看到的价格")+(L.gaps?"；"+L.gaps:"")+"，结算以 "+L.settle+" 1 分钟 K 为准；Predict 已结算的档位算已触及"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
+  row(highWord,L.high+(L.high_at?"（"+L.high_at+"）":"")+"："+(L.bars?"GeckoTerminal 小时 K 近似（最活跃的池子"+(L.pool?" "+L.pool.slice(0,6)+"…"+L.pool.slice(-4):"")+"）":"只含机器人运行以来每 10 秒看到的价格")+(L.coverage?"；"+L.coverage:"")+(L.gaps?"；"+L.gaps:"")+"，结算以 "+L.settle+" 1 分钟 K 为准；Predict 已结算的档位算已触及"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
   if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
   row("模型",(L.sigma_kind==="prior"?"σ 为先验值，仅供参考。":"")+"碰到即 Yes：零漂移、固定波动率的单边触及概率 Φ((−h−s²/2)/s) + (M/K)·Φ((−h+s²/2)/s)，h = ln(K/M)，s = σ√T");
   det.append(dl);c.append(det);
@@ -6411,6 +6447,7 @@ function ladder(c,it){
   if(it.missing)st.append($("p","","概率暂缺："+it.missing));else if(L.error)st.append($("div","warn small","⚠️ "+L.error));
   if(L.waiting)st.append($("div","mut small",L.waiting));  // a spec without levels of its own, before Predict lists them
   if(L.gaps&&!it.missing){const g=$("div","warn small","⚠️ "+L.gaps);g.title="这张卡没有 K 线来源，窗口最高只含机器人自己采到的价格；没采到的时段里碰到档位不会被发现，以 Predict 为准";st.append(g)}
+  if(L.coverage&&!it.missing){const g=$("div","warn small","⚠️ 历史未补齐："+L.coverage);g.title="已观测最高只含已读到的小时 K 和机器人自己看到的价格；没读到的时段里碰到档位不会被发现，以 Predict 为准";st.append(g)}
   const prior=L.sigma_kind==="prior";
   if(prior&&!it.missing){const prog=(L.sigma_note||"").match(/自采价格 ([0-9.]+)/);
     const w=$("div","warn small","⚠️ σ 暂用先验 "+(L.sigma*100).toFixed(0)+"%"+(prog?"（自采 "+prog[1]+"/12 小时）":"")+"，优势仅供参考");
@@ -6439,6 +6476,7 @@ function priceLadder(c,it,L,det,sm){
   const st=$("div","lstat");
   if(it.missing)st.append($("p","","概率暂缺："+it.missing));else if(L.error)st.append($("div","warn small","⚠️ "+L.error));
   if(L.hold&&!it.missing)st.append($("div","warn small","⚠️ "+L.hold));
+  if(L.question)st.append($("div","qline",L.question));  // a stock: the market's question in one line
   if(L.session)st.append($("div","mut small",L.session));  // a stock: trading now, or closed until the next open
   if(L.waiting)st.append($("div","mut small",L.waiting));
   const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
@@ -9431,6 +9469,7 @@ class Bot:
                        "window": f"{start:%m-%d %H:%M} ET（北京 {bj(spec.start_ms)}）起",
                        "years": max(0.0, (spec.end_ms - max(now_ms, spec.start_ms)) / YEAR_MS),
                        "first_skipped": cap.history.get("first") == "skipped", "gaps": cap.gaps_note(),
+                       "coverage": cap.backfill_note(now_ms), "pool": cap.pool if spec.gecko else "",
                        "metric": spec.metric, "settle": spec.settle, "bars": bool(spec.gecko),
                        "sigma_kind": cap.sigma_kind, "vol_error": cap.vol_error,
                        "supply_note": "总量 − 销毁" if spec.supply == "rpc" else f"DexScreener {spec.metric} ÷ 价格"},
@@ -9548,6 +9587,8 @@ class Bot:
             out["touched"] = fair == 1.0 and "请核实" not in out["error"]
             rows.append(out)
         rows.sort(key=lambda r: -r["level"])  # high to low: the price sits between the ↑ and the ↓ levels
+        if isinstance(rm, StockRangeMarket):
+            rm.level_names = [r["label"].split(" ", 1)[-1] for r in rows]  # "$100", for the card's question line
         marks = rm.marks()
         high, low = marks["high"], marks["low"]
         price_text = lambda v: f"${v:,.2f}" if v is not None and v < 1000 else f"${v:,.0f}" if v is not None else "—"
