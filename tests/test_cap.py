@@ -3,7 +3,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
 D = m.D
-NIU, ANSEM, PONS, MEME, CASHCAT, AI = m.CAP_MARKETS
+NIU, ANSEM, PONS, MEME, CASHCAT, AI, STONK, STONKBROKER = m.CAP_MARKETS
 m.CapMarket.GECKO_GAP = 0  # request spacing is tested on its own below
 TOKEN = NIU.token
 
@@ -60,7 +60,16 @@ for cs, c_start, c_pair, c_token in ((MEME, dt.datetime(2026, 9, 4, 10, 0, tzinf
     assert cs.start_ms == int(c_start.timestamp() * 1000) and cs.end_ms == PONS.end_ms and cs.pair == c_pair and cs.token == c_token, cs.key
     assert cs.chain == "robinhood" and cs.supply == "fdv" and cs.gecko == "" and cs.metric == "FDV" and cs.settle == "DexScreener"
     assert cs.targets == () and cs.name == f"${cs.key} FDV" and cs.slug.startswith(f"what-fdv-will-{cs.key.lower()}-hit-before-")
-assert len({s.key for s in m.CAP_MARKETS}) == 6 and len({s.slug for s in m.CAP_MARKETS}) == 6
+# STONK (Solana, settled on its DexScreener STONK/SOL pair, no bars) and STONKBROKER (Robinhood chain): levels read from Predict
+assert STONK.start_ms == int(dt.datetime(2026, 9, 6, 8, 0, tzinfo=dt.timezone.utc).timestamp() * 1000) and STONK.end_ms == PONS.end_ms
+assert STONK.chain == "solana" and STONK.pair == "afrddtgywcveqb1gxcahr8i48o6qtxyqksdvkeludehg" and STONK.gecko == ""
+assert STONK.token == "6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx" and STONK.supply == "fdv" and STONK.targets == ()
+assert STONK.name == "$STONK FDV" and STONK.slug == "what-fdv-will-stonk-hit-before-november-2026" and STONK.settle == "DexScreener"
+assert STONKBROKER.start_ms == int(dt.datetime(2026, 9, 1, 7, 45, tzinfo=dt.timezone.utc).timestamp() * 1000) and STONKBROKER.end_ms == PONS.end_ms
+assert STONKBROKER.chain == "robinhood" and STONKBROKER.pair == "0xd33c8fd38b06e989cdbd4dffdefab71c4bdd415b24964c8d69e38ff35b068f92"
+assert STONKBROKER.token == "0xe934e36A439C94017B64a3FecE66AF12099aBF50" and STONKBROKER.supply == "fdv" and STONKBROKER.gecko == ""
+assert STONKBROKER.name == "$STONKBROKER FDV" and STONKBROKER.slug == "what-fdv-will-stonkbroker-hit-by-november-2026" and STONKBROKER.targets == ()
+assert len({s.key for s in m.CAP_MARKETS}) == 8 and len({s.slug for s in m.CAP_MARKETS}) == 8
 # a named pair's answer ({"pair": {...}}), the base matched without regard to case, FDV kept apart from market cap
 single = {"schemaVersion": "1.0.0", "pair": {"dexId": "uniswap", "baseToken": {"address": PONS.token.lower()}, "priceUsd": "0.8",
                                            "liquidity": {"usd": 5e5}, "marketCap": 6e8, "fdv": 7.2e8}}
@@ -177,7 +186,7 @@ async def run():
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
     bot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(), None)
     assert bot.predict_targets(NOW)["NIULAI"] == NIU.slug and "NIULAI" in bot.predict.ladder_keys
-    assert {"MEME", "CASHCAT", "AI"} <= bot.predict.ladder_keys and bot.predict_targets(NOW)["AI"] == AI.slug
+    assert {"MEME", "CASHCAT", "AI", "STONK", "STONKBROKER"} <= bot.predict.ladder_keys and bot.predict_targets(NOW)["STONK"] == STONK.slug
     meme = bot.cap_payload(bot.caps["MEME"], NOW)["ladder"]  # no levels of its own: the card waits for Predict's titles
     assert meme["rows"] == [] and meme["waiting"] == "等待 Predict 档位", meme
     markets = [("11", "$200M", "Yes"), ("12", "$300M", "No"), ("13", "$500M", "Yes"), ("14", "$1B", "Yes"), ("15", "Other", "Yes")]

@@ -574,7 +574,12 @@ async def browser_check(bot):
         assert strip.startswith("🔥 机会 2") and "挂单 1" in strip and "吃单 1" in strip, strip
         assert "甲挂跌 5.0+45.0¢" in strip.replace("\n", "") and f"↑ $120k {tk['label']} {tk['price'] * 100:.1f}" in strip, strip
         assert strip.index("挂单 1") < strip.index("甲") < strip.index("吃单 1") < strip.index("BTC 10月价格") and m.cents(tk["edge"], True) in strip
-        await page.click("#opps .opp:nth-of-type(2)"); await page.wait_for_timeout(300)
+        # each side on a row of its own: the heading and 挂单 on the first, 吃单 on the second (one below the other on screen)
+        rows = page.locator("#opps .orow")
+        assert await rows.count() == 2 and (await rows.nth(0).inner_text()).startswith("🔥 机会 2\n挂单 1") and "吃单" not in await rows.nth(0).inner_text()
+        assert (await rows.nth(1).inner_text()).startswith("吃单 1") and await page.locator("#opps > .ok, #opps > .og, #opps > .opp").count() == 0
+        assert (await rows.nth(0).bounding_box())["y"] + (await rows.nth(0).bounding_box())["height"] <= (await rows.nth(1).bounding_box())["y"]
+        await page.locator("#opps .opp").nth(1).click(); await page.wait_for_timeout(300)
         assert await card.evaluate("c => c.classList.contains('flash') && c.style.scrollMarginTop !== ''")
         # 自定义: leaving makers out drops 甲 (its edges are maker ones); a section can be left out; takers can go too; hidden while customising
         await page.click("#edit"); assert await page.is_hidden("#opps")
@@ -613,7 +618,7 @@ async def browser_check(bot):
         # a folded section still counts its red-framed cards in its title; the strip unfolds it before jumping in
         await page.click("#h-levels .fold")
         assert not await page.is_visible("#g-levels") and await page.inner_text("#h-levels .fs") == "4 张 · 🔥 1"
-        await page.click("#opps .opp:nth-of-type(2)"); await page.wait_for_timeout(300)
+        await page.locator("#opps .opp").nth(1).click(); await page.wait_for_timeout(300)
         assert await page.is_visible("#g-levels .card") and await card.evaluate("c => c.classList.contains('flash')")
         assert await page.evaluate("localStorage.getItem('folded')") == "[]"
         await card.locator(".price-model summary").click()

@@ -100,12 +100,12 @@ async def layout_check(browser, page):
     await page.evaluate("localStorage.removeItem('favs')"); await page.reload(); await page.wait_for_selector(".card .odds")
     assert not await page.is_visible("#custom") and await page.locator(".ctl").count() == 0
     await page.click("#edit")
-    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == 19
+    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == 21
     lad = "#g-ladder .card"
-    assert await page.is_disabled(f"{lad}:nth-child(1) .ctl button[title='前移']") and await page.is_disabled(f"{lad}:nth-child(6) .ctl button[title='后移']")
+    assert await page.is_disabled(f"{lad}:nth-child(1) .ctl button[title='前移']") and await page.is_disabled(f"{lad}:nth-child(8) .ctl button[title='后移']")
     await page.click(f"{lad}:nth-child(1) .ctl button[title='后移']")
-    assert await names("ladder") == ["$ANSEM FDV", "$牛来 市值", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV"]
-    assert json.loads(await stored("order")) == {"ladder": ["ANSEM", "NIULAI", "PONS", "MEME", "CASHCAT", "AI"]}
+    assert await names("ladder") == ["$ANSEM FDV", "$牛来 市值", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV"]
+    assert json.loads(await stored("order")) == {"ladder": ["ANSEM", "NIULAI", "PONS", "MEME", "CASHCAT", "AI", "STONK", "STONKBROKER"]}
     await page.click("#g-crypto .card:nth-child(4) .ctl button[title='前移']")
     crypto = ["BNB 先触 700/900", "SOL 先触 60/140", "ETH 先触 1k/3k", "BTC 先触 70k/90k", "BTC 10月涨跌", "HYPE 反超 SOL"]
     assert await names("crypto") == crypto
@@ -127,7 +127,7 @@ async def layout_check(browser, page):
     wide = lambda g: page.evaluate(f"document.getElementById('g-{g}').classList.contains('wide')")
     assert await wide("ladder") and await gw("#g-ladder .card") < await gw("#g-ladder") / 2
     hs = lambda: page.eval_on_selector_all("#g-ladder .card", "els => els.map(e => Math.round(e.getBoundingClientRect().height))")
-    assert len(await hs()) == 6 and len(set(await hs())) == 1 and 0 < (await hs())[0] <= 460, await hs()  # two-up: one height for every cap card
+    assert len(await hs()) == 8 and len(set(await hs())) == 1 and 0 < (await hs())[0] <= 460, await hs()  # two-up: one height for every cap card
     await page.check("#onerow input[data-row=ladder]")
     assert len(set(await hs())) > 1, await hs()  # one per row: each card its own height again
     assert not await wide("ladder") and await wide("levels") and abs(await gw("#g-ladder .card") - await gw("#g-ladder")) < 1
@@ -148,7 +148,7 @@ async def layout_check(browser, page):
     assert [await stored(k) for k in ("hidden", "hideSec")] == ['["上证指数","UNITREEUSDT"]', '["sim","ladder"]']
     # bringing them back: one card by its own button, the rest with 全部显示, the section by its tick box
     await page.click("#edit")
-    assert await names("ladder") == ["$ANSEM FDV", "$牛来 市值", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV"]
+    assert await names("ladder") == ["$ANSEM FDV", "$牛来 市值", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV"]
     await page.click("#g-contract .card .ctl button:has-text('显示')")
     assert await page.locator(".card.off").count() == 1 and await stored("hidden") == '["上证指数"]'
     await page.click("#showall")
@@ -186,14 +186,14 @@ async def layout_check(browser, page):
     await page.evaluate("keep('folded', ['index']); keep('oneRow', ['ladder'])")
     await page.click("#g-crypto .card:nth-child(4) .star")
     await page.click("#reset")
-    assert await page.inner_text("#reset") == "再点一次确认" and await names("ladder") == ["$ANSEM FDV", "$牛来 市值", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV"]
+    assert await page.inner_text("#reset") == "再点一次确认" and await names("ladder") == ["$ANSEM FDV", "$牛来 市值", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV"]
     await page.evaluate("armed = Date.now() - 5000")  # the 4 seconds ran out: the next click only asks again
     await page.click("#reset")
     assert await page.inner_text("#reset") == "再点一次确认" and await stored("order") is not None
     await page.click("#reset")
     assert await page.inner_text("#reset") == "恢复默认布局" and await heads() == ["fav", "index", "contract", "crypto", "levels", "ladder", "sim"]
     assert await stored("oneRow") is None and await page.evaluate("document.getElementById('g-ladder').classList.contains('wide')")
-    assert await names("ladder") == ["$牛来 市值", "$ANSEM FDV", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV"] and await names("crypto") == [*crypto[:3], *crypto[4:]]
+    assert await names("ladder") == ["$牛来 市值", "$ANSEM FDV", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV"] and await names("crypto") == [*crypto[:3], *crypto[4:]]
     assert await stored("order") is None and await stored("secs") is None and await stored("favs") == '["BTCUSDT"]'
     assert await stored("folded") is None
     assert await names("fav") == ["BTC 先触 70k/90k"]
@@ -302,7 +302,7 @@ async def run():
     payload = bot.odds_payload()
     names = [i["name"] for i in payload["items"]]
     assert names == ["上证指数", "宇树 UNITREE", "BNB 先触 700/900", "SOL 先触 60/140", "BTC 先触 70k/90k", "ETH 先触 1k/3k", "BTC 10月涨跌", "HYPE 反超 SOL",
-                     "BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格", "$牛来 市值", "$ANSEM FDV", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "模拟交易"], names
+                     "BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格", "$牛来 市值", "$ANSEM FDV", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV", "模拟交易"], names
     bnb = payload["items"][2]
     assert bnb["group"] == "crypto" and bnb["labels"] == ["$900", "$700"] and bnb["missing"].startswith("等待币安行情"), bnb
     assert payload["items"][0]["group"] == "index" and payload["items"][1]["symbol"] == "UNITREEUSDT" and payload["items"][1]["group"] == "contract"
