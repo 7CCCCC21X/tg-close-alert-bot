@@ -1,4 +1,4 @@
-import asyncio, os, sys, time, json, datetime as dt
+import asyncio, gzip, os, sys, time, json, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
@@ -237,6 +237,15 @@ async def browser_check(async_playwright, chrome, port, token):
         await page.wait_for_timeout(2300)
         assert await page.inner_text(".cd") != cd, "countdown must tick"
         assert "数据 09-30 22:05:00" in await page.inner_text("#meta") and "秒前刷新" in await page.inner_text("#meta")
+        assert await page.evaluate("load() === load()") and await page.evaluate("(async () => { await load(); return loading === null })()")  # one fetch at a time
+        # a phone: the filter bar is one rail that scrolls sideways (one row high), wrapping into rows only on a wider screen
+        fb = "document.getElementById('fbar')"
+        assert await page.evaluate(f"getComputedStyle({fb}).overflowX") == "auto" and await page.evaluate(f"{fb}.scrollWidth > {fb}.clientWidth")
+        assert await page.evaluate(f"{fb}.getBoundingClientRect().height") < 44, await page.evaluate(f"{fb}.getBoundingClientRect().height")
+        assert await page.evaluate(f"getComputedStyle({fb}).position") == "sticky"
+        await page.set_viewport_size({"width": 1300, "height": 900})
+        assert await page.evaluate(f"getComputedStyle({fb}).overflowX") == "visible" and await page.evaluate(f"{fb}.scrollWidth <= {fb}.clientWidth")
+        await page.set_viewport_size({"width": 390, "height": 900})
         assert await page.inner_text("#h-index") == "指数" and await page.is_visible("#h-contract")
         assert await page.get_attribute("#g-contract .name", "title") == "UNITREEUSDT" and "上证指数" in await page.inner_text("#g-index")
         await page.click("#g-index details summary"); assert await page.is_visible("#g-index dl")
@@ -331,7 +340,22 @@ async def run():
     assert st == 200 and b"<title>" in body and "text/html" in head and "Cache-Control: no-store" in head and "Referrer-Policy: no-referrer" in head
     st, head, body = await request(port, f"GET /p/{token}/data.json?x=1 HTTP/1.1\r\nHost: x\r\n\r\n".encode())
     assert st == 200 and json.loads(body)["items"][0]["name"] == "上证指数" and "application/json" in head
+    assert "Content-Encoding" not in head and "Vary: Accept-Encoding" in head  # no Accept-Encoding: plain
     st, _, body = await request(port, f"HEAD /p/{token} HTTP/1.1\r\n\r\n".encode()); assert st == 200 and body == b""
+    # gzip for a client that accepts it (the page on every open, data.json every 10 seconds per tab); plain when it does not; a HEAD carries the headers only
+    st, head, body = await request(port, f"GET /p/{token} HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, deflate, br\r\n\r\n".encode())
+    assert st == 200 and "Content-Encoding: gzip" in head and f"Content-Length: {len(body)}" in head and "text/html" in head, head
+    assert len(body) < len(m.WEB_PAGE.encode()) / 2 and gzip.decompress(body) == m.WEB_PAGE.encode()
+    st, head, body = await request(port, f"GET /p/{token}/data.json HTTP/1.1\r\nHost: x\r\naccept-encoding: identity;q=1, gzip;q=0.5\r\n\r\n".encode())
+    assert st == 200 and "Content-Encoding: gzip" in head and json.loads(gzip.decompress(body))["items"][0]["name"] == "上证指数"
+    st, head, body = await request(port, f"GET /p/{token}/data.json HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip;q=0\r\n\r\n".encode())
+    assert st == 200 and "Content-Encoding" not in head and json.loads(body)["items"][0]["name"] == "上证指数"
+    st, head, body = await request(port, f"GET /p/{token}/data.json HTTP/1.1\r\nHost: x\r\nAccept-Encoding: br\r\n\r\n".encode())
+    assert st == 200 and "Content-Encoding" not in head and json.loads(body)["items"]
+    st, head, body = await request(port, f"HEAD /p/{token} HTTP/1.1\r\nAccept-Encoding: gzip\r\n\r\n".encode())
+    assert st == 200 and body == b"" and "Content-Encoding: gzip" in head
+    st, head, body = await request(port, b"GET /health HTTP/1.1\r\nAccept-Encoding: gzip\r\n\r\n"); assert body == b"ok" and "Content-Encoding" not in head  # too small to be worth it
+    assert m.accepts_gzip("Accept-Encoding: *\r\n") and not m.accepts_gzip("Accept-Encoding: gzip;q=abc\r\n") and not m.accepts_gzip("X-Accept-Encoding: gzip\r\n")
     for raw in [b"GET /p/wrongtokenwrongtoken HTTP/1.1\r\n\r\n", f"GET /p/{token}/other HTTP/1.1\r\n\r\n".encode(), b"GET /etc/passwd HTTP/1.1\r\n\r\n"]:
         st, _, _ = await request(port, raw); assert st == 404, raw
     st, _, _ = await request(port, f"POST /p/{token} HTTP/1.1\r\n\r\n".encode()); assert st == 405
