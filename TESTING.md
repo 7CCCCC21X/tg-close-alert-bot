@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.24.0
+版本：1.24.1
 
 ## 已完成
 
+- 1.24.1（网页传输与刷新、手机筛选条）：网页服务对声明 `Accept-Encoding: gzip` 的浏览器压缩回复（`accepts_gzip` 解析 q 值，`*` 也算；页面 83 KB → 28 KB，data.json 约缩到 1/5，512 字节以下不压；`Vary: Accept-Encoding`，HEAD 只回头部）。页面 `load()` 改为同一时刻只有一个请求在飞（慢回复不会在下一次 10 秒轮询后面堆积）、8 秒没有响应即中止并在旧数据条写明、标签页不在前台时不轮询（回到前台照旧立即取一次）；市值阶梯在宽屏里卡片内滚动的表格，每 10 秒重绘后保持原来的滚动位置（`scrollMarks` / `restoreScroll` 按卡片 key 记录）。手机宽度（≤560px）下筛选条改为一行横向滑动的栏（芯片、排序、试算依次排开，右侧渐隐提示还有内容），不再在每屏顶部占三行；原生控件按 `color-scheme` 跟随深色模式，`theme-color` 跟随背景；键盘焦点有可见外框（`:focus-visible`）；`prefers-reduced-motion` 时跳转不平滑滚动、闪边框改为静态框。tests/test_web.py 覆盖 gzip（有/无/q=0/只有 br/HEAD/过小不压）、`load()` 的单飞、手机筛选条一行高且可横向滚动、宽屏仍换行；tests/test_cap.py 覆盖刷新后表格滚动位置不变。
 - 1.24.0（两张 FDV 卡、机会条分两行）：市值阶梯新增 $STONK（Solana，结算来源是规则里 DexScreener 的 STONK/SOL 交易对，`chain="solana"`、`pair` 按规则链接的写法、`gecko=""` 没有 K 线）和 $STONKBROKER（Robinhood 链，STONKBROKER/WETH 交易对），都是 `supply="fdv"`、`targets=()`，档位由 Predict 市场标题读出。“🔥 机会”条改为挂单一行、吃单一行（`#opps` 改为纵向排列，每一侧一个 `.orow`，标题“🔥 机会 N”放在第一行开头），内容、排序、各最多 6 个和 ✎ 自定义的开关不变。tests/test_cap.py 校验两张新卡的规格和 `ladder_keys`；test_web 的市值阶梯名单、卡片数（21）、等高检查（8 张）跟着改；test_range 校验机会条两行各自的内容、第二行在第一行下方、`#opps` 下不再直接挂按钮。
 - 1.23.0（机会条分挂单 / 吃单）：“🔥 机会”条改为先列挂单再列吃单（各自按净优势排序、各最多 6 个，标题写总数、各组写个数），每张卡分别贡献最优挂单和最优吃单（`hots` 的 `maker` / `taker`，不再只取一个 `best`）；挂单默认只列现在挂单能拿积分的市场（`points_ok`，和卡片上蓝色 ● 一致）。✎ 自定义新增“机会条的方向”：挂单、吃单、挂单只列积分可得的三个开关（`oppMakers` / `oppTakers` / `oppPoints`，默认都开），旧的“只列吃单”`oppTaker` 一次性迁移为关掉挂单；恢复默认布局全部清掉。卡片红框、筛选和 Telegram 提醒不变。tests/test_range.py 校验分组顺序、三个开关、积分未激活的挂单不进机会条、旧开关迁移、恢复默认。
 - 1.22.2（市值阶梯卡片等高）：`#g-ladder.wide` 在 1042px 以上（两张或更多一行）改为 `grid-auto-rows:1fr` + `align-items:stretch`，每张卡等高、上限 460px；超出的表格在卡片里滚动（`.pg` 纵向滚动、表头 `position:sticky`），“行情 / 盘口”行紧跟表格不再推到底；手机和“整行显示”不受影响。tests/test_cap.py 新增 14 档在 1300 宽度下卡片不超过 460px、表格可滚、表头固定、390 宽度下不滚；test_web 校验两张一行时六张卡等高、整行显示后各按内容。

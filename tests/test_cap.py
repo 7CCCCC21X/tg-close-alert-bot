@@ -525,6 +525,9 @@ async def browser_check():
         assert await page.evaluate(f"{pg}.scrollHeight > {pg}.clientHeight + 40") and await page.evaluate(f"getComputedStyle({pg}).overflowY") == "auto"
         await page.evaluate(f"{pg}.scrollTop = 150")
         assert await page.evaluate(f"Math.abs({pg}.querySelector('.lh').getBoundingClientRect().top - {pg}.getBoundingClientRect().top) < 1")  # the header stays
+        scrolled = await page.evaluate(f"{pg}.scrollTop"); assert scrolled > 100, scrolled  # 150, clamped to the table's own range
+        await page.evaluate("load()"); await page.wait_for_timeout(300)  # a data refresh rebuilds the card: the table keeps its place
+        assert await page.evaluate(f"{pg}.scrollTop") == scrolled and await page.evaluate(f"{pg}.querySelectorAll('.ptarget').length") == 14
         assert await page.evaluate("document.querySelector('#g-ladder .ages').getBoundingClientRect().top") > await page.evaluate(f"{pg}.getBoundingClientRect().bottom") - 1
         await page.set_viewport_size({"width": 390, "height": 900})
         assert await page.evaluate(f"getComputedStyle({pg}).overflowY") == "visible"  # a phone: the page scrolls, not the card

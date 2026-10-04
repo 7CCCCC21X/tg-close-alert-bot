@@ -14,6 +14,7 @@ import copy
 import datetime as dt
 import functools
 import decimal
+import gzip
 import html
 import inspect
 import json
@@ -40,7 +41,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.24.0"
+VERSION = "1.24.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5566,12 +5567,16 @@ WEB_PAGE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
+<meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#101215" media="(prefers-color-scheme: dark)">
 <title>收盘涨跌概率</title>
 <style>
-:root{--best:#2d6cdf;--best-bg:#eef3fd;--warn:#c77c00;--bg:#f4f5f7;--card:#fff;--text:#1b1f23;--muted:#6b737c;--faint:#9aa3ad;--line:#e5e8ec;--up:#d63b3b;--down:#1e9a54;--flat:#b8c0c8;--chip:#f0f2f5;--hot:#e02424;--hot-bg:#fdecec}
-@media (prefers-color-scheme:dark){:root{--bg:#101215;--card:#1a1d21;--text:#e8eaed;--muted:#9aa3ad;--faint:#6b737c;--line:#2a2f35;--chip:#23272c;--best:#6f9ef0;--best-bg:#1c2a42;--warn:#e0a040;--hot:#ff5a5a;--hot-bg:#3a1c1e}}
+:root{color-scheme:light;--best:#2d6cdf;--best-bg:#eef3fd;--warn:#c77c00;--bg:#f4f5f7;--card:#fff;--text:#1b1f23;--muted:#6b737c;--faint:#9aa3ad;--line:#e5e8ec;--up:#d63b3b;--down:#1e9a54;--flat:#b8c0c8;--chip:#f0f2f5;--hot:#e02424;--hot-bg:#fdecec}
+@media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#101215;--card:#1a1d21;--text:#e8eaed;--muted:#9aa3ad;--faint:#6b737c;--line:#2a2f35;--chip:#23272c;--best:#6f9ef0;--best-bg:#1c2a42;--warn:#e0a040;--hot:#ff5a5a;--hot-bg:#3a1c1e}}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--best);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){.card.flash{animation:none;outline:3px solid var(--best);outline-offset:3px}}
 .wrap{max-width:1560px;margin:0 auto;padding:12px 16px}
 header{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 16px;margin-bottom:4px}
 h1{font-size:18px;margin:0}.hr{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px}.tog{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:2px 9px 2px 6px;cursor:pointer;user-select:none}.tog input{margin:0;accent-color:var(--best)}body.nobook .pb{display:none}.meta{color:var(--muted);font-size:12px;display:flex;flex-wrap:wrap;gap:2px 10px}
@@ -5615,6 +5620,9 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:6px 0 2px;fon
 .fchips{display:flex;flex-wrap:wrap;gap:5px}.fchips .tog.on,.famt .tog.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}
 button.tog{font-family:inherit}.fsort select{font:inherit;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--text);padding:1px 4px}
 .famt{display:inline-flex;align-items:center;gap:4px;color:var(--muted)}.famt input{width:64px;font:inherit;padding:1px 4px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--text)}
+/* a phone: the bar is one rail that scrolls sideways (chips, sort, size), so it does not stack three rows on top of every screen */
+@media(max-width:560px){.fbar{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;overscroll-behavior-x:contain;-webkit-overflow-scrolling:touch;margin:0 -16px 2px;padding:6px 16px;mask-image:linear-gradient(90deg,#000 calc(100% - 28px),transparent);-webkit-mask-image:linear-gradient(90deg,#000 calc(100% - 28px),transparent)}
+.fbar::-webkit-scrollbar{display:none}.fbar>*{flex:none}.fchips{flex-wrap:nowrap}.fbar .famt:after{content:"";display:block;width:12px;flex:none}}
 #stale{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;background:var(--hot-bg);border:1px solid var(--warn);color:var(--text);border-radius:10px;padding:6px 10px;margin:4px 0;font-size:13px}
 body.olddata .card.hot{border:1px solid var(--line);box-shadow:none;padding:10px 12px 8px}
 body.olddata .edge.best,body.olddata .edge.hot{border-color:transparent;background:var(--chip)}
@@ -6028,7 +6036,7 @@ function drawOpps(){  // every red-framed suggestion on the page in one strip on
   el.replaceChildren();let head=$("span","ok","🔥 机会 "+n);
   const jump=h=>{const find=()=>[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);let c=find();if(!c)return;
     const g=c.parentElement.id.slice(2);if(folded.includes(g)){folded=folded.filter(x=>x!==g);keep("folded",folded);if(last)render(last);c=find()}
-    c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+8)+"px";c.scrollIntoView({behavior:"smooth",block:"start"});
+    c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+8)+"px";c.scrollIntoView({behavior:matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth",block:"start"});
     c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")};
   const group=(label,list,title)=>{if(!list.length)return;const row=$("div","orow");if(head){row.append(head);head=null}
     const t=$("span","og",label+" "+list.length);t.title=title;row.append(t);
@@ -6140,9 +6148,12 @@ function drawStale(){  // a failed refresh says the cards are old; past STALE_MS
     (old?"；建议高亮已撤掉":"，"+Math.max(0,Math.ceil((STALE_MS-gone)/1000))+" 秒后撤掉建议高亮")}
 let plan={};  // section -> the card keys it shows, for the ◀ ▶ buttons while a render is being built
 function keysOrder(g){return plan[g]||[]}
+function scrollMarks(){  // where each card's table (.pg, scrolling inside a wide 市值阶梯 card) stands, by card key
+  return new Map([...document.querySelectorAll(".card .pg")].filter(e=>e.scrollTop>0).map(e=>[e.closest(".card").dataset.key,e.scrollTop]))}
+function restoreScroll(marks){if(marks.size)document.querySelectorAll(".card .pg").forEach(e=>{const t=marks.get(e.closest(".card").dataset.key);if(t)e.scrollTop=t})}
 function render(d){
   if(drag){pending=d;return}  // never rebuild the cards under a drag; the latest data is drawn when it ends
-  drawBar();hots=[];
+  const marks=scrollMarks();drawBar();hots=[];
   const flat=!editing&&(filt.length>0||sortBy!=="");document.body.classList.toggle("flatview",flat);
   const fh=document.getElementById("h-flat"),fg=document.getElementById("g-flat");fh.hidden=fg.hidden=!flat;
   if(flat){  // every visible card that passes the bar, in one list (cards and sections hidden in 自定义 stay hidden)
@@ -6154,7 +6165,7 @@ function render(d){
     const clear=ctlBtn("清除筛选","回到按栏目分组的页面",()=>{filt=[];sortBy="";keep("filt",filt);keep("sort",sortBy);if(last)render(last)});
     fh.replaceChildren($("span","hn",(filt.length?"筛选结果":"全部卡片")+" "+hits.length+" 张"+(sortBy==="edge"?" · 按净优势":sortBy==="time"?" · 按剩余时间":"")),clear);
     fg.replaceChildren(...(hits.length?hits.map(x=>card(x.it,"flat")):[$("p","mut","没有符合条件的卡片")]));
-    drawOpps();tick();return}
+    restoreScroll(marks);drawOpps();tick();return}
   // starred cards leave their own section for the one on top, in the order the viewer keeps them (drag ⠿ to change);
   // hidden cards and sections are left out, except in 自定义 where they show faded so they can be brought back
   const shown=i=>editing||!hidden.includes(favKey(i));
@@ -6178,7 +6189,7 @@ function render(d){
       ...(editing&&g!=="fav"?[ctlBtn("↑","栏目上移",()=>moveSec(g,-1),i<=0),ctlBtn("↓","栏目下移",()=>moveSec(g,1),i<0||i>=vis.length-1)]:[]))}
   const now=[...document.querySelectorAll(".wrap>.grid")].map(e=>e.id.slice(2)).filter(g=>g!=="fav");
   if(now.join()!==secOrder.join())for(const g of secOrder)foot.before(document.getElementById("h-"+g),document.getElementById("g-"+g));
-  drawOpps();tick()}
+  restoreScroll(marks);drawOpps();tick()}
 function drawLegend(){
   const lg=document.getElementById("legend");const sw=$("span","sw");[["涨",upColor()],["平","var(--flat)"],["跌",downColor()]].forEach(([t,col])=>{const i=$("i");i.style.background=col;sw.append(i,t)});
   const hot=$("span","sw hot");hot.append($("i"),"红框 = 净优势 ≥"+hotCents+"¢（高亮门槛）");hot.title="可在 ✎ 自定义 里修改；和建议门槛不是一回事：没超过建议门槛的方向不会被建议";
@@ -6230,18 +6241,24 @@ document.getElementById("reset").addEventListener("click",e=>{const b=e.currentT
   order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;folded=[];oneRow=[];
   ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","folded","oneRow"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
-async function load(){
-  try{
-    const r=await fetch(location.pathname.replace(/\\/$/,"")+"/data.json",{cache:"no-store"});
+let loading=null;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
+const LOAD_TIMEOUT_MS=8000;
+function load(){
+  if(loading)return loading;
+  const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),LOAD_TIMEOUT_MS);
+  loading=(async()=>{try{
+    const r=await fetch(location.pathname.replace(/\\/$/,"")+"/data.json",{cache:"no-store",signal:ctl.signal});
     if(!r.ok)throw new Error("HTTP "+r.status);
     const d=await r.json();if(d.server_ms)skew=d.server_ms-Date.now();fetchedAt=okAt=Date.now();failMsg="";style=d.color_style||"cn";
     last=d;render(d);
-    document.getElementById("meta").replaceChildren(...(d.today?[$("span","","今天 "+d.today)]:[]),$("span","","数据 "+d.generated_at),$("span","","",),$("span","","基准 "+d.mode),$("span","","v"+d.version));
-    document.getElementById("meta").children[d.today?2:1].id="ago";
+    const ago=$("span","","");ago.id="ago";
+    document.getElementById("meta").replaceChildren(...(d.today?[$("span","","今天 "+d.today)]:[]),$("span","","数据 "+d.generated_at),ago,$("span","","基准 "+d.mode),$("span","","v"+d.version));
     drawLegend();
     document.getElementById("foot").textContent=d.note;tick();
-  }catch(e){failMsg=e.message||"网络错误";if(!okAt)document.getElementById("meta").replaceChildren($("span","warn","刷新失败："+failMsg+"，稍后自动重试"));drawStale()}
-}
+  }catch(e){failMsg=e.name==="AbortError"?"超过 "+LOAD_TIMEOUT_MS/1000+" 秒没有响应":(e.message||"网络错误");
+    if(!okAt)document.getElementById("meta").replaceChildren($("span","warn","刷新失败："+failMsg+"，稍后自动重试"));drawStale()}
+  finally{clearTimeout(timer);loading=null}})();
+  return loading}
 function drawBar(){  // the filter chips, the sort and the trade size, as this browser keeps them
   const fc=document.getElementById("fchips");fc.replaceChildren(...FILTERS.map(([k,t,tip])=>{const b=$("button","tog"+(filt.includes(k)?" on":""),t);b.type="button";b.title=tip;
     b.setAttribute("aria-pressed",filt.includes(k)?"true":"false");
@@ -6260,7 +6277,7 @@ document.getElementById("amtin").addEventListener("change",e=>{const v=Math.roun
   if(e.target.value.trim()!==""&&Number.isFinite(v)&&v>=1){const base=(last&&last.notional)||100;amount=v===base?0:Math.min(v,1e6);keep("amount",amount)}if(last)render(last)});
 document.getElementById("retry").addEventListener("click",()=>load());
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once
-load();setInterval(load,10000);setInterval(tick,1000);
+load();setInterval(()=>{if(document.visibilityState!=="hidden")load()},10000);setInterval(tick,1000);  // a hidden tab waits: visibilitychange fetches at once on return
 </script></body></html>"""
 
 
@@ -6450,14 +6467,32 @@ load();setInterval(load,60000);
 </script></body></html>"""
 
 
+def accepts_gzip(header_block: str) -> bool:
+    """Whether the request's Accept-Encoding lists gzip (any positive q), from the raw header lines after the request line."""
+    for line in header_block.split("\r\n"):
+        name, sep, value = line.partition(":")
+        if sep and name.strip().lower() == "accept-encoding":
+            for token in value.split(","):
+                coding, _, params = token.strip().partition(";")
+                if coding.strip().lower() in {"gzip", "x-gzip", "*"}:
+                    q = params.strip().lower().removeprefix("q=").strip() if params.strip().lower().startswith("q=") else "1"
+                    try:
+                        return float(q) > 0
+                    except ValueError:
+                        return False
+    return False
+
+
 class WebServer:
     """Tiny read-only HTTP server (stdlib asyncio) for the probability page.
 
     Routes: /health, /p/<token> (HTML), /p/<token>/data.json (JSON), /p/<token>/journal (the paper trades' review page)
     with journal.json / journal.csv (exports). Everything else is 404, the token is compared in constant time, and
-    responses are no-store with a restrictive CSP.
+    responses are no-store with a restrictive CSP. Text bodies are gzip-compressed for a client that accepts it
+    (the page is ~80 KB, data.json is fetched every 10 seconds by every open tab).
     """
     MAX_HEADER_BYTES = 8192
+    GZIP_MIN_BYTES = 512  # below this a gzip header costs about as much as it saves
 
     def __init__(self, bot: "Bot", port: int, token: str):
         self.bot, self.port, self.token = bot, port, token
@@ -6500,16 +6535,21 @@ class WebServer:
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
             if len(head) > self.MAX_HEADER_BYTES:
                 raise ValueError("header too large")
-            method, target, _ = head.split(b"\r\n", 1)[0].decode("latin-1").split(" ", 2)
+            request_line, _, rest = head.decode("latin-1").partition("\r\n")
+            method, target, _ = request_line.split(" ", 2)
+            gzip_ok = accepts_gzip(rest)
             status, ctype, body = self.route(method.upper(), urllib.parse.urlsplit(target).path)
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ValueError):
-            status, ctype, body, method = 400, "text/plain; charset=utf-8", b"bad request", "GET"
+            status, ctype, body, method, gzip_ok = 400, "text/plain; charset=utf-8", b"bad request", "GET", False
         except Exception as error:  # Never let a page request touch the bot's loops.
             LOG.warning("web request failed: %s", clean_error(error))
-            status, ctype, body, method = 500, "text/plain; charset=utf-8", b"error", "GET"
+            status, ctype, body, method, gzip_ok = 500, "text/plain; charset=utf-8", b"error", "GET", False
+        encoding = ""
+        if gzip_ok and status == 200 and len(body) >= self.GZIP_MIN_BYTES:
+            body, encoding = gzip.compress(body, compresslevel=6), "Content-Encoding: gzip\r\n"
         reason = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed", 500: "Internal Server Error"}[status]
-        headers = (f"HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n"
-                   "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
+        headers = (f"HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n{encoding}"
+                   "Vary: Accept-Encoding\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
                    "X-Robots-Tag: noindex\r\nContent-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; "
                    "script-src 'unsafe-inline'; img-src 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n")
         with contextlib.suppress(Exception):
