@@ -234,11 +234,20 @@ EXCHANGE_BASE_HOLD_DAYS = 30  # safety cap for a held exchange-close baseline; N
 
 
 # Exchange holidays on weekdays (official 2026 notices where known); override with HOLIDAYS_CN/HK/KR.
+# Only dates that are certain are listed: a holiday missing here costs a "close pending" evening, a wrong one would
+# skip a real session. 2027 Lunar New Year closures are added once the exchanges publish them.
 DEFAULT_HOLIDAYS = {
-    "CN": "2026-09-25,2026-10-01..2026-10-07",   # SSE notice: Mid-Autumn 9/25, National Day 10/1-10/7
-    "KR": "2026-09-24,2026-09-25,2026-10-05,2026-10-09",  # Chuseok, National Foundation Day (substitute), Hangul Day
-    "HK": "2026-10-01",
+    "CN": "2026-09-25,2026-10-01..2026-10-07,2027-01-01",   # SSE notice: Mid-Autumn 9/25, National Day 10/1-10/7; New Year
+    "KR": "2026-09-24,2026-09-25,2026-10-05,2026-10-09,2026-12-25,2026-12-31,2027-01-01",  # Chuseok, Foundation Day (substitute), Hangul Day, Christmas, year-end closure, New Year
+    "HK": "2026-10-01,2026-12-25,2027-01-01",  # National Day, Christmas (Boxing Day falls on a Saturday: no weekday off), New Year
 }
+# Days whose session differs from the usual one (verified notices; override with HK_HALF_DAYS / KR_LATE_DAYS):
+#   HKEX half days (the eves of Christmas, New Year and Lunar New Year): morning session only, closing auction
+#     12:00–12:10, HSI futures day session ends 12:30 and there is no after-hours session that evening.
+#   KRX CSAT day (the college entrance exam, third Thursday of November): everything one hour later, regular
+#     session 10:00–16:30 KST, close fixed at 16:30, Nextrade after-hours from 16:40.
+DEFAULT_SPECIAL_DAYS = {"HK_HALF": "2026-12-24,2026-12-31,2027-02-05", "KR_LATE": "2026-11-19"}
+HOLIDAY_WARN_DAYS = 30  # warn this many days before the configured calendar runs out
 
 
 def parse_dates(spec: str, label: str) -> frozenset:
@@ -262,6 +271,23 @@ def parse_holidays(env: dict[str, str]) -> dict[str, frozenset]:
     cn = parse_dates(env.get("HOLIDAYS_CN", DEFAULT_HOLIDAYS["CN"]), "HOLIDAYS_CN")
     return {"sh": cn, "sz": cn, "hk": parse_dates(env.get("HOLIDAYS_HK", DEFAULT_HOLIDAYS["HK"]), "HOLIDAYS_HK"),
             "kr": parse_dates(env.get("HOLIDAYS_KR", DEFAULT_HOLIDAYS["KR"]), "HOLIDAYS_KR")}
+
+
+def calendar_until(holidays: dict[str, frozenset]) -> dt.date | None:
+    """The last date the holiday table knows about (per market the earliest of those), None when it is empty."""
+    ends = [max(days) for days in holidays.values() if days]
+    return min(ends) if ends else None
+
+
+def calendar_warning(holidays: dict[str, frozenset], today: dt.date) -> str:
+    """A reminder to extend HOLIDAYS_CN/HK/KR before the table runs out ("" while it reaches far enough)."""
+    until = calendar_until(holidays)
+    if until is None:
+        return "⚠️ 未配置任何交易所假期（HOLIDAYS_CN/HK/KR），假期会被当成交易日"
+    if (until - today).days < HOLIDAY_WARN_DAYS:
+        return (f"⚠️ 假期表只配置到 {until.isoformat()}" + ("（已过期）" if until < today else "") +
+                "，请在 Railway 变量 HOLIDAYS_CN/HK/KR 补充之后的休市日，否则假期会被当成交易日")
+    return ""
 
 
 def parse_beta(value: str, name: str = "A50_BETA") -> float:
@@ -423,6 +449,8 @@ class Config:
     a50_beta: float = 0.8   # Composite move per unit of A50 move when mapping the proxy.
     kospi_beta: float = 1.0  # KOSPI move per unit of HL KR200 (KOSPI 200 perp) move.
     holidays: dict[str, frozenset] = field(default_factory=dict)  # market -> non-trading weekdays
+    hk_half_days: frozenset = frozenset()  # HKEX half days (close 12:10, futures 12:30, no night session)
+    kr_late_days: frozenset = frozenset()  # KRX days that run one hour late (CSAT day: 10:00–16:30)
     web_port: int = 0        # Read-only probability web page; 0 = disabled. Railway injects PORT.
     web_token: str = ""      # Secret path segment; generated and persisted when empty.
     web_base: str = ""       # Public base URL, e.g. https://xxx.up.railway.app
@@ -483,6 +511,9 @@ class Config:
         style = e.get("COLOR_STYLE", "cn").strip().lower()
         if style not in {"cn", "us"}:
             raise ValueError("COLOR_STYLE 只能是 cn（红涨绿跌）或 us（绿涨红跌）")
+        # The session helpers consult one process-wide calendar (a half day is one fact, not a dozen call sites).
+        CALENDAR.configure(parse_dates(e.get("HK_HALF_DAYS", DEFAULT_SPECIAL_DAYS["HK_HALF"]), "HK_HALF_DAYS"),
+                           parse_dates(e.get("KR_LATE_DAYS", DEFAULT_SPECIAL_DAYS["KR_LATE"]), "KR_LATE_DAYS"))
         return cls(
             token=e.get("TELEGRAM_BOT_TOKEN", "").strip(),
             admin_id=bounded_int(e, "ADMIN_USER_ID", 0, 0, 10**15),
@@ -525,6 +556,8 @@ class Config:
             a50_beta=parse_beta(e.get("A50_BETA", "0.8")),
             kospi_beta=parse_beta(e.get("KOSPI_BETA", "1"), "KOSPI_BETA"),
             holidays=parse_holidays(e),
+            hk_half_days=parse_dates(e.get("HK_HALF_DAYS", DEFAULT_SPECIAL_DAYS["HK_HALF"]), "HK_HALF_DAYS"),
+            kr_late_days=parse_dates(e.get("KR_LATE_DAYS", DEFAULT_SPECIAL_DAYS["KR_LATE"]), "KR_LATE_DAYS"),
             web_port=0 if e.get("WEB", "on").strip().lower() in {"off", "0", "false", "no"}
             else bounded_int(e, "WEB_PORT", int(e.get("PORT") or 0), 0, 65535),
             web_token=e.get("WEB_TOKEN", "").strip(),
@@ -1116,7 +1149,7 @@ def finished_bars(bars: list[tuple], market: str, now_ms: int) -> list[tuple]:
     info = STOCK_MARKETS[market]
     tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
     local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
-    done = local >= dt.datetime.combine(local.date(), info.close_time, tz) + dt.timedelta(minutes=15)
+    done = local >= dt.datetime.combine(local.date(), CALENDAR.close_time(market, local.date()), tz) + dt.timedelta(minutes=15)
     return [bar for bar in bars if bar[0] < local.date() or (bar[0] == local.date() and done)]
 
 
@@ -1126,7 +1159,7 @@ def last_completed_bar(bars: list[tuple[dt.date, D]], info: StockMarketInfo,
     plus the close of the bar before it when known."""
     tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
     local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
-    final_from = dt.datetime.combine(local.date(), info.close_time, tz) + dt.timedelta(minutes=15)
+    final_from = dt.datetime.combine(local.date(), CALENDAR.close_time_for(info, local.date()), tz) + dt.timedelta(minutes=15)
     ordered = sorted(bars, reverse=True)
     for index, (day, close) in enumerate(ordered):
         if day < local.date() or (day == local.date() and local >= final_from):
@@ -1161,7 +1194,7 @@ def parse_quote_close(source: str, market: str, raw: bytes, info: StockMarketInf
         raise ValueError(f"{source}行情格式异常") from None
     tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
     local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
-    final_from = dt.datetime.combine(local.date(), info.close_time, tz) + dt.timedelta(minutes=15)
+    final_from = dt.datetime.combine(local.date(), CALENDAR.close_time_for(info, local.date()), tz) + dt.timedelta(minutes=15)
     if quoted.date() < local.date() or (quoted.date() == local.date() and local >= final_from):
         return quoted.date(), number(current, "收盘价"), number(previous, "昨收价")
     return None, number(previous, "昨收价"), None
@@ -1179,8 +1212,8 @@ def stock_live_window(market: str, now_ms: int, holidays: frozenset = frozenset(
     today = local.date()
     if today.weekday() >= 5 or today in holidays:
         return None
-    start = dt.datetime.combine(today, SESSIONS[market][0][0], tz)
-    final = dt.datetime.combine(today, info.close_time, tz) + dt.timedelta(minutes=15)
+    start = dt.datetime.combine(today, CALENDAR.sessions(market, today)[0][0], tz)
+    final = dt.datetime.combine(today, CALENDAR.close_time(market, today), tz) + dt.timedelta(minutes=15)
     if not start <= local < final:
         return None
     return int(start.timestamp() * 1000), int(final.timestamp() * 1000)
@@ -1233,6 +1266,7 @@ class StockMarket:
         self.store = store
         self.closes: dict[str, Baseline] = {}
         self.errors: dict[str, str] = {}
+        self.notes: dict[str, str] = {}  # ticker code -> a caveat about the close that is not a failure (KRX correction)
         self.refreshed = -1e9
         self.live: dict[str, IndexQuote] = {}   # realtime stock quote while its session runs
         self.live_errors: dict[str, str] = {}
@@ -1258,11 +1292,12 @@ class StockMarket:
                      {"Referer": "https://finance.naver.com/"})]
         secid = {"sh": "1", "sz": "0", "hk": "116"}[ticker.market] + "." + ticker.code
         sina = ("rt_hk" if ticker.market == "hk" else ticker.market) + ticker.code
+        tencent = ("r_hk" if ticker.market == "hk" else ticker.market) + code  # plain hkXXXXX is 15 minutes delayed
         return [
             ("东方财富", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=10"
                          "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&secid=" + urllib.parse.quote(secid),
              {"Referer": "https://quote.eastmoney.com/"}),
-            ("腾讯", f"https://qt.gtimg.cn/q={ticker.market}{code}", {"Referer": "https://gu.qq.com/"}),
+            ("腾讯", f"https://qt.gtimg.cn/q={tencent}", {"Referer": "https://gu.qq.com/"}),
             ("新浪", f"https://hq.sinajs.cn/list={sina}", {"Referer": "https://finance.sina.com.cn/"}),
         ]
 
@@ -1357,12 +1392,12 @@ class StockMarket:
             return None, "现货行情缺少报价时间"
         if q.quoted_ms < window[0] - 30 * 60_000:  # still yesterday's print (pre-open auction may stamp minutes early)
             return None, "现货今日尚未开盘成交"
-        sessions = SESSIONS[ticker.market]
-        lunch = (sessions[0][1], sessions[1][0]) if len(sessions) > 1 else None  # HK/A-share lunch, Beijing time
         info = STOCK_MARKETS[ticker.market]
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         day = dt.datetime.fromtimestamp(now_ms / 1000, tz).date()
-        end = max(sessions[-1][1], info.close_time)  # no new prints after the close; don't call its last one stale
+        sessions = CALENDAR.sessions(ticker.market, day)
+        lunch = (sessions[0][1], sessions[1][0]) if len(sessions) > 1 else None  # HK/A-share lunch, Beijing time
+        end = max(sessions[-1][1], CALENDAR.close_time(ticker.market, day))  # no new prints after the close; don't call its last one stale
         clock = min(now_ms, int(dt.datetime.combine(day, end, tz).timestamp() * 1000) + 60_000)
         if quote_stale(q, clock, self.LIVE_STALE_MS, lunch):
             return None, f"现货行情已超 10 分钟未更新（最后 {stamp(q.quoted_ms, seconds=False)}）"
@@ -1431,18 +1466,21 @@ class StockMarket:
         try:
             url = self.live_sources(ticker)[0][1]
             q = parse_naver_index(await fetch_source(url, {"Referer": "https://finance.naver.com/"}), now_ms)
-        except Exception:
+        except Exception as error:  # the chart's close stands; /diag shows that the KRX correction was not available
+            self.notes[ticker.code] = f"Naver 实时价不可用，收盘未经 KRX 正规时段校正：{clean_error(error) or type(error).__name__}"
             return day, close, prev, source
+        self.notes.pop(ticker.code, None)
         if q.quoted_ms <= 0:
             return day, close, prev, source  # an undated quote cannot say which session it belongs to
-        kst, info = dt.timezone(dt.timedelta(hours=9)), STOCK_MARKETS["kr"]
+        kst = dt.timezone(dt.timedelta(hours=9))
         quoted = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst)
         qday = quoted.date()  # may be newer than the chart's last final bar (today's counts only from 15:45)
         key = f"krx_close:{ticker.code}:{qday.isoformat()}"
-        close_ms = int(dt.datetime.combine(qday, info.close_time, kst).timestamp() * 1000)
+        close_time = CALENDAR.close_time("kr", qday)  # 16:30 on the CSAT day, when a 15:33 print is still intraday
+        close_ms = int(dt.datetime.combine(qday, close_time, kst).timestamp() * 1000)
         settled = now_ms >= close_ms + CLOSE_SETTLE_MS["kr"]  # the auction's random end and feed lag are past
-        after_close = qday >= day and quoted.time() >= info.close_time
-        if after_close and settled and quoted.time() < KRX_NXT_AFTER:
+        after_close = qday >= day and quoted.time() >= close_time
+        if after_close and settled and quoted.time() < CALENDAR.kr_time(KRX_NXT_AFTER, qday):
             # between the KRX close and Nextrade's after-hours session the quote is the KRX close: keep it
             if self.store:
                 self.store.put(key, [str(q.last), str(q.prev_close or "")])
@@ -1461,7 +1499,7 @@ class StockMarket:
     def baseline(ticker: StockTicker, info: StockMarketInfo, source: str, day: dt.date | None, close: D,
                  prev: D | None = None) -> Baseline:
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
-        close_ms = int(dt.datetime.combine(day, info.close_time, tz).timestamp() * 1000) if day else 0
+        close_ms = int(dt.datetime.combine(day, CALENDAR.close_time(ticker.market, day), tz).timestamp() * 1000) if day else 0
         when = str(day) if day else "上一交易日"
         return Baseline(close, f"exchange:{when}:{close}", f"证券交易所收盘价｜{when} {info.name}",
                         (close_ms or int(time.time() * 1000)) + DAY_MS, close_ms,
@@ -1475,14 +1513,39 @@ class StockMarket:
                 "close_ms": close.close_ms, "currency": close.currency, "source": close.source,
                 "close_note": close.close_note, "prev_value": str(close.prev_value) if close.prev_value else ""})
 
+    PENDING_SECONDS = 60      # refresh cadence while a session's close is due but not yet confirmed
+    PENDING_WINDOW_MS = 2 * 3600_000  # ...for this long after it was due (then back to the normal cadence)
+
+    def close_pending(self, now_ms: int) -> bool:
+        """A close the calendar says should be final by now is not confirmed yet (and is less than two hours overdue):
+        the baseline switch must not wait for the 10-minute cadence."""
+        for symbol, ticker in self.config.tickers.items():
+            holidays = self.config.holidays.get(ticker.market, frozenset())
+            expected = expected_close_date(ticker.market, now_ms, holidays)
+            info = STOCK_MARKETS[ticker.market]
+            tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+            final_ms = int((dt.datetime.combine(expected, CALENDAR.close_time(ticker.market, expected), tz)
+                            + dt.timedelta(minutes=15)).timestamp() * 1000)
+            known = self.closes.get(symbol)
+            known_day = dt.datetime.fromtimestamp(known.close_ms / 1000, tz).date() if known and known.close_ms else None
+            if (known_day is None or known_day < expected) and final_ms <= now_ms < final_ms + self.PENDING_WINDOW_MS:
+                return True
+        return False
+
     async def refresh(self, now_ms: int, force: bool = False) -> Refreshed | bool:
-        if not self.config.tickers or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
+        if not self.config.tickers:
+            return False
+        cadence = self.PENDING_SECONDS if self.close_pending(now_ms) else self.REFRESH_SECONDS
+        if not force and time.monotonic() - self.refreshed < cadence:
             return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
-        got = 0
+        started, got = time.monotonic(), 0
         for index, (symbol, ticker) in enumerate(self.config.tickers.items()):
             if index:
                 await asyncio.sleep(0.5)  # Spread requests out; feeds drop bursts from one IP.
+            # each stock is judged at its own moment: a round that straddles the "bar is final" minute must not
+            # reject a close for the later stocks with the earlier clock
+            now_ms = now_ms + int((time.monotonic() - started) * 1000) if index else now_ms
             try:
                 close = await self.fetch(symbol, ticker, now_ms)
             except Exception as error:  # Keep the last good close; report the failure alongside it.
@@ -1512,6 +1575,7 @@ class FxRates:
     Manual FX_RATES entries always win; fetched rates come from keyless public sources.
     """
     REFRESH_SECONDS = 6 * 3600
+    RETRY_SECONDS = 300  # after a failed round (both sources), not six hours later
     SOURCES = (("Frankfurter（欧洲央行参考汇率）",
                 "https://api.frankfurter.app/latest?from=USD&to=CNY,HKD,KRW,JPY,EUR,GBP,SGD,INR"),
                ("open.er-api.com", "https://open.er-api.com/v6/latest/USD"))
@@ -1571,6 +1635,7 @@ class FxRates:
             except Exception as error:
                 failures.append(f"{name}: {clean_error(error)}")
         self.error = "；".join(failures)
+        self.refreshed = time.monotonic() - self.REFRESH_SECONDS + self.RETRY_SECONDS  # try again soon
         return Refreshed("failed", self.error)
 
 
@@ -1729,9 +1794,9 @@ def hk_previous_day(day: dt.date, holidays: frozenset = frozenset()) -> dt.date:
 
 
 def hk_cash_close_date(now_ms: int, holidays: frozenset = frozenset()) -> dt.date:
-    """The latest HK trading day whose 16:10 cash close has passed."""
+    """The latest HK trading day whose cash close (16:10; 12:10 on a half day) has passed."""
     local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
-    day = local.date() if local.time() >= dt.time(16, 10) else local.date() - dt.timedelta(days=1)
+    day = local.date() if local.time() >= CALENDAR.close_time("hk", local.date()) else local.date() - dt.timedelta(days=1)
     while not hk_trading_day(day, holidays):
         day -= dt.timedelta(days=1)
     return day
@@ -1752,14 +1817,16 @@ def local_ms(text: str, tz: dt.tzinfo = BEIJING) -> int:
 
 def hk_futures_session(now_ms: int, holidays: frozenset = frozenset()) -> str:
     """HKEX HSI futures: day session 09:15-16:30, after-hours (夜市) 17:15-03:00 next day, HK time.
-    Sessions only start on trading days, so Friday's night ends Saturday 03:00 and weekends are shut."""
+    Sessions only start on trading days, so Friday's night ends Saturday 03:00 and weekends are shut.
+    A half day ends the day session at 12:30 and has no night session."""
     moment = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
     local, today = moment.time(), moment.date()
-    if local >= dt.time(17, 15) and hk_trading_day(today, holidays):
+    if local >= dt.time(17, 15) and hk_trading_day(today, holidays) and not CALENDAR.half_day("hk", today):
         return "夜市"
-    if local < dt.time(3, 0) and hk_trading_day(today - dt.timedelta(days=1), holidays):
+    yesterday = today - dt.timedelta(days=1)
+    if local < dt.time(3, 0) and hk_trading_day(yesterday, holidays) and not CALENDAR.half_day("hk", yesterday):
         return "夜市"
-    if dt.time(9, 15) <= local <= dt.time(16, 30) and hk_trading_day(today, holidays):
+    if dt.time(9, 15) <= local <= CALENDAR.hk_futures_day_end(today) and hk_trading_day(today, holidays):
         return "日市"
     return "休市"
 
@@ -1769,8 +1836,8 @@ def hk_session_end(session: str, now_ms: int, holidays: frozenset = frozenset())
     local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
     day = local.date()
     for _ in range(30):
-        if hk_trading_day(day, holidays):
-            end = (dt.datetime.combine(day, dt.time(16, 30), BEIJING) if session == "日市"
+        if hk_trading_day(day, holidays) and (session == "日市" or not CALENDAR.half_day("hk", day)):
+            end = (dt.datetime.combine(day, CALENDAR.hk_futures_day_end(day), BEIJING) if session == "日市"
                    else dt.datetime.combine(day + dt.timedelta(days=1), dt.time(3, 0), BEIJING))
             if end <= local:
                 return int(end.timestamp() * 1000)
@@ -1894,9 +1961,9 @@ class IndexFutures:
         return q.last, q.prev_close
 
     def cash_open(self, now_ms: int) -> bool:
-        """The HSI cash session (09:30–16:10, closing auction included) is running."""
+        """The HSI cash session (09:30–16:10, closing auction included; to 12:10 on a half day) is running."""
         local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
-        return hk_trading_day(local.date(), self.holidays) and dt.time(9, 30) <= local.time() < dt.time(16, 10)
+        return hk_trading_day(local.date(), self.holidays) and dt.time(9, 30) <= local.time() < CALENDAR.close_time("hk", local.date())
 
     def futures_problem(self, q: FuturesQuote, now_ms: int) -> str:
         """Why q cannot stand for the futures now ("" when it can): while a session trades it must have moved within
@@ -1952,7 +2019,7 @@ class IndexFutures:
         """The first refresh after the 16:10 cash close is not left to the 60-second cadence: the futures price at
         that moment is the anchor that maps the after-hours move onto the close."""
         local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
-        close = int(dt.datetime.combine(local.date(), dt.time(16, 10), BEIJING).timestamp() * 1000)
+        close = int(dt.datetime.combine(local.date(), CALENDAR.close_time("hk", local.date()), BEIJING).timestamp() * 1000)
         return hk_trading_day(local.date(), self.holidays) and self.refreshed_ms < close <= now_ms
 
     async def refresh(self, now_ms: int, force: bool = False) -> Refreshed | bool:
@@ -1971,7 +2038,9 @@ class IndexFutures:
         self.spot_error = ""
         if why:  # no cash index with the futures (Eastmoney, CFD), or etnet's cannot be trusted now: ask the timed feeds
             def with_spot(s: IndexQuote) -> FuturesQuote:
-                return dataclasses.replace(quote, spot=s.last, spot_prev=s.prev_close, spot_source=s.source, spot_ms=s.quoted_ms)
+                # another feed's cash index: etnet's published premium (水位) belonged to its own spot and goes with it
+                return dataclasses.replace(quote, spot=s.last, spot_prev=s.prev_close, spot_source=s.source,
+                                           spot_ms=s.quoted_ms, water=None)
             spot, _, spot_error = await pick_quote(self.SPOT_SOURCES, lambda n, r: self.parse_spot_quote(n, r, now_ms),
                                                    lambda s: self.spot_problem(with_spot(s), now_ms))
             prev = self.quote
@@ -2011,7 +2080,9 @@ class IndexFutures:
         if q.change is not None and q.prev_settle:
             parts.append(f"期货前收 {bold(fmt(q.prev_settle))} {pct_text(q.change / q.prev_settle * 100, style)}（{q.change:+,.0f}）")
         source = q.source if q.exchange_contract else f"{q.source}·非港交所合约，仅参考"
-        parts.append(f"{quote_time(q.quoted_ms)} {source}" + (stale_note(q.quoted_ms, now_ms, BEIJING) if q.quoted_ms else ""))
+        # "非今日数据" only when the quote really is behind (not on a weekend, when the last session's print is the right one)
+        parts.append(f"{quote_time(q.quoted_ms)} {source}"
+                     + (stale_note(q.quoted_ms, now_ms, BEIJING) if q.quoted_ms and self.futures_problem(q, now_ms) else ""))
         line = "｜".join(parts)
         if self.spot_error:
             line += f"｜⚠️ 恒指现货刷新失败：{brief_error(self.spot_error)}"
@@ -2222,9 +2293,12 @@ def parse_eastmoney_index(raw: bytes, now_ms: int, name: str) -> IndexQuote:
                       _opt(d.get("f44")), _opt(d.get("f45")), eastmoney_ms(d), "东方财富", fetched_ms=now_ms)
 
 
-def krx_session(now_ms: int) -> str:
-    local = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=9))).time()
-    return "交易中" if dt.time(9, 0) <= local <= dt.time(15, 30) else "已收盘"
+def krx_session(now_ms: int, holidays: frozenset = frozenset()) -> str:
+    local = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=9)))
+    if local.weekday() >= 5 or local.date() in holidays:
+        return "休市"
+    start, end = CALENDAR.sessions("kr", local.date())[0]
+    return "交易中" if start <= local.time() <= end else "已收盘"
 
 
 def a50_session(now_ms: int) -> str:
@@ -2699,8 +2773,8 @@ class DailyCloses:
     10 minutes and every minute from 15 minutes after the close until the day's bar is in. Realtime index feeds can
     be read before the closing auction's final value is published; a dated bar is the settled close."""
 
-    def __init__(self, market: str, sources: tuple[tuple[str, str], ...]):
-        self.market, self.sources = market, sources
+    def __init__(self, market: str, sources: tuple[tuple[str, str], ...], holidays: frozenset = frozenset()):
+        self.market, self.sources, self.holidays = market, sources, holidays
         self.daily: dict[dt.date, D] = {}
         self.ranks: dict[dt.date, int] = {}  # which source each close came from (earlier in ``sources`` wins)
         self.refreshed = -1e9
@@ -2723,8 +2797,9 @@ class DailyCloses:
         info = STOCK_MARKETS[self.market]
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
-        final = dt.datetime.combine(local.date(), info.close_time, tz) + dt.timedelta(minutes=15)
-        waiting = local.weekday() < 5 and local >= final and local.date() not in self.daily
+        final = dt.datetime.combine(local.date(), CALENDAR.close_time(self.market, local.date()), tz) + dt.timedelta(minutes=15)
+        waiting = (local.weekday() < 5 and local.date() not in self.holidays and local >= final
+                   and local.date() not in self.daily)  # a holiday evening has no bar to wait for
         if time.monotonic() - self.refreshed < (60 if waiting else 600):
             return None
         self.refreshed, failures, got = time.monotonic(), [], False
@@ -2796,9 +2871,10 @@ class KospiIndex:
         """(the KRX regular session runs now, when the latest finished session closed)."""
         kst = dt.timezone(dt.timedelta(hours=9))
         local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
-        live = local.weekday() < 5 and local.date() not in self.holidays and dt.time(9, 0) <= local.time() < KRX_SETTLED
+        live = (local.weekday() < 5 and local.date() not in self.holidays
+                and CALENDAR.sessions("kr", local.date())[0][0] <= local.time() < CALENDAR.kr_time(KRX_SETTLED, local.date()))
         last = expected_close_date("kr", now_ms, self.holidays)
-        return live, int(dt.datetime.combine(last, dt.time(15, 30), kst).timestamp() * 1000)
+        return live, int(dt.datetime.combine(last, CALENDAR.close_time("kr", last), kst).timestamp() * 1000)
 
     def problem(self, q: IndexQuote, now_ms: int) -> str:
         """Why q cannot stand for the index now ("" when it can): see quote_problem."""
@@ -2811,8 +2887,8 @@ class KospiIndex:
         not overwritten by Naver. None = not due; "" = the latest session's close is known; else what went wrong."""
         kst = dt.timezone(dt.timedelta(hours=9))
         local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
-        waiting = (local.weekday() < 5 and local.date() not in self.holidays and local.time() >= dt.time(15, 45)
-                   and local.date() not in self.daily)
+        waiting = (local.weekday() < 5 and local.date() not in self.holidays
+                   and local.time() >= CALENDAR.kr_time(dt.time(15, 45), local.date()) and local.date() not in self.daily)
         if time.monotonic() - self.daily_refreshed < (60 if waiting else 600):
             return None
         self.daily_refreshed = time.monotonic()
@@ -2860,12 +2936,12 @@ class KospiIndex:
         q = self.quote
         if q is None:
             return f"🇰🇷 KOSPI ⚠️ 获取失败（{self.error}）" if self.error else "🇰🇷 KOSPI ⏳ 等待首次获取"
-        status = q.status or krx_session(now_ms)
+        status = q.status or krx_session(now_ms, self.holidays)
         line = f"🇰🇷 {bold('KOSPI ' + status)} {bold(fmt(q.last))}"
         if q.change is not None and q.prev_close:
             line += f" → 昨收 {bold(fmt(q.prev_close))} {pct_text(q.change / q.prev_close * 100, style)}（{q.change:+,.2f}）"
         kst = dt.timezone(dt.timedelta(hours=9))
-        line += f"｜{quote_time(q.quoted_ms)} {q.source}" + (stale_note(q.quoted_ms, now_ms, kst) if q.quoted_ms else "")
+        line += f"｜{quote_time(q.quoted_ms)} {q.source}" + (stale_note(q.quoted_ms, now_ms, kst) if q.quoted_ms and self.problem(q, now_ms) else "")
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error)}" if self.error else line
 
     def line200(self, now_ms: int, style: str, hl: "HlQuote | None", hl_note: str = "") -> str:
@@ -2875,7 +2951,7 @@ class KospiIndex:
         q = self.quote200
         if q is None:
             return f"🇰🇷 KOSPI200 ⚠️ 获取失败（{brief_error(self.error200)}）" if self.error200 else "🇰🇷 KOSPI200 ⏳ 等待首次获取"
-        status = q.status or krx_session(now_ms)
+        status = q.status or krx_session(now_ms, self.holidays)
         line = f"🇰🇷 {bold('KOSPI200 ' + status)} {bold(fmt(q.last))}"
         if q.change is not None and q.prev_close:
             line += f" → 昨收 {bold(fmt(q.prev_close))} {pct_text(q.change / q.prev_close * 100, style)}"
@@ -2885,7 +2961,7 @@ class KospiIndex:
         elif hl_note:
             line += f"｜🌊 HL {brief_error(hl_note, 40)}"
         kst = dt.timezone(dt.timedelta(hours=9))
-        line += f"｜{quote_time(q.quoted_ms)} {q.source}" + (stale_note(q.quoted_ms, now_ms, kst) if q.quoted_ms else "")
+        line += f"｜{quote_time(q.quoted_ms)} {q.source}" + (stale_note(q.quoted_ms, now_ms, kst) if q.quoted_ms and self.problem(q, now_ms) else "")
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error200)}" if self.error200 else line
 
 
@@ -2899,6 +2975,69 @@ SESSIONS = {  # continuous-trading intervals, local time
     "hk": ((dt.time(9, 30), dt.time(12, 0)), (dt.time(13, 0), dt.time(16, 0))),
     "kr": ((dt.time(9, 0), dt.time(15, 30)),),
 }
+HK_HALF_DAY_CLOSE = dt.time(12, 10)      # closing auction 12:00–12:10 on a half day
+HK_HALF_DAY_FUTURES_END = dt.time(12, 30)  # HSI futures day session on a half day
+KR_LATE_SHIFT = dt.timedelta(hours=1)   # the CSAT day runs one hour late
+
+
+class SessionCalendar:
+    """Session exceptions by market day: HKEX half days and KRX days that run late. One process-wide instance
+    (CALENDAR), configured from the environment by Config.from_env and consulted by every session-time helper, so
+    "12-24 is a half day" is one fact rather than a dozen call sites remembering it."""
+
+    def __init__(self) -> None:
+        self.hk_half: frozenset = frozenset()
+        self.kr_late: frozenset = frozenset()
+
+    def configure(self, hk_half: frozenset, kr_late: frozenset) -> None:
+        self.hk_half, self.kr_late = frozenset(hk_half), frozenset(kr_late)
+
+    def half_day(self, market: str, day: dt.date) -> bool:
+        return market == "hk" and day in self.hk_half
+
+    def late_day(self, market: str, day: dt.date) -> bool:
+        return market == "kr" and day in self.kr_late
+
+    def kr_time(self, base: dt.time, day: dt.date) -> dt.time:
+        """A KRX clock time on ``day`` (KRX_SETTLED, KRX_NXT_AFTER... are one hour later on a late day)."""
+        if not self.late_day("kr", day):
+            return base
+        return (dt.datetime.combine(day, base) + KR_LATE_SHIFT).time()
+
+    def close_time(self, market: str, day: dt.date) -> dt.time:
+        """When the official close is fixed on ``day`` (local time)."""
+        if self.half_day(market, day):
+            return HK_HALF_DAY_CLOSE
+        if self.late_day(market, day):
+            return self.kr_time(STOCK_MARKETS["kr"].close_time, day)
+        return STOCK_MARKETS[market].close_time
+
+    def close_time_for(self, info: StockMarketInfo, day: dt.date) -> dt.time:
+        market = next((key for key, value in STOCK_MARKETS.items() if value is info), "")
+        return self.close_time(market, day) if market else info.close_time
+
+    def sessions(self, market: str, day: dt.date) -> tuple:
+        """The continuous-trading intervals of ``day`` (local time)."""
+        if self.half_day(market, day):
+            return (SESSIONS["hk"][0],)
+        if self.late_day(market, day):
+            return tuple((self.kr_time(a, day), self.kr_time(b, day)) for a, b in SESSIONS["kr"])
+        return SESSIONS[market]
+
+    def hk_futures_day_end(self, day: dt.date) -> dt.time:
+        return HK_HALF_DAY_FUTURES_END if self.half_day("hk", day) else dt.time(16, 30)
+
+    def note(self, market: str, day: dt.date) -> str:
+        """'半日市' / '高考日延后 1 小时' for labels, "" on an ordinary day."""
+        if self.half_day(market, day):
+            return "半日市"
+        if self.late_day(market, day):
+            return "高考日延后 1 小时"
+        return ""
+
+
+CALENDAR = SessionCalendar()
+CALENDAR.configure(parse_dates(DEFAULT_SPECIAL_DAYS["HK_HALF"], "HK_HALF_DAYS"), parse_dates(DEFAULT_SPECIAL_DAYS["KR_LATE"], "KR_LATE_DAYS"))
 PRIOR_VOL = {"sh": 0.035, "sz": 0.035, "hk": 0.03, "kr": 0.03, "HSI": 0.013, "KOSPI": 0.02, "SSE": 0.011}
 PRIOR_WEIGHT = 10  # pseudo-observations given to the prior when blending with estimated volatility
 
@@ -2933,13 +3072,13 @@ def session_remaining(market: str, now_ms: int, close_date: dt.date | None = Non
     tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
     local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
     total = sum((dt.datetime.combine(local.date(), b) - dt.datetime.combine(local.date(), a)).seconds
-                for a, b in SESSIONS[market]) / 60
+                for a, b in SESSIONS[market]) / 60  # a full ordinary session is the unit of variance
     today = local.date()
     trading_today = today.weekday() < 5 and today not in holidays
-    finalised = local >= dt.datetime.combine(today, info.close_time, tz) + dt.timedelta(minutes=15)
+    finalised = local >= dt.datetime.combine(today, CALENDAR.close_time(market, today), tz) + dt.timedelta(minutes=15)
     if trading_today and not finalised and (close_date is None or close_date < today):
         remaining = sum(max(0.0, (dt.datetime.combine(today, b, tz) - max(dt.datetime.combine(today, a, tz), local)).total_seconds())
-                        for a, b in SESSIONS[market]) / 60
+                        for a, b in CALENDAR.sessions(market, today)) / 60  # a half day has less of it ahead
         return max(remaining, 1.0) / total, today
     target, skipped = today + dt.timedelta(days=1), 0
     while target.weekday() >= 5 or target in holidays:
@@ -2959,7 +3098,7 @@ def expected_close_date(market: str, now_ms: int, holidays: frozenset = frozense
     tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
     local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
     day = local.date()
-    if local < dt.datetime.combine(day, info.close_time, tz) + dt.timedelta(minutes=15):
+    if local < dt.datetime.combine(day, CALENDAR.close_time(market, day), tz) + dt.timedelta(minutes=15):
         day -= dt.timedelta(days=1)
     for _ in range(60):
         if day.weekday() < 5 and day not in holidays:
@@ -3463,9 +3602,25 @@ AUCTIONS = {
 AUCTIONS["sz"] = AUCTIONS["sh"]
 
 
+def auction_window(market: str, now_ms: int) -> tuple[dt.time, dt.time, str] | None:
+    """(start, end, description) of ``market``'s closing auction on the day of ``now_ms``, Beijing time: the usual
+    window, or the half day's / late day's one."""
+    base = AUCTIONS.get(market)
+    info = STOCK_MARKETS.get(market)
+    if not base or not info:
+        return None
+    day = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset))).date()
+    if CALENDAR.half_day(market, day):
+        return dt.time(12, 0), HK_HALF_DAY_CLOSE, "港交所收市竞价（半日市 12:00–12:10，12:08 后随机收市）"
+    if CALENDAR.late_day(market, day):
+        start, end = (dt.datetime.combine(day, t, BEIJING) + KR_LATE_SHIFT for t in base[:2])
+        return start.time(), end.time(), "韩交所收盘集合竞价（高考日延后：首尔 16:20–16:30，随机结束至 16:30:30）"
+    return base
+
+
 def auction_running(market: str, now_ms: int, holidays: frozenset = frozenset()) -> bool:
     """Whether ``market``'s closing auction is under way now (a weekday that is not a configured holiday)."""
-    window = AUCTIONS.get(market)
+    window = auction_window(market, now_ms)
     if not window:
         return False
     local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
@@ -3477,12 +3632,13 @@ def auction_running(market: str, now_ms: int, holidays: frozenset = frozenset())
 
 def session_state(market: str, now_ms: int, holidays: frozenset = frozenset()) -> str:
     """Where ``market`` stands now (its local time): 未开盘 / 开盘中 / 午休 / 已收盘, or 休市 on a weekend or holiday."""
-    sessions, info = SESSIONS.get(market), STOCK_MARKETS.get(market)
-    if not sessions or not info:
+    info = STOCK_MARKETS.get(market)
+    if market not in SESSIONS or not info:
         return ""
     local = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset)))
     if local.weekday() >= 5 or local.date() in holidays:
         return "休市"
+    sessions = CALENDAR.sessions(market, local.date())
     t = local.time()
     if t < sessions[0][0]:
         return "未开盘"
@@ -7708,7 +7864,7 @@ class Bot:
             ("tencent", "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=hkHSI,day,,,10,"),
             ("eastmoney", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=10"
                           "&fields1=f1&fields2=f51,f52,f53&secid=100.HSI"),
-            ("yahoo", yahoo_url("^HSI"))))
+            ("yahoo", yahoo_url("^HSI"))), config.holidays.get("hk", frozenset()))
         self.hsi.dated_close = lambda day: self.hsi_daily.daily.get(day)  # checks the cash index belongs to the right day
         self.touches = {spec.key: TouchMarket(store, spec) for spec in TOUCH_MARKETS}
         self.updowns = {spec.key: UpDownMarket(store, spec) for spec in UPDOWN_MARKETS}
@@ -8385,14 +8541,16 @@ class Bot:
             self.note_outcome("SSE", self.cn.close.day.isoformat(), self.cn.close.value, self.cn.close.source)
         k = self.kospi.quote
         kst = dt.timezone(dt.timedelta(hours=9))
-        if k and dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).time() >= dt.time(15, 30):
-            day = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date()
+        quoted_kst = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst) if k else None
+        if quoted_kst and quoted_kst.time() >= CALENDAR.close_time("kr", quoted_kst.date()):
+            day = quoted_kst.date()
             official = self.kospi.official_close(day)
             rank = self.kospi.daily_rank.get(day)
             self.note_outcome("KOSPI", day.isoformat(), official or k.last,
                               ("Yahoo ^KS11 日K", "Naver 日K")[rank] if official and rank in (0, 1) else f"{k.source} 实时（日K未出）")
         q, local = self.hsi.quote, dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
-        if local.time() >= dt.time(16, 15) and hk_cash_close_date(now_ms, self.hsi.holidays) == local.date():
+        hk_final = dt.datetime.combine(local.date(), CALENDAR.close_time("hk", local.date()), BEIJING) + dt.timedelta(minutes=5)
+        if local >= hk_final and hk_cash_close_date(now_ms, self.hsi.holidays) == local.date():
             # the dated daily close once it is out; before that the cash quote, if it is that day's
             close, source = self.hsi_daily.daily.get(local.date()), ""
             if close is not None:
@@ -8560,7 +8718,7 @@ class Bot:
     def kospi_close_ms(q: IndexQuote) -> int:
         kst = dt.timezone(dt.timedelta(hours=9))
         day = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst).date()
-        return int(dt.datetime.combine(day, dt.time(15, 30), kst).timestamp() * 1000)
+        return int(dt.datetime.combine(day, CALENDAR.close_time("kr", day), kst).timestamp() * 1000)
 
     @staticmethod
     def hk_cash_close_date(now_ms: int, holidays: frozenset = frozenset()) -> dt.date:
@@ -8572,7 +8730,7 @@ class Bot:
         info = STOCK_MARKETS[ticker.market]
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         today = dt.datetime.fromtimestamp(now_ms / 1000, tz).date()
-        close_ms = int(dt.datetime.combine(today, info.close_time, tz).timestamp() * 1000)
+        close_ms = int(dt.datetime.combine(today, CALENDAR.close_time(ticker.market, today), tz).timestamp() * 1000)
         if now_ms < close_ms + CLOSE_SETTLE_MS.get(ticker.market, 60_000):
             return
         live, _ = self.stocks.live_quote(symbol, now_ms)  # None once the close is final (+15 min): keep the last one
@@ -8661,7 +8819,7 @@ class Bot:
         if not read_ms or not q.quoted_ms:
             return
         day = dt.datetime.fromtimestamp(read_ms / 1000, BEIJING).date()
-        close_ms = int(dt.datetime.combine(day, dt.time(16, 10), BEIJING).timestamp() * 1000)
+        close_ms = int(dt.datetime.combine(day, CALENDAR.close_time("hk", day), BEIJING).timestamp() * 1000)
         if (not hk_trading_day(day, holidays) or not close_ms <= read_ms <= close_ms + self.HSI_PRINT_MS
                 or q.session_name(holidays) != "日市" or self.hsi.futures_problem(q, read_ms)):
             return
@@ -8677,7 +8835,7 @@ class Bot:
         """(the futures price at close_date's 16:10 cash close, its label, approximate?) for mapping q onto that close.
         Prefers the recorded print of the same family and contract month; otherwise the same contract's 16:30 day
         close, clearly approximate (the 16:10–16:30 futures move is missing); else none, with the reason."""
-        close_ms = int(dt.datetime.combine(close_date, dt.time(16, 10), BEIJING).timestamp() * 1000)
+        close_ms = int(dt.datetime.combine(close_date, CALENDAR.close_time("hk", close_date), BEIJING).timestamp() * 1000)
         saved = self.store.get(f"anchor:{hsi_anchor_key(q)}")
         with contextlib.suppress(ValueError, TypeError, IndexError, decimal.InvalidOperation):
             if int(saved[0]) == close_ms and (not saved[3] or not q.contract or saved[3] == q.contract) and D(str(saved[1])) > 0:
@@ -8770,7 +8928,7 @@ class Bot:
         hl, anchor = self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
         remaining, target = session_remaining("kr", now_ms, quoted_day, holidays)
         expected = expected_close_date("kr", now_ms, holidays)
-        if quoted_day < expected or (quoted_day == local.date() and local.time() < KRX_SETTLED):
+        if quoted_day < expected or (quoted_day == local.date() and local.time() < CALENDAR.kr_time(KRX_SETTLED, local.date())):
             return f"KOSPI 基准停在 {stamp(k.quoted_ms, seconds=False)}，应为 {expected.strftime('%m-%d')} 收盘；暂不输出概率"
         if hl is None:
             return "缺少 HL KR200 代理"
@@ -8843,7 +9001,7 @@ class Bot:
             if market:
                 holidays = self.config.holidays.get(market, frozenset())
                 if auction_running(market, now_ms, holidays):
-                    base["auction"] = AUCTIONS[market][2]
+                    base["auction"] = (auction_window(market, now_ms) or AUCTIONS[market])[2]
                 elif state := session_state(market, now_ms, holidays):
                     base["trading"] = state
             if isinstance(odds, str):
@@ -10169,10 +10327,11 @@ class Bot:
         next cycle while the auction is young; a copy whose data aged in the send queue is dropped, then rebuilt."""
         if not self.config.auction_alert or not self.config.probability:
             return
-        for market, (start, end, label) in AUCTIONS.items():
+        for market in AUCTIONS:
             holidays = self.config.holidays.get(market, frozenset())
             if market == "sz" or not auction_running(market, now_ms, holidays):
                 continue
+            start, end, label = auction_window(market, now_ms) or AUCTIONS[market]
             local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
             opened = dt.datetime.combine(local.date(), start, BEIJING)
             day_key = f"auction:{market}:{local.date().isoformat()}"
@@ -10356,10 +10515,11 @@ class Bot:
             ticker = self.config.tickers.get(title.split("｜")[-1])
             market = ticker.market if ticker else "sh"
         info = STOCK_MARKETS[market]
-        close = dt.datetime.combine(target, info.close_time, dt.timezone(dt.timedelta(hours=info.utc_offset)))
+        close = dt.datetime.combine(target, CALENDAR.close_time(market, target), dt.timezone(dt.timedelta(hours=info.utc_offset)))
         local = f"，{info.tz_name[:-2]} {close.strftime('%H:%M')}" if info.utc_offset != 8 else ""
+        special = f"，{CALENDAR.note(market, target)}" if CALENDAR.note(market, target) else ""
         return (int(close.timestamp() * 1000),
-                f"{close.astimezone(BEIJING).strftime('%m-%d %H:%M')} {info.name}收盘（北京时间{local}）")
+                f"{close.astimezone(BEIJING).strftime('%m-%d %H:%M')} {info.name}收盘（北京时间{local}{special}）")
 
     def web_url(self) -> str:
         path = f"/p/{self.web_token}"
@@ -10438,7 +10598,8 @@ class Bot:
                   if sub and sub.get("suspended") else "⏸ 未订阅/已暂停")
         style = self.config.color_style
         lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(),
-                 f"📊 {legend(style)}｜→ 后为币安现价相对该行价格"]
+                 f"📊 {legend(style)}｜→ 后为币安现价相对该行价格",
+                 calendar_warning(self.config.holidays, dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date())]
         if self.settings()["mode"] == "binance_daily" and self.config.tickers:
             lines.append("💡 /mode exchange 可把基准对齐到交易所收盘时刻")
         if self.config.edge_alert and self.config.predict:
@@ -10896,9 +11057,10 @@ class Bot:
                 sigma, note = self.stock_sigma(symbol, ticker.market)
                 share = self.vols.shares.get(symbol)
                 vol = f"σ {sigma * 100:.2f}%（{note}）" + (f"，盘中占 {share[0] * 100:.0f}%" if share else "")
-            if "error" in snap or err or live_text or vol:
+            note = self.stocks.notes.get(ticker.code, "") if ticker else ""
+            if "error" in snap or err or live_text or vol or note:
                 lines.append(f"  {short_name(symbol)}：" + "｜".join(x for x in (snap.get("error"), f"交易所收盘：{err}" if err else "",
-                                                                                live_text, vol) if x))
+                                                                                note, live_text, vol) if x))
         return lines
 
     @staticmethod
@@ -10969,7 +11131,8 @@ class Bot:
 
     async def refresh_hsi(self, now_ms: int) -> Refreshed | bool:
         result = await self.hsi.refresh(now_ms)
-        daily = await self.hsi_daily.refresh(now_ms) if self.config.hsi_futures and self.config.probability else None
+        # the dated closes also tell whether etnet's cash index is today's (spot_problem), so they are not tied to PROBABILITY
+        daily = await self.hsi_daily.refresh(now_ms) if self.config.hsi_futures else None
         if result is False and daily is None:
             return False  # neither part was due
         errors = [result.error if isinstance(result, Refreshed) else "", f"恒指日K：{daily}" if daily else ""]
@@ -11142,6 +11305,8 @@ class Bot:
         await self.register_menu()
         if not self.config.admin_id:
             LOG.warning("ADMIN_USER_ID 尚未配置：只能使用 /id；没有任何自动订阅")
+        if warning := calendar_warning(self.config.holidays, dt.datetime.now(BEIJING).date()):
+            LOG.warning("%s", warning)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(NotImplementedError):
