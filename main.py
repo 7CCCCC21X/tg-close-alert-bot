@@ -16,6 +16,7 @@ import functools
 import decimal
 import gzip
 import html
+import http.client
 import inspect
 import json
 import hmac
@@ -31,6 +32,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 from dataclasses import dataclass, field
@@ -41,7 +44,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.27.0"
+VERSION = "1.28.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -224,17 +227,28 @@ STOCK_MARKETS = {
 # HK0625USDT is a quanto contract: its price is the HKD stock price itself, so it compares directly (:same).
 # The others are USD-denominated, so their exchange closes are converted with the FX rate first.
 DEFAULT_TICKERS = "UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:688825,SKHYNIXUSDT=kr:000660"
+NOTICE_GRACE_SECONDS = 30  # a data fault must last this long before subscribers hear of it (one failed request is not an outage)
+SHUTDOWN_GRACE_SECONDS = 8  # at shutdown, how long messages already on their way may take to finish
 REFERENCE_TICK = 5        # seconds between checks in each reference task (each feed has its own cadence)
 REFERENCE_TIMEOUT = 300   # one reference refresh may take this long before it is abandoned
 EXCHANGE_BASE_HOLD_DAYS = 30  # safety cap for a held exchange-close baseline; National Day / Chuseok fit easily
 
 
 # Exchange holidays on weekdays (official 2026 notices where known); override with HOLIDAYS_CN/HK/KR.
+# Only dates that are certain are listed: a holiday missing here costs a "close pending" evening, a wrong one would
+# skip a real session. 2027 Lunar New Year closures are added once the exchanges publish them.
 DEFAULT_HOLIDAYS = {
-    "CN": "2026-09-25,2026-10-01..2026-10-07",   # SSE notice: Mid-Autumn 9/25, National Day 10/1-10/7
-    "KR": "2026-09-24,2026-09-25,2026-10-05,2026-10-09",  # Chuseok, National Foundation Day (substitute), Hangul Day
-    "HK": "2026-10-01",
+    "CN": "2026-09-25,2026-10-01..2026-10-07,2027-01-01",   # SSE notice: Mid-Autumn 9/25, National Day 10/1-10/7; New Year
+    "KR": "2026-09-24,2026-09-25,2026-10-05,2026-10-09,2026-12-25,2026-12-31,2027-01-01",  # Chuseok, Foundation Day (substitute), Hangul Day, Christmas, year-end closure, New Year
+    "HK": "2026-10-01,2026-12-25,2027-01-01",  # National Day, Christmas (Boxing Day falls on a Saturday: no weekday off), New Year
 }
+# Days whose session differs from the usual one (verified notices; override with HK_HALF_DAYS / KR_LATE_DAYS):
+#   HKEX half days (the eves of Christmas, New Year and Lunar New Year): morning session only, closing auction
+#     12:00–12:10, HSI futures day session ends 12:30 and there is no after-hours session that evening.
+#   KRX CSAT day (the college entrance exam, third Thursday of November): everything one hour later, regular
+#     session 10:00–16:30 KST, close fixed at 16:30, Nextrade after-hours from 16:40.
+DEFAULT_SPECIAL_DAYS = {"HK_HALF": "2026-12-24,2026-12-31,2027-02-05", "KR_LATE": "2026-11-19"}
+HOLIDAY_WARN_DAYS = 30  # warn this many days before the configured calendar runs out
 
 
 def parse_dates(spec: str, label: str) -> frozenset:
@@ -258,6 +272,23 @@ def parse_holidays(env: dict[str, str]) -> dict[str, frozenset]:
     cn = parse_dates(env.get("HOLIDAYS_CN", DEFAULT_HOLIDAYS["CN"]), "HOLIDAYS_CN")
     return {"sh": cn, "sz": cn, "hk": parse_dates(env.get("HOLIDAYS_HK", DEFAULT_HOLIDAYS["HK"]), "HOLIDAYS_HK"),
             "kr": parse_dates(env.get("HOLIDAYS_KR", DEFAULT_HOLIDAYS["KR"]), "HOLIDAYS_KR")}
+
+
+def calendar_until(holidays: dict[str, frozenset]) -> dt.date | None:
+    """The last date the holiday table knows about (per market the earliest of those), None when it is empty."""
+    ends = [max(days) for days in holidays.values() if days]
+    return min(ends) if ends else None
+
+
+def calendar_warning(holidays: dict[str, frozenset], today: dt.date) -> str:
+    """A reminder to extend HOLIDAYS_CN/HK/KR before the table runs out ("" while it reaches far enough)."""
+    until = calendar_until(holidays)
+    if until is None:
+        return "⚠️ 未配置任何交易所假期（HOLIDAYS_CN/HK/KR），假期会被当成交易日"
+    if (until - today).days < HOLIDAY_WARN_DAYS:
+        return (f"⚠️ 假期表只配置到 {until.isoformat()}" + ("（已过期）" if until < today else "") +
+                "，请在 Railway 变量 HOLIDAYS_CN/HK/KR 补充之后的休市日，否则假期会被当成交易日")
+    return ""
 
 
 def parse_beta(value: str, name: str = "A50_BETA") -> float:
@@ -419,6 +450,8 @@ class Config:
     a50_beta: float = 0.8   # Composite move per unit of A50 move when mapping the proxy.
     kospi_beta: float = 1.0  # KOSPI move per unit of HL KR200 (KOSPI 200 perp) move.
     holidays: dict[str, frozenset] = field(default_factory=dict)  # market -> non-trading weekdays
+    hk_half_days: frozenset = frozenset()  # HKEX half days (close 12:10, futures 12:30, no night session)
+    kr_late_days: frozenset = frozenset()  # KRX days that run one hour late (CSAT day: 10:00–16:30)
     web_port: int = 0        # Read-only probability web page; 0 = disabled. Railway injects PORT.
     web_token: str = ""      # Secret path segment; generated and persisted when empty.
     web_base: str = ""       # Public base URL, e.g. https://xxx.up.railway.app
@@ -479,6 +512,9 @@ class Config:
         style = e.get("COLOR_STYLE", "cn").strip().lower()
         if style not in {"cn", "us"}:
             raise ValueError("COLOR_STYLE 只能是 cn（红涨绿跌）或 us（绿涨红跌）")
+        # The session helpers consult one process-wide calendar (a half day is one fact, not a dozen call sites).
+        CALENDAR.configure(parse_dates(e.get("HK_HALF_DAYS", DEFAULT_SPECIAL_DAYS["HK_HALF"]), "HK_HALF_DAYS"),
+                           parse_dates(e.get("KR_LATE_DAYS", DEFAULT_SPECIAL_DAYS["KR_LATE"]), "KR_LATE_DAYS"))
         return cls(
             token=e.get("TELEGRAM_BOT_TOKEN", "").strip(),
             admin_id=bounded_int(e, "ADMIN_USER_ID", 0, 0, 10**15),
@@ -521,6 +557,8 @@ class Config:
             a50_beta=parse_beta(e.get("A50_BETA", "0.8")),
             kospi_beta=parse_beta(e.get("KOSPI_BETA", "1"), "KOSPI_BETA"),
             holidays=parse_holidays(e),
+            hk_half_days=parse_dates(e.get("HK_HALF_DAYS", DEFAULT_SPECIAL_DAYS["HK_HALF"]), "HK_HALF_DAYS"),
+            kr_late_days=parse_dates(e.get("KR_LATE_DAYS", DEFAULT_SPECIAL_DAYS["KR_LATE"]), "KR_LATE_DAYS"),
             web_port=0 if e.get("WEB", "on").strip().lower() in {"off", "0", "false", "no"}
             else bounded_int(e, "WEB_PORT", int(e.get("PORT") or 0), 0, 65535),
             web_token=e.get("WEB_TOKEN", "").strip(),
@@ -539,23 +577,58 @@ class Store:
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.execute("CREATE TABLE IF NOT EXISTS records (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
         self.conn.commit()
+        self.touched: dict[str, int] = {}  # key family ("sim", "notice"...) -> how many writes it has seen: in-memory views check this
+
+    def _bump(self, key: str) -> None:
+        family = key.partition(":")[0]
+        self.touched[family] = self.touched.get(family, 0) + 1
 
     def get(self, key: str, default: Any = None) -> Any:
         row = self.conn.execute("SELECT v FROM records WHERE k=?", (key,)).fetchone()
         return json.loads(row[0]) if row else copy.deepcopy(default)
 
+    UPSERT = "INSERT INTO records(k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v"
+
     def put(self, key: str, value: Any) -> None:
         with self.conn:
-            self.conn.execute("INSERT INTO records(k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                              (key, json.dumps(value, ensure_ascii=False)))
+            self.conn.execute(self.UPSERT, (key, json.dumps(value, ensure_ascii=False)))
+        self._bump(key)
+
+    def put_many(self, pairs: Any) -> None:
+        """Several records in one transaction (one fsync instead of one per record)."""
+        rows = [(key, json.dumps(value, ensure_ascii=False)) for key, value in pairs]
+        if rows:
+            with self.conn:
+                self.conn.executemany(self.UPSERT, rows)
+            for key, _ in rows:
+                self._bump(key)
+
+    def keys(self, prefix: str) -> list[str]:
+        return [k for (k,) in self.conn.execute("SELECT k FROM records WHERE k >= ? AND k < ? ORDER BY k", self._bounds(prefix))]
+
+    @staticmethod
+    def _bounds(prefix: str) -> tuple[str, str]:
+        """Key range [low, high) covering every key that starts with ``prefix`` (uses the primary-key index)."""
+        return prefix, (prefix[:-1] + chr(ord(prefix[-1]) + 1)) if prefix else "\U0010ffff"
 
     def items(self, prefix: str) -> list[tuple[str, Any]]:
-        rows = self.conn.execute("SELECT k, v FROM records WHERE substr(k,1,?)=? ORDER BY k", (len(prefix), prefix))
+        rows = self.conn.execute("SELECT k, v FROM records WHERE k >= ? AND k < ? ORDER BY k", self._bounds(prefix))
         return [(k, json.loads(v)) for k, v in rows]
+
+    def count(self, prefix: str) -> int:
+        return int(self.conn.execute("SELECT count(*) FROM records WHERE k >= ? AND k < ?", self._bounds(prefix)).fetchone()[0])
 
     def delete_prefix(self, prefix: str) -> None:
         with self.conn:
-            self.conn.execute("DELETE FROM records WHERE substr(k,1,?)=?", (len(prefix), prefix))
+            self.conn.execute("DELETE FROM records WHERE k >= ? AND k < ?", self._bounds(prefix))
+        self._bump(prefix)
+
+    def delete_keys(self, keys: list[str]) -> None:
+        if keys:
+            with self.conn:
+                self.conn.executemany("DELETE FROM records WHERE k=?", [(k,) for k in keys])
+            for key in keys:
+                self._bump(key)
 
     def close(self) -> None:
         self.conn.close()
@@ -572,6 +645,28 @@ class RemoteError(Exception):
 
 
 BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+MAX_BODY = 8_000_000  # bytes per response, before and after decompression
+# What an HTTP status means for the operator. Binance's geo / ban codes and their long cool-downs mean nothing on
+# Telegram, whose answers carry their own description (and retry_after); a 409 there is the two-instances conflict.
+HTTP_HINTS = {451: "部署所在地或接口访问受限；请核对官方地区规则",
+              403: "访问被拒绝；请核对权限与服务地区",
+              418: "接口暂时封禁；停止高频请求并等待解除",
+              429: "接口限流，等待后重试"}
+TELEGRAM_HINTS = {409: "Telegram 轮询冲突；同一个 Bot Token 只能运行一个实例"}
+
+
+def _inflate(raw: bytes, encoding: str) -> bytes:
+    """Decode a gzip / deflate body (only when the server says it is one), capped like a plain body."""
+    encoding = (encoding or "").strip().lower()
+    if encoding not in {"gzip", "x-gzip", "deflate"}:
+        return raw
+    try:
+        out = zlib.decompressobj(zlib.MAX_WBITS | (16 if encoding != "deflate" else 0)).decompress(raw, MAX_BODY + 1)
+    except zlib.error:
+        return raw  # not actually compressed: use the bytes as they came
+    if len(out) > MAX_BODY:
+        raise RemoteError("接口返回的数据过大")
+    return out
 
 
 def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
@@ -579,15 +674,17 @@ def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
     """GET (or POST ``payload`` as JSON) and return the body; HTTP/network failures become RemoteError."""
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={
-        "User-Agent": f"CloseAlert/{VERSION}", "Accept": "application/json",
+        "User-Agent": f"CloseAlert/{VERSION}", "Accept": "application/json", "Accept-Encoding": "gzip",
         **({"Content-Type": "application/json"} if data is not None else {}), **(headers or {}),
     })
+    host = urllib.parse.urlsplit(url).hostname or ""
+    telegram = host.endswith("telegram.org")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            raw = response.read(8_000_001)
-            if len(raw) > 8_000_000:
+            raw = response.read(MAX_BODY + 1)
+            if len(raw) > MAX_BODY:
                 raise RemoteError("接口返回的数据过大")
-            return raw
+            return _inflate(raw, response.headers.get("Content-Encoding", ""))
     except urllib.error.HTTPError as error:
         retry = 0
         try:
@@ -596,25 +693,26 @@ def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
             pass
         description = ""
         try:
-            body = json.loads(error.read(4096))
+            body = json.loads(_inflate(error.read(4096), error.headers.get("Content-Encoding", "")))
             description = str(body.get("description") or body.get("msg") or "")
             retry = max(retry, int(body.get("parameters", {}).get("retry_after", 0)))
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, TypeError, AttributeError, RemoteError):
             pass
-        hints = {451: "部署所在地或接口访问受限；请核对官方地区规则",
-                 403: "访问被拒绝；请核对权限与服务地区",
-                 418: "接口暂时封禁；停止高频请求并等待解除",
-                 429: "接口限流，等待后重试",
-                 409: "Telegram 轮询冲突；同一个 Bot Token 只能运行一个实例"}
-        if error.code in {418, 429}:
-            retry = max(retry, 120 if error.code == 418 else 30)
-        text = f"HTTP {error.code}: {hints.get(error.code, description or '接口请求失败')}"
-        raise RemoteError(clean_error(text), retry) from None
+        if telegram:  # Telegram says exactly what is wrong (blocked, kicked, retry after N) and how long to wait
+            text = TELEGRAM_HINTS.get(error.code) or description or "接口请求失败"
+        else:
+            if "binance" in host and error.code in {418, 429}:
+                retry = max(retry, 120 if error.code == 418 else 30)
+            text = HTTP_HINTS.get(error.code) or description or "接口请求失败"
+        raise RemoteError(clean_error(f"HTTP {error.code}: {text}"), retry) from None
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         # Keep the underlying reason (DNS failure, refused, proxy 403, certificate...): /diag relies on it.
         reason = getattr(error, "reason", None) if isinstance(error, urllib.error.URLError) else None
         detail = f": {clean_error(str(reason))[:80]}" if reason else ""
         raise RemoteError(f"网络错误 ({type(error).__name__}{detail})") from None
+    except http.client.HTTPException as error:  # IncompleteRead, BadStatusLine, LineTooLong: a broken answer
+        detail = clean_error(str(error))[:80]
+        raise RemoteError(f"网络错误 ({type(error).__name__}{': ' + detail if detail else ''})") from None
 
 
 def _http_json(url: str, payload: dict | None = None, timeout: int = 15) -> Any:
@@ -695,14 +793,17 @@ class SourceHealth:
 SOURCE_HEALTH = SourceHealth()
 
 
-async def fetch_source(url: str, extra: dict[str, str] | None = None) -> bytes:
-    """GET one quote-feed URL with a browser UA and the short feed timeout, recording the host's health."""
+async def fetch_source(url: str, extra: dict[str, str] | None = None, record: bool = True) -> bytes:
+    """GET one quote-feed URL with a browser UA and the short feed timeout, recording the host's health
+    (``record=False`` for a diagnostic probe, which must not reorder the sources the live refresh uses)."""
     try:
         raw = await http_get(url, timeout=SOURCE_TIMEOUT, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **(extra or {})})
     except (RemoteError, TimeoutError, OSError) as error:
-        SOURCE_HEALTH.record(url, clean_error(error) or type(error).__name__)
+        if record:
+            SOURCE_HEALTH.record(url, clean_error(error) or type(error).__name__)
         raise
-    SOURCE_HEALTH.record(url)
+    if record:
+        SOURCE_HEALTH.record(url)
     return raw
 
 
@@ -1063,7 +1164,7 @@ def finished_bars(bars: list[tuple], market: str, now_ms: int) -> list[tuple]:
     info = STOCK_MARKETS[market]
     tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
     local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
-    done = local >= dt.datetime.combine(local.date(), info.close_time, tz) + dt.timedelta(minutes=15)
+    done = local >= dt.datetime.combine(local.date(), CALENDAR.close_time(market, local.date()), tz) + dt.timedelta(minutes=15)
     return [bar for bar in bars if bar[0] < local.date() or (bar[0] == local.date() and done)]
 
 
@@ -1073,7 +1174,7 @@ def last_completed_bar(bars: list[tuple[dt.date, D]], info: StockMarketInfo,
     plus the close of the bar before it when known."""
     tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
     local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
-    final_from = dt.datetime.combine(local.date(), info.close_time, tz) + dt.timedelta(minutes=15)
+    final_from = dt.datetime.combine(local.date(), CALENDAR.close_time_for(info, local.date()), tz) + dt.timedelta(minutes=15)
     ordered = sorted(bars, reverse=True)
     for index, (day, close) in enumerate(ordered):
         if day < local.date() or (day == local.date() and local >= final_from):
@@ -1108,7 +1209,7 @@ def parse_quote_close(source: str, market: str, raw: bytes, info: StockMarketInf
         raise ValueError(f"{source}行情格式异常") from None
     tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
     local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
-    final_from = dt.datetime.combine(local.date(), info.close_time, tz) + dt.timedelta(minutes=15)
+    final_from = dt.datetime.combine(local.date(), CALENDAR.close_time_for(info, local.date()), tz) + dt.timedelta(minutes=15)
     if quoted.date() < local.date() or (quoted.date() == local.date() and local >= final_from):
         return quoted.date(), number(current, "收盘价"), number(previous, "昨收价")
     return None, number(previous, "昨收价"), None
@@ -1126,8 +1227,8 @@ def stock_live_window(market: str, now_ms: int, holidays: frozenset = frozenset(
     today = local.date()
     if today.weekday() >= 5 or today in holidays:
         return None
-    start = dt.datetime.combine(today, SESSIONS[market][0][0], tz)
-    final = dt.datetime.combine(today, info.close_time, tz) + dt.timedelta(minutes=15)
+    start = dt.datetime.combine(today, CALENDAR.sessions(market, today)[0][0], tz)
+    final = dt.datetime.combine(today, CALENDAR.close_time(market, today), tz) + dt.timedelta(minutes=15)
     if not start <= local < final:
         return None
     return int(start.timestamp() * 1000), int(final.timestamp() * 1000)
@@ -1180,6 +1281,7 @@ class StockMarket:
         self.store = store
         self.closes: dict[str, Baseline] = {}
         self.errors: dict[str, str] = {}
+        self.notes: dict[str, str] = {}  # ticker code -> a caveat about the close that is not a failure (KRX correction)
         self.refreshed = -1e9
         self.live: dict[str, IndexQuote] = {}   # realtime stock quote while its session runs
         self.live_errors: dict[str, str] = {}
@@ -1205,11 +1307,12 @@ class StockMarket:
                      {"Referer": "https://finance.naver.com/"})]
         secid = {"sh": "1", "sz": "0", "hk": "116"}[ticker.market] + "." + ticker.code
         sina = ("rt_hk" if ticker.market == "hk" else ticker.market) + ticker.code
+        tencent = ("r_hk" if ticker.market == "hk" else ticker.market) + code  # plain hkXXXXX is 15 minutes delayed
         return [
             ("东方财富", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=10"
                          "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&secid=" + urllib.parse.quote(secid),
              {"Referer": "https://quote.eastmoney.com/"}),
-            ("腾讯", f"https://qt.gtimg.cn/q={ticker.market}{code}", {"Referer": "https://gu.qq.com/"}),
+            ("腾讯", f"https://qt.gtimg.cn/q={tencent}", {"Referer": "https://gu.qq.com/"}),
             ("新浪", f"https://hq.sinajs.cn/list={sina}", {"Referer": "https://finance.sina.com.cn/"}),
         ]
 
@@ -1304,12 +1407,12 @@ class StockMarket:
             return None, "现货行情缺少报价时间"
         if q.quoted_ms < window[0] - 30 * 60_000:  # still yesterday's print (pre-open auction may stamp minutes early)
             return None, "现货今日尚未开盘成交"
-        sessions = SESSIONS[ticker.market]
-        lunch = (sessions[0][1], sessions[1][0]) if len(sessions) > 1 else None  # HK/A-share lunch, Beijing time
         info = STOCK_MARKETS[ticker.market]
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         day = dt.datetime.fromtimestamp(now_ms / 1000, tz).date()
-        end = max(sessions[-1][1], info.close_time)  # no new prints after the close; don't call its last one stale
+        sessions = CALENDAR.sessions(ticker.market, day)
+        lunch = (sessions[0][1], sessions[1][0]) if len(sessions) > 1 else None  # HK/A-share lunch, Beijing time
+        end = max(sessions[-1][1], CALENDAR.close_time(ticker.market, day))  # no new prints after the close; don't call its last one stale
         clock = min(now_ms, int(dt.datetime.combine(day, end, tz).timestamp() * 1000) + 60_000)
         if quote_stale(q, clock, self.LIVE_STALE_MS, lunch):
             return None, f"现货行情已超 10 分钟未更新（最后 {stamp(q.quoted_ms, seconds=False)}）"
@@ -1378,18 +1481,21 @@ class StockMarket:
         try:
             url = self.live_sources(ticker)[0][1]
             q = parse_naver_index(await fetch_source(url, {"Referer": "https://finance.naver.com/"}), now_ms)
-        except Exception:
+        except Exception as error:  # the chart's close stands; /diag shows that the KRX correction was not available
+            self.notes[ticker.code] = f"Naver 实时价不可用，收盘未经 KRX 正规时段校正：{clean_error(error) or type(error).__name__}"
             return day, close, prev, source
+        self.notes.pop(ticker.code, None)
         if q.quoted_ms <= 0:
             return day, close, prev, source  # an undated quote cannot say which session it belongs to
-        kst, info = dt.timezone(dt.timedelta(hours=9)), STOCK_MARKETS["kr"]
+        kst = dt.timezone(dt.timedelta(hours=9))
         quoted = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst)
         qday = quoted.date()  # may be newer than the chart's last final bar (today's counts only from 15:45)
         key = f"krx_close:{ticker.code}:{qday.isoformat()}"
-        close_ms = int(dt.datetime.combine(qday, info.close_time, kst).timestamp() * 1000)
+        close_time = CALENDAR.close_time("kr", qday)  # 16:30 on the CSAT day, when a 15:33 print is still intraday
+        close_ms = int(dt.datetime.combine(qday, close_time, kst).timestamp() * 1000)
         settled = now_ms >= close_ms + CLOSE_SETTLE_MS["kr"]  # the auction's random end and feed lag are past
-        after_close = qday >= day and quoted.time() >= info.close_time
-        if after_close and settled and quoted.time() < KRX_NXT_AFTER:
+        after_close = qday >= day and quoted.time() >= close_time
+        if after_close and settled and quoted.time() < CALENDAR.kr_time(KRX_NXT_AFTER, qday):
             # between the KRX close and Nextrade's after-hours session the quote is the KRX close: keep it
             if self.store:
                 self.store.put(key, [str(q.last), str(q.prev_close or "")])
@@ -1408,7 +1514,7 @@ class StockMarket:
     def baseline(ticker: StockTicker, info: StockMarketInfo, source: str, day: dt.date | None, close: D,
                  prev: D | None = None) -> Baseline:
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
-        close_ms = int(dt.datetime.combine(day, info.close_time, tz).timestamp() * 1000) if day else 0
+        close_ms = int(dt.datetime.combine(day, CALENDAR.close_time(ticker.market, day), tz).timestamp() * 1000) if day else 0
         when = str(day) if day else "上一交易日"
         return Baseline(close, f"exchange:{when}:{close}", f"证券交易所收盘价｜{when} {info.name}",
                         (close_ms or int(time.time() * 1000)) + DAY_MS, close_ms,
@@ -1422,14 +1528,39 @@ class StockMarket:
                 "close_ms": close.close_ms, "currency": close.currency, "source": close.source,
                 "close_note": close.close_note, "prev_value": str(close.prev_value) if close.prev_value else ""})
 
+    PENDING_SECONDS = 60      # refresh cadence while a session's close is due but not yet confirmed
+    PENDING_WINDOW_MS = 2 * 3600_000  # ...for this long after it was due (then back to the normal cadence)
+
+    def close_pending(self, now_ms: int) -> bool:
+        """A close the calendar says should be final by now is not confirmed yet (and is less than two hours overdue):
+        the baseline switch must not wait for the 10-minute cadence."""
+        for symbol, ticker in self.config.tickers.items():
+            holidays = self.config.holidays.get(ticker.market, frozenset())
+            expected = expected_close_date(ticker.market, now_ms, holidays)
+            info = STOCK_MARKETS[ticker.market]
+            tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+            final_ms = int((dt.datetime.combine(expected, CALENDAR.close_time(ticker.market, expected), tz)
+                            + dt.timedelta(minutes=15)).timestamp() * 1000)
+            known = self.closes.get(symbol)
+            known_day = dt.datetime.fromtimestamp(known.close_ms / 1000, tz).date() if known and known.close_ms else None
+            if (known_day is None or known_day < expected) and final_ms <= now_ms < final_ms + self.PENDING_WINDOW_MS:
+                return True
+        return False
+
     async def refresh(self, now_ms: int, force: bool = False) -> Refreshed | bool:
-        if not self.config.tickers or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
+        if not self.config.tickers:
+            return False
+        cadence = self.PENDING_SECONDS if self.close_pending(now_ms) else self.REFRESH_SECONDS
+        if not force and time.monotonic() - self.refreshed < cadence:
             return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
-        got = 0
+        started, got = time.monotonic(), 0
         for index, (symbol, ticker) in enumerate(self.config.tickers.items()):
             if index:
                 await asyncio.sleep(0.5)  # Spread requests out; feeds drop bursts from one IP.
+            # each stock is judged at its own moment: a round that straddles the "bar is final" minute must not
+            # reject a close for the later stocks with the earlier clock
+            now_ms = now_ms + int((time.monotonic() - started) * 1000) if index else now_ms
             try:
                 close = await self.fetch(symbol, ticker, now_ms)
             except Exception as error:  # Keep the last good close; report the failure alongside it.
@@ -1459,6 +1590,7 @@ class FxRates:
     Manual FX_RATES entries always win; fetched rates come from keyless public sources.
     """
     REFRESH_SECONDS = 6 * 3600
+    RETRY_SECONDS = 300  # after a failed round (both sources), not six hours later
     SOURCES = (("Frankfurter（欧洲央行参考汇率）",
                 "https://api.frankfurter.app/latest?from=USD&to=CNY,HKD,KRW,JPY,EUR,GBP,SGD,INR"),
                ("open.er-api.com", "https://open.er-api.com/v6/latest/USD"))
@@ -1518,6 +1650,7 @@ class FxRates:
             except Exception as error:
                 failures.append(f"{name}: {clean_error(error)}")
         self.error = "；".join(failures)
+        self.refreshed = time.monotonic() - self.REFRESH_SECONDS + self.RETRY_SECONDS  # try again soon
         return Refreshed("failed", self.error)
 
 
@@ -1676,9 +1809,9 @@ def hk_previous_day(day: dt.date, holidays: frozenset = frozenset()) -> dt.date:
 
 
 def hk_cash_close_date(now_ms: int, holidays: frozenset = frozenset()) -> dt.date:
-    """The latest HK trading day whose 16:10 cash close has passed."""
+    """The latest HK trading day whose cash close (16:10; 12:10 on a half day) has passed."""
     local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
-    day = local.date() if local.time() >= dt.time(16, 10) else local.date() - dt.timedelta(days=1)
+    day = local.date() if local.time() >= CALENDAR.close_time("hk", local.date()) else local.date() - dt.timedelta(days=1)
     while not hk_trading_day(day, holidays):
         day -= dt.timedelta(days=1)
     return day
@@ -1699,14 +1832,16 @@ def local_ms(text: str, tz: dt.tzinfo = BEIJING) -> int:
 
 def hk_futures_session(now_ms: int, holidays: frozenset = frozenset()) -> str:
     """HKEX HSI futures: day session 09:15-16:30, after-hours (夜市) 17:15-03:00 next day, HK time.
-    Sessions only start on trading days, so Friday's night ends Saturday 03:00 and weekends are shut."""
+    Sessions only start on trading days, so Friday's night ends Saturday 03:00 and weekends are shut.
+    A half day ends the day session at 12:30 and has no night session."""
     moment = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
     local, today = moment.time(), moment.date()
-    if local >= dt.time(17, 15) and hk_trading_day(today, holidays):
+    if local >= dt.time(17, 15) and hk_trading_day(today, holidays) and not CALENDAR.half_day("hk", today):
         return "夜市"
-    if local < dt.time(3, 0) and hk_trading_day(today - dt.timedelta(days=1), holidays):
+    yesterday = today - dt.timedelta(days=1)
+    if local < dt.time(3, 0) and hk_trading_day(yesterday, holidays) and not CALENDAR.half_day("hk", yesterday):
         return "夜市"
-    if dt.time(9, 15) <= local <= dt.time(16, 30) and hk_trading_day(today, holidays):
+    if dt.time(9, 15) <= local <= CALENDAR.hk_futures_day_end(today) and hk_trading_day(today, holidays):
         return "日市"
     return "休市"
 
@@ -1716,8 +1851,8 @@ def hk_session_end(session: str, now_ms: int, holidays: frozenset = frozenset())
     local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
     day = local.date()
     for _ in range(30):
-        if hk_trading_day(day, holidays):
-            end = (dt.datetime.combine(day, dt.time(16, 30), BEIJING) if session == "日市"
+        if hk_trading_day(day, holidays) and (session == "日市" or not CALENDAR.half_day("hk", day)):
+            end = (dt.datetime.combine(day, CALENDAR.hk_futures_day_end(day), BEIJING) if session == "日市"
                    else dt.datetime.combine(day + dt.timedelta(days=1), dt.time(3, 0), BEIJING))
             if end <= local:
                 return int(end.timestamp() * 1000)
@@ -1841,9 +1976,9 @@ class IndexFutures:
         return q.last, q.prev_close
 
     def cash_open(self, now_ms: int) -> bool:
-        """The HSI cash session (09:30–16:10, closing auction included) is running."""
+        """The HSI cash session (09:30–16:10, closing auction included; to 12:10 on a half day) is running."""
         local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
-        return hk_trading_day(local.date(), self.holidays) and dt.time(9, 30) <= local.time() < dt.time(16, 10)
+        return hk_trading_day(local.date(), self.holidays) and dt.time(9, 30) <= local.time() < CALENDAR.close_time("hk", local.date())
 
     def futures_problem(self, q: FuturesQuote, now_ms: int) -> str:
         """Why q cannot stand for the futures now ("" when it can): while a session trades it must have moved within
@@ -1899,7 +2034,7 @@ class IndexFutures:
         """The first refresh after the 16:10 cash close is not left to the 60-second cadence: the futures price at
         that moment is the anchor that maps the after-hours move onto the close."""
         local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
-        close = int(dt.datetime.combine(local.date(), dt.time(16, 10), BEIJING).timestamp() * 1000)
+        close = int(dt.datetime.combine(local.date(), CALENDAR.close_time("hk", local.date()), BEIJING).timestamp() * 1000)
         return hk_trading_day(local.date(), self.holidays) and self.refreshed_ms < close <= now_ms
 
     async def refresh(self, now_ms: int, force: bool = False) -> Refreshed | bool:
@@ -1918,7 +2053,9 @@ class IndexFutures:
         self.spot_error = ""
         if why:  # no cash index with the futures (Eastmoney, CFD), or etnet's cannot be trusted now: ask the timed feeds
             def with_spot(s: IndexQuote) -> FuturesQuote:
-                return dataclasses.replace(quote, spot=s.last, spot_prev=s.prev_close, spot_source=s.source, spot_ms=s.quoted_ms)
+                # another feed's cash index: etnet's published premium (水位) belonged to its own spot and goes with it
+                return dataclasses.replace(quote, spot=s.last, spot_prev=s.prev_close, spot_source=s.source,
+                                           spot_ms=s.quoted_ms, water=None)
             spot, _, spot_error = await pick_quote(self.SPOT_SOURCES, lambda n, r: self.parse_spot_quote(n, r, now_ms),
                                                    lambda s: self.spot_problem(with_spot(s), now_ms))
             prev = self.quote
@@ -1958,7 +2095,9 @@ class IndexFutures:
         if q.change is not None and q.prev_settle:
             parts.append(f"期货前收 {bold(fmt(q.prev_settle))} {pct_text(q.change / q.prev_settle * 100, style)}（{q.change:+,.0f}）")
         source = q.source if q.exchange_contract else f"{q.source}·非港交所合约，仅参考"
-        parts.append(f"{quote_time(q.quoted_ms)} {source}" + (stale_note(q.quoted_ms, now_ms, BEIJING) if q.quoted_ms else ""))
+        # "非今日数据" only when the quote really is behind (not on a weekend, when the last session's print is the right one)
+        parts.append(f"{quote_time(q.quoted_ms)} {source}"
+                     + (stale_note(q.quoted_ms, now_ms, BEIJING) if q.quoted_ms and self.futures_problem(q, now_ms) else ""))
         line = "｜".join(parts)
         if self.spot_error:
             line += f"｜⚠️ 恒指现货刷新失败：{brief_error(self.spot_error)}"
@@ -2169,9 +2308,12 @@ def parse_eastmoney_index(raw: bytes, now_ms: int, name: str) -> IndexQuote:
                       _opt(d.get("f44")), _opt(d.get("f45")), eastmoney_ms(d), "东方财富", fetched_ms=now_ms)
 
 
-def krx_session(now_ms: int) -> str:
-    local = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=9))).time()
-    return "交易中" if dt.time(9, 0) <= local <= dt.time(15, 30) else "已收盘"
+def krx_session(now_ms: int, holidays: frozenset = frozenset()) -> str:
+    local = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=9)))
+    if local.weekday() >= 5 or local.date() in holidays:
+        return "休市"
+    start, end = CALENDAR.sessions("kr", local.date())[0]
+    return "交易中" if start <= local.time() <= end else "已收盘"
 
 
 def a50_session(now_ms: int) -> str:
@@ -2521,7 +2663,7 @@ class CnIndex:
             if self.close is None or day >= self.close.day:  # never step back to an older session
                 self.close = DailyClose(day, close, prev, name, now_ms)
             self.bars = sorted({**dict(self.bars), **dict(bars)}.items())[-60:]
-            self.opens = {**self.opens, **{d: o for d, o, _ in ohlc if o}}
+            self.opens = dict(sorted({**self.opens, **{d: o for d, o, _ in ohlc if o}}.items())[-120:])
             if day >= expected:
                 break  # this answer has the expected close: the next source is not needed
         # a source that answered but lags is not a failure (the bar may simply not be out yet)
@@ -2646,8 +2788,8 @@ class DailyCloses:
     10 minutes and every minute from 15 minutes after the close until the day's bar is in. Realtime index feeds can
     be read before the closing auction's final value is published; a dated bar is the settled close."""
 
-    def __init__(self, market: str, sources: tuple[tuple[str, str], ...]):
-        self.market, self.sources = market, sources
+    def __init__(self, market: str, sources: tuple[tuple[str, str], ...], holidays: frozenset = frozenset()):
+        self.market, self.sources, self.holidays = market, sources, holidays
         self.daily: dict[dt.date, D] = {}
         self.ranks: dict[dt.date, int] = {}  # which source each close came from (earlier in ``sources`` wins)
         self.refreshed = -1e9
@@ -2670,8 +2812,9 @@ class DailyCloses:
         info = STOCK_MARKETS[self.market]
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
-        final = dt.datetime.combine(local.date(), info.close_time, tz) + dt.timedelta(minutes=15)
-        waiting = local.weekday() < 5 and local >= final and local.date() not in self.daily
+        final = dt.datetime.combine(local.date(), CALENDAR.close_time(self.market, local.date()), tz) + dt.timedelta(minutes=15)
+        waiting = (local.weekday() < 5 and local.date() not in self.holidays and local >= final
+                   and local.date() not in self.daily)  # a holiday evening has no bar to wait for
         if time.monotonic() - self.refreshed < (60 if waiting else 600):
             return None
         self.refreshed, failures, got = time.monotonic(), [], False
@@ -2743,9 +2886,10 @@ class KospiIndex:
         """(the KRX regular session runs now, when the latest finished session closed)."""
         kst = dt.timezone(dt.timedelta(hours=9))
         local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
-        live = local.weekday() < 5 and local.date() not in self.holidays and dt.time(9, 0) <= local.time() < KRX_SETTLED
+        live = (local.weekday() < 5 and local.date() not in self.holidays
+                and CALENDAR.sessions("kr", local.date())[0][0] <= local.time() < CALENDAR.kr_time(KRX_SETTLED, local.date()))
         last = expected_close_date("kr", now_ms, self.holidays)
-        return live, int(dt.datetime.combine(last, dt.time(15, 30), kst).timestamp() * 1000)
+        return live, int(dt.datetime.combine(last, CALENDAR.close_time("kr", last), kst).timestamp() * 1000)
 
     def problem(self, q: IndexQuote, now_ms: int) -> str:
         """Why q cannot stand for the index now ("" when it can): see quote_problem."""
@@ -2758,8 +2902,8 @@ class KospiIndex:
         not overwritten by Naver. None = not due; "" = the latest session's close is known; else what went wrong."""
         kst = dt.timezone(dt.timedelta(hours=9))
         local = dt.datetime.fromtimestamp(now_ms / 1000, kst)
-        waiting = (local.weekday() < 5 and local.date() not in self.holidays and local.time() >= dt.time(15, 45)
-                   and local.date() not in self.daily)
+        waiting = (local.weekday() < 5 and local.date() not in self.holidays
+                   and local.time() >= CALENDAR.kr_time(dt.time(15, 45), local.date()) and local.date() not in self.daily)
         if time.monotonic() - self.daily_refreshed < (60 if waiting else 600):
             return None
         self.daily_refreshed = time.monotonic()
@@ -2807,12 +2951,12 @@ class KospiIndex:
         q = self.quote
         if q is None:
             return f"🇰🇷 KOSPI ⚠️ 获取失败（{self.error}）" if self.error else "🇰🇷 KOSPI ⏳ 等待首次获取"
-        status = q.status or krx_session(now_ms)
+        status = q.status or krx_session(now_ms, self.holidays)
         line = f"🇰🇷 {bold('KOSPI ' + status)} {bold(fmt(q.last))}"
         if q.change is not None and q.prev_close:
             line += f" → 昨收 {bold(fmt(q.prev_close))} {pct_text(q.change / q.prev_close * 100, style)}（{q.change:+,.2f}）"
         kst = dt.timezone(dt.timedelta(hours=9))
-        line += f"｜{quote_time(q.quoted_ms)} {q.source}" + (stale_note(q.quoted_ms, now_ms, kst) if q.quoted_ms else "")
+        line += f"｜{quote_time(q.quoted_ms)} {q.source}" + (stale_note(q.quoted_ms, now_ms, kst) if q.quoted_ms and self.problem(q, now_ms) else "")
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error)}" if self.error else line
 
     def line200(self, now_ms: int, style: str, hl: "HlQuote | None", hl_note: str = "") -> str:
@@ -2822,7 +2966,7 @@ class KospiIndex:
         q = self.quote200
         if q is None:
             return f"🇰🇷 KOSPI200 ⚠️ 获取失败（{brief_error(self.error200)}）" if self.error200 else "🇰🇷 KOSPI200 ⏳ 等待首次获取"
-        status = q.status or krx_session(now_ms)
+        status = q.status or krx_session(now_ms, self.holidays)
         line = f"🇰🇷 {bold('KOSPI200 ' + status)} {bold(fmt(q.last))}"
         if q.change is not None and q.prev_close:
             line += f" → 昨收 {bold(fmt(q.prev_close))} {pct_text(q.change / q.prev_close * 100, style)}"
@@ -2832,7 +2976,7 @@ class KospiIndex:
         elif hl_note:
             line += f"｜🌊 HL {brief_error(hl_note, 40)}"
         kst = dt.timezone(dt.timedelta(hours=9))
-        line += f"｜{quote_time(q.quoted_ms)} {q.source}" + (stale_note(q.quoted_ms, now_ms, kst) if q.quoted_ms else "")
+        line += f"｜{quote_time(q.quoted_ms)} {q.source}" + (stale_note(q.quoted_ms, now_ms, kst) if q.quoted_ms and self.problem(q, now_ms) else "")
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error200)}" if self.error200 else line
 
 
@@ -2846,6 +2990,69 @@ SESSIONS = {  # continuous-trading intervals, local time
     "hk": ((dt.time(9, 30), dt.time(12, 0)), (dt.time(13, 0), dt.time(16, 0))),
     "kr": ((dt.time(9, 0), dt.time(15, 30)),),
 }
+HK_HALF_DAY_CLOSE = dt.time(12, 10)      # closing auction 12:00–12:10 on a half day
+HK_HALF_DAY_FUTURES_END = dt.time(12, 30)  # HSI futures day session on a half day
+KR_LATE_SHIFT = dt.timedelta(hours=1)   # the CSAT day runs one hour late
+
+
+class SessionCalendar:
+    """Session exceptions by market day: HKEX half days and KRX days that run late. One process-wide instance
+    (CALENDAR), configured from the environment by Config.from_env and consulted by every session-time helper, so
+    "12-24 is a half day" is one fact rather than a dozen call sites remembering it."""
+
+    def __init__(self) -> None:
+        self.hk_half: frozenset = frozenset()
+        self.kr_late: frozenset = frozenset()
+
+    def configure(self, hk_half: frozenset, kr_late: frozenset) -> None:
+        self.hk_half, self.kr_late = frozenset(hk_half), frozenset(kr_late)
+
+    def half_day(self, market: str, day: dt.date) -> bool:
+        return market == "hk" and day in self.hk_half
+
+    def late_day(self, market: str, day: dt.date) -> bool:
+        return market == "kr" and day in self.kr_late
+
+    def kr_time(self, base: dt.time, day: dt.date) -> dt.time:
+        """A KRX clock time on ``day`` (KRX_SETTLED, KRX_NXT_AFTER... are one hour later on a late day)."""
+        if not self.late_day("kr", day):
+            return base
+        return (dt.datetime.combine(day, base) + KR_LATE_SHIFT).time()
+
+    def close_time(self, market: str, day: dt.date) -> dt.time:
+        """When the official close is fixed on ``day`` (local time)."""
+        if self.half_day(market, day):
+            return HK_HALF_DAY_CLOSE
+        if self.late_day(market, day):
+            return self.kr_time(STOCK_MARKETS["kr"].close_time, day)
+        return STOCK_MARKETS[market].close_time
+
+    def close_time_for(self, info: StockMarketInfo, day: dt.date) -> dt.time:
+        market = next((key for key, value in STOCK_MARKETS.items() if value is info), "")
+        return self.close_time(market, day) if market else info.close_time
+
+    def sessions(self, market: str, day: dt.date) -> tuple:
+        """The continuous-trading intervals of ``day`` (local time)."""
+        if self.half_day(market, day):
+            return (SESSIONS["hk"][0],)
+        if self.late_day(market, day):
+            return tuple((self.kr_time(a, day), self.kr_time(b, day)) for a, b in SESSIONS["kr"])
+        return SESSIONS[market]
+
+    def hk_futures_day_end(self, day: dt.date) -> dt.time:
+        return HK_HALF_DAY_FUTURES_END if self.half_day("hk", day) else dt.time(16, 30)
+
+    def note(self, market: str, day: dt.date) -> str:
+        """'半日市' / '高考日延后 1 小时' for labels, "" on an ordinary day."""
+        if self.half_day(market, day):
+            return "半日市"
+        if self.late_day(market, day):
+            return "高考日延后 1 小时"
+        return ""
+
+
+CALENDAR = SessionCalendar()
+CALENDAR.configure(parse_dates(DEFAULT_SPECIAL_DAYS["HK_HALF"], "HK_HALF_DAYS"), parse_dates(DEFAULT_SPECIAL_DAYS["KR_LATE"], "KR_LATE_DAYS"))
 PRIOR_VOL = {"sh": 0.035, "sz": 0.035, "hk": 0.03, "kr": 0.03, "HSI": 0.013, "KOSPI": 0.02, "SSE": 0.011}
 PRIOR_WEIGHT = 10  # pseudo-observations given to the prior when blending with estimated volatility
 
@@ -2880,13 +3087,13 @@ def session_remaining(market: str, now_ms: int, close_date: dt.date | None = Non
     tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
     local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
     total = sum((dt.datetime.combine(local.date(), b) - dt.datetime.combine(local.date(), a)).seconds
-                for a, b in SESSIONS[market]) / 60
+                for a, b in SESSIONS[market]) / 60  # a full ordinary session is the unit of variance
     today = local.date()
     trading_today = today.weekday() < 5 and today not in holidays
-    finalised = local >= dt.datetime.combine(today, info.close_time, tz) + dt.timedelta(minutes=15)
+    finalised = local >= dt.datetime.combine(today, CALENDAR.close_time(market, today), tz) + dt.timedelta(minutes=15)
     if trading_today and not finalised and (close_date is None or close_date < today):
         remaining = sum(max(0.0, (dt.datetime.combine(today, b, tz) - max(dt.datetime.combine(today, a, tz), local)).total_seconds())
-                        for a, b in SESSIONS[market]) / 60
+                        for a, b in CALENDAR.sessions(market, today)) / 60  # a half day has less of it ahead
         return max(remaining, 1.0) / total, today
     target, skipped = today + dt.timedelta(days=1), 0
     while target.weekday() >= 5 or target in holidays:
@@ -2906,7 +3113,7 @@ def expected_close_date(market: str, now_ms: int, holidays: frozenset = frozense
     tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
     local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
     day = local.date()
-    if local < dt.datetime.combine(day, info.close_time, tz) + dt.timedelta(minutes=15):
+    if local < dt.datetime.combine(day, CALENDAR.close_time(market, day), tz) + dt.timedelta(minutes=15):
         day -= dt.timedelta(days=1)
     for _ in range(60):
         if day.weekday() < 5 and day not in holidays:
@@ -3007,6 +3214,7 @@ def model_swing(odds: CloseOdds) -> float:
 
 
 PRED_EVERY_MS = 30 * 60_000   # one saved prediction snapshot per index per 30 minutes
+PRED_KEEP_DAYS = 400          # snapshots older than this are pruned (a year of /calib history, not an ever-growing table)
 CALIB_MIN_DAYS = 10           # walk-forward: target days used only for training before the first test day
 
 
@@ -3190,6 +3398,8 @@ PREDICT_SITE = "https://predict.fun/zh-cn/market/"
 PREDICT_ITEMS = (("HSI", "恒生指数", "hk"), ("KOSPI", "KOSPI", "kr"), ("SSE", "上证指数", "sh"))
 PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
 PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and never recommended
+PREDICT_PARALLEL = 6            # Predict requests in flight at once (a hundred ladder books share the feeds' thread pool)
+PREDICT_BACKOFF_SECONDS = 20    # after a 429 without retry_after: how long every Predict request waits
 PREDICT_META_SECONDS = 600     # outcome names / status of a ladder market are re-read this often
 PREDICT_REWARD_SECONDS = 60    # price-ladder reward metadata is refreshed every minute
 PREDICT_REWARD_STALE_SECONDS = 120  # allows the normal refresh to finish across a 60-second alert confirmation
@@ -3410,9 +3620,25 @@ AUCTIONS = {
 AUCTIONS["sz"] = AUCTIONS["sh"]
 
 
+def auction_window(market: str, now_ms: int) -> tuple[dt.time, dt.time, str] | None:
+    """(start, end, description) of ``market``'s closing auction on the day of ``now_ms``, Beijing time: the usual
+    window, or the half day's / late day's one."""
+    base = AUCTIONS.get(market)
+    info = STOCK_MARKETS.get(market)
+    if not base or not info:
+        return None
+    day = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset))).date()
+    if CALENDAR.half_day(market, day):
+        return dt.time(12, 0), HK_HALF_DAY_CLOSE, "港交所收市竞价（半日市 12:00–12:10，12:08 后随机收市）"
+    if CALENDAR.late_day(market, day):
+        start, end = (dt.datetime.combine(day, t, BEIJING) + KR_LATE_SHIFT for t in base[:2])
+        return start.time(), end.time(), "韩交所收盘集合竞价（高考日延后：首尔 16:20–16:30，随机结束至 16:30:30）"
+    return base
+
+
 def auction_running(market: str, now_ms: int, holidays: frozenset = frozenset()) -> bool:
     """Whether ``market``'s closing auction is under way now (a weekday that is not a configured holiday)."""
-    window = AUCTIONS.get(market)
+    window = auction_window(market, now_ms)
     if not window:
         return False
     local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
@@ -3424,12 +3650,13 @@ def auction_running(market: str, now_ms: int, holidays: frozenset = frozenset())
 
 def session_state(market: str, now_ms: int, holidays: frozenset = frozenset()) -> str:
     """Where ``market`` stands now (its local time): 未开盘 / 开盘中 / 午休 / 已收盘, or 休市 on a weekend or holiday."""
-    sessions, info = SESSIONS.get(market), STOCK_MARKETS.get(market)
-    if not sessions or not info:
+    info = STOCK_MARKETS.get(market)
+    if market not in SESSIONS or not info:
         return ""
     local = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset)))
     if local.weekday() >= 5 or local.date() in holidays:
         return "休市"
+    sessions = CALENDAR.sessions(market, local.date())
     t = local.time()
     if t < sessions[0][0]:
         return "未开盘"
@@ -3534,12 +3761,24 @@ class PredictFeed:
         self.ladders: dict[str, list[LadderRow]] = {}            # item key -> one row per market, by threshold
         self.fees: dict[str, tuple[int | None, float]] = {}      # market id -> (feeRateBps or None, when read)
         self.refreshed = -1e9
+        self.gate = asyncio.Semaphore(PREDICT_PARALLEL)          # requests in flight: the other feeds share the thread pool
+        self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
 
     def headers(self) -> dict[str, str]:
         return {"x-api-key": self.config.predict_api_key} if self.config.predict_api_key else {}
 
     async def fetch(self, url: str, payload: dict | None = None) -> Any:
-        raw = await _blocking(_http_get, url, payload, SOURCE_TIMEOUT, self.headers() if url.startswith(PREDICT_REST) else {})
+        """One Predict request, at most PREDICT_PARALLEL at a time; a 429 (or any retry_after) pauses them all."""
+        left = self.blocked_until - time.monotonic()
+        if left > 0:
+            raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
+        async with self.gate:
+            try:
+                raw = await _blocking(_http_get, url, payload, SOURCE_TIMEOUT, self.headers() if url.startswith(PREDICT_REST) else {})
+            except RemoteError as error:
+                if error.retry_after or "429" in str(error):
+                    self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, PREDICT_BACKOFF_SECONDS))
+                raise
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -3760,6 +3999,8 @@ class PredictFeed:
         """targets: item key -> slug. False = not due yet."""
         if not force and time.monotonic() - self.refreshed < self.config.predict_poll:
             return False
+        if (left := self.blocked_until - time.monotonic()) > 0:
+            return Refreshed("failed", f"Predict 接口限流，冷却 {int(left) + 1} 秒后再试（盘口暂按上次结果显示）")
         self.refreshed = time.monotonic()
         for key in list(self.books):
             if targets.get(key) != self.books[key].slug:
@@ -3771,6 +4012,10 @@ class PredictFeed:
             if key not in targets:
                 self.ladders.pop(key)
         self.slugs = dict(targets)
+        keep = set(targets.values())  # yesterday's daily slugs are not kept around for ever
+        for table in (self.markets, self.market_lists, self.strikes, self.types, self.info):
+            for slug in [s for s in table if s not in keep]:
+                table.pop(slug, None)
         await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in targets.items()))
         # a market not listed yet is an answer, not a failure
         failed = [f"{key}：{error}" for key, error in self.errors.items() if key in targets and "还没有这个市场" not in error]
@@ -3996,6 +4241,8 @@ class TouchMarket:
                 self.times["price"] = mono
                 data = await self.get("ticker/price", symbol=self.spec.symbol)
                 self.price, self.priced_ms = number(data["price"], "BNB"), now_ms
+                if (self.price <= self.spec.low or self.price >= self.spec.high) and self.history.get("kind") in {None, "clear"}:
+                    self.times["scan"] = -1e9  # the price is at a line right now: check the path at once, not in 5 minutes
             if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
                 self.times["vol"] = mono
                 # 722: the newest bar is the hour still running, which realized_vol drops; 721 finished bars remain
@@ -4041,6 +4288,14 @@ class TouchMarket:
             cursor = int(done[-1][6]) + 1
             if len(rows) < 1000:
                 break
+        if end == now_ms and cursor <= now_ms:
+            # The hour still running: its closed minutes are checked as well, so a spike is seen within SCAN_SECONDS of
+            # its minute rather than up to an hour later when the bar closes (Predict settles at once). The "through"
+            # mark stays at the hour's start: the hourly pass covers the hour once it has closed.
+            result = await self.peek(cursor, now_ms)
+            if result:
+                self.store.put(f"touch:{self.spec.slug}", {**result, "start": self.start_ms})
+                return
         if now_ms >= self.window_end and cursor < self.window_end:
             # past the deadline: the rest of the window, minute by minute, through the deadline's minute
             rows = await self.get("klines", symbol=self.spec.symbol, interval="1m", startTime=cursor,
@@ -4062,6 +4317,23 @@ class TouchMarket:
             elif minutes:
                 cursor = max(cursor, max(int(r[6]) for r in minutes) + 1)  # read this far; the rest next time
         self.store.put(f"touch:{self.spec.slug}", {"kind": "clear", "through": cursor, "start": self.start_ms})
+
+    async def peek(self, start: int, now_ms: int) -> dict | None:
+        """The closed minutes from ``start`` (inside the hour still running) up to now: a line reached in one of them
+        is a hit like any other; the minute still forming decides nothing."""
+        rows = await self.get("klines", symbol=self.spec.symbol, interval="1m", startTime=start, endTime=now_ms, limit=60)
+        low, high = float(self.spec.low), float(self.spec.high)
+        for row in rows:
+            if not (isinstance(row, list) and len(row) > 6):
+                continue
+            opened, closed, hi, lo = int(row[0]), int(row[6]), float(row[2]), float(row[3])
+            if closed > now_ms or closed < start or opened > self.spec.deadline_ms:
+                continue
+            hit_low, hit_high = lo <= low, hi >= high
+            if hit_low or hit_high:
+                kind = "ambiguous" if (hit_low and hit_high) or opened < self.start_ms else "low" if hit_low else "high"
+                return {"kind": kind, "time": opened, "hi": hi, "lo": lo}
+        return None
 
     def verified_clear(self) -> bool:
         """The whole window, through the deadline's minute, has been read and neither line was reached."""
@@ -5215,15 +5487,17 @@ def deadline_from_text(texts: list[str], after_ms: int) -> int:
     of) December", "截止于 12 月 31 日", "2026-12-31". A date without a year is the first such date on or after after_ms (the
     market's creation). The first text that names one wins; 0 when none does."""
     since = et_date(after_ms) if after_ms else dt.date.today()
-    month = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+    # whole month words only: "before MARket close" and "by DECision of the committee" name no month
+    month = (r"(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|"
+             r"october|oct|november|nov|december|dec)\b\.?")
     patterns = [
         (r"(20\d\d)-(\d\d)-(\d\d)", lambda g: (int(g[0]), int(g[1]), int(g[2]))),
         (r"(20\d\d)\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", lambda g: (int(g[0]), int(g[1]), int(g[2]))),
         (r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", lambda g: (0, int(g[0]), int(g[1]))),
         (r"(?i)\b(?:by|before|until|through)\s+(?:the\s+)?(?:end\s+of\s+)?" + month + r"\s*(\d{1,2})?(?:st|nd|rd|th)?,?\s*(20\d\d)?",
-         lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()], int(g[1]) if g[1] else 0)),
+         lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()[:3]], int(g[1]) if g[1] else 0)),
         (r"(?i)\b" + month + r"\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(20\d\d)?",
-         lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()], int(g[1]))),
+         lambda g: (int(g[2]) if g[2] else 0, MONTH_NAMES[g[0].lower()[:3]], int(g[1]))),
     ]
     for text in texts:
         for pattern, pick in patterns:
@@ -5387,6 +5661,19 @@ def book_disputes(book: "PredictBook | None") -> bool:
     if book is None or not (book.bids or book.asks):
         return False
     return max((float(p) for p, _ in (*book.bids[:1], *book.asks[:1])), default=0.0) < 0.9
+
+
+def book_decided(book: "PredictBook | None") -> str:
+    """The market is trading as if its question were already answered: "up" when the Yes side is bid at 90¢ or more,
+    "down" when it is offered at 10¢ or less, else "". Against a model that still sees an open question, that is the
+    market knowing something (a spike the path check has not reached yet), not a 49¢ edge."""
+    if book is None:
+        return ""
+    if book.bid and float(book.bid[0]) >= 0.9:
+        return "up"
+    if book.ask and float(book.ask[0]) <= 0.1:
+        return "down"
+    return ""
 
 
 async def binance_futures(path: str, **params: Any) -> Any:
@@ -5859,10 +6146,40 @@ class SimMarket:
     hold: str                # why the card suggests nothing now ("" = it may)
     sides: tuple[str, str]   # the card's names for the two sides: (涨, 跌), (Yes, No), ($3k, $1k)
     settle: dict             # what deciding the result needs
-    evidence: dict = field(default_factory=dict)  # what the odds rest on: model inputs, price sources, proxy / anchor
+    evidence: Mapping = field(default_factory=dict)  # what the odds rest on (model inputs, price sources, proxy / anchor); a
+    # LazyEvidence builds it on first access, i.e. when a trade is opened or filled, not on every look at every market
     makers: bool = True      # paper-trading maker orders (price ladders remain taker-only)
     maker_alerts: bool = False  # price ladders: separately gated maker opportunities, independent of taker alerts
     maker_note: str = ""     # why a price-ladder maker suggestion is unavailable
+
+
+class LazyEvidence(Mapping):
+    """A read-only mapping whose contents are built by ``build`` on first access. A failure never stops a trade: it is
+    kept as the record ({"error": ...})."""
+
+    def __init__(self, build: Any):
+        self._build, self._data = build, None
+
+    def _load(self) -> dict:
+        if self._data is None:
+            try:
+                built = self._build()
+                self._data = built if isinstance(built, dict) else {}
+            except Exception as error:
+                self._data = {"error": clean_error(error) or type(error).__name__}
+        return self._data
+
+    def __getitem__(self, key: str) -> Any:
+        return self._load()[key]
+
+    def __iter__(self) -> Any:
+        return iter(self._load())
+
+    def __len__(self) -> int:
+        return len(self._load())
+
+    def __repr__(self) -> str:
+        return repr(self._load())
 
 
 SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": "月度涨跌", "flip": "反超", "range": "价格阶梯",
@@ -5871,12 +6188,21 @@ SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": 
 # 0.2¢ bid under an 80¢ ask is not a quote anyone sells into: an order joining it would rest until the result and tell
 # nothing (10-03: 54 such price-ladder orders sat as 挂单中 0/100 for weeks).
 SIM_MAKER_SPREAD = 0.10
+SIM_MIN_FILL = 0.5  # a taker buys only when the book fills at least this share of SIM_SHARES (dust is not a trade)
+
+
+def book_crossed(book: PredictBook) -> bool:
+    """Bid at or above ask: a snapshot caught mid-update (or a broken feed), not a book anyone could trade."""
+    return bool(book.bid and book.ask and float(book.bid[0]) >= float(book.ask[0]) - 1e-9)
 
 
 def sim_maker_block(book: PredictBook, spread: float = SIM_MAKER_SPREAD) -> str:
-    """Why no resting paper order is placed on this book (one-sided, or a spread wider than ``spread``); "" when it may be."""
+    """Why no resting paper order is placed on this book (one-sided, crossed, or a spread wider than ``spread``); ""
+    when it may be."""
     if not book.bid or not book.ask:
         return "盘口只有一边"
+    if book_crossed(book):
+        return "盘口交叉（买价不低于卖价），快照不可信"
     gap = float(book.ask[0]) - float(book.bid[0])
     if gap > spread + 1e-9:
         return f"买卖价差 {cents(gap)} 超过 {cents(spread)}"
@@ -6135,9 +6461,9 @@ WEB_PAGE = """<!doctype html>
 <title>收盘涨跌概率</title>
 <script>try{var t=JSON.parse(localStorage.getItem("theme"));if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}catch(e){}</script>
 <style>
-:root{color-scheme:light;--bg:#f2f4f8;--card:#fff;--text:#161a20;--muted:#636b77;--faint:#98a0ab;--line:#e2e6ec;--line2:#edf0f4;--chip:#eef1f5;--chip2:#e2e6ed;--best:#2a66e0;--best-bg:#e8f0fe;--best-soft:#cfdefb;--warn:#b86e00;--warn-bg:#fff4df;--up:#dd3a40;--down:#17a05b;--up-bg:#fdeaea;--down-bg:#e3f6ec;--flat:#c6ccd4;--hot:#e4262d;--hot-bg:#fdeaea;--hot-soft:#f6c4c6;--star:#f3b304;--shadow:0 1px 2px rgba(18,26,40,.05),0 2px 8px rgba(18,26,40,.05);--shadow2:0 8px 24px rgba(18,26,40,.12);--r:14px}
-@media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--up-bg:#3a1b1f;--down-bg:#11301f;--flat:#3a424c;--hot:#ff5a60;--hot-bg:#3a1b1f;--hot-soft:#5c2a2f;--star:#f5c518;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}}
-:root[data-theme=dark]{color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--up-bg:#3a1b1f;--down-bg:#11301f;--flat:#3a424c;--hot:#ff5a60;--hot-bg:#3a1b1f;--hot-soft:#5c2a2f;--star:#f5c518;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}
+:root{color-scheme:light;--bg:#f2f4f8;--card:#fff;--text:#161a20;--muted:#636b77;--faint:#98a0ab;--line:#e2e6ec;--line2:#edf0f4;--chip:#eef1f5;--chip2:#e2e6ed;--best:#2a66e0;--on-accent:#fff;--best-bg:#e8f0fe;--best-soft:#cfdefb;--warn:#b86e00;--warn-bg:#fff4df;--up:#dd3a40;--down:#17a05b;--up-bg:#fdeaea;--down-bg:#e3f6ec;--flat:#c6ccd4;--hot:#e4262d;--hot-bg:#fdeaea;--hot-soft:#f6c4c6;--star:#f3b304;--shadow:0 1px 2px rgba(18,26,40,.05),0 2px 8px rgba(18,26,40,.05);--shadow2:0 8px 24px rgba(18,26,40,.12);--r:14px}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--on-accent:#0d1014;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--up-bg:#3a1b1f;--down-bg:#11301f;--flat:#3a424c;--hot:#ff5a60;--hot-bg:#3a1b1f;--hot-soft:#5c2a2f;--star:#f5c518;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}}
+:root[data-theme=dark]{color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--on-accent:#0d1014;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--up-bg:#3a1b1f;--down-bg:#11301f;--flat:#3a424c;--hot:#ff5a60;--hot-bg:#3a1b1f;--hot-soft:#5c2a2f;--star:#f5c518;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
 button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--best);outline-offset:2px}
@@ -6170,7 +6496,7 @@ h2{font-size:13px;font-weight:700;color:var(--text);letter-spacing:.02em;margin:
 @media (pointer:coarse){.star{padding:8px;margin:-8px -6px -8px -9px}.grip{padding:8px 8px;margin:-8px 0 -8px -10px}}.star.on{color:var(--star)}.star:hover{color:var(--star);transform:scale(1.15)}
 .name{font-weight:700;font-size:15px;min-width:0;max-width:calc(100% - 20px);flex:1 0 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:-.005em}
 .tag{border-radius:999px;padding:2px 8px;font-size:11.5px;font-weight:600;line-height:1.35;background:var(--chip);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
-.tag.next{background:var(--best-bg);color:var(--best)}.tag.auc{background:var(--warn);color:#fff}.tag.open{background:var(--down-bg);color:var(--down)}.tag.new{background:var(--best);color:#fff}.tag.hotk{background:var(--hot);color:#fff}
+.tag.next{background:var(--best-bg);color:var(--best)}.tag.auc{background:var(--warn);color:var(--on-accent)}.tag.open{background:var(--down-bg);color:var(--down)}.tag.new{background:var(--best);color:var(--on-accent)}.tag.hotk{background:var(--hot);color:var(--on-accent)}
 .cd{font-size:11.5px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;background:var(--chip);border-radius:999px;padding:2px 8px;line-height:1.35}
 .cd.done{color:var(--muted);font-weight:500}.cd.soon{color:var(--warn);background:var(--warn-bg)}
 .odds{display:flex;align-items:center;gap:10px;font-variant-numeric:tabular-nums;margin:2px -4px 0;padding:2px 4px;border-radius:8px}
@@ -6198,7 +6524,7 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:7px 0 3px;fon
 .ages+.pb{margin-top:0}
 .fbar{position:sticky;top:0;z-index:5;background:var(--bg);display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:7px 0;margin-bottom:4px;font-size:12.5px;border-bottom:1px solid var(--line);transition:box-shadow .2s}
 .fbar.stuck{box-shadow:0 10px 18px -14px rgba(0,0,0,.35)}
-.fchips{display:flex;flex-wrap:wrap;gap:5px}.fchips .tog.on,.famt .tog.on{border-color:var(--best);color:#fff;background:var(--best)}
+.fchips{display:flex;flex-wrap:wrap;gap:5px}.fchips .tog.on,.famt .tog.on{border-color:var(--best);color:var(--on-accent);background:var(--best)}
 button.tog{font-family:inherit}.fsort select{font:inherit;font-size:12.5px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);padding:3px 6px}
 .famt{display:inline-flex;align-items:center;gap:4px;color:var(--muted)}.famt input{width:64px;font:inherit;font-size:12.5px;padding:3px 6px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}
 /* a phone: the bar is one rail that scrolls sideways (chips, sort, size), so it does not stack three rows on top of every screen */
@@ -6230,7 +6556,7 @@ body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){displ
 .simg{display:grid;grid-template-columns:auto auto auto 1fr;gap:3px 12px;font-size:12.5px;font-variant-numeric:tabular-nums;margin-top:4px;padding:8px 10px;border-radius:10px;background:var(--chip)}.simg .lh{color:var(--faint);font-size:11px}.simg .ln{text-align:right}
 .simrows{display:flex;flex-direction:column;gap:2px;margin-top:4px}
 a.simrow{display:grid;grid-template-columns:auto 1fr auto auto;gap:2px 8px;font-size:12.5px;color:inherit;text-decoration:none;font-variant-numeric:tabular-nums;padding:4px 6px;margin:0 -6px;border-radius:8px;border-top:1px dashed var(--line)}
-a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);text-decoration:none;align-self:flex-start}.simj:hover{text-decoration:underline}.panel a.cb{text-decoration:none;color:var(--best)}
+a.simrow>*{min-width:0}a.simrow>:nth-child(2){overflow:hidden;text-overflow:ellipsis;white-space:nowrap}a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);text-decoration:none;align-self:flex-start}.simj:hover{text-decoration:underline}.panel a.cb{text-decoration:none;color:var(--best)}
 .small{font-size:12px;margin-top:3px}.mut{color:var(--faint)}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:22px;padding-top:12px;border-top:1px solid var(--line);line-height:1.6;max-width:760px}
 #opps{display:flex;flex-direction:column;align-items:stretch;gap:5px;margin:8px 0 4px;padding:8px 11px;font-size:12px;border-radius:12px;border:1px solid var(--hot-soft);background:linear-gradient(90deg,var(--hot-bg),var(--card) 85%)}
 #opps .orow{display:flex;flex-wrap:wrap;align-items:center;gap:5px 6px}#opps .ok{color:var(--hot);font-weight:700;white-space:nowrap}#opps .og{color:var(--muted);font-weight:600;white-space:nowrap;margin-left:2px}
@@ -6269,7 +6595,7 @@ body.sorting,body.sorting *{cursor:grabbing!important;user-select:none!important
 .ctl{display:flex;align-items:center;gap:6px;font-size:12px;padding-bottom:6px;border-bottom:1px dashed var(--line)}.ctl .sp,.panel .sp{flex:1}
 .ctl .grip{font-size:16px;margin:0;padding:1px 6px;border:1px solid var(--line);border-radius:6px;background:var(--chip)}
 .cb{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:8px;padding:2px 10px;font:inherit;font-size:12px;line-height:1.6;cursor:pointer;box-shadow:var(--shadow);transition:border-color .15s,color .15s,background .15s}.cb:hover{border-color:var(--best);color:var(--best)}
-.cb.pri{background:var(--best);border-color:var(--best);color:#fff}.cb.pri:hover{color:#fff;filter:brightness(1.08)}.cb.arm{border-color:var(--warn);color:var(--warn)}.cb:disabled{opacity:.4;cursor:default}
+.cb.pri{background:var(--best);border-color:var(--best);color:var(--on-accent)}.cb.pri:hover{color:var(--on-accent);filter:brightness(1.08)}.cb.arm{border-color:var(--warn);color:var(--warn)}.cb:disabled{opacity:.4;cursor:default}
 h2 .cb{margin-left:6px;padding:0 8px;letter-spacing:0;font-weight:400}
 h2 .fold{border:0;background:none;font:inherit;color:inherit;letter-spacing:inherit;padding:4px 8px 4px 0;margin:-4px 0;cursor:pointer;display:inline-flex;align-items:center;gap:5px;border-radius:6px}
 h2 .fold:before{content:"▾";color:var(--faint);font-size:11px;width:10px}h2 .fold[aria-expanded=false]:before{content:"▸"}h2 .fold:hover .hn{color:var(--best)}
@@ -6845,10 +7171,10 @@ document.getElementById("reset").addEventListener("click",e=>{const b=e.currentT
   order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;folded=[];oneRow=[];
   ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","folded","oneRow"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
-let loading=null;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
+let loading=null,lastSig="",dead=false;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
 const LOAD_TIMEOUT_MS=8000;
 function load(){
-  if(loading)return loading;
+  if(loading||dead)return loading;
   const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),LOAD_TIMEOUT_MS);
   loading=(async()=>{try{
     const r=await fetch(location.pathname.replace(/\\/$/,"")+"/data.json",{cache:"no-store",signal:ctl.signal});
@@ -6856,13 +7182,15 @@ function load(){
     const d=await r.json();if(d.server_ms)skew=d.server_ms-Date.now();fetchedAt=okAt=Date.now();failMsg="";style=d.color_style||"cn";
     if(last)for(const it of d.items){const k=favKey(it),o=last.items.find(x=>favKey(x)===k);  // a fair price that moved since the last refresh
       if(o&&o.fair_up!=null&&it.fair_up!=null&&Math.abs(o.fair_up-it.fair_up)>=5e-4)changedAt[k]={at:Date.now(),up:it.fair_up>o.fair_up}}
-    last=d;render(d);
+    const sig=JSON.stringify(d.items),same=!!last&&sig===lastSig;lastSig=sig;  // books move every 15 s, quotes every 30 s: most 10-second
+    last=d;if(!same)render(d);                                                  // answers repeat the last one, and a repeat rebuilds nothing
     const ago=$("span","","");ago.id="ago";
     document.getElementById("meta").replaceChildren(...(d.today?[$("span","","今天 "+d.today)]:[]),$("span","","数据 "+d.generated_at),ago,$("span","","基准 "+d.mode),$("span","","v"+d.version));
-    drawLegend();
+    if(!same)drawLegend();
     document.getElementById("foot").textContent=d.note;tick();
   }catch(e){failMsg=e.name==="AbortError"?"超过 "+LOAD_TIMEOUT_MS/1000+" 秒没有响应":(e.message||"网络错误");
-    if(!okAt){document.getElementById("meta").replaceChildren($("span","warn","刷新失败："+failMsg+"，稍后自动重试"));document.querySelectorAll(".skel").forEach(e=>e.remove())}drawStale()}
+    if(e.message==="HTTP 404"){dead=true;failMsg="这个链接已失效（令牌已更换或网页已关闭）：请在 Telegram 重新发送 /web 取得新链接；本页不再自动刷新"}
+    if(!okAt){document.getElementById("meta").replaceChildren($("span","warn","刷新失败："+failMsg+(dead?"":"，稍后自动重试")));document.querySelectorAll(".skel").forEach(e=>e.remove())}drawStale()}
   finally{clearTimeout(timer);loading=null}})();
   return loading}
 function drawBar(){  // the filter chips, the sort and the trade size, as this browser keeps them
@@ -6900,9 +7228,9 @@ JOURNAL_PAGE = r"""<!doctype html>
 <title>模拟交易复盘</title>
 <script>try{var t=JSON.parse(localStorage.getItem("theme"));if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}catch(e){}</script>
 <style>
-:root{color-scheme:light;--bg:#f2f4f8;--card:#fff;--text:#161a20;--muted:#636b77;--faint:#98a0ab;--line:#e2e6ec;--line2:#edf0f4;--chip:#eef1f5;--chip2:#e2e6ed;--best:#2a66e0;--best-bg:#e8f0fe;--best-soft:#cfdefb;--warn:#b86e00;--warn-bg:#fff4df;--up:#dd3a40;--down:#17a05b;--hot:#e4262d;--hot-bg:#fdeaea;--shadow:0 1px 2px rgba(18,26,40,.05),0 2px 8px rgba(18,26,40,.05);--shadow2:0 8px 24px rgba(18,26,40,.12);--r:14px}
-@media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--hot:#ff5a60;--hot-bg:#3a1b1f;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}}
-:root[data-theme=dark]{color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--hot:#ff5a60;--hot-bg:#3a1b1f;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}
+:root{color-scheme:light;--bg:#f2f4f8;--card:#fff;--text:#161a20;--muted:#636b77;--faint:#98a0ab;--line:#e2e6ec;--line2:#edf0f4;--chip:#eef1f5;--chip2:#e2e6ed;--best:#2a66e0;--on-accent:#fff;--best-bg:#e8f0fe;--best-soft:#cfdefb;--warn:#b86e00;--warn-bg:#fff4df;--up:#dd3a40;--down:#17a05b;--hot:#e4262d;--hot-bg:#fdeaea;--shadow:0 1px 2px rgba(18,26,40,.05),0 2px 8px rgba(18,26,40,.05);--shadow2:0 8px 24px rgba(18,26,40,.12);--r:14px}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--on-accent:#0d1014;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--hot:#ff5a60;--hot-bg:#3a1b1f;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}}
+:root[data-theme=dark]{color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--faint:#6b747f;--line:#262c34;--line2:#20262d;--chip:#20252c;--chip2:#2b313a;--best:#79a7f7;--on-accent:#0d1014;--best-bg:#19284a;--best-soft:#2a4172;--warn:#e6a93f;--warn-bg:#33270f;--up:#ff6166;--down:#3ccc7f;--hot:#ff5a60;--hot-bg:#3a1b1f;--shadow:0 1px 2px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.25);--shadow2:0 8px 24px rgba(0,0,0,.45)}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
 button:focus-visible,a:focus-visible{outline:2px solid var(--best);outline-offset:2px}
@@ -6925,7 +7253,7 @@ td,th{border-bottom:1px solid var(--line2);padding:6px 10px;text-align:left;vert
 th{color:var(--faint);font-weight:600;font-size:11.5px;letter-spacing:.03em;background:var(--chip)}tr:last-child td{border-bottom:0}tr:hover td{background:var(--chip)}td.wrap{white-space:normal;min-width:140px}
 .filters{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0;font-size:12.5px;color:var(--muted)}
 .chip{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:4px 11px;font:inherit;font-size:12.5px;color:var(--muted);cursor:pointer;transition:border-color .15s,color .15s,background .15s}
-.chip:hover{border-color:var(--best-soft);color:var(--text)}.chip.on{border-color:var(--best);color:#fff;background:var(--best)}
+.chip:hover{border-color:var(--best-soft);color:var(--text)}.chip.on{border-color:var(--best);color:var(--on-accent);background:var(--best)}
 .list{display:flex;flex-direction:column;gap:8px}
 .tr{background:var(--card);border:1px solid var(--line);border-radius:var(--r);min-width:0;box-shadow:var(--shadow);transition:box-shadow .2s,border-color .2s}
 .tr:hover{box-shadow:var(--shadow2)}.tr.open{border-color:var(--best);box-shadow:0 0 0 1px var(--best),var(--shadow)}
@@ -6935,7 +7263,7 @@ th{color:var(--faint);font-weight:600;font-size:11.5px;letter-spacing:.03em;back
 .row .t3{font-size:12px;color:var(--warn);margin-top:3px;line-height:1.4}
 .row .r{text-align:right;font-variant-numeric:tabular-nums;flex:0 0 auto}.row .r b{display:block;font-size:16px;font-weight:750}
 .badge{font-size:11.5px;border-radius:999px;padding:1px 8px;background:var(--chip);color:var(--muted);white-space:nowrap;font-weight:600}
-.badge.ok{color:var(--best);background:var(--best-bg)}.badge.bad{color:#fff;background:var(--hot)}.badge.pre{color:var(--warn);background:var(--warn-bg)}
+.badge.ok{color:var(--best);background:var(--best-bg)}.badge.bad{color:var(--on-accent);background:var(--hot)}.badge.pre{color:var(--warn);background:var(--warn-bg)}
 .det{border-top:1px solid var(--line2);padding:10px 14px 14px;display:flex;flex-direction:column;gap:14px;min-width:0}
 .sec h3{font-size:13px;margin:0 0 6px;display:flex;align-items:center;gap:8px}.sec h3:before{content:"";width:3px;height:14px;border-radius:2px;background:var(--best)}
 .sec .sub{font-size:12px;color:var(--muted);margin:8px 0 4px}
@@ -6977,6 +7305,7 @@ const CENT_KEYS=new Set(["fair_up"]);
 let data=null,stateF="all",wayF="all",kindF="all",openId=decodeURIComponent(location.hash.slice(1)||"");
 const base=location.pathname.replace(/\/journal\/?$/,"");
 document.getElementById("back").href=base;
+document.getElementById("csv").href=base+"/journal.csv";document.getElementById("json").href=base+"/journal.json";  // also right under /journal/
 function val(k,v){if(v==null||v==="")return"—";if(typeof v==="boolean")return v?"是":"否";
   if(MS_KEYS.has(k))return v?when(v):"—";if(k==="high_at")return v?when(v*1000):"—";if(CENT_KEYS.has(k))return cent(v);
   if(k==="sigma_daily"||k==="sigma")return (v*100).toFixed(2)+"%";if(k==="history")return JSON.stringify(v);
@@ -7078,11 +7407,19 @@ function render(){
   tiles();groups();filters();
   const list=document.getElementById("list"),shown=data.trades.filter(t=>(stateF==="all"||cat(t)===stateF)&&(wayF==="all"||(wayF==="maker")===t.maker)&&(kindF==="all"||t.kind===kindF));
   list.replaceChildren(...(shown.length?shown.map(row):[$("p","mut",data.trades.length?"没有符合条件的交易":"还没有模拟交易")]))}
+let okAt=0,dead=false;
+function two(n){return String(n).padStart(2,"0")}
 async function load(){
-  try{const r=await fetch(base+"/journal.json",{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();
+  if(dead||load.busy)return;load.busy=true;
+  try{const r=await fetch(base+"/journal.json",{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);data=await r.json();okAt=Date.now();
     document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"));
     render();const o=openId&&document.querySelector(".tr.open");if(o&&!load.done)o.scrollIntoView({block:"start"});load.done=true}
-  catch(e){document.getElementById("meta").replaceChildren($("span","bad","读取失败："+e.message))}}
+  catch(e){const at=okAt?new Date(okAt):null,hms=at?two(at.getHours())+":"+two(at.getMinutes())+":"+two(at.getSeconds()):"";
+    if(e.message==="HTTP 404")dead=true;
+    document.getElementById("meta").replaceChildren($("span","bad","⚠️ 读取失败："+(dead?"链接已失效，请在 Telegram 重新发送 /web；本页不再自动刷新":e.message)+
+      (okAt?"；下面显示的是 "+hms+" 的旧数据":"")))}
+  finally{load.busy=false}}
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once
 const THEMES={auto:["◐","自动"],light:["☀","浅色"],dark:["☾","深色"]};let theme="auto";try{const t=JSON.parse(localStorage.getItem("theme"));if(typeof t==="string"&&Object.prototype.hasOwnProperty.call(THEMES,t))theme=t}catch(e){}
 function applyTheme(){const r=document.documentElement;if(theme==="auto")delete r.dataset.theme;else r.dataset.theme=theme;const b=document.getElementById("theme");b.textContent=THEMES[theme][0]+" "+THEMES[theme][1];b.title="主题："+THEMES[theme][1]+"（点击切换）"}
 document.getElementById("theme").addEventListener("click",()=>{const ks=Object.keys(THEMES);theme=ks[(ks.indexOf(theme)+1)%ks.length];try{localStorage.setItem("theme",JSON.stringify(theme))}catch(e){}applyTheme()});applyTheme();
@@ -7116,10 +7453,29 @@ class WebServer:
     """
     MAX_HEADER_BYTES = 8192
     GZIP_MIN_BYTES = 512  # below this a gzip header costs about as much as it saves
+    CACHE_SECONDS = {"data.json": 2.0, "journal.json": 5.0}  # several tabs (or a scanner) share one build per interval
 
     def __init__(self, bot: "Bot", port: int, token: str):
         self.bot, self.port, self.token = bot, port, token
         self.server: asyncio.base_events.Server | None = None
+        self.pages = {"page": WEB_PAGE.encode("utf-8"), "journal": JOURNAL_PAGE.encode("utf-8")}
+        self.cache: dict[str, tuple[float, bytes]] = {}  # name -> (expires, body): the JSON is built once per interval
+        self.gzipped: dict[bytes, bytes] = {body: gzip.compress(body, compresslevel=9) for body in self.pages.values()}
+
+    def cached(self, name: str, build: Any) -> bytes:
+        entry = self.cache.get(name)
+        if entry is None or time.monotonic() >= entry[0]:
+            entry = self.cache[name] = (time.monotonic() + self.CACHE_SECONDS.get(name, 0.0), build())
+        return entry[1]
+
+    def compressed(self, body: bytes) -> bytes:
+        """gzip of ``body``, computed once per distinct body (the pages forever, a JSON answer for its cache interval)."""
+        found = self.gzipped.get(body)
+        if found is None:
+            if len(self.gzipped) > 8:
+                self.gzipped = {page: self.gzipped[page] for page in self.pages.values()}
+            found = self.gzipped[body] = gzip.compress(body, compresslevel=6)
+        return found
 
     async def start(self) -> int:
         self.server = await asyncio.start_server(self.handle, "0.0.0.0", self.port)
@@ -7138,17 +7494,18 @@ class WebServer:
         if path in {"/", "/health"}:
             return 200, "text/plain; charset=utf-8", b"ok"
         parts = path.strip("/").split("/")
-        if len(parts) in {2, 3} and parts[0] == "p" and hmac.compare_digest(parts[1], self.token):
+        # (compare_digest needs ASCII on both sides: a scanner's odd bytes are simply not the token)
+        if len(parts) in {2, 3} and parts[0] == "p" and parts[1].isascii() and hmac.compare_digest(parts[1], self.token):
             if len(parts) == 2:
-                return 200, "text/html; charset=utf-8", WEB_PAGE.encode("utf-8")
+                return 200, "text/html; charset=utf-8", self.pages["page"]
             if parts[2] == "data.json":
-                body = json.dumps(self.bot.odds_payload(), ensure_ascii=False).encode("utf-8")
-                return 200, "application/json; charset=utf-8", body
+                return 200, "application/json; charset=utf-8", self.cached(
+                    "data.json", lambda: json.dumps(self.bot.odds_payload(), ensure_ascii=False, default=str).encode("utf-8"))
             if parts[2] == "journal":
-                return 200, "text/html; charset=utf-8", JOURNAL_PAGE.encode("utf-8")
+                return 200, "text/html; charset=utf-8", self.pages["journal"]
             if parts[2] == "journal.json":
-                body = json.dumps(self.bot.journal_payload(), ensure_ascii=False, default=str).encode("utf-8")
-                return 200, "application/json; charset=utf-8", body
+                return 200, "application/json; charset=utf-8", self.cached(
+                    "journal.json", lambda: json.dumps(self.bot.journal_payload(), ensure_ascii=False, default=str).encode("utf-8"))
             if parts[2] == "journal.csv":
                 return 200, "text/csv; charset=utf-8", self.bot.journal_csv().encode("utf-8")
         return 404, "text/plain; charset=utf-8", b"not found"
@@ -7165,11 +7522,11 @@ class WebServer:
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ValueError):
             status, ctype, body, method, gzip_ok = 400, "text/plain; charset=utf-8", b"bad request", "GET", False
         except Exception as error:  # Never let a page request touch the bot's loops.
-            LOG.warning("web request failed: %s", clean_error(error))
+            self.bot.log_limited("web", f"web request failed: {clean_error(error) or type(error).__name__}")
             status, ctype, body, method, gzip_ok = 500, "text/plain; charset=utf-8", b"error", "GET", False
         encoding = ""
         if gzip_ok and status == 200 and len(body) >= self.GZIP_MIN_BYTES:
-            body, encoding = gzip.compress(body, compresslevel=6), "Content-Encoding: gzip\r\n"
+            body, encoding = self.compressed(body), "Content-Encoding: gzip\r\n"
         reason = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed", 500: "Internal Server Error"}[status]
         headers = (f"HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n{encoding}"
                    "Vary: Accept-Encoding\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
@@ -7272,7 +7629,8 @@ def alert_plan(state: dict | None, baseline_key: str, change: D, now: float,
     elapsed = now - float(s.get("last_sent", 0))
     reason = ""
     if s.get("side", 0) != side:
-        reason = "首次/重新超过阈值" if not s.get("side") else "方向反转并超过阈值"
+        reason = ("方向反转并超过阈值" if s.get("side")
+                  else "重新超过阈值（曾回到阈值 80% 以内）" if s.get("last_sent") else "首次超过阈值")
     elif step > 0 and tier > int(s.get("highest_tier", 0)):
         reason = "偏离继续扩大"
     elif cooldown > 0 and elapsed >= cooldown:
@@ -7287,21 +7645,35 @@ def alert_plan(state: dict | None, baseline_key: str, change: D, now: float,
 
 def alert_text(symbol: str, quote: Quote, base: Baseline, change: D, threshold: D, reason: str,
                references: dict[str, Baseline] | None = None, fx: "FxRates | None" = None,
-               style: str = "cn", context: list[str] | None = None) -> str:
-    """Alert body with bold sentinels; send it with html=True. ``context`` = extra rows (HL, indices)."""
+               style: str = "cn", context: list[str] | None = None, now_ms: int | None = None) -> str:
+    """Alert body with bold sentinels; send it with html=True. ``context`` = extra rows (HL, indices); ``now_ms`` is
+    when the text is rendered, so the quote's age ("N 秒前") is real rather than always 0."""
     side = "上涨" if change > 0 else "下跌"
     rows = [f"基准 {fmt(base.value)}（{baseline_brief(base)}）→ {pct_text(change, style, strong=True, digits=3)}"]
     rows += [reference_row(kind, quote.price, ref, fx, style) for kind, ref in (references or {}).items()]
     rows += [line for line in (context or []) if line]
     rows.append(f"📝 {reason}")
     return "\n".join([f"{trend_mark(change, style)} {bold(f'{side}超过 {fmt(threshold)}%｜{NAMES.get(symbol, symbol)}')}（{symbol}）",
-                      quote.price_row(quote.timestamp_ms), *tree(rows),
+                      quote.price_row(quote.timestamp_ms if now_ms is None else max(now_ms, quote.timestamp_ms)), *tree(rows),
                       "⚠️ 合约行情提示，不代表股票官方收盘结算结果。"])
 
 
 # A message's freshness check (set by Bot.tell): run again after the send queue's wait, right before the message goes
 # out, so a Telegram cool-down (429 retry_after can be minutes) never delivers a price that was current back then.
 SEND_CHECK: contextvars.ContextVar[Any] = contextvars.ContextVar("send_check", default=None)
+# A message's renderer (set by Bot.tell): rebuilds the text right before it goes out, so what it says about "now"
+# (a quote's age) is true at the moment of sending, not at the moment it was queued.
+SEND_RENDER: contextvars.ContextVar[Any] = contextvars.ContextVar("send_render", default=None)
+# Telegram says this when a chat can no longer be delivered to; retrying every cycle would only clog the queue.
+CHAT_GONE = ("bot was blocked by the user", "user is deactivated", "bot was kicked", "chat not found",
+             "bot is not a member", "message thread not found", "topic_closed", "chat_write_forbidden",
+             "have no rights to send", "not enough rights to send")
+
+
+def chat_gone(error: BaseException) -> str:
+    """Why Telegram will keep refusing this chat ("" when the failure may be temporary)."""
+    text = str(error).lower()
+    return next((reason for reason in CHAT_GONE if reason in text), "")
 
 
 class StaleMessage(Exception):
@@ -7309,10 +7681,15 @@ class StaleMessage(Exception):
 
 
 class Telegram:
+    CHAT_GAP = 1.1    # seconds between two messages to the same chat (Telegram allows about one per second there)
+    GLOBAL_GAP = 0.1  # seconds between any two messages (Telegram's overall limit is about 30 per second)
+
     def __init__(self, token: str):
         self.root = f"https://api.telegram.org/bot{token}/"
-        self.lock = asyncio.Lock()
-        self.next_send = 0.0
+        self.lock = asyncio.Lock()                     # one request in flight; the global spacing
+        self.next_send = 0.0                           # no message to anyone before this (monotonic)
+        self.chat_next: dict[Any, float] = {}          # chat -> no message to it before this (its 429 cool-down)
+        self.chat_locks: dict[Any, asyncio.Lock] = {}  # chat -> its messages keep their order
 
     async def call(self, method: str, payload: dict | None = None, timeout: int = 15) -> Any:
         data = await http_json(self.root + method, payload or {}, timeout)
@@ -7323,25 +7700,43 @@ class Telegram:
         return data.get("result")
 
     async def paced(self, method: str, payload: dict) -> Any:
-        """Serialize outgoing messages and respect Telegram's per-chat send rate. A message with a freshness check is
-        re-validated after the wait, right before it is sent (StaleMessage when its data no longer holds)."""
-        async with self.lock:
-            await asyncio.sleep(max(0, self.next_send - time.monotonic()))
-            check = SEND_CHECK.get()
-            if check is not None and not check():
-                raise StaleMessage("排队等待发送期间数据已失效，未发送")
-            try:
-                return await self.call(method, payload)
-            except RemoteError as error:
-                self.next_send = time.monotonic() + max(1.1, error.retry_after)
-                raise
-            finally:
-                self.next_send = max(self.next_send, time.monotonic() + 1.1)
+        """Serialize outgoing messages per chat and respect Telegram's send rates: about one message per second to a
+        chat (a 429 cool-down holds only that chat), a small gap between any two. A message with a freshness check is
+        re-validated after the wait, right before it is sent (StaleMessage when its data no longer holds); one with a
+        renderer is rebuilt then."""
+        chat = payload.get("chat_id")
+        if len(self.chat_locks) > 2000:
+            self.chat_locks = {c: lock for c, lock in self.chat_locks.items() if lock.locked()}
+            self.chat_next = {c: t for c, t in self.chat_next.items() if t > time.monotonic()}
+        async with self.chat_locks.setdefault(chat, asyncio.Lock()):
+            await asyncio.sleep(max(0, self.chat_next.get(chat, 0) - time.monotonic()))
+            async with self.lock:
+                await asyncio.sleep(max(0, self.next_send - time.monotonic()))
+                check = SEND_CHECK.get()
+                if check is not None and not check():
+                    raise StaleMessage("排队等待发送期间数据已失效，未发送")
+                render = SEND_RENDER.get()
+                if render is not None and "text" in payload:
+                    payload = {**payload, "text": split_text(render())[0]}
+                    SEND_RENDER.set(None)
+                try:
+                    return await self.call(method, payload)
+                except RemoteError as error:
+                    self.chat_next[chat] = time.monotonic() + max(self.CHAT_GAP, error.retry_after)
+                    raise
+                finally:
+                    now = time.monotonic()
+                    self.next_send = max(self.next_send, now + self.GLOBAL_GAP)
+                    self.chat_next[chat] = max(self.chat_next.get(chat, 0), now + self.CHAT_GAP)
 
     async def send(self, chat: int, thread: int, text: str, reply_markup: dict | None = None,
                    parse_mode: str | None = None) -> None:
         # Plain text by default; HTML only for messages that were escaped with to_html().
         chunks = split_text(text)
+        if len(chunks) > 1:
+            SEND_RENDER.set(None)  # a long message is sent as queued: its parts must come from one rendering
+            if parse_mode == "HTML":
+                chunks = balance_bold(chunks)
         for index, chunk in enumerate(chunks):
             payload: dict[str, Any] = {"chat_id": chat, "text": chunk,
                                       "link_preview_options": {"is_disabled": True}}
@@ -7372,9 +7767,23 @@ def split_text(text: str, limit: int = 3400) -> list[str]:
             break
         cut = remaining.rfind("\n", 0, limit)
         cut = cut if cut > 0 else limit
+        amp = remaining.rfind("&", max(0, cut - 8), cut)  # never cut through an HTML entity (&amp; → &am + p;)
+        if amp >= 0 and remaining.find(";", amp, cut) < 0:
+            cut = amp
         chunks.append(remaining[:cut])
         remaining = remaining[cut:].lstrip("\n")
     return chunks or [""]
+
+
+def balance_bold(chunks: list[str]) -> list[str]:
+    """Close a <b> left open at the end of a chunk and reopen it in the next: Telegram rejects a part with an unmatched tag."""
+    out, open_tag = [], False
+    for chunk in chunks:
+        if open_tag:
+            chunk = "<b>" + chunk
+        open_tag = chunk.count("<b>") > chunk.count("</b>")
+        out.append(chunk + "</b>" if open_tag else chunk)
+    return out
 
 
 def target_from_message(message: dict) -> tuple[int, int]:
@@ -7417,9 +7826,9 @@ COMMANDS: tuple[Command, ...] = (
     Command("unsubscribe", "取消当前订阅"),
     Command("status", "查看合约、基准与数据状态"),
     Command("threshold", "改为严格超过 ±1% 提醒", "1", "不带数字则弹出档位按钮卡片，点选即可"),
-    Command("cooldown", "持续超标每 300 秒提醒（0=关闭周期提醒）", "300"),
+    Command("cooldown", "持续超标每 300 秒提醒（0=关闭周期提醒）", "300", "不带数字则弹出档位按钮卡片，点选即可"),
     Command("mode", "daily=币安上一 UTC 日日 K 收盘；exchange=币安合约在证券交易所收盘时刻的价格；manual=手动参考价",
-            "daily|exchange|manual"),
+            "daily|exchange|manual", "不带参数则弹出模式按钮卡片，点选即可"),
     Command("setclose", "设置手动参考价，可一次发多条", "UNITREE 75 09-17 16:00",
             "示例：75 是基准，09-17 16:00 是它的收盘时间（北京，可省略）\n"
             "  末尾再写 YYYY-MM-DD 可指定适用日（默认今天）；批量：每行一组，首行可写统一适用日"),
@@ -7450,6 +7859,28 @@ def threshold_card(current: D) -> tuple[str, dict]:
     text = (f"📏 提醒阈值：跟上一日收盘价（基准）偏离多少才提醒\n当前：严格超过 ±{fmt(current)}%\n\n"
             "点选下方档位即时生效；其他数值请发送 /threshold 0.8。")
     return text, {"inline_keyboard": [buttons[i:i + 4] for i in range(0, len(buttons), 4)]}
+
+
+COOLDOWN_PRESETS = (0, 60, 300, 600, 1800, 3600)  # seconds; 0 = no repeat while the deviation persists
+
+
+def cooldown_card(current: int) -> tuple[str, dict]:
+    """Card text + inline keyboard for the repeat interval; the active preset is ticked."""
+    label = lambda s: "关闭" if s == 0 else f"{s // 60} 分钟" if s % 60 == 0 and s >= 60 else f"{s} 秒"
+    buttons = [{"text": ("✅ " if s == current else "") + label(s), "callback_data": f"cooldown:{s}"} for s in COOLDOWN_PRESETS]
+    text = (f"🔁 周期重复提醒：偏离持续超过阈值时，每隔多久再提醒一次\n当前：{label(current)}"
+            f"{'' if current else '（只在首次超过、档位扩大、方向反转时提醒）'}\n\n点选下方档位即时生效；其他秒数请发送 /cooldown 900。")
+    return text, {"inline_keyboard": [buttons[i:i + 3] for i in range(0, len(buttons), 3)]}
+
+
+def mode_card(current: str) -> tuple[str, dict]:
+    """Card text + inline keyboard for the baseline mode; the active one is ticked."""
+    names = (("binance_daily", "daily 日K"), ("exchange_close", "exchange 交易所收盘"), ("manual", "manual 手动"))
+    buttons = [{"text": ("✅ " if mode == current else "") + name, "callback_data": f"mode:{mode}"} for mode, name in names]
+    text = ("🧭 基准模式：涨跌幅相对哪个价格计算\n当前：" + BASELINE_MODES.get(current, current) + "\n\n"
+            + "\n".join(f"· {name}：{BASELINE_MODES[mode]}" for mode, name in names)
+            + "\n\n点选即时生效（切换后重新判断当前偏离，30 秒最短间隔仍然有效）。")
+    return text, {"inline_keyboard": [buttons]}
 
 HELP = "📡 合约昨收偏离提醒\n\n" + "\n".join(c.help_line() for c in COMMANDS) + """
 
@@ -7573,6 +8004,7 @@ def parse_close_entries(raw: str, now_ms: int, command: str = "/setclose") -> li
     Qualifiers before the first symbol apply to every entry that has none of its own.
     Nothing is stored here, so a bad line rejects the whole batch.
     """
+    raw = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", raw)  # 258,000 is one price, not two entries
     today = beijing_day(now_ms / 1000)
     usage = (f"用法：{command} UNITREE 75 [货币 如 HKD] [收盘时间 MM-DD HH:MM] [适用日期 YYYY-MM-DD]\n"
              "批量：每行（或用逗号分隔）一组「合约 价格 [货币] [收盘时间]」，最前面可写统一适用日/收盘时间/货币，例如\n"
@@ -7619,7 +8051,7 @@ class Bot:
             ("tencent", "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=hkHSI,day,,,10,"),
             ("eastmoney", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=10"
                           "&fields1=f1&fields2=f51,f52,f53&secid=100.HSI"),
-            ("yahoo", yahoo_url("^HSI"))))
+            ("yahoo", yahoo_url("^HSI"))), config.holidays.get("hk", frozenset()))
         self.hsi.dated_close = lambda day: self.hsi_daily.daily.get(day)  # checks the cash index belongs to the right day
         self.touches = {spec.key: TouchMarket(store, spec) for spec in TOUCH_MARKETS}
         self.updowns = {spec.key: UpDownMarket(store, spec) for spec in UPDOWN_MARKETS}
@@ -7650,6 +8082,14 @@ class Bot:
         self.a50_anchor_source = "东方财富"
         self.anchor_tries: dict[str, float] = {}
         self.deliveries: dict[str, asyncio.Task] = {}  # Telegram sends in flight, by alert / notice key
+        self.faults: dict[tuple[str, str], float] = {}  # (subscription, data item) -> when its current fault began
+        self.reply_seq = 0  # command replies get their own delivery keys
+        self.last_send_error = ""  # the latest Telegram send failure, for /status
+        self.sim_cache: dict[str, dict] | None = None  # in-memory view of the sim: records (sim_trades)
+        self.sim_gen = -1
+        self.notice_cache: dict[str, dict] | None = None  # in-memory view of the notice: records
+        self.notice_gen = -1
+        self.pred_pruned = 0.0  # when old prediction snapshots were last pruned
         self.vol_errors: dict[str, str] = {}  # symbol -> why its exchange daily bars could not be read (σ is the prior)
         self.stopping = asyncio.Event()
         self.started = time.time()
@@ -7772,13 +8212,17 @@ class Bot:
             self.last_log[key] = now
 
     async def tell(self, chat: int, thread: int, text: str, reply_markup: dict | None = None,
-                   html_mode: bool = False, fresh: Any = None) -> bool:
+                   html_mode: bool = False, fresh: Any = None, render: Any = None) -> bool:
         """Send one message; True once Telegram accepted it. ``fresh`` (optional) is re-checked right before sending,
-        also after any wait in the send queue: when it says the data no longer holds, nothing is sent (False)."""
+        also after any wait in the send queue: when it says the data no longer holds, nothing is sent (False).
+        ``render`` (optional, returns the text) is called right before sending too, so the text speaks of that moment."""
         token = SEND_CHECK.set(fresh)
+        rtoken = SEND_RENDER.set(None if render is None else (lambda: to_html(render())) if html_mode else render)
         try:
             if fresh is not None and not fresh():
                 raise StaleMessage("数据已失效，未发送")
+            if render is not None:
+                text = render()
             if html_mode:
                 await self.telegram.send(chat, thread, to_html(text), reply_markup, "HTML")
             else:
@@ -7788,10 +8232,31 @@ class Bot:
             LOG.info("Telegram message dropped: %s", error)
             return False
         except Exception as error:
-            self.log_limited("telegram_send", f"Telegram 发送失败：{clean_error(error)}")
+            gone = chat_gone(error)
+            if gone:
+                self.suspend_target(chat, thread, gone)
+            self.last_send_error = f"{stamp(time.time() * 1000, seconds=False)} chat {chat}：{brief_error(clean_error(error), 80)}"
+            self.log_limited(f"telegram_send:{chat}", f"Telegram 发送失败（chat {chat}）：{clean_error(error)}")
             return False
         finally:
             SEND_CHECK.reset(token)
+            SEND_RENDER.reset(rtoken)
+
+    def suspend_target(self, chat: int, thread: int, why: str) -> None:
+        """Telegram refuses this chat for good (bot blocked or kicked, topic deleted): pause its subscription instead
+        of retrying every cycle, and tell the administrator. /resume (or /subscribe) in that chat turns it back on."""
+        subs = self.subscriptions()
+        sub_id = subscription_key(chat, thread)
+        sub = subs.get(sub_id)
+        if not sub or not sub.get("active"):
+            return
+        subs[sub_id] = {**sub, "active": False, "suspended": why, "suspended_at": time.time()}
+        self.store.put("subscriptions", subs)
+        LOG.warning("订阅 %s 已自动暂停：Telegram 拒绝投递（%s）", sub_id, why)
+        if self.config.admin_id and (chat, thread) != (self.config.admin_id, 0):
+            text = (f"⏸ 订阅 {sub_id} 已自动暂停\nTelegram 拒绝向该聊天投递：{why}\n"
+                    "机器人可能已被移出群组、被拉黑，或话题已删除/关闭。处理后在该聊天发送 /resume 恢复。")
+            self.deliver(f"notice:suspended:{sub_id}", functools.partial(self.tell, self.config.admin_id, 0, text))
 
     # --- delivery: sampling never waits on Telegram -------------------------------------------------------------------
 
@@ -7803,7 +8268,7 @@ class Bot:
         """Run one Telegram delivery in the background, so the 5-second sampling never waits on Telegram (a 429 cool-
         down can last minutes). One delivery per key at a time: while it is in flight the same message is not planned
         again; it re-checks its data right before sending and records itself only once Telegram accepted it."""
-        if self.delivering(key):
+        if self.delivering(key) or self.stopping.is_set():
             return False
 
         async def guarded() -> None:
@@ -7822,26 +8287,43 @@ class Bot:
         self.deliveries.clear()
 
     def notice(self, sub_id: str, sub: dict, key: str, error: str | None) -> None:
-        """A fault / recovery notice for one subscription, sent in the background and recorded once delivered."""
+        """A fault / recovery notice for one subscription, sent in the background and recorded once delivered.
+        A fault is announced only once it has lasted NOTICE_GRACE_SECONDS (one timed-out request is not an outage),
+        then at most every 30 minutes; the recovery note follows only a fault that was announced."""
         record_key = f"notice:{sub_id}:{key}"
         if self.delivering(record_key):
             return
-        old = self.store.get(record_key, {})
         now = time.time()
         if error:
+            since = self.faults.setdefault((sub_id, key), now)
+            if now - since < NOTICE_GRACE_SECONDS:
+                return
+            old = self.notice_records().get(record_key, {})
             if old.get("active") and now - old.get("sent", 0) < 1800:
                 return
-            text = f"⚠️ 行情监控异常｜{key}\n{error}\n该项暂停涨跌提醒；恢复后继续。\n这不代表价格没有变化。"
+            lasting = f"已持续 {int((now - since) // 60)} 分钟｜" if now - since >= 60 else ""
+            text = f"⚠️ 行情监控异常｜{key}\n{lasting}{error}\n该项暂停涨跌提醒；恢复后继续。\n这不代表价格没有变化。"
             state = {"active": True, "sent": now}
-        elif old.get("active"):
-            text, state = f"✅ 数据恢复｜{key}\n后续按当前基准继续监控。", {"active": False, "sent": now}
         else:
-            return
+            self.faults.pop((sub_id, key), None)
+            old = self.notice_records().get(record_key, {})
+            if not old.get("active"):
+                return
+            text, state = f"✅ 数据恢复｜{key}\n后续按当前基准继续监控。", {"active": False, "sent": now}
 
         async def send() -> None:
             if await self.tell(sub["chat"], sub["thread"], text):
                 self.store.put(record_key, state)
         self.deliver(record_key, send)
+
+    def notice_records(self) -> dict[str, dict]:
+        """notice:* records as an in-memory view (read every cycle for every subscription and contract), refreshed
+        whenever one is written or deleted."""
+        generation = self.store.touched.get("notice", 0)
+        if self.notice_cache is None or self.notice_gen != generation:
+            self.notice_cache = {k: v for k, v in self.store.items("notice:") if isinstance(v, dict)}
+            self.notice_gen = generation
+        return self.notice_cache
 
     def parse_request(self, message: dict) -> Request | None:
         """Return the command in ``message`` when it is addressed to this bot, else None."""
@@ -7870,7 +8352,12 @@ class Bot:
         markup, html_mode = None, False
         try:
             handler = self.handlers.get(req.command)
-            reply = handler(req) if handler else "未知命令。发送 /help 查看用法。"
+            if handler is None:
+                if req.chat < 0 and "@" not in message.get("text", "").split()[0]:
+                    return  # a group's command for some other bot: not ours to answer
+                reply: Any = "未知命令。发送 /help 查看用法。"
+            else:
+                reply = handler(req)
             if inspect.isawaitable(reply):
                 reply = await reply
             if isinstance(reply, tuple):  # (text, inline keyboard) card
@@ -7879,7 +8366,22 @@ class Bot:
                 reply, markup, html_mode = reply.text, reply.markup, reply.html
         except (ValueError, decimal.InvalidOperation) as error:
             reply = "❌ " + clean_error(error)
-        await self.tell(req.chat, req.thread, reply, markup, html_mode)
+        except Exception as error:  # a bug in one handler must not leave the administrator without any answer
+            LOG.exception("命令 %s 处理失败", req.command)
+            reply = (f"❌ 命令执行失败：{clean_error(error) or type(error).__name__}\n"
+                     "已写入日志；可发 /diag 检查数据源，或稍后重试。")
+        await self.reply(req, reply, markup, html_mode)
+
+    async def reply(self, req: Request, text: str, markup: dict | None = None, html_mode: bool = False) -> None:
+        """Answer a command. While the background loops run the answer is queued like any other message, so a
+        Telegram cool-down never stalls the command poll (the next command is read at once); one-off runs and tests
+        send inline."""
+        job = functools.partial(self.tell, req.chat, req.thread, text, markup, html_mode)
+        if not self.reference_tasks:
+            await job()
+            return
+        self.reply_seq += 1
+        self.deliver(f"reply:{self.reply_seq}", job)
 
     async def process_callback(self, query: dict) -> None:
         """Handle a tap on a card button (callback_query)."""
@@ -7896,10 +8398,21 @@ class Bot:
             return
         kind, _, value = str(query.get("data", "")).partition(":")
         try:
-            if kind != "threshold":
+            if kind == "threshold":
+                toast = self.apply_threshold(value)
+                text, markup = threshold_card(D(self.settings()["threshold"]))
+            elif kind == "cooldown":
+                toast = self.apply_cooldown(value)
+                text, markup = cooldown_card(int(self.settings()["cooldown"]))
+            elif kind == "mode":
+                full = self.apply_mode(value)
+                toast = full.splitlines()[0]
+                text, markup = mode_card(self.settings()["mode"])
+                if self.settings()["mode"] == "manual" and message.get("chat"):  # the template to fill in is worth a message of its own
+                    await self.reply(Request("/mode", [], int(message["chat"]["id"]), int(message.get("message_thread_id") or 0),
+                                             int((query.get("from") or {}).get("id") or 0)), full)
+            else:
                 raise ValueError("未知操作，请重新发送命令")
-            toast = self.apply_threshold(value)
-            text, markup = threshold_card(D(self.settings()["threshold"]))
         except (ValueError, decimal.InvalidOperation) as error:
             await answer("❌ " + clean_error(error), alert=True)
             return
@@ -7919,8 +8432,9 @@ class Bot:
         if len(self.command_notice) > 2000:
             self.command_notice.clear()
         self.command_notice[req.user_id] = now
-        await self.tell(req.chat, req.thread, id_text(req.user_id, req.chat, req.thread) +
-                        "\n把你的用户 ID 填入 Railway 的 ADMIN_USER_ID 后重新部署，再发 /subscribe。")
+        intro = ("ℹ️ 这是一个合约涨跌提醒机器人：订阅、查看状态和修改设置只有管理员能做。\n" if req.command == "/help" else "")
+        await self.tell(req.chat, req.thread, intro + id_text(req.user_id, req.chat, req.thread) +
+                        "\n如果你是部署者：把你的用户 ID 填入 Railway 的 ADMIN_USER_ID 后重新部署，再发 /subscribe。")
 
     # --- command handlers: each returns the reply text or raises ValueError with the usage hint ---
 
@@ -7936,21 +8450,34 @@ class Bot:
     def cmd_test(self, req: Request) -> str:
         return "✅ TG 测试消息发送成功。\n此测试仅验证推送，行情是否正常请看 /status。"
 
-    def cmd_subscribe(self, req: Request) -> str:
+    def cmd_subscribe(self, req: Request) -> "Reply":
         self.set_subscription(req, active=True)
-        return ("✅ 当前私聊/话题已订阅。\n" + self.config_summary() +
-                "\n首次观察就超过阈值，也会提醒；请用 /status 核对基准和行情。")
+        return Reply("✅ 当前私聊/话题已订阅。首次观察就超过阈值，也会提醒。\n下面是当前状态（随时可发 /status 再看）：\n\n"
+                     + self.status(req.sub_id), html=True)
 
     def cmd_resume(self, req: Request) -> str:
+        sub = self.subscriptions().get(req.sub_id)
+        if sub is None:
+            raise ValueError("当前私聊/话题还没有订阅；请先发送 /subscribe")
+        if sub.get("active"):
+            return "ℹ️ 当前订阅本来就在运行中，无需恢复。\n" + self.config_summary()
         self.set_subscription(req, active=True)
-        return "✅ 当前订阅已恢复。\n" + self.config_summary()
+        why = f"\n（此前因「{sub['suspended']}」被自动暂停）" if sub.get("suspended") else ""
+        return "✅ 当前订阅已恢复。" + why + "\n" + self.config_summary()
 
     def cmd_pause(self, req: Request) -> str:
+        sub = self.subscriptions().get(req.sub_id)
+        if sub is None:
+            raise ValueError("当前私聊/话题没有订阅，无需暂停；/subscribe 可以订阅")
+        if not sub.get("active"):
+            return "ℹ️ 当前订阅已经是暂停状态；/resume 可以恢复。"
         self.set_subscription(req, active=False)
-        return "⏸ 当前订阅已暂停。"
+        return "⏸ 当前订阅已暂停；/resume 可以恢复。"
 
     def cmd_unsubscribe(self, req: Request) -> str:
         subs = self.subscriptions()
+        if req.sub_id not in subs:
+            return "ℹ️ 当前私聊/话题没有订阅，无需取消。"
         subs.pop(req.sub_id, None)
         self.store.put("subscriptions", subs)
         self.store.delete_prefix(f"alert:{req.sub_id}:")
@@ -7970,25 +8497,46 @@ class Bot:
         if not D("0.01") <= value <= D(100):
             raise ValueError("阈值必须在 0.01～100 之间")
         self.update_settings(threshold=str(value))
-        self.store.delete_prefix("alert:")
+        self.reset_alerts()
         return f"✅ 全局阈值已改为严格超过 ±{fmt(value)}%。下一轮按新阈值判断。"
 
-    def cmd_cooldown(self, req: Request) -> str:
-        if len(req.args) != 1 or not req.args[0].isdigit() or not 0 <= int(req.args[0]) <= 86400:
+    def reset_alerts(self) -> None:
+        """Open a fresh alert episode for every subscription and contract (a changed threshold / mode re-judges the
+        current deviation), keeping only each one's last send time so the MIN_ALERT_GAP spam guard still holds."""
+        self.store.put_many((key, {"last_sent": value.get("last_sent", 0)})
+                            for key, value in self.store.items("alert:") if isinstance(value, dict))
+
+    def cmd_cooldown(self, req: Request) -> str | tuple[str, dict]:
+        if not req.args:
+            return cooldown_card(int(self.settings()["cooldown"]))
+        if len(req.args) != 1:
+            raise ValueError("用法：/cooldown 300，范围 0～86400 秒；0 关闭周期重复提醒；不带数字弹出档位卡片")
+        return self.apply_cooldown(req.args[0])
+
+    def apply_cooldown(self, raw: str) -> str:
+        if not raw.isdigit() or not 0 <= int(raw) <= 86400:
             raise ValueError("用法：/cooldown 300，范围 0～86400 秒；0 关闭周期重复提醒")
-        seconds = int(req.args[0])
+        seconds = int(raw)
         self.update_settings(cooldown=seconds)
         return f"✅ 周期重复提醒间隔：{seconds} 秒（0 表示关闭）。"
 
-    def cmd_mode(self, req: Request) -> str:
-        choice = req.args[0].lower() if len(req.args) == 1 else ""
+    def cmd_mode(self, req: Request) -> str | tuple[str, dict]:
+        if not req.args:
+            return mode_card(self.settings()["mode"])
+        if len(req.args) != 1:
+            raise ValueError("用法：/mode daily、/mode exchange 或 /mode manual；不带参数弹出模式卡片")
+        return self.apply_mode(req.args[0])
+
+    def apply_mode(self, choice: str) -> str:
+        """Validate and persist the baseline mode; shared by the command and the card buttons."""
+        choice = choice.lower()
         aliases = {"daily": "binance_daily", "binance_daily": "binance_daily", "manual": "manual",
                    "exchange": "exchange_close", "exchange_close": "exchange_close", "stock": "exchange_close"}
         if choice not in aliases:
             raise ValueError("用法：/mode daily、/mode exchange 或 /mode manual")
         settings = self.update_settings(mode=aliases[choice])
         self.snapshots.clear()
-        self.store.delete_prefix("alert:")
+        self.reset_alerts()
         reply = "✅ " + self.config_summary()
         if settings["mode"] == "exchange_close":
             missing = [s for s in self.config.symbols if s not in self.config.tickers]
@@ -8219,18 +8767,27 @@ class Bot:
                 "ref_raw": float(raw.ref), "up_raw": raw.fair_up, "strike": float(shown.ref) if shown.ref != raw.ref else None,
                 "move": raw.move, "beta": raw.beta, "sigma": raw.sigma_daily, "R": raw.remaining, "proxy": raw.proxy_note,
                 "slug": slug, "url": predict_url(slug, self.config.predict_ref) if slug else ""})
+        if time.time() - self.pred_pruned > 86400:  # the snapshots are kept PRED_KEEP_DAYS, not forever
+            self.pred_pruned = time.time()
+            cutoff = now_ms - PRED_KEEP_DAYS * DAY_MS
+            old = [k for k in self.store.keys("pred:") if k.rsplit(":", 1)[-1].isdigit() and int(k.rsplit(":", 1)[-1]) < cutoff]
+            if old:
+                self.store.delete_keys(old)
+                LOG.info("pruned %s prediction snapshots older than %s days", len(old), PRED_KEEP_DAYS)
         if self.cn.close:
             self.note_outcome("SSE", self.cn.close.day.isoformat(), self.cn.close.value, self.cn.close.source)
         k = self.kospi.quote
         kst = dt.timezone(dt.timedelta(hours=9))
-        if k and dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).time() >= dt.time(15, 30):
-            day = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst).date()
+        quoted_kst = dt.datetime.fromtimestamp(k.quoted_ms / 1000, kst) if k else None
+        if quoted_kst and quoted_kst.time() >= CALENDAR.close_time("kr", quoted_kst.date()):
+            day = quoted_kst.date()
             official = self.kospi.official_close(day)
             rank = self.kospi.daily_rank.get(day)
             self.note_outcome("KOSPI", day.isoformat(), official or k.last,
                               ("Yahoo ^KS11 日K", "Naver 日K")[rank] if official and rank in (0, 1) else f"{k.source} 实时（日K未出）")
         q, local = self.hsi.quote, dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
-        if local.time() >= dt.time(16, 15) and hk_cash_close_date(now_ms, self.hsi.holidays) == local.date():
+        hk_final = dt.datetime.combine(local.date(), CALENDAR.close_time("hk", local.date()), BEIJING) + dt.timedelta(minutes=5)
+        if local >= hk_final and hk_cash_close_date(now_ms, self.hsi.holidays) == local.date():
             # the dated daily close once it is out; before that the cash quote, if it is that day's
             close, source = self.hsi_daily.daily.get(local.date()), ""
             if close is not None:
@@ -8241,10 +8798,14 @@ class Bot:
             if close is not None:
                 self.note_outcome("HSI", local.date().isoformat(), close, source)
 
+    PRED_FIELDS = frozenset({"key", "t", "target", "mode", "ref", "up", "move", "R", "beta", "sigma"})
+
     def calibration_text(self) -> str:
-        preds = [v for _, v in self.store.items("pred:")]
+        saved = [v for _, v in self.store.items("pred:") if isinstance(v, dict)]
+        preds = [v for v in saved if self.PRED_FIELDS <= v.keys()]  # snapshots from before 1.14 lack the fit's inputs
         outcomes = {k.removeprefix("outcome:"): float(v) for k, v in self.store.items("outcome:")}
-        return "\n".join(["📐 概率模型回测（只评估，不会自动改参数）"] + calibration_report(preds, outcomes))
+        skipped = f"（忽略 {len(saved) - len(preds)} 条旧格式快照）" if len(saved) > len(preds) else ""
+        return "\n".join([f"📐 概率模型回测（只评估，不会自动改参数）{skipped}"] + calibration_report(preds, outcomes))
 
     async def cmd_calib(self, req: Request) -> str:
         return self.calibration_text()
@@ -8398,7 +8959,7 @@ class Bot:
     def kospi_close_ms(q: IndexQuote) -> int:
         kst = dt.timezone(dt.timedelta(hours=9))
         day = dt.datetime.fromtimestamp(q.quoted_ms / 1000, kst).date()
-        return int(dt.datetime.combine(day, dt.time(15, 30), kst).timestamp() * 1000)
+        return int(dt.datetime.combine(day, CALENDAR.close_time("kr", day), kst).timestamp() * 1000)
 
     @staticmethod
     def hk_cash_close_date(now_ms: int, holidays: frozenset = frozenset()) -> dt.date:
@@ -8410,7 +8971,7 @@ class Bot:
         info = STOCK_MARKETS[ticker.market]
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         today = dt.datetime.fromtimestamp(now_ms / 1000, tz).date()
-        close_ms = int(dt.datetime.combine(today, info.close_time, tz).timestamp() * 1000)
+        close_ms = int(dt.datetime.combine(today, CALENDAR.close_time(ticker.market, today), tz).timestamp() * 1000)
         if now_ms < close_ms + CLOSE_SETTLE_MS.get(ticker.market, 60_000):
             return
         live, _ = self.stocks.live_quote(symbol, now_ms)  # None once the close is final (+15 min): keep the last one
@@ -8499,7 +9060,7 @@ class Bot:
         if not read_ms or not q.quoted_ms:
             return
         day = dt.datetime.fromtimestamp(read_ms / 1000, BEIJING).date()
-        close_ms = int(dt.datetime.combine(day, dt.time(16, 10), BEIJING).timestamp() * 1000)
+        close_ms = int(dt.datetime.combine(day, CALENDAR.close_time("hk", day), BEIJING).timestamp() * 1000)
         if (not hk_trading_day(day, holidays) or not close_ms <= read_ms <= close_ms + self.HSI_PRINT_MS
                 or q.session_name(holidays) != "日市" or self.hsi.futures_problem(q, read_ms)):
             return
@@ -8515,7 +9076,7 @@ class Bot:
         """(the futures price at close_date's 16:10 cash close, its label, approximate?) for mapping q onto that close.
         Prefers the recorded print of the same family and contract month; otherwise the same contract's 16:30 day
         close, clearly approximate (the 16:10–16:30 futures move is missing); else none, with the reason."""
-        close_ms = int(dt.datetime.combine(close_date, dt.time(16, 10), BEIJING).timestamp() * 1000)
+        close_ms = int(dt.datetime.combine(close_date, CALENDAR.close_time("hk", close_date), BEIJING).timestamp() * 1000)
         saved = self.store.get(f"anchor:{hsi_anchor_key(q)}")
         with contextlib.suppress(ValueError, TypeError, IndexError, decimal.InvalidOperation):
             if int(saved[0]) == close_ms and (not saved[3] or not q.contract or saved[3] == q.contract) and D(str(saved[1])) > 0:
@@ -8608,7 +9169,7 @@ class Bot:
         hl, anchor = self.hl.quotes.get("KR200"), self.anchors.get("KOSPI")
         remaining, target = session_remaining("kr", now_ms, quoted_day, holidays)
         expected = expected_close_date("kr", now_ms, holidays)
-        if quoted_day < expected or (quoted_day == local.date() and local.time() < KRX_SETTLED):
+        if quoted_day < expected or (quoted_day == local.date() and local.time() < CALENDAR.kr_time(KRX_SETTLED, local.date())):
             return f"KOSPI 基准停在 {stamp(k.quoted_ms, seconds=False)}，应为 {expected.strftime('%m-%d')} 收盘；暂不输出概率"
         if hl is None:
             return "缺少 HL KR200 代理"
@@ -8681,7 +9242,7 @@ class Bot:
             if market:
                 holidays = self.config.holidays.get(market, frozenset())
                 if auction_running(market, now_ms, holidays):
-                    base["auction"] = AUCTIONS[market][2]
+                    base["auction"] = (auction_window(market, now_ms) or AUCTIONS[market])[2]
                 elif state := session_state(market, now_ms, holidays):
                     base["trading"] = state
             if isinstance(odds, str):
@@ -8704,14 +9265,16 @@ class Bot:
                 "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down,
             })
-        if self.config.touch:
-            items.extend(self.touch_payload(t, now_ms) for t in self.touches.values())
-            items.extend(self.updown_payload(u, now_ms) for u in self.updowns.values())
-            items.extend(self.flip_payload(f, now_ms) for f in self.flips.values())
-            items.extend(self.range_payload(r, now_ms) for r in self.ranges.values())
-            items.extend(self.cap_payload(c, now_ms) for c in self.caps.values())
+        if self.config.touch:  # one broken card must not take the whole page down with it
+            items.extend(self.safe_card(f"{t.spec.symbol.removesuffix('USDT')} 先触", t.spec.key, "crypto", self.touch_payload, t, now_ms)
+                         for t in self.touches.values())
+            items.extend(self.safe_card(u.spec.name, u.spec.key, "crypto", self.updown_payload, u, now_ms) for u in self.updowns.values())
+            items.extend(self.safe_card(f.spec.name, f.spec.key, "crypto", self.flip_payload, f, now_ms) for f in self.flips.values())
+            items.extend(self.safe_card(r.spec.name, r.spec.key, "crypto", self.range_payload, r, now_ms) for r in self.ranges.values())
+            items.extend(self.safe_card(c.spec.name, c.spec.key, "crypto", self.cap_payload, c, now_ms) for c in self.caps.values())
         if self.config.sim and self.config.predict:
-            items.append({"name": "模拟交易", "symbol": "SIM", "group": "sim", "kind": "sim", "sim": self.sim_report()})
+            items.append(self.safe_card("模拟交易", "SIM", "sim", lambda: {"name": "模拟交易", "symbol": "SIM", "group": "sim",
+                                                                          "kind": "sim", "sim": self.sim_report()}))
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION, "server_ms": now_ms,
                 "today": f"{today:%m-%d} {WEEKDAYS[today.weekday()]}",
@@ -8720,6 +9283,15 @@ class Bot:
                 "note": ("模型参考，非投资建议。有效价 = 参考收盘 × 代理现价 ÷ 代理在参考收盘时刻的价格；"
                          "P(涨) = 1 − Φ(ln((参考+半跳)/有效)/σ剩余)，平盘两边各计一半。目标日跳过周末和已配置的交易所假期。"
                          if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")}
+
+    def safe_card(self, name: str, key: str, group: str, build: Any, *args: Any) -> dict:
+        """One card's payload, or a placeholder saying it could not be built (logged, rate-limited): a feed changing
+        shape under one card must not turn the whole page into an HTTP 500."""
+        try:
+            return build(*args)
+        except Exception as error:
+            self.log_limited(f"card:{key}", f"网页卡片 {name} 构建失败：{clean_error(error) or type(error).__name__}")
+            return {"name": name, "symbol": key, "group": group, "missing": f"卡片构建失败：{brief_error(clean_error(error) or type(error).__name__, 80)}"}
 
     def touch_book(self, spec: TouchSpec) -> tuple[PredictBook | None, str]:
         """The book priced as "high barrier first" (the card's 涨 side), whatever the market's outcome order."""
@@ -8743,11 +9315,16 @@ class Bot:
         out: dict[str, Any] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
         book, why = self.touch_book(spec)
         odds = touch.odds(now_ms)
+        hold = touch.advice_problem(now_ms) if isinstance(odds, TouchOdds) else ""
+        if isinstance(odds, TouchOdds) and not hold and book is not None and not book.stale(now_ms):
+            decided = book_decided(book)
+            if (decided == "up" and odds.fair_upper < 0.9) or (decided == "down" and odds.fair_upper > 0.1):
+                hold = (f"盘口已把 {high if decided == 'up' else low} 先触当作定局（{'买价 ≥90¢' if decided == 'up' else '卖价 ≤10¢'}），"
+                        "模型尚未核验到这次触线；待核验，暂不给建议")
         if book is not None:
             ok = isinstance(odds, TouchOdds)
             swing = touch.model_swing(now_ms) if ok else 0.0
-            self.book_block(out, book, odds.fair_upper if ok else None, self.edge_need(swing), swing,
-                            touch.advice_problem(now_ms) if ok else "", (high, low), now_ms)
+            self.book_block(out, book, odds.fair_upper if ok else None, self.edge_need(swing), swing, hold, (high, low), now_ms)
         elif why and spec.key in self.predict.books:
             out["error"] = why
         if self.config.predict:
@@ -8764,7 +9341,7 @@ class Bot:
                     "to_high": float(percent(spec.high, price)) if price else 0.0,
                     "sigma": touch.sigma or 0.0, "years": years, "status": touch.status(),
                     "p_low": odds.lower, "p_high": odds.upper, "p_none": odds.none,
-                    "error": touch.error, "hold": touch.advice_problem(now_ms)}}
+                    "error": touch.error, "hold": hold}}
 
     def updown_book(self, spec: UpDownSpec) -> tuple[PredictBook | None, str]:
         """The book priced as "Up" (the card's 涨 side), whatever the market's outcome order."""
@@ -8889,7 +9466,22 @@ class Bot:
     SIM_SETTLE_MS = 60 * 60_000       # a daily market is settled this long after its close: the official close is in
 
     def sim_trades(self) -> dict[str, dict]:
-        return {k.removeprefix("sim:"): sim_upgrade(v) for k, v in self.store.items("sim:") if isinstance(v, dict) and "status" in v}
+        """Every paper trade, from an in-memory view of the store (the journal page and the sim step would otherwise parse
+        every record's JSON on every look); any write to a sim: record, by whoever, refreshes the view."""
+        generation = self.store.touched.get("sim", 0)
+        if self.sim_cache is None or self.sim_gen != generation:
+            self.sim_cache = {k.removeprefix("sim:"): sim_upgrade(v) for k, v in self.store.items("sim:")
+                              if isinstance(v, dict) and "status" in v}
+            self.sim_gen = generation
+        return dict(self.sim_cache)
+
+    def sim_save(self, pairs: Any) -> None:
+        """Persist (trade id, trade) pairs in one transaction and keep the in-memory view current."""
+        pairs = list(pairs)
+        self.store.put_many((f"sim:{tid}", trade) for tid, trade in pairs)
+        if self.sim_cache is not None:
+            self.sim_cache.update(pairs)
+        self.sim_gen = self.store.touched.get("sim", 0)
 
     def note_outcome(self, key: str, day: str, value: Any, source: str) -> None:
         """An official close as it becomes known (scored by /calib, settles the paper trades), with where it came from."""
@@ -9054,12 +9646,14 @@ class Bot:
                 "fee_bps": c.predict_fee_bps, "trade_usd": c.predict_trade_usd, "a50_beta": c.a50_beta,
                 "kospi_beta": c.kospi_beta, "sigma_error": MODEL_SIGMA_ERROR, "beta_error": MODEL_BETA_ERROR}
 
-    def evidence(self, build: Any) -> dict:
-        """An evidence record never stops a trade: a failure is kept as the record."""
-        try:
-            return build()
-        except Exception as error:
-            return {"error": clean_error(error) or type(error).__name__}
+    def evidence(self, build: Any) -> "LazyEvidence":
+        """A SimMarket's evidence, built on first access: when a trade is opened or filled, not for every market on
+        every look of the paper trader, the alerts and the journal page."""
+        return LazyEvidence(build)
+
+    @staticmethod
+    def evidence_of(mk: SimMarket) -> dict:
+        return dict(mk.evidence)
 
     def sim_markets(self, now_ms: int) -> list[SimMarket]:
         """Every Predict market a card prices right now, with the bar its suggestion must clear and why it holds back."""
@@ -9161,7 +9755,7 @@ class Bot:
                  "order": self.config.sim_shares, "fills": [], "revisions": [],
                  "entry": {"at": now_ms, "fair": fair, "fair_up": mk.fair_up, "need": mk.need, "book": book_snapshot(mk.book),
                            "card": [edge_json(e, shown, e.label.replace("涨", mk.sides[0]).replace("跌", mk.sides[1]))
-                                    for e in edges], **mk.evidence},
+                                    for e in edges], **self.evidence_of(mk)},
                  "version": self.sim_version()}
         if maker is not None:
             queue = next((q for p, q in own_levels(mk.book, side) if abs(p - maker.price) < 1e-9), 0.0)
@@ -9185,7 +9779,7 @@ class Bot:
             return
         fair = mk.fair_up if trade["side"] == "up" else 1 - mk.fair_up
         trade["fills"].append({"at": now_ms, "shares": credited - float(trade["shares"]), "fair": fair, "fair_up": mk.fair_up,
-                               "how": "推定成交", "seen": seen, "book": book_snapshot(mk.book), **mk.evidence})
+                               "how": "推定成交", "seen": seen, "book": book_snapshot(mk.book), **self.evidence_of(mk)})
         trade["shares"] = credited
         if trade.get("filled") is None:
             trade["filled"], trade["fill_fair"] = now_ms, fair
@@ -9362,11 +9956,14 @@ class Bot:
         trade.update(status="settled", payout=payout, note=note, settled=trade.get("settled") or now_ms)
 
     SIM_CONFIRM_SECONDS = 600  # each market's final result is asked of Predict at most this often
+    SIM_GIVE_UP_MS = 7 * DAY_MS  # ...and no longer than this after the local settlement
 
     def sim_due(self, trade: dict, now_ms: int) -> bool:
         """Should Predict have a final result for this trade's market by now (or has the local data decided it)?"""
         if trade.get("final") or trade["status"] in {"expired", "cancelled"} and not float(trade.get("shares") or 0):
             return False
+        if (trade.get("final_check") or {}).get("gave_up"):
+            return False  # Predict never gave a readable result for this market: the local settlement stands
         if trade.get("local"):
             return True
         s = trade.get("settle") or {}
@@ -9414,7 +10011,7 @@ class Bot:
             except Exception as error:
                 for tid in tids:
                     trades[tid]["final_error"] = clean_error(error) or type(error).__name__
-                    self.store.put(f"sim:{tid}", trades[tid])
+                self.sim_save((tid, trades[tid]) for tid in tids)
                 continue
             resolved = details.get("resolved")
             for tid in tids:
@@ -9423,7 +10020,11 @@ class Bot:
                 up = self.resolution_up(trade, resolved) if resolved else None
                 if up is None:
                     trade["final_check"] = {"at": now_ms, "status": details.get("status", ""), "resolved": resolved}
-                    self.store.put(f"sim:{tid}", trade)
+                    since = int((trade.get("local") or {}).get("at") or now_ms)
+                    if now_ms - since > self.SIM_GIVE_UP_MS:  # a result name the bot cannot read, or a market taken down
+                        trade["final_check"]["gave_up"] = True
+                        trade["note"] = (trade.get("note") or "") + "；Predict 结果 7 天内无法识别或未公布，已停止核对，以本地预结算为准"
+                    self.sim_save([(tid, trade)])
                     continue
                 trade["final"] = {"up": up, "name": resolved.get("name", ""), "how": resolved.get("how", ""), "at": now_ms,
                                   "status": details.get("status", ""), "outcomes": details.get("outcomes", [])}
@@ -9432,7 +10033,7 @@ class Bot:
                 self.sim_settle(trade, up, f"Predict 结算：{resolved.get('name', '')}"
                                 + (f"（本地预结算为 {local['note']}）" if mismatch else ""), now_ms, "Predict 最终结果")
                 trade["confirm"] = "mismatch" if mismatch else "confirmed"
-                self.store.put(f"sim:{tid}", trade)
+                self.sim_save([(tid, trade)])
 
     async def sim_step(self, now_ms: int) -> "Refreshed | bool":
         """Paper trading: whenever a card suggests a trade whose net edge reaches SIM_EDGE_CENTS, buy SIM_SHARES of it.
@@ -9450,8 +10051,9 @@ class Bot:
         trades = self.sim_trades()
         costs, bar = self.edge_costs(), self.config.sim_edge
         ways, kinds = self.config.sim_ways, self.config.sim_markets
+        changed: list[tuple[str, dict]] = []  # written once, in one transaction
         for mk in markets.values():
-            if mk.hold or mk.book.stale(now_ms) or mk.kind not in kinds:
+            if mk.hold or mk.book.stale(now_ms) or mk.kind not in kinds or book_crossed(mk.book):
                 continue  # positions filled in other kinds (SIM_MARKETS narrowed) still settle below; resting ones are withdrawn
             maker = (best_edge([e for e in book_edges(mk.fair_up, mk.book, costs) if e.maker], mk.need)
                      if mk.makers and ways != "taker" else None)
@@ -9460,21 +10062,27 @@ class Bot:
                 tid = f"{mk.market}|{side}|挂"
                 if tid not in trades:  # one position per market, side and way of trading, however long the edge lasts
                     trades[tid] = self.sim_open(mk, side, now_ms, maker=maker)
-                    self.store.put(f"sim:{tid}", trades[tid])
+                    changed.append((tid, trades[tid]))
             bps = mk.book.fee_bps if mk.book.fee_bps is not None else self.config.predict_fee_bps
             quotes = []
             for side in ("up", "down") if ways != "maker" else ():
                 q = taker_quote(mk.book, side, self.config.sim_shares, bps)
                 fair = mk.fair_up if side == "up" else 1 - mk.fair_up
-                if q and fair - q["cost"] > mk.need and fair - q["cost"] >= bar - 1e-9:  # checked on the fill itself
+                # checked on the fill itself; a few dust shares at a stray price are not the trade the edge is about,
+                # and would hold the market's one position slot against the real opportunity
+                if (q and q["got"] >= self.config.sim_shares * SIM_MIN_FILL - 1e-9
+                        and fair - q["cost"] > mk.need and fair - q["cost"] >= bar - 1e-9):
                     quotes.append((round(fair - q["cost"], 4), side, q))
             if quotes:
                 _, side, q = max(quotes, key=lambda x: x[0])
                 tid = f"{mk.market}|{side}|吃"
                 if tid not in trades:
                     trades[tid] = self.sim_open(mk, side, now_ms, taker=q)
-                    self.store.put(f"sim:{tid}", trades[tid])
+                    changed.append((tid, trades[tid]))
+        opened = {tid for tid, _ in changed}
         for tid, trade in trades.items():
+            if trade.get("final") or tid in opened:
+                continue  # settled and confirmed: nothing below applies (and no JSON round trip for it every 10 seconds)
             before = json.dumps(trade, sort_keys=True, default=str)
             mk = markets.get(trade["market"])
             if trade["status"] == "resting":
@@ -9493,7 +10101,9 @@ class Bot:
                     self.sim_settle(trade, up, note, now_ms, "本地数据更正" if local else "本地预结算")
                     trade["confirm"] = "local"
             if json.dumps(trade, sort_keys=True, default=str) != before:
-                self.store.put(f"sim:{tid}", trade)
+                changed.append((tid, trade))
+        if changed:
+            self.sim_save(changed)
         await self.sim_confirm(trades, now_ms)
         return Refreshed("ok")
 
@@ -9541,12 +10151,23 @@ class Bot:
         for group in (r["kinds"], r["modes"]):
             if len(group) > 1:
                 lines.append("｜".join(f"{g['name']} {g['settled']} 笔 {money(g['pnl'])}" for g in group))
+        lines.append("｜".join(f"{label} {s['settled']} 笔 {money(s['pnl'])}（预期 {money(s['expected'])}）"
+                               for label, s in self.sim_recent_stats().items()))  # is the model holding up lately?
         lines.append("\n最近：")
-        lines += [f"{x['opened']} {x['item']} {x['label']} {x['price'] * 100:.1f}¢×{x['shares']:g}"
-                  f"（净优势 {x['edge'] * 100:+.1f}¢）→ {x['text']}" + (f"·{x['state']}" if x["state"] else "") for x in r["rows"]]
+        lines += [f"{x['opened']} {x['item']} {x['label']} {x['price'] * 100:.1f}¢×{x['shares']:g} → {x['text']}"
+                  + (f"·{x['state']}" if x["state"] else "") for x in r["rows"]]
         if self.config.web_port and self.web_token:
             lines.append(f"\n完整复盘（每笔的判断依据、来源、成交与结算证据，可导出）：{self.web_url()}/journal")
         return "\n".join(lines)
+
+    def sim_recent_stats(self) -> dict[str, dict]:
+        """{'今天': stats, '近 7 天': stats} over the trades settled in those windows (Beijing days): the lifetime total
+        cannot say whether the model has stopped working lately."""
+        now_ms = self.market.now_ms()
+        today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).replace(hour=0, minute=0, second=0, microsecond=0)
+        windows = {"今天": int(today.timestamp() * 1000), "近 7 天": int((today - dt.timedelta(days=6)).timestamp() * 1000)}
+        trades = [t for t in self.sim_trades().values() if t["status"] == "settled" and t.get("settled")]
+        return {label: sim_stats([t for t in trades if int(t["settled"]) >= since]) for label, since in windows.items()}
 
     def journal_payload(self) -> dict:
         """Every paper trade with its whole record (entry and fill snapshots, fills, local and final settlement,
@@ -9625,8 +10246,8 @@ class Bot:
     def cap_payload(self, cap: "CapMarket", now_ms: int) -> dict:
         """Web card for a market-cap ladder: per threshold the model's P(Yes), the Yes book and its best edge."""
         spec = cap.spec
-        start = dt.datetime.fromtimestamp(spec.start_ms / 1000, dt.timezone(dt.timedelta(hours=-4)))
-        end = dt.datetime.fromtimestamp(spec.end_ms / 1000, dt.timezone(dt.timedelta(hours=-4)))
+        start = dt.datetime.fromtimestamp(spec.start_ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(spec.start_ms))))
+        end = dt.datetime.fromtimestamp(spec.end_ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(spec.end_ms))))
         bj = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING).strftime("%m-%d %H:%M")
         rows_in = self.predict.ladders.get(spec.key) or [LadderRow(t, "", "", None, "") for t in spec.targets]
         rows = []
@@ -10007,10 +10628,11 @@ class Bot:
         next cycle while the auction is young; a copy whose data aged in the send queue is dropped, then rebuilt."""
         if not self.config.auction_alert or not self.config.probability:
             return
-        for market, (start, end, label) in AUCTIONS.items():
+        for market in AUCTIONS:
             holidays = self.config.holidays.get(market, frozenset())
             if market == "sz" or not auction_running(market, now_ms, holidays):
                 continue
+            start, end, label = auction_window(market, now_ms) or AUCTIONS[market]
             local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
             opened = dt.datetime.combine(local.date(), start, BEIJING)
             day_key = f"auction:{market}:{local.date().isoformat()}"
@@ -10194,10 +10816,11 @@ class Bot:
             ticker = self.config.tickers.get(title.split("｜")[-1])
             market = ticker.market if ticker else "sh"
         info = STOCK_MARKETS[market]
-        close = dt.datetime.combine(target, info.close_time, dt.timezone(dt.timedelta(hours=info.utc_offset)))
+        close = dt.datetime.combine(target, CALENDAR.close_time(market, target), dt.timezone(dt.timedelta(hours=info.utc_offset)))
         local = f"，{info.tz_name[:-2]} {close.strftime('%H:%M')}" if info.utc_offset != 8 else ""
+        special = f"，{CALENDAR.note(market, target)}" if CALENDAR.note(market, target) else ""
         return (int(close.timestamp() * 1000),
-                f"{close.astimezone(BEIJING).strftime('%m-%d %H:%M')} {info.name}收盘（北京时间{local}）")
+                f"{close.astimezone(BEIJING).strftime('%m-%d %H:%M')} {info.name}收盘（北京时间{local}{special}）")
 
     def web_url(self) -> str:
         path = f"/p/{self.web_token}"
@@ -10262,6 +10885,13 @@ class Bot:
         """A ready-to-edit batch /setclose covering every monitored symbol."""
         return f"/setclose {day}\n" + "\n".join(f"{short_name(s)} 价格 MM-DD HH:MM" for s in self.config.symbols)
 
+    def health_line(self) -> str:
+        """How the bot itself is doing: when it last sampled, what is still on its way to Telegram, the last send failure."""
+        sampled = f"{int(time.time() - self.last_cycle)} 秒前" if self.last_cycle else "尚未开始"
+        in_flight = sum(not task.done() for task in self.deliveries.values())
+        line = f"⏱ 最近采样 {sampled}｜运行 {int((time.time() - self.started) // 60)} 分钟｜Telegram 投递中 {in_flight} 条"
+        return line + (f"｜最近发送失败：{self.last_send_error}" if self.last_send_error else "")
+
     def config_summary(self) -> str:
         settings = self.settings()
         mode = BASELINE_SHORT.get(settings["mode"], settings["mode"])
@@ -10272,10 +10902,12 @@ class Bot:
         """Status card with bold sentinels; send it with html_mode=True."""
         now_ms = self.market.now_ms()
         sub = self.subscriptions().get(sub_id)
-        active = "🟢 已订阅" if sub and sub.get("active") else "⏸ 未订阅/已暂停"
+        active = ("🟢 已订阅" if sub and sub.get("active") else f"⏸ 已自动暂停（{sub['suspended']}）→ /resume 恢复"
+                  if sub and sub.get("suspended") else "⏸ 未订阅/已暂停")
         style = self.config.color_style
-        lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(),
-                 f"📊 {legend(style)}｜→ 后为币安现价相对该行价格"]
+        lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(), self.health_line(),
+                 f"📊 {legend(style)}｜→ 后为币安现价相对该行价格",
+                 calendar_warning(self.config.holidays, dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date())]
         if self.settings()["mode"] == "binance_daily" and self.config.tickers:
             lines.append("💡 /mode exchange 可把基准对齐到交易所收盘时刻")
         if self.config.edge_alert and self.config.predict:
@@ -10297,7 +10929,6 @@ class Bot:
                                           else None,
                                           self.a50_anchor_note))
             lines.append(self.odds_row(self.sse_odds(now_ms), "上证"))
-        lines = [line for line in lines if line]
         lines = [line for line in lines if line]
         for symbol in self.config.symbols:
             snapshot = self.snapshots.get(symbol)
@@ -10322,8 +10953,7 @@ class Bot:
                 rows.append(self.hl_line(symbol, quote.price))
             rows.append(self.odds_row(self.contract_odds(symbol, quote.price, now_ms)))
             lines.extend(tree(rows))
-        used = tuple(dict.fromkeys(STOCK_MARKETS[t.market].currency for t in self.config.tickers.values()
-                                   if not t.same_unit or True))
+        used = tuple(dict.fromkeys(STOCK_MARKETS[t.market].currency for t in self.config.tickers.values()))
         lines.append("\n💱 " + self.fx.summary(used or ("CNY", "HKD", "KRW")))
         lines.append("仅价格提醒；不会自动撤单/交易。")
         return "\n".join(lines)
@@ -10406,11 +11036,8 @@ class Bot:
                     self.notice(sub_id, sub, symbol, error)
                     continue
                 self.notice(sub_id, sub, symbol, None)
-                if self.settings() != settings:
-                    return
-                current_sub = self.subscriptions().get(sub_id)
-                if not current_sub or not current_sub.get("active"):
-                    break
+                # (nothing here awaits: the settings and subscriptions read at the start still hold; the delivery re-checks
+                # both right before it sends)
                 quote: Quote = snapshot["quote"]
                 base: Baseline = snapshot["baseline"]
                 current_ms = self.market.now_ms()
@@ -10429,11 +11056,17 @@ class Bot:
                     self.store.put(state_key, passive)
                 if not plan:
                     continue
-                text = alert_text(symbol, quote, base, change, threshold, plan.reason,
-                                  self.references_for(symbol, current_ms), self.fx, self.config.color_style,
-                                  self.context_lines(symbol, current_ms, quote.price))
-                self.deliver(state_key, functools.partial(self.deliver_alert, sub_id, sub, symbol, text, plan, passive,
+                render = functools.partial(self.render_alert, symbol, quote, base, change, threshold, plan.reason,
+                                           self.references_for(symbol, current_ms),
+                                           self.context_lines(symbol, current_ms, quote.price))
+                self.deliver(state_key, functools.partial(self.deliver_alert, sub_id, sub, symbol, render, plan, passive,
                                                           quote, base, settings))
+
+    def render_alert(self, symbol: str, quote: Quote, base: Baseline, change: D, threshold: D, reason: str,
+                     references: dict[str, Baseline], context: list[str]) -> str:
+        """The alert text as of now (called when the message is planned and again right before it is sent)."""
+        return alert_text(symbol, quote, base, change, threshold, reason, references, self.fx, self.config.color_style,
+                          context, self.market.now_ms())
 
     def alert_still_true(self, sub_id: str, symbol: str, plan: Plan, state: dict, quote: Quote, base: Baseline,
                          settings: dict) -> bool:
@@ -10455,10 +11088,10 @@ class Bot:
                 return False  # the move that triggered it is gone
         return True
 
-    async def deliver_alert(self, sub_id: str, sub: dict, symbol: str, text: str, plan: Plan, state: dict, quote: Quote,
+    async def deliver_alert(self, sub_id: str, sub: dict, symbol: str, render: Any, plan: Plan, state: dict, quote: Quote,
                             base: Baseline, settings: dict) -> None:
         fresh = functools.partial(self.alert_still_true, sub_id, symbol, plan, state, quote, base, settings)
-        if await self.tell(sub["chat"], sub["thread"], text, html_mode=True, fresh=fresh):
+        if await self.tell(sub["chat"], sub["thread"], "", html_mode=True, fresh=fresh, render=render):
             # Only mark a price alert as delivered AFTER Telegram accepts it.
             # Avoid resurrecting state deleted by a command during delivery.
             if self.settings() == settings and self.subscriptions().get(sub_id, {}).get("active"):
@@ -10471,7 +11104,7 @@ class Bot:
         probes: list[tuple[str, str, Any, Any]] = []
 
         def get(url: str, extra: dict[str, str]) -> Any:
-            return lambda: fetch_source(url, extra)  # a probe's outcome also updates the host's cooldown
+            return lambda: fetch_source(url, extra, record=False)  # a probe must not reorder the live refresh's sources
 
         def when(ms: int) -> str:
             return quote_time(ms) + (stale_note(ms, now_ms, BEIJING) if ms else "")
@@ -10727,9 +11360,10 @@ class Bot:
                 sigma, note = self.stock_sigma(symbol, ticker.market)
                 share = self.vols.shares.get(symbol)
                 vol = f"σ {sigma * 100:.2f}%（{note}）" + (f"，盘中占 {share[0] * 100:.0f}%" if share else "")
-            if "error" in snap or err or live_text or vol:
+            note = self.stocks.notes.get(ticker.code, "") if ticker else ""
+            if "error" in snap or err or live_text or vol or note:
                 lines.append(f"  {short_name(symbol)}：" + "｜".join(x for x in (snap.get("error"), f"交易所收盘：{err}" if err else "",
-                                                                                live_text, vol) if x))
+                                                                                note, live_text, vol) if x))
         return lines
 
     @staticmethod
@@ -10749,16 +11383,36 @@ class Bot:
         partial = [r for r in failed if r.group not in broken]
         if partial and len(failed) < len(results):
             lines.append("⚠️ 其余失败的源（同组有别的源顶上）：" + "、".join(f"{r.group}·{r.name}" for r in partial))
+        # what the bot runs on comes first (that is what a phone screen shows); a group with nothing wrong is one line
+        lines += ["", *state, ""]
         for group, rs in groups.items():
             lines.append(f"\n【{group}】")
-            lines.extend(f"{'✅' if r.ok else '❌'} {r.name}（{r.ms} ms）：{r.detail}" for r in rs)
-        return "\n".join(lines + [""] + state)
+            if all(r.ok for r in rs) and len(rs) > 1:
+                lines.append(f"✅ 全部正常（{len(rs)} 项）：" + "；".join(f"{r.name} {r.ms} ms" for r in rs))
+            else:
+                lines.extend(f"{'✅' if r.ok else '❌'} {r.name}（{r.ms} ms）：{r.detail}" for r in rs)
+        return "\n".join(lines)
 
     async def cmd_diag(self, req: Request) -> str:
-        await self.tell(req.chat, req.thread, "🩺 正在逐个检测数据源，约 10–30 秒…")
-        results = await self.diagnose()
-        return self.diag_text(results, self.diag_state(self.market.now_ms()),
-                              f"🩺 数据源检测 v{VERSION}｜{stamp(self.market.now_ms())}（北京时间）")
+        """Probe every source. With the background loops running the probes run beside the command poll (they can
+        take up to two minutes) and the report follows as its own message; one-off runs and tests do it inline."""
+        key = f"diag:{req.sub_id}"
+        if self.delivering(key):
+            return "🩺 上一轮检测仍在进行，结果稍后发到这里。"
+        note = "🩺 正在逐个检测数据源，通常 10–30 秒，最长约 2 分钟；结果稍后发到这里…"
+
+        async def report() -> str:
+            results = await self.diagnose()
+            return self.diag_text(results, self.diag_state(self.market.now_ms()),
+                                  f"🩺 数据源检测 v{VERSION}｜{stamp(self.market.now_ms())}（北京时间）")
+
+        if self.reference_tasks:
+            async def deliver_report() -> None:
+                await self.tell(req.chat, req.thread, await report())
+            self.deliver(key, deliver_report)
+            return note
+        await self.tell(req.chat, req.thread, note)
+        return await report()
 
     def reference_jobs(self) -> list[tuple[str, Any]]:
         """(name, coroutine factory) per reference feed; each has its own refresh cadence inside."""
@@ -10785,7 +11439,8 @@ class Bot:
 
     async def refresh_hsi(self, now_ms: int) -> Refreshed | bool:
         result = await self.hsi.refresh(now_ms)
-        daily = await self.hsi_daily.refresh(now_ms) if self.config.hsi_futures and self.config.probability else None
+        # the dated closes also tell whether etnet's cash index is today's (spot_problem), so they are not tied to PROBABILITY
+        daily = await self.hsi_daily.refresh(now_ms) if self.config.hsi_futures else None
         if result is False and daily is None:
             return False  # neither part was due
         errors = [result.error if isinstance(result, Refreshed) else "", f"恒指日K：{daily}" if daily else ""]
@@ -10876,17 +11531,20 @@ class Bot:
     async def monitor_loop(self) -> None:
         while not self.stopping.is_set():
             started = time.monotonic()
-            try:
+            try:  # nothing in here may end the loop: a price-alert loop that died quietly would be the worst fault
                 await self.one_cycle()
+                self.heartbeat()
             except Exception as error:
                 self.log_limited("monitor", "监控轮次异常：" + clean_error(error))
-            if time.monotonic() - self.last_log.get("heartbeat", -1e9) >= 60:
-                ok = sum("quote" in value for value in self.snapshots.values())
-                LOG.info("heartbeat: valid_quotes=%s/%s active_subscriptions=%s mode=%s", ok,
-                         len(self.config.symbols), sum(bool(s.get("active")) for s in self.subscriptions().values()),
-                         self.settings()["mode"])
-                self.last_log["heartbeat"] = time.monotonic()
             await self.wait(max(0.1, self.config.poll - (time.monotonic() - started)))
+
+    def heartbeat(self) -> None:
+        if time.monotonic() - self.last_log.get("heartbeat", -1e9) >= 60:
+            ok = sum("quote" in value for value in self.snapshots.values())
+            LOG.info("heartbeat: valid_quotes=%s/%s active_subscriptions=%s mode=%s deliveries=%s", ok,
+                     len(self.config.symbols), sum(bool(s.get("active")) for s in self.subscriptions().values()),
+                     self.settings()["mode"], sum(not t.done() for t in self.deliveries.values()))
+            self.last_log["heartbeat"] = time.monotonic()
 
     async def process_update(self, update: dict) -> None:
         message = update.get("message")
@@ -10895,6 +11553,8 @@ class Bot:
             age = time.time() - float(message.get("date", time.time()))
             if -60 <= age <= 900:
                 await self.process_message(message)
+            elif age > 900 and is_admin(message, self.config) and (req := self.parse_request(message)) is not None:
+                await self.reply(req, f"⌛ 这条命令发送于 {int(age // 60)} 分钟前（机器人当时未运行），已过期未执行；需要的话请重发。")
             return
         query = update.get("callback_query")
         if isinstance(query, dict):  # A button tap is a live intent, so it is not age-filtered.
@@ -10905,8 +11565,10 @@ class Bot:
         failures = 0
         while not self.stopping.is_set():
             try:
-                updates = await self.telegram.call("getUpdates", {"offset": offset, "timeout": 25,
-                                                   "allowed_updates": ["message", "callback_query"]}, timeout=40)
+                # A 20-second long poll: at shutdown the blocked request has to finish before the process can exit,
+                # and Railway gives 45 seconds in all.
+                updates = await self.telegram.call("getUpdates", {"offset": offset, "timeout": 20,
+                                                   "allowed_updates": ["message", "callback_query"]}, timeout=30)
                 if not isinstance(updates, list):
                     raise ValueError("Telegram 更新格式异常")
                 failures = 0
@@ -10937,7 +11599,9 @@ class Bot:
         except Exception as error:
             LOG.warning("注册命令菜单失败（不影响手动输入命令）：%s", clean_error(error))
 
-    async def run(self) -> None:
+    async def run(self) -> int:
+        """The bot's life: 0 when it stopped on request (signal), 1 when a core loop ended on its own (the process
+        exits so Railway restarts it; a bot that keeps answering commands but no longer samples prices must not live)."""
         # Refuse to silently remove a webhook that may belong to another service.
         webhook = await self.telegram.call("getWebhookInfo")
         if webhook.get("url"):
@@ -10949,12 +11613,19 @@ class Bot:
         await self.register_menu()
         if not self.config.admin_id:
             LOG.warning("ADMIN_USER_ID 尚未配置：只能使用 /id；没有任何自动订阅")
+        if warning := calendar_warning(self.config.holidays, dt.datetime.now(BEIJING).date()):
+            LOG.warning("%s", warning)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, self.stopping.set)
+        # Binance, Telegram and the long poll share the default pool; on a one-core box Python gives it 5 threads, and at
+        # a day change several contracts' candle requests would then queue the Telegram sends behind them.
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=16, thread_name_prefix="io"))
         self.start_reference_tasks()
-        tasks = [asyncio.create_task(self.monitor_loop()), asyncio.create_task(self.commands_loop()), *self.reference_tasks]
+        core = [asyncio.create_task(self.monitor_loop(), name="monitor"),
+                asyncio.create_task(self.commands_loop(), name="commands")]
+        tasks = [*core, *self.reference_tasks]
         if self.config.web_port:
             try:
                 self.web = WebServer(self, self.config.web_port, self.web_token)
@@ -10964,18 +11635,33 @@ class Bot:
             except OSError as error:
                 LOG.warning("概率网页启动失败（不影响提醒）：%s", clean_error(error))
                 self.web = None
+        exit_code = 0
+        stopper = asyncio.create_task(self.stopping.wait(), name="stopping")
         try:
-            await self.stopping.wait()
+            await asyncio.wait([stopper, *core], return_when=asyncio.FIRST_COMPLETED)
+            for task in core:
+                if task.done() and not task.cancelled():  # a core loop never ends on its own: let Railway restart us
+                    error = task.exception()
+                    LOG.error("核心循环 %s 意外结束：%s；进程退出等待重启", task.get_name(),
+                              clean_error(error) if error else "无异常")
+                    exit_code = 1
         finally:
-            tasks += [task for task in self.deliveries.values() if not task.done()]
-            for task in tasks:
+            self.stopping.set()
+            stopper.cancel()
+            # Railway drains for 45 seconds: give the messages already on their way a moment to finish (Telegram may
+            # have taken them, and only then is their state recorded), then stop everything else.
+            pending = [task for task in self.deliveries.values() if not task.done()]
+            if pending:
+                await asyncio.wait(pending, timeout=SHUTDOWN_GRACE_SECONDS)
+            for task in [*tasks, *pending]:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, *pending, stopper, return_exceptions=True)
             if self.reference_pool:
                 self.reference_pool.shutdown(wait=False, cancel_futures=True)
             if self.web:
                 await self.web.stop()
-            LOG.info("Stopped safely")
+            LOG.info("Stopped safely (exit %s)", exit_code)
+        return exit_code
 
 
 async def run_diagnostics(config: Config) -> int:
@@ -11067,8 +11753,7 @@ def main() -> int:
         if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", config.token):
             raise ValueError("请在 Railway Variables 配置 TELEGRAM_BOT_TOKEN，不要写进代码或提交到 GitHub")
         store = Store(config.db_path)
-        asyncio.run(Bot(config, store, Binance(config), Telegram(config.token)).run())
-        return 0
+        return asyncio.run(Bot(config, store, Binance(config), Telegram(config.token)).run())
     except KeyboardInterrupt:
         return 0
     except Exception as error:

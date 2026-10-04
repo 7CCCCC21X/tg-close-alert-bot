@@ -19,7 +19,10 @@ async def run():
     store = m.Store(":memory:"); tg = FakeTelegram(); bot = m.Bot(cfg, store, FakeMarket(cfg), tg)
     today = m.beijing_day()
     store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
+    m.NOTICE_GRACE_SECONDS = 0.05
     await bot.one_cycle()
+    assert not tg.sent, tg.sent  # a fault is announced only once it has lasted the grace period
+    await asyncio.sleep(0.06); await bot.one_cycle()
     assert len(tg.sent) == 1 and "行情监控异常" in tg.sent[0] and "缺少" in tg.sent[0], tg.sent  # no manual baseline yet
     store.put(f"manual:UNITREEUSDT:{today}", {"value": "75", "valid_date": today})
     await bot.one_cycle()

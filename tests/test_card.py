@@ -34,10 +34,10 @@ async def run():
     assert tg.of("answerCallbackQuery")[-1]["text"] == "仅管理员可以修改设置" and bot.settings()["threshold"] == "1"
     assert not tg.of("editMessageText")
 
-    # admin tap: setting applied, toast, card edited with new tick, alert state cleared
-    bot.store.put("alert:-100:7:UNITREEUSDT", {"side": 1})
+    # admin tap: setting applied, toast, card edited with new tick, alert episode reset (only the spam guard is kept)
+    bot.store.put("alert:-100:7:UNITREEUSDT", {"side": 1, "baseline_key": "k", "highest_tier": 2, "last_sent": 123.0})
     await bot.process_update({"update_id": 3, "callback_query": tap("threshold:2")})
-    assert bot.settings()["threshold"] == "2" and bot.store.get("alert:-100:7:UNITREEUSDT") is None
+    assert bot.settings()["threshold"] == "2" and bot.store.get("alert:-100:7:UNITREEUSDT") == {"last_sent": 123.0}
     assert "±2%" in tg.of("answerCallbackQuery")[-1]["text"]
     ed = tg.of("editMessageText")[-1]; assert ed["message_id"] == 555 and ed["chat_id"] == -100 and "±2%" in ed["text"]
     ticked = [b["text"] for row in ed["reply_markup"]["inline_keyboard"] for b in row if b["text"].startswith("✅")]
@@ -58,8 +58,10 @@ async def run():
     assert not any(b["text"].startswith("✅") for row in tg.of("sendMessage")[-1]["reply_markup"]["inline_keyboard"] for b in row)
     await bot.process_update({"update_id": 9, "message": msg("/threshold 1 2")})
     assert "❌" in tg.of("sendMessage")[-1]["text"]
-    # stale message ignored, long text: markup only on last chunk
-    n = len(tg.calls); await bot.process_update({"update_id": 10, "message": {**msg("/threshold"), "date": time.time() - 5000}}); assert len(tg.calls) == n
+    # a stale command is not executed (the administrator is told), long text: markup only on last chunk
+    n = len(tg.calls); await bot.process_update({"update_id": 10, "message": {**msg("/threshold"), "date": time.time() - 5000}})
+    assert len(tg.calls) == n + 1 and "已过期未执行" in tg.of("sendMessage")[-1]["text"] and "83 分钟前" in tg.of("sendMessage")[-1]["text"]
+    n = len(tg.calls); await bot.process_update({"update_id": 11, "message": {**msg("/threshold", uid=9), "date": time.time() - 5000}}); assert len(tg.calls) == n
     await tg.send(1, 0, "x\n" * 4000, {"inline_keyboard": []})
     chunks = tg.of("sendMessage")[-3:]; assert len(chunks) >= 2 and "reply_markup" in chunks[-1] and "reply_markup" not in chunks[-2]
     print("CARD_OK")
