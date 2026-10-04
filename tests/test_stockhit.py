@@ -189,7 +189,22 @@ async def run():
     bot = m.Bot(cfg, m.Store(":memory:"), FakeMarket(), None)
     srm = bot.ranges["STRC-100"]
     assert isinstance(srm, m.StockRangeMarket) and bot.predict_targets(NOW)["STRC-100"] == STRC.slug and "STRC-100" in bot.predict.ladder_keys
-    assert bot.predict.ladder_parse["STRC-100"] is m.price_level and "STRC-100" in bot.predict.reward_keys
+    parse = bot.predict.ladder_parse["STRC-100"]
+    assert parse is not m.price_level and bot.predict.ladder_pick["STRC-100"] == srm.choose and "STRC-100" in bot.predict.reward_keys
+    # Predict titles the category's markets by their deadline alone: a bare day number is no price; "$100" anywhere is
+    assert [parse(x) for x in ("December 31", "June 30", "STRC hits $100 by December 31?", "STRC 达到 $100，截止于 12 月 31 日", "$1.5k by Dec 31", "")] == \
+        [D("100"), D("100"), D("100"), D("100"), D("1500"), D("100")]
+    assert m.hit_level_parser("some-other-slug")("December 31") is None and m.hit_level_parser("strc-hits-100-by-x")("$100") == D("100")
+    # of the markets listed (one per deadline), the card keeps the latest still ahead; a pinned deadline wins when listed
+    dated = [m.LadderRow(D("100"), mid, title, None, "", f"Will STRC hit $100 by {title}?") for mid, title in
+             (("61", "June 30"), ("62", "September 30"), ("63", "December 31"), ("64", "March 31"))]
+    metas = {mid: ({"created_ms": m.et_ms(2026, 6, 18, 0, 16, -4), "question": "", "rules": ""}, 0) for mid in ("61", "62", "63", "64")}
+    assert [r.market_id for r in srm.choose(dated, metas)] == ["64"]  # 2027-03-31: the latest ahead
+    assert [r.market_id for r in srm.choose(dated[:3], metas)] == ["63"] and [r.market_id for r in srm.choose(dated[:1], metas)] == ["61"]
+    nov = m.StockRangeMarket(m.Store(":memory:"), STRC, m.et_wall_ms(dt.date(2026, 11, 30), 23, 59))
+    assert [r.market_id for r in nov.choose(dated, metas)] == ["64"]  # 11-30 is not listed: the latest ahead
+    dec = m.StockRangeMarket(m.Store(":memory:"), STRC, m.et_wall_ms(dt.date(2026, 12, 31), 23, 59))
+    assert [r.market_id for r in dec.choose(dated, metas)] == ["63"]
     pinned = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "LADDER_DEADLINES": "STRC-100=2026-11-30"}), m.Store(":memory:"), FakeMarket(), None)
     assert pinned.ranges["STRC-100"].end_ms == m.et_wall_ms(dt.date(2026, 11, 30), 23, 59)
 

@@ -247,8 +247,8 @@ async def browser_check(async_playwright, chrome, port, token):
         assert await page.evaluate(f"getComputedStyle({fb}).overflowX") == "visible" and await page.evaluate(f"{fb}.scrollWidth <= {fb}.clientWidth")
         await page.set_viewport_size({"width": 390, "height": 900})
         assert await page.inner_text("#h-index") == "指数" and await page.is_visible("#h-contract")
-        # the theme button: 自动 → 浅色 → 深色 → 自动, kept in this browser and applied before the first paint; the line under the
-        # bar counts down to the next refresh; the skeleton cards are gone; the back-to-top button shows once scrolled
+        # the theme button: 自动 → 浅色 → 深色 → 自动, kept in this browser and applied before the first paint; the skeleton
+        # cards are gone; the back-to-top button shows once scrolled
         html = "document.documentElement"
         assert await page.inner_text("#theme") == "◐ 自动" and await page.evaluate(f"{html}.dataset.theme") is None
         await page.click("#theme")
@@ -261,7 +261,7 @@ async def browser_check(async_playwright, chrome, port, token):
         await page.click("#theme")
         assert await page.evaluate(f"{html}.dataset.theme") is None and await page.evaluate("localStorage.getItem('theme')") == '"auto"'
         assert await page.evaluate("getComputedStyle(document.body).backgroundColor") == "rgb(242, 244, 248)"
-        assert await page.evaluate(f"parseFloat({fb}.style.getPropertyValue('--prog'))") >= 0 and await page.locator(".skel").count() == 0
+        assert await page.locator(".skel").count() == 0
         assert not await page.evaluate("document.getElementById('totop').classList.contains('show')")
         await page.evaluate("scrollTo(0, 1500)"); await page.wait_for_timeout(100)
         assert await page.evaluate("document.getElementById('totop').classList.contains('show')")

@@ -41,7 +41,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.26.1"
+VERSION = "1.26.3"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -3530,6 +3530,7 @@ class PredictFeed:
         self.reward_keys: set[str] = set()                      # price ladders: refresh reward metadata more often
         self.ladder_keys: set[str] = set()                       # item keys whose category holds several Yes/No markets
         self.ladder_parse: dict[str, Any] = {}                   # item key -> its markets' level parser (default cap_target)
+        self.ladder_pick: dict[str, Any] = {}                    # item key -> which of the category's markets its ladder keeps
         self.ladders: dict[str, list[LadderRow]] = {}            # item key -> one row per market, by threshold
         self.fees: dict[str, tuple[int | None, float]] = {}      # market id -> (feeRateBps or None, when read)
         self.refreshed = -1e9
@@ -3715,6 +3716,8 @@ class PredictFeed:
         rows = [row for row in await asyncio.gather(*(self.ladder_row(key, slug, m) for m in markets)) if row]
         if not rows:
             raise RemoteError("Predict 市场标题里没有可识别的档位")
+        if key in self.ladder_pick:
+            rows = self.ladder_pick[key](rows, self.market_meta)
         self.ladders[key] = sorted(rows, key=lambda row: row.target)
         self.errors.pop(key, None)
 
@@ -5245,6 +5248,22 @@ def price_level(title: str) -> D | None:
     return value * {"": D(1), "k": D(1000), "m": D(10) ** 6}[unit.lower()] if value > 0 else None
 
 
+def hit_level_parser(slug: str) -> Any:
+    """The level parser of a "<stock> hits $X by <date>" category. Predict lists the question once per deadline, and such
+    a market's title may name the date alone ("December 31"): a bare day number is not a price. A "$"-marked price in the
+    title (or "$100" in the question) is the level; else the one the category's slug names (strc-hits-100-by-...)."""
+    named = re.search(r"-hits?-(\d+(?:\.\d+)?)-by-", slug)
+    base = D(named.group(1)) if named else None
+
+    def parse(title: str) -> D | None:
+        found = re.search(r"\$\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*([kK]?)(?![\w.])", str(title or ""))
+        if found:
+            value = D(found.group(1).replace(",", "")) * (1000 if found.group(2) else 1)
+            return value if value > 0 else base
+        return base
+    return parse
+
+
 def level_direction(rules: str, *titles: str) -> tuple[str, str]:
     """('up' | 'down' | '', where it was read): a market's own rules (High ≥ / Low ≤; rules naming both say nothing about
     this one market), else an arrow in its title or question, else a word there (reach / dip); '' when nothing says. An
@@ -5605,6 +5624,24 @@ class StockRangeMarket(RangeMarket):
 
     def known(self) -> bool:
         return bool(self.start_ms and self.end_ms)
+
+    def choose(self, rows: list, meta: dict) -> list:
+        """Predict lists this question once per deadline ("June 30", "September 30", "December 31": a market each). The card
+        prices one of them: the pinned deadline's (LADDER_DEADLINES), else the latest deadline still ahead, else the latest."""
+        if len(rows) <= 1:
+            return list(rows)
+        now = int(time.time() * 1000)
+        dated = []
+        for row in rows:
+            details = (meta.get(row.market_id) or ({}, 0))[0] if row.market_id else {}
+            texts = [row.title, row.question, details.get("question", ""), details.get("rules", "")]
+            dated.append((deadline_from_text(texts, int(details.get("created_ms") or 0) or now), row))
+        if self.deadline_override:
+            pinned = [row for deadline, row in dated if deadline == self.deadline_override]
+            if pinned:
+                return pinned[:1]
+        ahead = [pair for pair in dated if pair[0] >= now]
+        return [max(ahead or dated, key=lambda pair: pair[0])[1]]
 
     def learn(self, rows: list, meta: dict) -> None:
         """The window from Predict's listing: createdAt (the start) and the date the title / question names (the end),
@@ -6056,7 +6093,7 @@ button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,s
 @keyframes pulse{0%,100%{box-shadow:0 0 0 3px var(--down-bg)}50%{box-shadow:0 0 0 6px transparent}}
 @keyframes shimmer{from{background-position:100% 0}to{background-position:0 0}}
 @keyframes chgr{from{background:var(--up-bg)}to{background:transparent}}@keyframes chgg{from{background:var(--down-bg)}to{background:transparent}}
-@media (prefers-reduced-motion:reduce){.card.flash{animation:none;outline:3px solid var(--best);outline-offset:3px}h1:before,.skel,.odds.chg-r,.odds.chg-g{animation:none!important}.fbar:after,.bar i,#totop{transition:none!important}}
+@media (prefers-reduced-motion:reduce){.card.flash{animation:none;outline:3px solid var(--best);outline-offset:3px}h1:before,.skel,.odds.chg-r,.odds.chg-g{animation:none!important}.bar i,#totop{transition:none!important}}
 .wrap{max-width:1560px;margin:0 auto;padding:12px 16px 28px}
 header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 16px;padding:4px 0 8px}
 .ttl{display:flex;flex-direction:column;gap:2px;min-width:0}
@@ -6110,8 +6147,6 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:7px 0 3px;fon
 .ages+.pb{margin-top:0}
 .fbar{position:sticky;top:0;z-index:5;background:var(--bg);display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:7px 0;margin-bottom:4px;font-size:12.5px;border-bottom:1px solid var(--line);transition:box-shadow .2s}
 .fbar.stuck{box-shadow:0 10px 18px -14px rgba(0,0,0,.35)}
-.fbar:after{content:"";position:absolute;left:0;bottom:-1px;height:2px;width:var(--prog,0%);background:var(--best);border-radius:0 2px 2px 0;transition:width 1s linear;pointer-events:none}
-body.olddata .fbar:after{background:var(--warn)}
 .fchips{display:flex;flex-wrap:wrap;gap:5px}.fchips .tog.on,.famt .tog.on{border-color:var(--best);color:#fff;background:var(--best)}
 button.tog{font-family:inherit}.fsort select{font:inherit;font-size:12.5px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);padding:3px 6px}
 .famt{display:inline-flex;align-items:center;gap:4px;color:var(--muted)}.famt input{width:64px;font:inherit;font-size:12.5px;padding:3px 6px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}
@@ -6448,7 +6483,7 @@ function ladder(c,it){
   const L=it.ladder,det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   const sm=$("summary");sm.title="点开看计算明细";
   if(L.kind==="price")return priceLadder(c,it,L,det,sm);
-  const highWord=L.coverage?"已观测最高":"窗口最高";  // "窗口最高" only once every finished hour since the opening has been read
+  const highWord=(L.coverage||!L.bars)?"已观测最高":"窗口最高";  // "窗口最高" only once every finished hour since the opening has been read; without bars it is only ever what the bot saw
   sm.append($("span","rd",L.metric),$("span","v",L.cap),$("span","rd",highWord),$("span","v",L.high));
   if(L.sigma)sm.append($("span","rd","σ"),$("span","v",(L.sigma*100).toFixed(0)+"%"));
   det.append(sm);const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
@@ -6470,7 +6505,7 @@ function ladder(c,it){
   if(done.length){const t=$("div","touched");t.append($("span","k","✓ 已触及"));
     const tip=done.map(r=>r.label+(r.bid!=null||r.ask!=null?"（盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1))+"）":"")).join("、");
     const shown=done.length>3?[{label:"≤ "+done[done.length-1].label+" · "+done.length+" 档"}]:done;  // many levels: one chip
-    shown.forEach(r=>{const x=$("span","tchip",r.label);x.title="窗口内"+L.metric+"已达到："+tip;t.append(x)});
+    shown.forEach(r=>{const x=$("span","tchip",r.label+(r.settled?" · 已结算":""));x.title=(r.settled?"Predict 已把这一档结算为已触及（机器人自己的记录不一定看到）；":"")+"窗口内"+L.metric+"已达到："+tip;t.append(x)});
     st.append(t)}
   c.append(st);return priceLadderBook(c,it,L,live)}  // the same table as the price ladders
 function priceLadder(c,it,L,det,sm){
@@ -6496,7 +6531,7 @@ function priceLadder(c,it,L,det,sm){
   const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
   if(done.length){const t=$("details","touched"),dk=it.name+"#touched";t.open=open.has(dk);t.addEventListener("toggle",()=>{t.open?open.add(dk):open.delete(dk)});
     t.append($("summary","","✓ 已触及 "+done.length+" 档"));const ts=$("div","tchips");
-    done.forEach(r=>{const x=$("span","tchip",r.label);x.title="本月"+(r.dir==="up"?"最高价":"最低价")+"已到 "+r.label.slice(2);ts.append(x)});t.append(ts);st.append(t)}
+    done.forEach(r=>{const x=$("span","tchip",r.label+(r.settled?" · 已结算":""));x.title=(r.settled?"Predict 已把这一档结算为已触及；":"")+(L.range_word||"本月")+(r.dir==="up"?"最高价":"最低价")+"已到 "+r.label.slice(2);ts.append(x)});t.append(ts);st.append(t)}
   c.append(st);return priceLadderBook(c,it,L,live)}
 function priceLadderBook(c,it,L,live){
   const w=$("div","pb"),h=$("div","quote"),key=favKey(it);h.append(it.predict?openLink(it.predict.url):$("span","pt","Predict"));
@@ -6656,7 +6691,6 @@ function tick(){
   const ago=document.getElementById("ago");if(ago&&fetchedAt)ago.textContent=Math.max(0,Math.round((Date.now()-fetchedAt)/1000))+" 秒前刷新";
   document.querySelectorAll(".age").forEach(el=>{const a=Math.max(0,now-Number(el.dataset.ms));
     el.textContent=a<60e3?Math.round(a/1000)+" 秒前":a<3600e3?Math.floor(a/60e3)+" 分钟前":Math.floor(a/3600e3)+" 小时前";el.classList.toggle("old",a>Number(el.dataset.old))});
-  document.getElementById("fbar").style.setProperty("--prog",(fetchedAt?Math.min(100,(Date.now()-fetchedAt)/100):0)+"%");  // the thin line under the bar: time to the next refresh
   drawStale()}
 function drawStale(){  // a failed refresh says the cards are old; past STALE_MS their suggestions stop being highlighted
   const el=document.getElementById("stale"),gone=okAt?Date.now()-okAt:Infinity,old=gone>STALE_MS,bad=!!failMsg||old&&!!okAt;
@@ -7537,6 +7571,9 @@ class Bot:
         self.caps = {spec.key: CapMarket(store, spec) for spec in CAP_MARKETS}
         self.ranges = {spec.key: range_market(store, spec, self.binance_futures, config) for spec in (*RANGE_MARKETS, *STOCK_HIT_MARKETS)}
         self.predict.ladder_parse.update({key: price_level for key in self.ranges})
+        for key, rm in self.ranges.items():
+            if isinstance(rm, StockRangeMarket):  # "hits $100 by <date>": the date-titled markets, one per deadline
+                self.predict.ladder_parse[key], self.predict.ladder_pick[key] = hit_level_parser(rm.spec.slug), rm.choose
         self.predict.reward_keys.update(self.ranges)
         if config.touch:
             self.predict.want_info.update(spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *FLIP_MARKETS))
@@ -8787,6 +8824,11 @@ class Bot:
             fair = 1.0
         return fair
 
+    def cap_settled(self, row: "LadderRow") -> bool:
+        """Predict has settled this level's market."""
+        meta = (self.predict.market_meta.get(row.market_id) or ({}, 0))[0] if row.market_id else {}
+        return "RESOLVED" in str(meta.get("status", "")).upper()
+
     SIM_SECONDS = 10                  # the paper trader looks at the books this often (they refresh every 15 s)
     SIM_SETTLE_MS = 60 * 60_000       # a daily market is settled this long after its close: the official close is in
 
@@ -9456,7 +9498,7 @@ class Bot:
             fair = self.ladder_fair(cap, row, now_ms)
             book, why = self.predict.yes_book(row) if row.market_id else (None, "")
             out: dict[str, Any] = {"label": usd_short(row.target), "fair": fair, "error": why,
-                                   "dist": float(row.target / cap.cap - 1) if cap.cap else None}
+                                   "dist": float(row.target / cap.cap - 1) if cap.cap else None, "settled": self.cap_settled(row)}
             if book is not None:
                 out.update(bid=float(book.bid[0]) if book.bid else None, ask=float(book.ask[0]) if book.ask else None)
                 if fair == 1.0 and book_disputes(book):
@@ -9586,7 +9628,7 @@ class Bot:
             book, why = self.predict.yes_book(row) if row.market_id else (None, "")
             out: dict[str, Any] = {"label": ("↑ " if direction == "up" else "↓ ") + level_label(row.target), "dir": direction,
                                    "dir_source": source, "dir_note": self.range_guess(source), "level": float(row.target),
-                                   "fair": fair, "error": why,
+                                   "fair": fair, "error": why, "settled": self.range_settled(row),
                                    "dist": float(row.target / rm.price - 1) if rm.price else None}
             out.update(self.range_maker_status(row, book, now_ms))
             if book is not None:
