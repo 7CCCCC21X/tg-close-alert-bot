@@ -109,14 +109,46 @@ async def run():
     assert len(atg.sent) == n
 
     # --- notices go through the same queue and are recorded only once delivered --------------------------------------
+    m.NOTICE_GRACE_SECONDS = 0
     ntg = RecTelegram(); nbot = m.Bot(cfg, m.Store(":memory:"), Market(cfg), ntg)
     sub = {"chat": 5, "thread": 0, "active": True}
     ntg.fail[5] = 1
     nbot.notice("5:0", sub, "X", "boom"); await nbot.drain_deliveries()
     assert not ntg.sent and nbot.store.get("notice:5:0:X") is None
-    ntg.next_send = 0
+    ntg.next_send = 0; ntg.chat_next.clear()
     nbot.notice("5:0", sub, "X", "boom"); await nbot.drain_deliveries()
     assert len(ntg.sent) == 1 and nbot.store.get("notice:5:0:X")["active"]
+
+    # --- a fault is announced only once it has lasted the grace period; a blip (fault, then fine) says nothing ------
+    m.NOTICE_GRACE_SECONDS = 0.2
+    gtg = RecTelegram(); gbot = m.Bot(cfg, m.Store(":memory:"), Market(cfg), gtg)
+    gbot.notice("5:0", sub, "X", "timeout"); await gbot.drain_deliveries()
+    gbot.notice("5:0", sub, "X", None); await gbot.drain_deliveries()      # recovered before anyone heard of it
+    assert not gtg.sent and not gbot.faults
+    gbot.notice("5:0", sub, "X", "timeout"); await gbot.drain_deliveries()
+    assert not gtg.sent
+    await asyncio.sleep(0.25)
+    gbot.notice("5:0", sub, "X", "timeout"); await gbot.drain_deliveries()  # still broken after the grace: announced
+    assert len(gtg.sent) == 1 and "行情监控异常" in gtg.sent[0][1], gtg.sent
+    gbot.notice("5:0", sub, "X", None); await gbot.drain_deliveries()
+    assert len(gtg.sent) == 2 and "数据恢复" in gtg.sent[1][1], gtg.sent
+    m.NOTICE_GRACE_SECONDS = 0
+
+    # --- a chat Telegram refuses for good pauses its subscription instead of being retried every cycle --------------
+    class GoneTelegram(RecTelegram):
+        async def call(self, method, payload=None, timeout=15):
+            if (payload or {}).get("chat_id") == 9:
+                raise m.RemoteError("HTTP 403: Forbidden: bot was blocked by the user")
+            return await super().call(method, payload, timeout)
+    stg = GoneTelegram()
+    scfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "1", "SYMBOLS": "UNITREEUSDT", "PROBABILITY": "off"})
+    sbot = m.Bot(scfg, m.Store(":memory:"), Market(scfg), stg)
+    sbot.store.put("subscriptions", {"9:0": {"chat": 9, "thread": 0, "active": True}, "1:0": {"chat": 1, "thread": 0, "active": True}})
+    assert not await sbot.tell(9, 0, "hello"); await sbot.drain_deliveries()
+    subs = sbot.subscriptions()
+    assert not subs["9:0"]["active"] and subs["9:0"]["suspended"] == "bot was blocked by the user" and subs["1:0"]["active"], subs
+    assert [c for c, _ in stg.sent] == [1] and "已自动暂停" in stg.sent[0][1], stg.sent  # the administrator was told
+    assert "已自动暂停" in sbot.status("9:0")
     print("DELIVERY_OK")
 
 

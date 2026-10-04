@@ -57,7 +57,8 @@ async def run():
     store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
     await bot.one_cycle()
     alert = [t for t in tg.sent if "上涨超过" in t]; assert alert, tg.sent
-    assert "币安 <b>40.5</b>（标记价·299 秒无成交）" in alert[0] and "+2.273%" in alert[0], alert[0]
+    idle = __import__("re").search(r"币安 <b>40\.5</b>（标记价·(\d+) 秒无成交）｜.*（(\d+) 秒前）", alert[0])
+    assert idle and int(idle.group(1)) >= 299 and int(idle.group(2)) < 60 and "+2.273%" in alert[0], alert[0]  # ages as of now, not 0
     tg.sent.clear(); await bot.process_message({"text": "/status", "chat": {"id": 1}, "from": {"id": 42}, "date": time.time()})
     assert "<b>40.5</b>（标记价" in tg.sent[-1] and "已过期" not in tg.sent[-1], tg.sent[-1]
     print("MARK_OK")

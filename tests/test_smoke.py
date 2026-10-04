@@ -55,7 +55,9 @@ async def run():
     assert "日K" in await ask("/mode daily") and bot.settings()["mode"] == "binance_daily"
     assert "不是手动模式" in await ask("/setclose CXMT 8")
     assert (await ask("/status")).startswith(f"📡 <b>监控状态 v{m.VERSION}</b>｜🟢 已订阅"); assert await ask("/price") == await ask("/status")
-    assert "测试" in await ask("/test"); assert "未知命令" in await ask("/nope")
+    assert "测试" in await ask("/test")
+    assert await ask("/nope") is None and "未知命令" in await ask("/nope@TestBot")  # a group's command for another bot is not answered
+    assert "未知命令" in await ask("/nope", chat=42, thread=0)                       # in a private chat it is
     assert "已取消" in await ask("/unsubscribe") and "-100:7" not in bot.subscriptions()
     assert await ask("hello") is None
     # alert text + wait helper

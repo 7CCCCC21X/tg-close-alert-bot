@@ -16,6 +16,7 @@ import functools
 import decimal
 import gzip
 import html
+import http.client
 import inspect
 import json
 import hmac
@@ -31,6 +32,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 from dataclasses import dataclass, field
@@ -224,6 +226,8 @@ STOCK_MARKETS = {
 # HK0625USDT is a quanto contract: its price is the HKD stock price itself, so it compares directly (:same).
 # The others are USD-denominated, so their exchange closes are converted with the FX rate first.
 DEFAULT_TICKERS = "UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:688825,SKHYNIXUSDT=kr:000660"
+NOTICE_GRACE_SECONDS = 30  # a data fault must last this long before subscribers hear of it (one failed request is not an outage)
+SHUTDOWN_GRACE_SECONDS = 8  # at shutdown, how long messages already on their way may take to finish
 REFERENCE_TICK = 5        # seconds between checks in each reference task (each feed has its own cadence)
 REFERENCE_TIMEOUT = 300   # one reference refresh may take this long before it is abandoned
 EXCHANGE_BASE_HOLD_DAYS = 30  # safety cap for a held exchange-close baseline; National Day / Chuseok fit easily
@@ -544,18 +548,39 @@ class Store:
         row = self.conn.execute("SELECT v FROM records WHERE k=?", (key,)).fetchone()
         return json.loads(row[0]) if row else copy.deepcopy(default)
 
+    UPSERT = "INSERT INTO records(k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v"
+
     def put(self, key: str, value: Any) -> None:
         with self.conn:
-            self.conn.execute("INSERT INTO records(k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                              (key, json.dumps(value, ensure_ascii=False)))
+            self.conn.execute(self.UPSERT, (key, json.dumps(value, ensure_ascii=False)))
+
+    def put_many(self, pairs: Any) -> None:
+        """Several records in one transaction (one fsync instead of one per record)."""
+        rows = [(key, json.dumps(value, ensure_ascii=False)) for key, value in pairs]
+        if rows:
+            with self.conn:
+                self.conn.executemany(self.UPSERT, rows)
+
+    @staticmethod
+    def _bounds(prefix: str) -> tuple[str, str]:
+        """Key range [low, high) covering every key that starts with ``prefix`` (uses the primary-key index)."""
+        return prefix, (prefix[:-1] + chr(ord(prefix[-1]) + 1)) if prefix else "\U0010ffff"
 
     def items(self, prefix: str) -> list[tuple[str, Any]]:
-        rows = self.conn.execute("SELECT k, v FROM records WHERE substr(k,1,?)=? ORDER BY k", (len(prefix), prefix))
+        rows = self.conn.execute("SELECT k, v FROM records WHERE k >= ? AND k < ? ORDER BY k", self._bounds(prefix))
         return [(k, json.loads(v)) for k, v in rows]
+
+    def count(self, prefix: str) -> int:
+        return int(self.conn.execute("SELECT count(*) FROM records WHERE k >= ? AND k < ?", self._bounds(prefix)).fetchone()[0])
 
     def delete_prefix(self, prefix: str) -> None:
         with self.conn:
-            self.conn.execute("DELETE FROM records WHERE substr(k,1,?)=?", (len(prefix), prefix))
+            self.conn.execute("DELETE FROM records WHERE k >= ? AND k < ?", self._bounds(prefix))
+
+    def delete_keys(self, keys: list[str]) -> None:
+        if keys:
+            with self.conn:
+                self.conn.executemany("DELETE FROM records WHERE k=?", [(k,) for k in keys])
 
     def close(self) -> None:
         self.conn.close()
@@ -572,6 +597,28 @@ class RemoteError(Exception):
 
 
 BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+MAX_BODY = 8_000_000  # bytes per response, before and after decompression
+# What an HTTP status means for the operator. Binance's geo / ban codes and their long cool-downs mean nothing on
+# Telegram, whose answers carry their own description (and retry_after); a 409 there is the two-instances conflict.
+HTTP_HINTS = {451: "部署所在地或接口访问受限；请核对官方地区规则",
+              403: "访问被拒绝；请核对权限与服务地区",
+              418: "接口暂时封禁；停止高频请求并等待解除",
+              429: "接口限流，等待后重试"}
+TELEGRAM_HINTS = {409: "Telegram 轮询冲突；同一个 Bot Token 只能运行一个实例"}
+
+
+def _inflate(raw: bytes, encoding: str) -> bytes:
+    """Decode a gzip / deflate body (only when the server says it is one), capped like a plain body."""
+    encoding = (encoding or "").strip().lower()
+    if encoding not in {"gzip", "x-gzip", "deflate"}:
+        return raw
+    try:
+        out = zlib.decompressobj(zlib.MAX_WBITS | (16 if encoding != "deflate" else 0)).decompress(raw, MAX_BODY + 1)
+    except zlib.error:
+        return raw  # not actually compressed: use the bytes as they came
+    if len(out) > MAX_BODY:
+        raise RemoteError("接口返回的数据过大")
+    return out
 
 
 def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
@@ -579,15 +626,17 @@ def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
     """GET (or POST ``payload`` as JSON) and return the body; HTTP/network failures become RemoteError."""
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={
-        "User-Agent": f"CloseAlert/{VERSION}", "Accept": "application/json",
+        "User-Agent": f"CloseAlert/{VERSION}", "Accept": "application/json", "Accept-Encoding": "gzip",
         **({"Content-Type": "application/json"} if data is not None else {}), **(headers or {}),
     })
+    host = urllib.parse.urlsplit(url).hostname or ""
+    telegram = host.endswith("telegram.org")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            raw = response.read(8_000_001)
-            if len(raw) > 8_000_000:
+            raw = response.read(MAX_BODY + 1)
+            if len(raw) > MAX_BODY:
                 raise RemoteError("接口返回的数据过大")
-            return raw
+            return _inflate(raw, response.headers.get("Content-Encoding", ""))
     except urllib.error.HTTPError as error:
         retry = 0
         try:
@@ -596,25 +645,26 @@ def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
             pass
         description = ""
         try:
-            body = json.loads(error.read(4096))
+            body = json.loads(_inflate(error.read(4096), error.headers.get("Content-Encoding", "")))
             description = str(body.get("description") or body.get("msg") or "")
             retry = max(retry, int(body.get("parameters", {}).get("retry_after", 0)))
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, TypeError, AttributeError, RemoteError):
             pass
-        hints = {451: "部署所在地或接口访问受限；请核对官方地区规则",
-                 403: "访问被拒绝；请核对权限与服务地区",
-                 418: "接口暂时封禁；停止高频请求并等待解除",
-                 429: "接口限流，等待后重试",
-                 409: "Telegram 轮询冲突；同一个 Bot Token 只能运行一个实例"}
-        if error.code in {418, 429}:
-            retry = max(retry, 120 if error.code == 418 else 30)
-        text = f"HTTP {error.code}: {hints.get(error.code, description or '接口请求失败')}"
-        raise RemoteError(clean_error(text), retry) from None
+        if telegram:  # Telegram says exactly what is wrong (blocked, kicked, retry after N) and how long to wait
+            text = TELEGRAM_HINTS.get(error.code) or description or "接口请求失败"
+        else:
+            if "binance" in host and error.code in {418, 429}:
+                retry = max(retry, 120 if error.code == 418 else 30)
+            text = HTTP_HINTS.get(error.code) or description or "接口请求失败"
+        raise RemoteError(clean_error(f"HTTP {error.code}: {text}"), retry) from None
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         # Keep the underlying reason (DNS failure, refused, proxy 403, certificate...): /diag relies on it.
         reason = getattr(error, "reason", None) if isinstance(error, urllib.error.URLError) else None
         detail = f": {clean_error(str(reason))[:80]}" if reason else ""
         raise RemoteError(f"网络错误 ({type(error).__name__}{detail})") from None
+    except http.client.HTTPException as error:  # IncompleteRead, BadStatusLine, LineTooLong: a broken answer
+        detail = clean_error(str(error))[:80]
+        raise RemoteError(f"网络错误 ({type(error).__name__}{': ' + detail if detail else ''})") from None
 
 
 def _http_json(url: str, payload: dict | None = None, timeout: int = 15) -> Any:
@@ -695,14 +745,17 @@ class SourceHealth:
 SOURCE_HEALTH = SourceHealth()
 
 
-async def fetch_source(url: str, extra: dict[str, str] | None = None) -> bytes:
-    """GET one quote-feed URL with a browser UA and the short feed timeout, recording the host's health."""
+async def fetch_source(url: str, extra: dict[str, str] | None = None, record: bool = True) -> bytes:
+    """GET one quote-feed URL with a browser UA and the short feed timeout, recording the host's health
+    (``record=False`` for a diagnostic probe, which must not reorder the sources the live refresh uses)."""
     try:
         raw = await http_get(url, timeout=SOURCE_TIMEOUT, headers={"User-Agent": BROWSER_UA, "Accept": "*/*", **(extra or {})})
     except (RemoteError, TimeoutError, OSError) as error:
-        SOURCE_HEALTH.record(url, clean_error(error) or type(error).__name__)
+        if record:
+            SOURCE_HEALTH.record(url, clean_error(error) or type(error).__name__)
         raise
-    SOURCE_HEALTH.record(url)
+    if record:
+        SOURCE_HEALTH.record(url)
     return raw
 
 
@@ -7272,7 +7325,8 @@ def alert_plan(state: dict | None, baseline_key: str, change: D, now: float,
     elapsed = now - float(s.get("last_sent", 0))
     reason = ""
     if s.get("side", 0) != side:
-        reason = "首次/重新超过阈值" if not s.get("side") else "方向反转并超过阈值"
+        reason = ("方向反转并超过阈值" if s.get("side")
+                  else "重新超过阈值（曾回到阈值 80% 以内）" if s.get("last_sent") else "首次超过阈值")
     elif step > 0 and tier > int(s.get("highest_tier", 0)):
         reason = "偏离继续扩大"
     elif cooldown > 0 and elapsed >= cooldown:
@@ -7287,21 +7341,35 @@ def alert_plan(state: dict | None, baseline_key: str, change: D, now: float,
 
 def alert_text(symbol: str, quote: Quote, base: Baseline, change: D, threshold: D, reason: str,
                references: dict[str, Baseline] | None = None, fx: "FxRates | None" = None,
-               style: str = "cn", context: list[str] | None = None) -> str:
-    """Alert body with bold sentinels; send it with html=True. ``context`` = extra rows (HL, indices)."""
+               style: str = "cn", context: list[str] | None = None, now_ms: int | None = None) -> str:
+    """Alert body with bold sentinels; send it with html=True. ``context`` = extra rows (HL, indices); ``now_ms`` is
+    when the text is rendered, so the quote's age ("N 秒前") is real rather than always 0."""
     side = "上涨" if change > 0 else "下跌"
     rows = [f"基准 {fmt(base.value)}（{baseline_brief(base)}）→ {pct_text(change, style, strong=True, digits=3)}"]
     rows += [reference_row(kind, quote.price, ref, fx, style) for kind, ref in (references or {}).items()]
     rows += [line for line in (context or []) if line]
     rows.append(f"📝 {reason}")
     return "\n".join([f"{trend_mark(change, style)} {bold(f'{side}超过 {fmt(threshold)}%｜{NAMES.get(symbol, symbol)}')}（{symbol}）",
-                      quote.price_row(quote.timestamp_ms), *tree(rows),
+                      quote.price_row(quote.timestamp_ms if now_ms is None else max(now_ms, quote.timestamp_ms)), *tree(rows),
                       "⚠️ 合约行情提示，不代表股票官方收盘结算结果。"])
 
 
 # A message's freshness check (set by Bot.tell): run again after the send queue's wait, right before the message goes
 # out, so a Telegram cool-down (429 retry_after can be minutes) never delivers a price that was current back then.
 SEND_CHECK: contextvars.ContextVar[Any] = contextvars.ContextVar("send_check", default=None)
+# A message's renderer (set by Bot.tell): rebuilds the text right before it goes out, so what it says about "now"
+# (a quote's age) is true at the moment of sending, not at the moment it was queued.
+SEND_RENDER: contextvars.ContextVar[Any] = contextvars.ContextVar("send_render", default=None)
+# Telegram says this when a chat can no longer be delivered to; retrying every cycle would only clog the queue.
+CHAT_GONE = ("bot was blocked by the user", "user is deactivated", "bot was kicked", "chat not found",
+             "bot is not a member", "message thread not found", "topic_closed", "chat_write_forbidden",
+             "have no rights to send", "not enough rights to send")
+
+
+def chat_gone(error: BaseException) -> str:
+    """Why Telegram will keep refusing this chat ("" when the failure may be temporary)."""
+    text = str(error).lower()
+    return next((reason for reason in CHAT_GONE if reason in text), "")
 
 
 class StaleMessage(Exception):
@@ -7309,10 +7377,15 @@ class StaleMessage(Exception):
 
 
 class Telegram:
+    CHAT_GAP = 1.1    # seconds between two messages to the same chat (Telegram allows about one per second there)
+    GLOBAL_GAP = 0.1  # seconds between any two messages (Telegram's overall limit is about 30 per second)
+
     def __init__(self, token: str):
         self.root = f"https://api.telegram.org/bot{token}/"
-        self.lock = asyncio.Lock()
-        self.next_send = 0.0
+        self.lock = asyncio.Lock()                     # one request in flight; the global spacing
+        self.next_send = 0.0                           # no message to anyone before this (monotonic)
+        self.chat_next: dict[Any, float] = {}          # chat -> no message to it before this (its 429 cool-down)
+        self.chat_locks: dict[Any, asyncio.Lock] = {}  # chat -> its messages keep their order
 
     async def call(self, method: str, payload: dict | None = None, timeout: int = 15) -> Any:
         data = await http_json(self.root + method, payload or {}, timeout)
@@ -7323,25 +7396,41 @@ class Telegram:
         return data.get("result")
 
     async def paced(self, method: str, payload: dict) -> Any:
-        """Serialize outgoing messages and respect Telegram's per-chat send rate. A message with a freshness check is
-        re-validated after the wait, right before it is sent (StaleMessage when its data no longer holds)."""
-        async with self.lock:
-            await asyncio.sleep(max(0, self.next_send - time.monotonic()))
-            check = SEND_CHECK.get()
-            if check is not None and not check():
-                raise StaleMessage("排队等待发送期间数据已失效，未发送")
-            try:
-                return await self.call(method, payload)
-            except RemoteError as error:
-                self.next_send = time.monotonic() + max(1.1, error.retry_after)
-                raise
-            finally:
-                self.next_send = max(self.next_send, time.monotonic() + 1.1)
+        """Serialize outgoing messages per chat and respect Telegram's send rates: about one message per second to a
+        chat (a 429 cool-down holds only that chat), a small gap between any two. A message with a freshness check is
+        re-validated after the wait, right before it is sent (StaleMessage when its data no longer holds); one with a
+        renderer is rebuilt then."""
+        chat = payload.get("chat_id")
+        if len(self.chat_locks) > 2000:
+            self.chat_locks = {c: lock for c, lock in self.chat_locks.items() if lock.locked()}
+            self.chat_next = {c: t for c, t in self.chat_next.items() if t > time.monotonic()}
+        async with self.chat_locks.setdefault(chat, asyncio.Lock()):
+            await asyncio.sleep(max(0, self.chat_next.get(chat, 0) - time.monotonic()))
+            async with self.lock:
+                await asyncio.sleep(max(0, self.next_send - time.monotonic()))
+                check = SEND_CHECK.get()
+                if check is not None and not check():
+                    raise StaleMessage("排队等待发送期间数据已失效，未发送")
+                render = SEND_RENDER.get()
+                if render is not None and "text" in payload:
+                    payload = {**payload, "text": split_text(render())[0]}
+                    SEND_RENDER.set(None)
+                try:
+                    return await self.call(method, payload)
+                except RemoteError as error:
+                    self.chat_next[chat] = time.monotonic() + max(self.CHAT_GAP, error.retry_after)
+                    raise
+                finally:
+                    now = time.monotonic()
+                    self.next_send = max(self.next_send, now + self.GLOBAL_GAP)
+                    self.chat_next[chat] = max(self.chat_next.get(chat, 0), now + self.CHAT_GAP)
 
     async def send(self, chat: int, thread: int, text: str, reply_markup: dict | None = None,
                    parse_mode: str | None = None) -> None:
         # Plain text by default; HTML only for messages that were escaped with to_html().
         chunks = split_text(text)
+        if len(chunks) > 1:
+            SEND_RENDER.set(None)  # a long message is sent as queued: its parts must come from one rendering
         for index, chunk in enumerate(chunks):
             payload: dict[str, Any] = {"chat_id": chat, "text": chunk,
                                       "link_preview_options": {"is_disabled": True}}
@@ -7650,6 +7739,8 @@ class Bot:
         self.a50_anchor_source = "东方财富"
         self.anchor_tries: dict[str, float] = {}
         self.deliveries: dict[str, asyncio.Task] = {}  # Telegram sends in flight, by alert / notice key
+        self.faults: dict[tuple[str, str], float] = {}  # (subscription, data item) -> when its current fault began
+        self.reply_seq = 0  # command replies get their own delivery keys
         self.vol_errors: dict[str, str] = {}  # symbol -> why its exchange daily bars could not be read (σ is the prior)
         self.stopping = asyncio.Event()
         self.started = time.time()
@@ -7772,13 +7863,17 @@ class Bot:
             self.last_log[key] = now
 
     async def tell(self, chat: int, thread: int, text: str, reply_markup: dict | None = None,
-                   html_mode: bool = False, fresh: Any = None) -> bool:
+                   html_mode: bool = False, fresh: Any = None, render: Any = None) -> bool:
         """Send one message; True once Telegram accepted it. ``fresh`` (optional) is re-checked right before sending,
-        also after any wait in the send queue: when it says the data no longer holds, nothing is sent (False)."""
+        also after any wait in the send queue: when it says the data no longer holds, nothing is sent (False).
+        ``render`` (optional, returns the text) is called right before sending too, so the text speaks of that moment."""
         token = SEND_CHECK.set(fresh)
+        rtoken = SEND_RENDER.set(None if render is None else (lambda: to_html(render())) if html_mode else render)
         try:
             if fresh is not None and not fresh():
                 raise StaleMessage("数据已失效，未发送")
+            if render is not None:
+                text = render()
             if html_mode:
                 await self.telegram.send(chat, thread, to_html(text), reply_markup, "HTML")
             else:
@@ -7788,10 +7883,30 @@ class Bot:
             LOG.info("Telegram message dropped: %s", error)
             return False
         except Exception as error:
-            self.log_limited("telegram_send", f"Telegram 发送失败：{clean_error(error)}")
+            gone = chat_gone(error)
+            if gone:
+                self.suspend_target(chat, thread, gone)
+            self.log_limited(f"telegram_send:{chat}", f"Telegram 发送失败（chat {chat}）：{clean_error(error)}")
             return False
         finally:
             SEND_CHECK.reset(token)
+            SEND_RENDER.reset(rtoken)
+
+    def suspend_target(self, chat: int, thread: int, why: str) -> None:
+        """Telegram refuses this chat for good (bot blocked or kicked, topic deleted): pause its subscription instead
+        of retrying every cycle, and tell the administrator. /resume (or /subscribe) in that chat turns it back on."""
+        subs = self.subscriptions()
+        sub_id = subscription_key(chat, thread)
+        sub = subs.get(sub_id)
+        if not sub or not sub.get("active"):
+            return
+        subs[sub_id] = {**sub, "active": False, "suspended": why, "suspended_at": time.time()}
+        self.store.put("subscriptions", subs)
+        LOG.warning("订阅 %s 已自动暂停：Telegram 拒绝投递（%s）", sub_id, why)
+        if self.config.admin_id and (chat, thread) != (self.config.admin_id, 0):
+            text = (f"⏸ 订阅 {sub_id} 已自动暂停\nTelegram 拒绝向该聊天投递：{why}\n"
+                    "机器人可能已被移出群组、被拉黑，或话题已删除/关闭。处理后在该聊天发送 /resume 恢复。")
+            self.deliver(f"notice:suspended:{sub_id}", functools.partial(self.tell, self.config.admin_id, 0, text))
 
     # --- delivery: sampling never waits on Telegram -------------------------------------------------------------------
 
@@ -7803,7 +7918,7 @@ class Bot:
         """Run one Telegram delivery in the background, so the 5-second sampling never waits on Telegram (a 429 cool-
         down can last minutes). One delivery per key at a time: while it is in flight the same message is not planned
         again; it re-checks its data right before sending and records itself only once Telegram accepted it."""
-        if self.delivering(key):
+        if self.delivering(key) or self.stopping.is_set():
             return False
 
         async def guarded() -> None:
@@ -7822,21 +7937,29 @@ class Bot:
         self.deliveries.clear()
 
     def notice(self, sub_id: str, sub: dict, key: str, error: str | None) -> None:
-        """A fault / recovery notice for one subscription, sent in the background and recorded once delivered."""
+        """A fault / recovery notice for one subscription, sent in the background and recorded once delivered.
+        A fault is announced only once it has lasted NOTICE_GRACE_SECONDS (one timed-out request is not an outage),
+        then at most every 30 minutes; the recovery note follows only a fault that was announced."""
         record_key = f"notice:{sub_id}:{key}"
         if self.delivering(record_key):
             return
-        old = self.store.get(record_key, {})
         now = time.time()
         if error:
+            since = self.faults.setdefault((sub_id, key), now)
+            if now - since < NOTICE_GRACE_SECONDS:
+                return
+            old = self.store.get(record_key, {})
             if old.get("active") and now - old.get("sent", 0) < 1800:
                 return
-            text = f"⚠️ 行情监控异常｜{key}\n{error}\n该项暂停涨跌提醒；恢复后继续。\n这不代表价格没有变化。"
+            lasting = f"已持续 {int((now - since) // 60)} 分钟｜" if now - since >= 60 else ""
+            text = f"⚠️ 行情监控异常｜{key}\n{lasting}{error}\n该项暂停涨跌提醒；恢复后继续。\n这不代表价格没有变化。"
             state = {"active": True, "sent": now}
-        elif old.get("active"):
-            text, state = f"✅ 数据恢复｜{key}\n后续按当前基准继续监控。", {"active": False, "sent": now}
         else:
-            return
+            self.faults.pop((sub_id, key), None)
+            old = self.store.get(record_key, {})
+            if not old.get("active"):
+                return
+            text, state = f"✅ 数据恢复｜{key}\n后续按当前基准继续监控。", {"active": False, "sent": now}
 
         async def send() -> None:
             if await self.tell(sub["chat"], sub["thread"], text):
@@ -7870,7 +7993,12 @@ class Bot:
         markup, html_mode = None, False
         try:
             handler = self.handlers.get(req.command)
-            reply = handler(req) if handler else "未知命令。发送 /help 查看用法。"
+            if handler is None:
+                if req.chat < 0 and "@" not in message.get("text", "").split()[0]:
+                    return  # a group's command for some other bot: not ours to answer
+                reply: Any = "未知命令。发送 /help 查看用法。"
+            else:
+                reply = handler(req)
             if inspect.isawaitable(reply):
                 reply = await reply
             if isinstance(reply, tuple):  # (text, inline keyboard) card
@@ -7879,7 +8007,22 @@ class Bot:
                 reply, markup, html_mode = reply.text, reply.markup, reply.html
         except (ValueError, decimal.InvalidOperation) as error:
             reply = "❌ " + clean_error(error)
-        await self.tell(req.chat, req.thread, reply, markup, html_mode)
+        except Exception as error:  # a bug in one handler must not leave the administrator without any answer
+            LOG.exception("命令 %s 处理失败", req.command)
+            reply = (f"❌ 命令执行失败：{clean_error(error) or type(error).__name__}\n"
+                     "已写入日志；可发 /diag 检查数据源，或稍后重试。")
+        await self.reply(req, reply, markup, html_mode)
+
+    async def reply(self, req: Request, text: str, markup: dict | None = None, html_mode: bool = False) -> None:
+        """Answer a command. While the background loops run the answer is queued like any other message, so a
+        Telegram cool-down never stalls the command poll (the next command is read at once); one-off runs and tests
+        send inline."""
+        job = functools.partial(self.tell, req.chat, req.thread, text, markup, html_mode)
+        if not self.reference_tasks:
+            await job()
+            return
+        self.reply_seq += 1
+        self.deliver(f"reply:{self.reply_seq}", job)
 
     async def process_callback(self, query: dict) -> None:
         """Handle a tap on a card button (callback_query)."""
@@ -7942,15 +8085,28 @@ class Bot:
                 "\n首次观察就超过阈值，也会提醒；请用 /status 核对基准和行情。")
 
     def cmd_resume(self, req: Request) -> str:
+        sub = self.subscriptions().get(req.sub_id)
+        if sub is None:
+            raise ValueError("当前私聊/话题还没有订阅；请先发送 /subscribe")
+        if sub.get("active"):
+            return "ℹ️ 当前订阅本来就在运行中，无需恢复。\n" + self.config_summary()
         self.set_subscription(req, active=True)
-        return "✅ 当前订阅已恢复。\n" + self.config_summary()
+        why = f"\n（此前因「{sub['suspended']}」被自动暂停）" if sub.get("suspended") else ""
+        return "✅ 当前订阅已恢复。" + why + "\n" + self.config_summary()
 
     def cmd_pause(self, req: Request) -> str:
+        sub = self.subscriptions().get(req.sub_id)
+        if sub is None:
+            raise ValueError("当前私聊/话题没有订阅，无需暂停；/subscribe 可以订阅")
+        if not sub.get("active"):
+            return "ℹ️ 当前订阅已经是暂停状态；/resume 可以恢复。"
         self.set_subscription(req, active=False)
-        return "⏸ 当前订阅已暂停。"
+        return "⏸ 当前订阅已暂停；/resume 可以恢复。"
 
     def cmd_unsubscribe(self, req: Request) -> str:
         subs = self.subscriptions()
+        if req.sub_id not in subs:
+            return "ℹ️ 当前私聊/话题没有订阅，无需取消。"
         subs.pop(req.sub_id, None)
         self.store.put("subscriptions", subs)
         self.store.delete_prefix(f"alert:{req.sub_id}:")
@@ -7970,8 +8126,14 @@ class Bot:
         if not D("0.01") <= value <= D(100):
             raise ValueError("阈值必须在 0.01～100 之间")
         self.update_settings(threshold=str(value))
-        self.store.delete_prefix("alert:")
+        self.reset_alerts()
         return f"✅ 全局阈值已改为严格超过 ±{fmt(value)}%。下一轮按新阈值判断。"
+
+    def reset_alerts(self) -> None:
+        """Open a fresh alert episode for every subscription and contract (a changed threshold / mode re-judges the
+        current deviation), keeping only each one's last send time so the MIN_ALERT_GAP spam guard still holds."""
+        self.store.put_many((key, {"last_sent": value.get("last_sent", 0)})
+                            for key, value in self.store.items("alert:") if isinstance(value, dict))
 
     def cmd_cooldown(self, req: Request) -> str:
         if len(req.args) != 1 or not req.args[0].isdigit() or not 0 <= int(req.args[0]) <= 86400:
@@ -7988,7 +8150,7 @@ class Bot:
             raise ValueError("用法：/mode daily、/mode exchange 或 /mode manual")
         settings = self.update_settings(mode=aliases[choice])
         self.snapshots.clear()
-        self.store.delete_prefix("alert:")
+        self.reset_alerts()
         reply = "✅ " + self.config_summary()
         if settings["mode"] == "exchange_close":
             missing = [s for s in self.config.symbols if s not in self.config.tickers]
@@ -10272,7 +10434,8 @@ class Bot:
         """Status card with bold sentinels; send it with html_mode=True."""
         now_ms = self.market.now_ms()
         sub = self.subscriptions().get(sub_id)
-        active = "🟢 已订阅" if sub and sub.get("active") else "⏸ 未订阅/已暂停"
+        active = ("🟢 已订阅" if sub and sub.get("active") else f"⏸ 已自动暂停（{sub['suspended']}）→ /resume 恢复"
+                  if sub and sub.get("suspended") else "⏸ 未订阅/已暂停")
         style = self.config.color_style
         lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(),
                  f"📊 {legend(style)}｜→ 后为币安现价相对该行价格"]
@@ -10429,11 +10592,17 @@ class Bot:
                     self.store.put(state_key, passive)
                 if not plan:
                     continue
-                text = alert_text(symbol, quote, base, change, threshold, plan.reason,
-                                  self.references_for(symbol, current_ms), self.fx, self.config.color_style,
-                                  self.context_lines(symbol, current_ms, quote.price))
-                self.deliver(state_key, functools.partial(self.deliver_alert, sub_id, sub, symbol, text, plan, passive,
+                render = functools.partial(self.render_alert, symbol, quote, base, change, threshold, plan.reason,
+                                           self.references_for(symbol, current_ms),
+                                           self.context_lines(symbol, current_ms, quote.price))
+                self.deliver(state_key, functools.partial(self.deliver_alert, sub_id, sub, symbol, render, plan, passive,
                                                           quote, base, settings))
+
+    def render_alert(self, symbol: str, quote: Quote, base: Baseline, change: D, threshold: D, reason: str,
+                     references: dict[str, Baseline], context: list[str]) -> str:
+        """The alert text as of now (called when the message is planned and again right before it is sent)."""
+        return alert_text(symbol, quote, base, change, threshold, reason, references, self.fx, self.config.color_style,
+                          context, self.market.now_ms())
 
     def alert_still_true(self, sub_id: str, symbol: str, plan: Plan, state: dict, quote: Quote, base: Baseline,
                          settings: dict) -> bool:
@@ -10455,10 +10624,10 @@ class Bot:
                 return False  # the move that triggered it is gone
         return True
 
-    async def deliver_alert(self, sub_id: str, sub: dict, symbol: str, text: str, plan: Plan, state: dict, quote: Quote,
+    async def deliver_alert(self, sub_id: str, sub: dict, symbol: str, render: Any, plan: Plan, state: dict, quote: Quote,
                             base: Baseline, settings: dict) -> None:
         fresh = functools.partial(self.alert_still_true, sub_id, symbol, plan, state, quote, base, settings)
-        if await self.tell(sub["chat"], sub["thread"], text, html_mode=True, fresh=fresh):
+        if await self.tell(sub["chat"], sub["thread"], "", html_mode=True, fresh=fresh, render=render):
             # Only mark a price alert as delivered AFTER Telegram accepts it.
             # Avoid resurrecting state deleted by a command during delivery.
             if self.settings() == settings and self.subscriptions().get(sub_id, {}).get("active"):
@@ -10471,7 +10640,7 @@ class Bot:
         probes: list[tuple[str, str, Any, Any]] = []
 
         def get(url: str, extra: dict[str, str]) -> Any:
-            return lambda: fetch_source(url, extra)  # a probe's outcome also updates the host's cooldown
+            return lambda: fetch_source(url, extra, record=False)  # a probe must not reorder the live refresh's sources
 
         def when(ms: int) -> str:
             return quote_time(ms) + (stale_note(ms, now_ms, BEIJING) if ms else "")
@@ -10755,10 +10924,25 @@ class Bot:
         return "\n".join(lines + [""] + state)
 
     async def cmd_diag(self, req: Request) -> str:
-        await self.tell(req.chat, req.thread, "🩺 正在逐个检测数据源，约 10–30 秒…")
-        results = await self.diagnose()
-        return self.diag_text(results, self.diag_state(self.market.now_ms()),
-                              f"🩺 数据源检测 v{VERSION}｜{stamp(self.market.now_ms())}（北京时间）")
+        """Probe every source. With the background loops running the probes run beside the command poll (they can
+        take up to two minutes) and the report follows as its own message; one-off runs and tests do it inline."""
+        key = f"diag:{req.sub_id}"
+        if self.delivering(key):
+            return "🩺 上一轮检测仍在进行，结果稍后发到这里。"
+        note = "🩺 正在逐个检测数据源，通常 10–30 秒，最长约 2 分钟；结果稍后发到这里…"
+
+        async def report() -> str:
+            results = await self.diagnose()
+            return self.diag_text(results, self.diag_state(self.market.now_ms()),
+                                  f"🩺 数据源检测 v{VERSION}｜{stamp(self.market.now_ms())}（北京时间）")
+
+        if self.reference_tasks:
+            async def deliver_report() -> None:
+                await self.tell(req.chat, req.thread, await report())
+            self.deliver(key, deliver_report)
+            return note
+        await self.tell(req.chat, req.thread, note)
+        return await report()
 
     def reference_jobs(self) -> list[tuple[str, Any]]:
         """(name, coroutine factory) per reference feed; each has its own refresh cadence inside."""
@@ -10876,17 +11060,20 @@ class Bot:
     async def monitor_loop(self) -> None:
         while not self.stopping.is_set():
             started = time.monotonic()
-            try:
+            try:  # nothing in here may end the loop: a price-alert loop that died quietly would be the worst fault
                 await self.one_cycle()
+                self.heartbeat()
             except Exception as error:
                 self.log_limited("monitor", "监控轮次异常：" + clean_error(error))
-            if time.monotonic() - self.last_log.get("heartbeat", -1e9) >= 60:
-                ok = sum("quote" in value for value in self.snapshots.values())
-                LOG.info("heartbeat: valid_quotes=%s/%s active_subscriptions=%s mode=%s", ok,
-                         len(self.config.symbols), sum(bool(s.get("active")) for s in self.subscriptions().values()),
-                         self.settings()["mode"])
-                self.last_log["heartbeat"] = time.monotonic()
             await self.wait(max(0.1, self.config.poll - (time.monotonic() - started)))
+
+    def heartbeat(self) -> None:
+        if time.monotonic() - self.last_log.get("heartbeat", -1e9) >= 60:
+            ok = sum("quote" in value for value in self.snapshots.values())
+            LOG.info("heartbeat: valid_quotes=%s/%s active_subscriptions=%s mode=%s deliveries=%s", ok,
+                     len(self.config.symbols), sum(bool(s.get("active")) for s in self.subscriptions().values()),
+                     self.settings()["mode"], sum(not t.done() for t in self.deliveries.values()))
+            self.last_log["heartbeat"] = time.monotonic()
 
     async def process_update(self, update: dict) -> None:
         message = update.get("message")
@@ -10895,6 +11082,8 @@ class Bot:
             age = time.time() - float(message.get("date", time.time()))
             if -60 <= age <= 900:
                 await self.process_message(message)
+            elif age > 900 and is_admin(message, self.config) and (req := self.parse_request(message)) is not None:
+                await self.reply(req, f"⌛ 这条命令发送于 {int(age // 60)} 分钟前（机器人当时未运行），已过期未执行；需要的话请重发。")
             return
         query = update.get("callback_query")
         if isinstance(query, dict):  # A button tap is a live intent, so it is not age-filtered.
@@ -10905,8 +11094,10 @@ class Bot:
         failures = 0
         while not self.stopping.is_set():
             try:
-                updates = await self.telegram.call("getUpdates", {"offset": offset, "timeout": 25,
-                                                   "allowed_updates": ["message", "callback_query"]}, timeout=40)
+                # A 20-second long poll: at shutdown the blocked request has to finish before the process can exit,
+                # and Railway gives 45 seconds in all.
+                updates = await self.telegram.call("getUpdates", {"offset": offset, "timeout": 20,
+                                                   "allowed_updates": ["message", "callback_query"]}, timeout=30)
                 if not isinstance(updates, list):
                     raise ValueError("Telegram 更新格式异常")
                 failures = 0
@@ -10937,7 +11128,9 @@ class Bot:
         except Exception as error:
             LOG.warning("注册命令菜单失败（不影响手动输入命令）：%s", clean_error(error))
 
-    async def run(self) -> None:
+    async def run(self) -> int:
+        """The bot's life: 0 when it stopped on request (signal), 1 when a core loop ended on its own (the process
+        exits so Railway restarts it; a bot that keeps answering commands but no longer samples prices must not live)."""
         # Refuse to silently remove a webhook that may belong to another service.
         webhook = await self.telegram.call("getWebhookInfo")
         if webhook.get("url"):
@@ -10954,7 +11147,9 @@ class Bot:
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, self.stopping.set)
         self.start_reference_tasks()
-        tasks = [asyncio.create_task(self.monitor_loop()), asyncio.create_task(self.commands_loop()), *self.reference_tasks]
+        core = [asyncio.create_task(self.monitor_loop(), name="monitor"),
+                asyncio.create_task(self.commands_loop(), name="commands")]
+        tasks = [*core, *self.reference_tasks]
         if self.config.web_port:
             try:
                 self.web = WebServer(self, self.config.web_port, self.web_token)
@@ -10964,18 +11159,33 @@ class Bot:
             except OSError as error:
                 LOG.warning("概率网页启动失败（不影响提醒）：%s", clean_error(error))
                 self.web = None
+        exit_code = 0
+        stopper = asyncio.create_task(self.stopping.wait(), name="stopping")
         try:
-            await self.stopping.wait()
+            await asyncio.wait([stopper, *core], return_when=asyncio.FIRST_COMPLETED)
+            for task in core:
+                if task.done() and not task.cancelled():  # a core loop never ends on its own: let Railway restart us
+                    error = task.exception()
+                    LOG.error("核心循环 %s 意外结束：%s；进程退出等待重启", task.get_name(),
+                              clean_error(error) if error else "无异常")
+                    exit_code = 1
         finally:
-            tasks += [task for task in self.deliveries.values() if not task.done()]
-            for task in tasks:
+            self.stopping.set()
+            stopper.cancel()
+            # Railway drains for 45 seconds: give the messages already on their way a moment to finish (Telegram may
+            # have taken them, and only then is their state recorded), then stop everything else.
+            pending = [task for task in self.deliveries.values() if not task.done()]
+            if pending:
+                await asyncio.wait(pending, timeout=SHUTDOWN_GRACE_SECONDS)
+            for task in [*tasks, *pending]:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, *pending, stopper, return_exceptions=True)
             if self.reference_pool:
                 self.reference_pool.shutdown(wait=False, cancel_futures=True)
             if self.web:
                 await self.web.stop()
-            LOG.info("Stopped safely")
+            LOG.info("Stopped safely (exit %s)", exit_code)
+        return exit_code
 
 
 async def run_diagnostics(config: Config) -> int:
@@ -11067,8 +11277,7 @@ def main() -> int:
         if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", config.token):
             raise ValueError("请在 Railway Variables 配置 TELEGRAM_BOT_TOKEN，不要写进代码或提交到 GitHub")
         store = Store(config.db_path)
-        asyncio.run(Bot(config, store, Binance(config), Telegram(config.token)).run())
-        return 0
+        return asyncio.run(Bot(config, store, Binance(config), Telegram(config.token)).run())
     except KeyboardInterrupt:
         return 0
     except Exception as error:

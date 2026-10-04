@@ -150,6 +150,7 @@ async def run():
     assert bot.snapshots["UNITREEUSDT"] == {"error": "等待首次获取上交所688836收盘价（后台刷新中）", "pending": True}, bot.snapshots
     assert not tg.sent, tg.sent
     bot.stocks.errors["UNITREEUSDT"] = "东方财富: 网络错误"  # the first fetch failed -> now it is a real fault
+    m.NOTICE_GRACE_SECONDS = 0
     await bot.one_cycle(); await bot.drain_deliveries()
     assert "尚未由带日期的日 K 确认" in bot.snapshots["UNITREEUSDT"]["error"] and any("行情监控异常" in t for t in tg.sent), tg.sent
 
