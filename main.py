@@ -44,7 +44,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.28.1"
+VERSION = "1.28.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -3576,6 +3576,11 @@ def book_edges(fair_up: float, book: PredictBook, costs: EdgeCosts | None = None
     return sorted(edges, key=lambda e: (not e.maker, e.side != "涨"))
 
 
+def edge_level_norm(text: str) -> str:
+    """'$300M' / '300m' / '↑ $120k' / '1B' -> '300m' / '120k' / '1b': how a ladder level is matched in /edge."""
+    return re.sub(r"[\s$＄↑↓,，]", "", str(text or "")).lower()
+
+
 def best_edge(edges: list[BookEdge], need: float = 0.0005) -> BookEdge | None:
     """The direction with the largest net edge above ``need`` (the minimum that covers the model's own error); a maker
     wins ties (it also collects the spread). None when no direction clears it."""
@@ -6601,6 +6606,9 @@ a.simrow>*{min-width:0}a.simrow>:nth-child(2){overflow:hidden;text-overflow:elli
 .opp:hover{border-color:var(--hot);box-shadow:0 0 0 3px var(--hot-bg)}body.olddata #opps{display:none}
 a.opp{text-decoration:none}a.opp.link:after{content:"↗";color:var(--best);font-size:11px;align-self:center}
 h2 .secsort{margin-left:auto;font-weight:400;font-size:12px;color:var(--muted);letter-spacing:0}h2 .secsort select{font-size:12px;padding:2px 5px}
+.hotset{display:inline-flex;align-items:center;gap:3px;font-size:12px;font-weight:400;color:var(--muted);letter-spacing:0;white-space:nowrap}
+.hotset input{width:52px;font:inherit;font-size:12px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--text);padding:2px 5px}
+.hotset input:not(:placeholder-shown){border-color:var(--hot);color:var(--hot);font-weight:600}h2 .hotset{margin-left:6px}.hotrow{margin-top:4px;display:flex;align-items:center;gap:6px}
 .card.flash{animation:flash 1.4s ease-out}@keyframes flash{from{outline:3px solid var(--best);outline-offset:3px}to{outline:3px solid transparent;outline-offset:3px}}
 #g-levels{grid-template-columns:repeat(auto-fill,minmax(min(100%,440px),1fr))}
 .card.price-lad{gap:8px}.price-top{display:flex;flex-wrap:wrap;align-items:baseline;gap:5px 9px;font-variant-numeric:tabular-nums}.price-top b{font-size:26px;font-weight:750;letter-spacing:-.02em}.price-top .plabel{font-size:12px;color:var(--muted)}
@@ -6666,7 +6674,7 @@ h2{margin:12px 2px 6px}.legend{margin-bottom:4px}.edge{min-height:40px}.pb{paddi
 <div class="pr" id="oppsrc"></div>
 <div class="pr" id="oppway"></div>
 <div class="pr"><span class="mut">“价格阶梯”和“模拟交易”栏默认不显示，勾上才出现；每笔交易的证据和导出在</span><a class="cb" id="journal" href="#">模拟交易复盘 ↗</a></div>
-<div class="pr"><label>高亮门槛 <input type="number" id="hotin" min="1" max="50" step="1"> ¢</label><span class="mut">净优势达到这个值的卡片标红框（和模型的“建议门槛”不是一回事：没超过建议门槛的方向不会被建议）</span></div>
+<div class="pr"><label>高亮门槛 <input type="number" id="hotin" min="1" max="50" step="1"> ¢</label><span class="mut">净优势达到这个值的卡片标红框、进机会条（和模型的“建议门槛”不是一回事：没超过建议门槛的方向不会被建议）。栏目标题和每张卡的工具条（自定义时）、每一档的说明（点开档位）旁各有一个“红框 ¢”框：填了按它，空着跟随上一级（档位 → 卡片 → 栏目 → 这里）</span></div>
 <div class="pr"><span class="mut" id="hidn"></span><span class="sp"></span><button type="button" class="cb" id="showall">全部显示</button><button type="button" class="cb" id="reset" title="还原卡片和栏目顺序、隐藏与高亮门槛（收藏保留）">恢复默认布局</button><button type="button" class="cb pri" id="done">完成</button></div>
 </div>
 <h2 id="h-flat" hidden></h2><div class="grid" id="g-flat" hidden></div>
@@ -6706,6 +6714,24 @@ try{if(!localStorage.getItem("levelsDefault")){if(!hideSec.includes("levels"))hi
   if(localStorage.getItem("ladderDefault")){hideSec=hideSec.filter(x=>x!=="ladder");localStorage.removeItem("ladderDefault")}  // 1.21.5 hid 市值阶梯 instead: undo that once
   keep("hideSec",hideSec);localStorage.setItem("levelsDefault","1")}}catch(e){}
 let hotCents=stored("hot",10,v=>typeof v==="number"&&v>=1&&v<=50),HOT=hotCents/100;  // an edge this large gets the red frame
+// the red-frame bar can also be set per section ("sec:<group>"), per card ("card:<key>") or per ladder level ("row:<key>#<label>"),
+// in cents; the most specific one set wins, the global one stands in otherwise
+let hotMap=stored("hotmap",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Object.values(v).every(x=>typeof x==="number"&&x>=1&&x<=50));
+const hotByCard={};  // card key -> the bar it was last drawn with (for the chips in its book block)
+function hotCentsFor(it,label){const k=favKey(it),g=it.group||"contract",row=label!=null?hotMap["row:"+k+"#"+label]:undefined;
+  return row??hotMap["card:"+k]??hotMap["sec:"+g]??hotCents}
+function hotFor(it,label){return hotCentsFor(it,label)/100}
+function setHot(key,v){if(v==null)delete hotMap[key];else hotMap[key]=v;keep("hotmap",hotMap);drawLegend();if(last)render(last)}
+const hotTyping=()=>!!document.activeElement&&document.activeElement.matches(".hotset input");  // a ¢ box has the focus: render() waits (as under a drag)
+function hotInput(key,inherit,tip){  // a small ¢ box: empty = inherit (the inherited bar shows as the placeholder)
+  const l=$("label","hotset"),i=$("input");i.type="number";i.min="1";i.max="50";i.step="1";i.placeholder=String(inherit);if(hotMap[key]!=null)i.value=hotMap[key];
+  i.title=tip;i.setAttribute("aria-label",tip);l.title=tip;
+  for(const ev of["click","pointerdown","mousedown","touchstart"])l.addEventListener(ev,e=>e.stopPropagation());  // not a fold, drag or row toggle
+  const commit=()=>{const t=i.value.trim(),n=Math.round(Number(t)),v=t!==""&&Number.isFinite(n)?Math.min(50,Math.max(1,n)):null;
+    if(v!==(hotMap[key]??null))setHot(key,v)};  // Chrome repeats change when a box is taken out of the page: the same value changes nothing
+  i.addEventListener("change",()=>{commit();i.blur()});  // the rebuild the new bar needs runs once the box has let go of the focus (below)
+  i.addEventListener("blur",()=>{commit();if(pending&&!drag){const d=pending;pending=null;render(d)}});
+  l.append("红框 ",i," ¢");return l}
 const isBool=v=>typeof v==="boolean";
 let oppOff=stored("oppOff",[],strs),oppMakers=stored("oppMakers",true,isBool),oppTakers=stored("oppTakers",true,isBool),oppPoints=stored("oppPoints",true,isBool);  // the strip on top: sections left out, which sides, makers only where points are earned
 try{if(localStorage.getItem("oppTaker")==="true"){oppMakers=false;keep("oppMakers",false)}localStorage.removeItem("oppTaker")}catch(e){}  // the old "只列吃单" switch carries over, once
@@ -6832,12 +6858,12 @@ function chipDetail(e,ctx){  // everything behind one edge chip, readable on a p
   const counted=!(e.maker&&ctx.makers===false),ok=counted&&e.edge>ctx.need;
   if(!counted)line($("span","warn",ctx.maker_note||"这类档位的挂单不算建议：挂的价位往往只是对面一张远离行情的挂单，基本不会成交"));
   line("净优势 "+sg(e.edge)+" · 建议门槛 "+cent(ctx.need)+(ctx.swing&&ctx.swing>=ctx.need-1e-9?"（模型误差）":"（最低净优势）")+" → ",$("b",ok?"ok":"no",ok?"满足":counted?"不满足":"不计入"));
-  if(ok)line("高亮门槛 "+hotCents+"¢ → "+(e.edge>=HOT?"标红框":"不标红框"));
+  const hb=ctx.hot??HOT;if(ok)line("高亮门槛 "+Math.round(hb*100)+"¢ → "+(e.edge>=hb?"标红框":"不标红框"));
   if(ctx.stale)line($("span","warn","盘口过期：不给建议"));else if(ctx.hold)line($("span","warn","暂不建议："+ctx.hold));
   return d}
 function chips(key,v,ctx){  // the four edge chips; tap one for its details (kept open across the 10-second refresh)
   const box=$("div","edgebox"),g=$("div","edges"),sel=openChip[key];
-  v.edges.forEach(e=>{const x=$("button","edge"+(e===v.best?" best":"")+(e===v.best&&e.edge>=HOT?" hot":"")+(v.pool.includes(e)&&e.edge>ctx.need?" pos":"")+(sel===e.label?" sel":""));
+  v.edges.forEach(e=>{const x=$("button","edge"+(e===v.best?" best":"")+(e===v.best&&e.edge>=(ctx.hot??HOT)?" hot":"")+(v.pool.includes(e)&&e.edge>ctx.need?" pos":"")+(sel===e.label?" sel":""));
     x.type="button";x.title="点开看明细";x.setAttribute("aria-expanded",sel===e.label?"true":"false");
     const el=$("span","el",e.label+" ");el.append($("i","",(e.price*100).toFixed(1)));x.append(el,$("b","",sg(e.edge)));
     if(e.short)x.append($("span","short","深度不足"));
@@ -6881,7 +6907,7 @@ function book(p,key){
   const pp=pointsPill(p);if(pp)q.append(pp);  // the market's points, after the quotes (a narrow card wraps it, not the quotes)
   if(p.error)w.append($("div","warn small",(has?"刷新失败，显示上次盘口：":"")+p.error));
   const v=bookView(p);
-  if(v.edges.length){w.append(chips(key,v,ctxOf(p)));if(p.stale)w.append($("div","warn small","盘口过期，不给建议"))}  // framed = suggested, grey = not big enough
+  if(v.edges.length){w.append(chips(key,v,{...ctxOf(p),hot:hotByCard[key]??HOT}));if(p.stale)w.append($("div","warn small","盘口过期，不给建议"))}  // framed = suggested, grey = not big enough
   return w}
 function upColor(){return style==="us"?"var(--down)":"var(--up)"}function downColor(){return style==="us"?"var(--up)":"var(--down)"}
 function simCard(c,it){
@@ -6971,7 +6997,7 @@ function priceLadderBook(c,it,L,live){
   if(it.predict&&it.predict.error)h.append($("span","warn qe",it.predict.error));
   w.append(h);const views=new Map(live.map(r=>[r,bookView(r)]));let hot=null,hotTk=null,hotMk=null;
   // Compute opportunities from every level, including those folded out of the compact table: the best maker and the best taker.
-  for(const r of live){const v=views.get(r);for(const e of v.ok){if(e.edge>=HOT){if(!hot||e.edge>hot.edge)hot={...e,row:r.label};
+  for(const r of live){const v=views.get(r),bar=hotFor(it,r.label);for(const e of v.ok){if(e.edge>=bar){if(!hot||e.edge>hot.edge)hot={...e,row:r.label};
     if(e.maker){if(!hotMk||e.edge>hotMk.edge)hotMk={...e,row:r.label,points:r.points_ok===true}}else if(!hotTk||e.edge>hotTk.edge)hotTk={...e,row:r.label}}}}
   if(live.length){
     // the compact view: every level whose quote earns points now or that has a suggestion, the two around the price, then the nearest up to five
@@ -7003,11 +7029,11 @@ function priceLadderBook(c,it,L,live){
         const bar=r.need!=null?"未过建议门槛 "+cent(r.need)+"（"+(r.swing!=null&&r.swing>=r.need-1e-9&&r.swing>0?"σ ×/÷1.25 的模型误差":"最低净优势")+"）":"未过建议门槛";
         a.title=e.label+" @ "+cent(e.price)+"；净优势 "+sg(e.edge)+(maker?"，挂单排队，成交不保证":"，约 "+qty(e.size)+" 份；已扣手续费与滑点")+(r.error?"；"+r.error:r.hold?"；"+r.hold:r.stale?"；盘口过期":!ok?"；"+bar:"");return a};
       g.append(target,model,action(true),action(false));
-      if(openChip[rk]){const d=$("div","lrow");d.append(rowNote(r,L));if(v.edges.length)d.append(chips(rk+"/",v,ctxOf(r)));g.append(d)}});
+      if(openChip[rk]){const d=$("div","lrow");d.append(rowNote(r,L,it));if(v.edges.length)d.append(chips(rk+"/",v,{...ctxOf(r),hot:hotFor(it,r.label)}));g.append(d)}});
     if(!marked&&L.spot!=null)g.append(spot());w.append(g)
   }else if(!L.waiting)w.append($("div","price-empty","暂无待触及的档位"));
   c.append(w);const ag=ages(it);if(ag)c.append(ag);
-  if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" "+sg(hot.edge);
+  if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCentsFor(it,hot.row)+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" "+sg(hot.edge);
     const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);
     hots.push({key,name:it.name,group:it.group||"levels",url:it.predict&&it.predict.url||"",maker:hotMk?{text:text(hotMk),edge:hotMk.edge,points:hotMk.points}:null,taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
   return c}
@@ -7033,7 +7059,7 @@ function drawOpps(){  // every red-framed suggestion on the page in one strip on
     if(list.length>6)row.append($("span","mut","还有 "+(list.length-6)+" 个"));el.append(row)};
   group("挂单",makers,"挂单机会：排队等成交，不保证成交"+(oppPoints?"；只列现在挂单能拿积分的市场":""));
   group("吃单",takers,"吃单机会：立即成交，已扣手续费与滑点")}
-function rowNote(r,L){  // one line about a ladder level itself, above its four directions: on a phone nothing hovers
+function rowNote(r,L,it){  // one line about a ladder level itself, above its four directions: on a phone nothing hovers
   const d=$("div","lnote"),parts=[];
   if(r.dist!=null)parts.push((L.kind==="price"?"现价还要"+(r.dist>=0?"涨 ":"跌 "):L.metric+"还要涨 ")+(Math.abs(r.dist)*100).toFixed(1)+"% 才碰到");
   if(L.kind==="price"&&r.dist!=null&&Math.abs(r.dist)<0.02&&L.range_word)parts.push("离档位很近，差几分钱的触及以 Predict 为准");
@@ -7047,17 +7073,19 @@ function rowNote(r,L){  // one line about a ladder level itself, above its four 
   if(r.dir_note)d.append($("span","warn",r.dir_note));
   if(r.hold&&!r.error&&r.hold!==r.dir_note)d.append($("span","warn","暂不建议："+r.hold));
   else if(r.stale&&!r.error)d.append($("span","warn","盘口过期：不给建议"));
+  if(it&&!r.touched){const hs=$("div","hotrow");hs.append(hotInput("row:"+favKey(it)+"#"+r.label,hotCentsFor(it),"这一档的红框门槛（空 = 跟随这张卡 / 栏目 / 全局）"),$("span","mut","这一档"));d.append(hs)}
   return d}
 function card(it,g){
   const c=$("div","card"+(it.missing?" missing":"")),head=$("div","head"),nm=$("div","name",it.name);
   nm.title=it.symbol||it.name;const fk=favKey(it),on=favs.includes(fk),st=$("button","star"+(on?" on":""),on?"★":"☆");
-  c.dataset.key=fk;
+  c.dataset.key=fk;hotByCard[fk]=hotFor(it);
   st.type="button";st.title=on?"取消收藏":"收藏（排到最前）";st.setAttribute("aria-label",st.title);st.addEventListener("click",e=>{e.preventDefault();toggleFav(fk)});
   const grip=$("button","grip","⠿");grip.type="button";grip.title="按住拖动，调整顺序";grip.setAttribute("aria-label","拖动排序");
   grip.addEventListener("pointerdown",e=>startDrag(e,c,g));
   if(editing){  // 自定义: every card can move (drag, ◀ ▶) and be hidden or shown again
     const bar=$("div","ctl"),off=hidden.includes(fk),keys=keysOrder(g),i=keys.indexOf(fk);
-    bar.append(grip,ctlBtn("◀","前移",()=>nudge(g,fk,-1),i<=0),ctlBtn("▶","后移",()=>nudge(g,fk,1),i<0||i>=keys.length-1),$("span","sp"),
+    bar.append(grip,ctlBtn("◀","前移",()=>nudge(g,fk,-1),i<=0),ctlBtn("▶","后移",()=>nudge(g,fk,1),i<0||i>=keys.length-1),
+      hotInput("card:"+fk,hotMap["sec:"+(it.group||"contract")]??hotCents,"这张卡的红框门槛（空 = 跟随栏目 / 全局）"),$("span","sp"),
       ctlBtn(off?"显示":"隐藏",off?"恢复显示这张卡":"隐藏这张卡（在自定义里可恢复）",()=>toggleHidden(fk)));
     c.append(bar);if(off)c.classList.add("off")}
   const tg=$("div","tags");head.append(...(g==="fav"&&!editing?[grip]:[]),st,nm,tg);  // tags wrap under the full name when the card is narrow
@@ -7072,11 +7100,11 @@ function card(it,g){
   c.append(head);
   if(it.kind==="sim")return simCard(c,it);
   if(it.kind==="ladder")return ladder(c,it);
-  const v=view(it),best=v.best;  // for the trade size picked in the bar
-  if(best&&best.edge>=HOT){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge);
+  const v=view(it),best=v.best,hb=hotFor(it);  // for the trade size picked in the bar; hb = the red-frame bar of this card
+  if(best&&best.edge>=hb){c.classList.add("hot");c.title="净优势 ≥"+hotCentsFor(it)+"¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge);
     const by=(a,b)=>b.edge-a.edge,mk=v.ok.filter(e=>e.maker).sort(by)[0],tk=v.ok.filter(e=>!e.maker).sort(by)[0],text=e=>e.label+" "+(e.price*100).toFixed(1);
-    hots.push({key:fk,name:it.name,group:it.group||"contract",url:it.predict&&it.predict.url||"",maker:mk&&mk.edge>=HOT?{text:text(mk),edge:mk.edge,points:!!(it.predict&&it.predict.points_ok===true)}:null,
-               taker:tk&&tk.edge>=HOT?{text:text(tk),edge:tk.edge}:null})}
+    hots.push({key:fk,name:it.name,group:it.group||"contract",url:it.predict&&it.predict.url||"",maker:mk&&mk.edge>=hb?{text:text(mk),edge:mk.edge,points:!!(it.predict&&it.predict.points_ok===true)}:null,
+               taker:tk&&tk.edge>=hb?{text:text(tk),edge:tk.edge}:null})}
   if(it.missing){c.append($("p","","概率暂缺："+it.missing));tail(c,it);return c}
   const o=$("div","odds"),a=$("b",style==="us"?"d":"u"),b=$("b",style==="us"?"u":"d");
   const lb=it.labels||["涨","跌"];a.append($("span","lbl",lb[0]),pct(it.fair_up)+"¢");b.append(pct(it.fair_down)+"¢",$("span","lbl",lb[1]));
@@ -7142,7 +7170,7 @@ function scrollMarks(){  // where each card's table (.pg, scrolling inside a wid
   return new Map([...document.querySelectorAll(".card .pg")].filter(e=>e.scrollTop>0).map(e=>[e.closest(".card").dataset.key,e.scrollTop]))}
 function restoreScroll(marks){if(marks.size)document.querySelectorAll(".card .pg").forEach(e=>{const t=marks.get(e.closest(".card").dataset.key);if(t)e.scrollTop=t})}
 function render(d){
-  if(drag){pending=d;return}  // never rebuild the cards under a drag; the latest data is drawn when it ends
+  if(drag||hotTyping()){pending=d;return}  // never rebuild the cards under a drag or while a ¢ box is being typed in; the latest data is drawn when that ends
   const marks=scrollMarks();drawBar();hots=[];
   const flat=!editing&&(filt.length>0||sortBy!=="");document.body.classList.toggle("flatview",flat);
   const fh=document.getElementById("h-flat"),fg=document.getElementById("g-flat");fh.hidden=fg.hidden=!flat;
@@ -7180,13 +7208,15 @@ function render(d){
     if(!editing&&SEC_SORTS[g]&&items.length>1){  // the ladder sections: a sort of their own (the filter bar's sort flattens the page instead)
       const l=$("label","fsort secsort"),s=$("select");l.append("排序 ",s);SEC_SORTS[g].forEach(([v,t])=>{const o=$("option","",t);o.value=v;s.append(o)});s.value=secSort[g]||"";
       s.title="这一栏卡片的排列顺序（只影响本浏览器；默认顺序 = 自定义里拖出来的顺序）";l.addEventListener("click",e=>e.stopPropagation());
-      s.addEventListener("change",()=>{secSort={...secSort,[g]:s.value};keep("secsort",secSort);if(last)render(last)});h.append(l)}}
+      s.addEventListener("change",()=>{secSort={...secSort,[g]:s.value};keep("secsort",secSort);if(last)render(last)});h.append(l)}
+    if(editing&&g!=="fav"&&g!=="sim")h.append(hotInput("sec:"+g,hotCents,"这一栏的红框门槛（空 = 全局）"))}  // 自定义: the section's own bar
   const now=[...document.querySelectorAll(".wrap>.grid")].map(e=>e.id.slice(2)).filter(g=>g!=="fav");
   if(now.join()!==secOrder.join())for(const g of secOrder)foot.before(document.getElementById("h-"+g),document.getElementById("g-"+g));
   restoreScroll(marks);drawOpps();tick()}
 function drawLegend(){
   const lg=document.getElementById("legend");const sw=$("span","sw");[["涨",upColor()],["平","var(--flat)"],["跌",downColor()]].forEach(([t,col])=>{const i=$("i");i.style.background=col;sw.append(i,t)});
-  const hot=$("span","sw hot");hot.append($("i"),"红框 = 净优势 ≥"+hotCents+"¢（高亮门槛）");hot.title="可在 ✎ 自定义 里修改；和建议门槛不是一回事：没超过建议门槛的方向不会被建议";
+  const own=Object.keys(hotMap).length,hot=$("span","sw hot");hot.append($("i"),"红框 = 净优势 ≥"+hotCents+"¢（高亮门槛"+(own?"，另有 "+own+" 处单独设置":"")+"）");
+  hot.title="可在 ✎ 自定义 里修改，栏目、卡片、档位还能各设各的；和建议门槛不是一回事：没超过建议门槛的方向不会被建议";
   const rule=$("span","","¢ 公平价 · 净优势 = 公平价 − 成交价 − 费用");rule.title="挂涨@买1 · 挂跌@1−卖1 · 吃涨@卖1 · 吃跌@1−买1；吃单另扣手续费和按单笔金额吃到的深度；加框的是建议方向，灰色的优势不够大（要超过最低净优势和模型误差中较大的那个），不建议；平盘两边各半";
   lg.replaceChildren(sw,rule,hot)}
 function drawPanel(){
@@ -7232,8 +7262,8 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;folded=[];oneRow=[];secSort={};
-  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","folded","oneRow","secsort"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
+  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;folded=[];oneRow=[];secSort={};hotMap={};
+  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","folded","oneRow","secsort","hotmap"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 let loading=null,lastSig="",dead=false;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
 const LOAD_TIMEOUT_MS=8000;
@@ -7902,6 +7932,8 @@ COMMANDS: tuple[Command, ...] = (
     Command("resume", "恢复当前订阅"),
     Command("prob", "查看各标的下个收盘涨跌概率及计算过程"),
     Command("book", "对比 Predict 订单簿和模型公平价，看挂涨还是挂跌优势大"),
+    Command("edge", "优势提醒门槛：按栏目 / 市场 / 档位单独设置几¢才提醒", "牛来 4",
+            "不带参数查看；/edge 6 改默认；/edge 市值阶梯 6、/edge 牛来 4、/edge 牛来 300M 3；末尾 off 取消；/edge 清空"),
     Command("web", "获取概率网页链接（自动刷新）"),
     Command("calib", "用已保存的预测快照和实际收盘给概率模型打分（Brier/校准/逐日向前拟合）"),
     Command("sim", "模拟交易：净优势 ≥10¢ 时买 100 份，看长期是赚还是亏（只记账，不下单）"),
@@ -8167,7 +8199,7 @@ class Bot:
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
             "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/calib": self.cmd_calib,
-            "/book": self.cmd_book, "/sim": self.cmd_sim,
+            "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge,
         }
 
     def settings(self) -> dict:
@@ -10524,9 +10556,11 @@ class Bot:
         state = self.store.get("edgealerts", {})
         state = state if isinstance(state, dict) else {}
         before = json.dumps(state, sort_keys=True)
-        costs, bar = self.edge_costs(), self.config.edge_alert_edge
+        costs = self.edge_costs()
+        bars, _ = self.edge_bars()  # read once a round, not once a market
         observed_makers = set()
         for mk in self.sim_markets(now_ms):
+            bar = self.edge_bar(mk, bars)  # the level's, market's or section's own bar (/edge), else EDGE_ALERT_CENTS
             self.edge_observe(state, mk.market, mk, costs, bar, now_ms)
             if mk.kind == "range":
                 # Its own state keeps a same-side taker alert from hiding a new maker opportunity (and vice versa).
@@ -10575,7 +10609,7 @@ class Bot:
             kind, side = change.split(":")
             st["note"] = self.edge_note(mk, sides[st["told"]], now_ms) if st["told"] else None
             st["alert"] = {"seq": st["seq"], "at": now_ms,
-                           "text": self.edge_alert_text(kind, side, mk, edges, sides, best, note, maker_only)}
+                           "text": self.edge_alert_text(kind, side, mk, edges, sides, best, note, maker_only, bar)}
             if maker_only:
                 st["alert"].update(kind=kind, maker_only=True, market=mk.market, side=side, note=note)
         if st.get("told") or st.get("pending") or st.get("alert") or any(now_ms - t < DAY_MS for t in st.get("last", {}).values()):
@@ -10595,7 +10629,7 @@ class Bot:
                         and e.edge > mk.need), None)
         if alert.get("kind") == "gone":
             return current is None
-        return current is not None and (alert.get("kind") != "appear" or current.edge >= self.config.edge_alert_edge - 1e-9)
+        return current is not None and (alert.get("kind") != "appear" or current.edge >= self.edge_bar(mk) - 1e-9)
 
     def edge_maker_text(self, alert: dict, now_ms: int) -> str:
         """Rebuild a confirmed maker announcement from today's quote, retaining its event and previous note."""
@@ -10618,8 +10652,10 @@ class Bot:
                 "edge": edge.edge, "at": now_ms}
 
     def edge_alert_text(self, kind: str, side: str, mk: SimMarket, edges: list[BookEdge], sides: dict, best: BookEdge | None,
-                        note: dict | None, maker_only: bool = False) -> str:
+                        note: dict | None, maker_only: bool = False, bar: float | None = None) -> str:
         """新机会 (side: the suggested one), 方向反转 (side: the one suggested now) or 建议失效 (side: the one announced)."""
+        default = self.edge_default()
+        bar = default if bar is None else bar
         name = mk.item + (f"（{mk.settle['target'][5:]}）" if mk.kind == "close" and mk.settle.get("target") else "")
         label = lambda e: ("挂" if e.maker else "吃") + mk.sides[0 if e.side == "涨" else 1]
         fair = lambda e: mk.fair_up if e.side == "涨" else 1 - mk.fair_up
@@ -10629,12 +10665,13 @@ class Bot:
                 if note else "")
         check = "⚠️ 如果按之前的提醒挂了单，请检查是否撤单或改价"
         if kind == "appear":
-            more = [e for e in edges if e is not best and e.edge > mk.need and e.edge >= self.config.edge_alert_edge - 1e-9]
+            more = [e for e in edges if e is not best and e.edge > mk.need and e.edge >= bar - 1e-9]
             lines = [f"🟢 {bold('新机会')}｜{name}", offer(best),
                      "挂单：排队等成交，不保证成交" if best.maker
                      else f"吃单：按 ${self.config.predict_trade_usd:g} 计，已扣手续费和盘口深度",
                      "积分已激活；优势仅按模型与挂单价计算，不含积分收益" if maker_only else "",
-                     ("也可以：" + "；".join(f"{label(e)} @ {cents(e.price)} {cents(e.edge, True)}" for e in more)) if more else ""]
+                     ("也可以：" + "；".join(f"{label(e)} @ {cents(e.price)} {cents(e.edge, True)}" for e in more)) if more else "",
+                     f"（这个市场的提醒门槛 {cents(bar)}，/edge 设置）" if abs(bar - default) > 1e-9 else ""]
         elif kind == "flip":
             lines = [f"🔄 {bold('方向反转')}｜{name}", told, "现在建议另一边：" + offer(sides[side]), check]
         else:
@@ -10787,6 +10824,143 @@ class Bot:
 
     def edge_costs(self) -> EdgeCosts:
         return EdgeCosts(self.config.predict_fee_bps, self.config.predict_trade_usd)
+
+    # --- /edge: the announcement bar per section, market or level -------------------------------------------------------
+
+    EDGE_GROUPS = {"index": "指数", "contract": "合约标的", "crypto": "加密", "levels": "价格阶梯", "ladder": "市值阶梯"}
+    EDGE_GROUP_WORDS = {"指数": "index", "index": "index", "合约": "contract", "合约标的": "contract", "个股": "contract",
+                        "contract": "contract", "加密": "crypto", "crypto": "crypto", "价格阶梯": "levels", "levels": "levels",
+                        "range": "levels", "市值阶梯": "ladder", "ladder": "ladder", "cap": "ladder"}
+    EDGE_ALIASES = {"恒指": "HSI", "恒生": "HSI", "恒生指数": "HSI", "上证": "SSE", "沪指": "SSE", "上证指数": "SSE", "韩国": "KOSPI"}
+
+    def edge_group(self, mk: SimMarket) -> str:
+        """The web page's section (the big heading) a market's card sits in."""
+        if mk.kind == "close":
+            return "index" if mk.key in PREDICT_KEYS.values() else "contract"
+        return {"range": "levels", "ladder": "ladder"}.get(mk.kind, "crypto")
+
+    @staticmethod
+    def edge_level(mk: SimMarket) -> str:
+        """A ladder level as the user would type it ("300m", "120k"), "" for a market without levels."""
+        return edge_level_norm(mk.item.rsplit(" ", 1)[-1]) if mk.kind in {"range", "ladder"} else ""
+
+    def edge_bars(self) -> tuple[dict[str, float], dict[str, str]]:
+        """({bar key: cents}, {bar key: shown name}) as set with /edge (persisted in the settings)."""
+        settings = self.settings()
+        bars, names = settings.get("edge_bars") or {}, settings.get("edge_names") or {}
+        bars = {k: float(v) for k, v in bars.items() if isinstance(v, (int, float))} if isinstance(bars, dict) else {}
+        return bars, (names if isinstance(names, dict) else {})
+
+    def edge_default(self, bars: dict[str, float] | None = None) -> float:
+        """The default announcement bar (per $1 share): /edge's, else EDGE_ALERT_CENTS."""
+        bars = self.edge_bars()[0] if bars is None else bars
+        return bars["default"] / 100 if "default" in bars else self.config.edge_alert_edge
+
+    def edge_bar(self, mk: SimMarket, bars: dict[str, float] | None = None) -> float:
+        """The net edge (per $1 share) a suggestion on this market must reach to be announced: the level's own bar, else
+        the market's, else its section's, else the default (/edge; EDGE_ALERT_CENTS at first)."""
+        bars = self.edge_bars()[0] if bars is None else bars
+        level = self.edge_level(mk)
+        for key in (f"level:{mk.key}|{level}" if level else "", f"key:{mk.key}", f"group:{self.edge_group(mk)}", "default"):
+            if key and key in bars:
+                return bars[key] / 100
+        return self.config.edge_alert_edge
+
+    def edge_markets(self) -> list[tuple[str, str]]:
+        """(key, card name) of every market the bars can be set for."""
+        out = [(key, title) for key, title, _ in PREDICT_ITEMS]
+        out += [(symbol, NAMES.get(symbol, symbol)) for symbol in self.config.symbols]
+        for table in (self.touches, self.updowns, self.flips, self.caps, self.ranges):
+            out += [(key, getattr(mkt.spec, "name", key)) for key, mkt in table.items()]
+        return out
+
+    def edge_target(self, words: list[str]) -> tuple[str, str]:
+        """The bar an /edge command addresses, from its words: nothing = the default; a section; a market (its key, an
+        alias, or part of its card's name), optionally followed by one of its levels. Returns (bar key, shown name)."""
+        if not words:
+            return "default", "默认"
+        text = " ".join(words)
+        if text.lower() in {"默认", "default", "全局"}:
+            return "default", "默认"
+        group = self.EDGE_GROUP_WORDS.get(text.lower())
+        if group:
+            return f"group:{group}", self.EDGE_GROUPS[group]
+        plain = lambda s: s.replace("$", "").replace("＄", "").lower()
+        markets = self.edge_markets()
+        for n in range(len(words), 0, -1):
+            head, rest = " ".join(words[:n]), words[n:]
+            want = plain(head)
+            alias = ALIASES.get(head.upper()) or self.EDGE_ALIASES.get(head)
+            exact = [(k, name) for k, name in markets if k.lower() == want or (alias and k == alias) or plain(name) == want]
+            found = exact or [(k, name) for k, name in markets if want and want in plain(name)]
+            if len({k for k, _ in found}) > 1:
+                raise ValueError(f"「{head}」对应不止一个市场：" + "、".join(dict(found).values()) + "；请写全名或代码")
+            if found:
+                key, name = found[0]
+                if rest:
+                    level = edge_level_norm(" ".join(rest))
+                    if not re.fullmatch(r"\d+(\.\d+)?[kmb]?", level):
+                        raise ValueError(f"档位「{' '.join(rest)}」看不懂；写成 300M、1B、120k 这样")
+                    return f"level:{key}|{level}", f"{name} {' '.join(rest)}"
+                return f"key:{key}", name
+        raise ValueError(f"找不到市场或栏目「{text}」。栏目：{'、'.join(self.EDGE_GROUPS.values())}；市场：" +
+                         "、".join(f"{name}（{k}）" for k, name in markets[:12]) + ("…" if len(markets) > 12 else ""))
+
+    def edge_text(self) -> str:
+        bars, names = self.edge_bars()
+        default = bars.get("default", self.config.edge_alert_edge * 100)
+        lines = [f"🔔 优势提醒门槛：默认 ≥{default:g}¢（持续 {self.config.edge_alert_confirm} 秒才提醒）"]
+        order = {"group": 0, "key": 1, "level": 2}
+        extra = sorted((k for k in bars if k != "default"), key=lambda k: (order.get(k.partition(':')[0], 9), k))
+        if extra:
+            lines.append("单独设置（档位 > 市场 > 栏目 > 默认）：")
+            lines += [f"· {names.get(k, k)}：≥{bars[k]:g}¢" for k in extra]
+        else:
+            lines.append("没有单独设置的栏目、市场或档位。")
+        lines.append("用法：/edge 6 改默认；/edge 市值阶梯 6（栏目：指数 / 合约标的 / 加密 / 价格阶梯 / 市值阶梯）；"
+                     "/edge 牛来 4（市场：名字、别名或代码）；/edge 牛来 300M 3（档位）；末尾写 off 取消；/edge 清空 全部取消。"
+                     "网页红框的门槛另在网页 ✎ 自定义里设置。")
+        return "\n".join(lines)
+
+    def edge_status_line(self) -> str:
+        bars, names = self.edge_bars()
+        line = (f"🔔 优势提醒：Predict 建议净优势 ≥{bars.get('default', self.config.edge_alert_edge * 100):g}¢ 持续 "
+                f"{self.config.edge_alert_confirm} 秒提醒；提醒过的建议失效或反转也会提醒")
+        extra = [k for k in bars if k != "default"]
+        if extra:
+            line += "｜单独门槛：" + "、".join(f"{names.get(k, k)} {bars[k]:g}¢" for k in extra[:6]) + ("…" if len(extra) > 6 else "")
+        return line + "｜/edge 调整"
+
+    def cmd_edge(self, req: Request) -> str:
+        """/edge: show or set the announcement bar per section, market or level."""
+        args = list(req.args)
+        if not args:
+            return self.edge_text()
+        bars, names = self.edge_bars()
+        if len(args) == 1 and args[0].lower() in {"清空", "clear", "全部取消"}:
+            self.update_settings(edge_bars={}, edge_names={})
+            return "✅ 已取消全部单独门槛，都按默认。\n" + self.edge_text()
+        value = args[-1].rstrip("¢c￠")
+        off = value.lower() in {"off", "关", "关闭", "取消", "删除", "reset"}
+        if not off:
+            try:
+                cents = float(value)
+            except ValueError:
+                raise ValueError("用法：/edge 6（默认）、/edge 市值阶梯 6、/edge 牛来 4、/edge 牛来 300M 3、/edge 牛来 off；"
+                                 "单位 ¢，0.5～50") from None
+            if not 0.5 <= cents <= 50:
+                raise ValueError("门槛范围 0.5～50¢")
+        key, name = self.edge_target(args[:-1])
+        if off:
+            if key not in bars:
+                return f"ℹ️ {name} 没有单独的门槛，无需取消。\n" + self.edge_text()
+            bars.pop(key, None); names.pop(key, None)
+            self.update_settings(edge_bars=bars, edge_names=names)
+            return f"✅ 已取消 {name} 的单独门槛。\n" + self.edge_text()
+        bars[key] = round(cents, 2); names[key] = name
+        self.update_settings(edge_bars=bars, edge_names=names)
+        what = "默认门槛" if key == "default" else f"{name} 的提醒门槛"
+        return f"✅ {what}改为 ≥{cents:g}¢（下一轮生效；已提醒过的建议不重发）。\n" + self.edge_text()
 
     def edge_need(self, swing: float = 0.0) -> float:
         """The net edge a suggestion must clear: the configured minimum, or the model's own error when that is larger."""
@@ -10978,8 +11152,7 @@ class Bot:
         if self.settings()["mode"] == "binance_daily" and self.config.tickers:
             lines.append("💡 /mode exchange 可把基准对齐到交易所收盘时刻")
         if self.config.edge_alert and self.config.predict:
-            lines.append(f"🔔 优势提醒：Predict 建议净优势 ≥{self.config.edge_alert_edge * 100:g}¢ 持续 "
-                         f"{self.config.edge_alert_confirm} 秒提醒；提醒过的建议失效或反转也会提醒")
+            lines.append(self.edge_status_line())
         if self.config.hsi_futures:
             lines.append(self.hsi.line(now_ms, style))
             lines.append(self.odds_row(self.hsi_odds(now_ms), "恒指"))

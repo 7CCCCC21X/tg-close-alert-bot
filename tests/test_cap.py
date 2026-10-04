@@ -532,6 +532,7 @@ async def browser_check():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         page = await browser.new_page(viewport={"width": 390, "height": 900})
+        errs = []; page.on("pageerror", lambda e: errs.append(str(e)))  # a script error anywhere on the page fails the check at the end
         await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
         await page.wait_for_selector("#g-ladder .pg")
         assert "⚠️ 窗口内有 2 段没有采样，共 1.5 小时" in await page.inner_text("#g-ladder .lstat")  # the unobserved stretches, on the card
@@ -550,6 +551,40 @@ async def browser_check():
         assert cells[0][2] == "挂No @ 63.8¢；净优势 +5.8¢，挂单排队，成交不保证；未过建议门槛 6.7¢（σ ×/÷1.25 的模型误差）", cells[0][2]
         assert cells[8][2].endswith("；σ 是先验值，只作参考"), cells[8][2]
         assert "低于门槛" in await page.inner_text("#g-ladder") and "6.7¢" not in await page.inner_text("#g-ladder .pg")  # the bar itself only in the tooltip / note
+        # the red-frame bar can be this card's own (hotmap, per browser): 2¢ makes the $1B 挂No +2.2¢ a red frame and a strip entry
+        await page.evaluate("localStorage.setItem('hotmap', JSON.stringify({'card:NIULAI': 2}))")
+        await page.reload(); await page.wait_for_selector("#g-ladder .pg")
+        strip = await page.inner_text("#opps")  # one card, listed on both rows: the $1B maker and taker
+        assert await page.locator("#g-ladder .card.hot").count() == 1 and strip.startswith("🔥 机会 2") and "$1B 挂No 97.4" in strip and "$1B 吃No 97.5" in strip, strip
+        assert "另有 1 处单独设置" in await page.inner_text("#legend")
+        # a level's own bar wins over the card's: 3¢ on $1B puts it back under; the box shows the inherited 2 as its placeholder
+        await page.click("#g-ladder .pg .lt:text-is('$1B')")
+        hotrow = page.locator("#g-ladder .lrow .hotrow input")
+        assert await hotrow.get_attribute("placeholder") == "2"
+        await hotrow.fill("3"); await hotrow.dispatch_event("change"); await page.wait_for_timeout(200)
+        assert await page.locator("#g-ladder .card.hot").count() == 0 and await page.evaluate("JSON.parse(localStorage.getItem('hotmap'))") == {"card:NIULAI": 2, "row:NIULAI#$1B": 3}
+        await page.click("#g-ladder .pg .lt:text-is('$1B')")  # close the row again
+        await page.evaluate("localStorage.removeItem('hotmap')"); await page.reload(); await page.wait_for_selector("#g-ladder .pg")
+        assert await page.locator("#g-ladder .card.hot").count() == 0
+        # 自定义: the section title and every card's edit bar carry a ¢ box of their own (栏目 < 卡 < 档位); an empty box inherits,
+        # and shows what it inherits as its placeholder
+        hotmap = lambda: page.evaluate("JSON.parse(localStorage.getItem('hotmap') || '{}')")
+        set_box = lambda sel, v: page.locator(sel).fill(v)
+        await page.click("#edit")
+        sec, crd = "#h-ladder .hotset input", "#g-ladder .card .ctl .hotset input"
+        assert await page.get_attribute(sec, "placeholder") == "10" and await page.input_value(sec) == ""  # the global 10¢
+        await set_box(sec, "2"); await page.dispatch_event(sec, "change"); await page.wait_for_timeout(200)
+        assert await hotmap() == {"sec:ladder": 2} and await page.get_attribute(crd, "placeholder") == "2"  # the card inherits the section's
+        await set_box(crd, "4"); await page.dispatch_event(crd, "change"); await page.wait_for_timeout(200)
+        assert await hotmap() == {"sec:ladder": 2, "card:NIULAI": 4}
+        await page.click("#done")
+        assert await page.locator("#g-ladder .card.hot").count() == 0 and "另有 2 处单独设置" in await page.inner_text("#legend")  # 4¢ > 2.2¢
+        await page.click("#edit"); await set_box(crd, ""); await page.dispatch_event(crd, "change"); await page.wait_for_timeout(200)
+        assert await hotmap() == {"sec:ladder": 2}
+        await page.click("#done")
+        assert await page.locator("#g-ladder .card.hot").count() == 1  # the section's 2¢ again
+        await page.evaluate("localStorage.removeItem('hotmap')"); await page.reload(); await page.wait_for_selector("#g-ladder .pg")
+        assert await page.locator("#g-ladder .card.hot").count() == 0 and "另有" not in await page.inner_text("#legend")
         # points on a cap-ladder level: ● with the rate when a quote would earn, a faint ○ when not, nothing while unknown
         assert await page.locator("#g-ladder .pg .ptarget .ppoints").evaluate_all("els => els.map(e => [e.className, e.textContent, e.title])") == \
             [["ppoints active", "● 50 PP/h", "积分可得：这个市场的挂单每小时发 50 PP（价差不超过 6.0¢、至少 100 份）"], ["ppoints off", "○", "积分未激活"]]
@@ -636,6 +671,7 @@ async def browser_check():
         await page.reload(); await page.wait_for_selector("#g-ladder .card")
         assert "等待 Predict 档位" in await page.inner_text("#g-ladder .lstat") and await page.locator("#g-ladder .pg").count() == 0
         assert "暂无待触及的档位" not in await page.inner_text("#g-ladder .card")
+        assert not errs, errs
         await browser.close()
     await web.stop()
 

@@ -207,6 +207,40 @@ async def run():
     assert SLUG not in store.get("edgealerts") and "pons#77" not in store.get("edgealerts")
     assert not list(store.items("edgesent:"))
 
+    # --- /edge: the bar per section, market or level (most specific wins), announced accordingly ------------------------
+    class AnyTelegram(FakeTelegram):
+        async def send(self, chat, thread, text, reply_markup=None, parse_mode=None):
+            self.sent.append((chat, re.sub(r"</?b>", "", text))); return True
+    acfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "ADMIN_USER_ID": "42", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
+    atg = AnyTelegram(); abot = m.Bot(acfg, m.Store(":memory:"), FM(NOW), atg)
+    abot.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
+    async def ask(text):
+        atg.sent.clear(); await abot.process_message({"text": text, "chat": {"id": 1}, "from": {"id": 42}, "date": time.time()}); return atg.sent[-1][1]
+    mk_hsi, mk_lad = hsi(0.40, [("0.45", "300")], [("0.48", "300")], NOW), lad
+    mk_unitree = m.dataclasses.replace(mk_hsi, market="uni", item="宇树 UNITREE", key="UNITREEUSDT")
+    assert abot.edge_group(mk_hsi) == "index" and abot.edge_group(mk_unitree) == "contract" and abot.edge_group(mk_lad) == "ladder"
+    assert abot.edge_level(mk_lad) == "300m" and abot.edge_level(mk_hsi) == ""
+    r = await ask("/edge"); assert r.startswith("🔔 优势提醒门槛：默认 ≥10¢") and "没有单独设置" in r, r
+    r = await ask("/edge 恒指 5"); assert r.startswith("✅ 恒生指数 的提醒门槛改为 ≥5¢") and abot.settings()["edge_bars"] == {"key:HSI": 5.0}, r
+    assert abs(abot.edge_bar(mk_hsi) - 0.05) < 1e-12 and abs(abot.edge_bar(mk_unitree) - 0.10) < 1e-12
+    r = await ask("/edge 市值阶梯 6"); assert "市值阶梯 的提醒门槛改为 ≥6¢" in r and abs(abot.edge_bar(mk_lad) - 0.06) < 1e-12, r
+    r = await ask("/edge 牛来 300M 3"); assert "$牛来 市值 300M 的提醒门槛改为 ≥3¢" in r and abs(abot.edge_bar(mk_lad) - 0.03) < 1e-12, r
+    other = m.dataclasses.replace(mk_lad, item="$牛来 市值 $500M"); assert abs(abot.edge_bar(other) - 0.06) < 1e-12  # the section's bar
+    r = await ask("/edge 7"); assert "默认门槛改为 ≥7¢" in r and abs(abot.edge_bar(mk_unitree) - 0.07) < 1e-12, r
+    assert abs(abot.edge_default() - 0.07) < 1e-12  # the alert text measures "its own bar" against this, not the env default
+    r = await ask("/edge 宇树 4.5¢"); assert abs(abot.edge_bar(mk_unitree) - 0.045) < 1e-12, r  # a symbol alias, the ¢ sign tolerated
+    r = await ask("/edge 牛来 300M off"); assert "已取消 $牛来 市值 300M 的单独门槛" in r and abs(abot.edge_bar(mk_lad) - 0.06) < 1e-12, r
+    r = await ask("/edge 牛来 off"); assert r.startswith("ℹ️ $牛来 市值 没有单独的门槛"), r
+    for bad in ("/edge 牛来 99", "/edge 不存在的市场 5", "/edge 牛来 abc 3", "/edge x"):
+        assert "❌" in await ask(bad), bad
+    assert "档位 > 市场 > 栏目 > 默认" in await ask("/edge") and "恒生指数：≥5¢" in await ask("/edge")
+    assert "单独门槛：恒生指数 5¢" in abot.status("1:0") and "/edge 调整" in abot.status("1:0")
+    # the HSI 挂跌 +8¢ that stayed under the 10¢ default is announced with the 5¢ bar, and says which bar applied
+    await step(abot, NOW, mk_hsi); await step(abot, NOW + MIN, hsi(0.40, [("0.45", "300")], [("0.48", "300")], NOW + MIN))
+    assert any(t.startswith("🟢 新机会｜恒生指数（10-05）\n挂跌 @ 52.0¢｜净优势 +8.0¢") and "提醒门槛 5.0¢" in t for _, t in atg.sent), atg.sent
+    r = await ask("/edge 清空"); assert "已取消全部单独门槛" in r and abot.settings()["edge_bars"] == {} and abs(abot.edge_bar(mk_hsi) - 0.10) < 1e-12
+    assert abs(abot.edge_default() - 0.10) < 1e-12
+
 
 asyncio.run(run())
 print("EDGEALERT_OK")
