@@ -401,7 +401,7 @@ async def run():
         print("browser check skipped (no Playwright/Chromium)")
     else:
         web.CACHE_SECONDS = {}  # the browser check changes the payload and reloads at once
-    await browser_check(async_playwright, chrome, port, token)
+        await browser_check(async_playwright, chrome, port, token)
     await web.stop()
     print("WEB_OK")
 asyncio.run(run())
