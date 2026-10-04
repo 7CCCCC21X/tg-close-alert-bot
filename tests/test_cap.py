@@ -38,6 +38,7 @@ for bad in ([], {"pairs": None}, [pair("0xother", "1", 1)]):
 pools = {"data": [{"attributes": {"address": "0xPOOLA", "reserve_in_usd": "1000"}},
                   {"attributes": {"address": "0xPOOLB", "reserve_in_usd": "250000.5"}}, {"attributes": {}}]}
 assert m.gecko_pool(pools) == "0xPOOLB"  # kept as given: Solana addresses are case-sensitive
+assert m.gecko_pool(pools, "0XPOOLA") == "0xPOOLA" and m.gecko_pool(pools, "0xnone") == "0xPOOLB"  # the rules' pair wins, spelt either way
 bars = {"data": {"attributes": {"ohlcv_list": [[7200, "1", "2", "0.5", "1.5", "9"], [3600, 1, 1.2, 0.9, 1.1, 3], ["x"]]}}}
 assert m.gecko_bars(bars) == [(3600, 1.0, 1.2, 0.9, 1.1), (7200, 1.0, 2.0, 0.5, 1.5)]
 assert m.gecko_bars({"data": {}}) == [] and m.gecko_bars(None) == []
@@ -407,6 +408,42 @@ async def run():
     assert mix.history["high"] == 0.5 and "through" not in mix.history
     await mix.scan(NOW)
     assert mix.history["high"] == 0.5 and mix.history["through"] == NOW_S - NOW_S % H, mix.history
+
+    # a short history first (the feed, or the pool it picked, served the last two hours only), the whole window later: the
+    # record notes where its bars begin, and a scan that meets older bars reads the window again, so the early high is in
+    short = m.CapMarket(m.Store(":memory:"), NIU); full_get, _ = world(peak_hour=FIRST_HOUR + 5 * H, peak_price=0.4)
+    async def short_get(url, payload=None):
+        data = await full_get(url, payload)
+        if "/ohlcv/hour" in url:
+            data["data"]["attributes"]["ohlcv_list"] = data["data"]["attributes"]["ohlcv_list"][:2]
+        return data
+    short.get = short_get
+    await short.scan(NOW)
+    assert short.history["high"] < 0.4 and short.history["bars_from"] == NOW_S - NOW_S % H - H and short.history["through"] == NOW_S - NOW_S % H, short.history
+    note = short.backfill_note(NOW)
+    assert note == f"K 线最早到 {m.stamp((NOW_S - NOW_S % H - H) * 1000, seconds=False)}，开窗到那时的 {(NOW_S - NOW_S % H - H - START_S) / H:.0f} 小时没有记录", note
+    short_item = bot.cap_payload(short, NOW)["ladder"]
+    assert short_item["coverage"] == note and short_item["pool"] == "0xPOOLB" and short_item["bars"] is True
+    assert short_item["pool_note"] == "最活跃的池子 0xPOOL…OOLB" and pons.pool_note() == ""  # NIULAI names no pair; STONK's lower-case pair is matched below
+    stonk = m.CapMarket(m.Store(":memory:"), STONK); stonk.pool = "AfrDdTgYwCvEqB1GxCaHr8i48O6QtXyQkSdVkELuDeHg"  # the rules' pair, spelt as GeckoTerminal does
+    assert stonk.pool_note() == "规则交易对的池子 AfrDdT…DeHg"
+    stonk.pool = "SomeOtherPool1111"; assert stonk.pool_note() == "最活跃的池子 SomeOt…1111（GeckoTerminal 没列出规则交易对）"
+    short.get = full_get
+    await short.scan(NOW)
+    assert short.history["high"] == 0.4 and short.history["bars_from"] == FIRST_HOUR - 800 * H and short.backfill_note(NOW) == "", short.history
+    assert bot.cap_payload(short, NOW)["ladder"]["coverage"] == ""
+    # a record from an older build (no "bars_from") is read from the opening once, so a high it missed is found
+    old = m.CapMarket(m.Store(":memory:"), NIU); old.get, _ = world(peak_hour=FIRST_HOUR + 5 * H, peak_price=0.4)
+    old.store.put(f"cap:{NIU.slug}", {"start": NIU.start_ms, "high": 0.1, "at": 0, "through": NOW_S - NOW_S % H, "first": "done"})
+    await old.scan(NOW)
+    assert old.history["high"] == 0.4 and old.history["bars_from"] == FIRST_HOUR - 800 * H, old.history
+    # not scanned yet: the note says so; read to the last finished hour: nothing to say; hours finished since: how many
+    fresh = m.CapMarket(m.Store(":memory:"), NIU)
+    assert fresh.backfill_note(NOW) == "历史 K 线尚未回填（启动后约 5 分钟内读取）" and fresh.backfill_note(NIU.start_ms - 1000) == ""
+    assert cap.backfill_note(NOW) == "" and cap.backfill_note(NOW + 2 * H * 1000) == ""  # within two scans of the hour's end: no complaint yet
+    later = NOW + (3 * H + 1200) * 1000
+    assert cap.backfill_note(later) == f"已核验到 {m.stamp(((NOW_S - NOW_S % H) + H) * 1000, seconds=False)}，之后 2 小时尚未读取", cap.backfill_note(later)
+    assert pons.backfill_note(NOW) == "" and bot.cap_payload(pons, NOW)["ladder"]["pool"] == ""  # no bars: the sampling gaps say it instead
 
 
 

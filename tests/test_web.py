@@ -247,6 +247,26 @@ async def browser_check(async_playwright, chrome, port, token):
         assert await page.evaluate(f"getComputedStyle({fb}).overflowX") == "visible" and await page.evaluate(f"{fb}.scrollWidth <= {fb}.clientWidth")
         await page.set_viewport_size({"width": 390, "height": 900})
         assert await page.inner_text("#h-index") == "指数" and await page.is_visible("#h-contract")
+        # the theme button: 自动 → 浅色 → 深色 → 自动, kept in this browser and applied before the first paint; the line under the
+        # bar counts down to the next refresh; the skeleton cards are gone; the back-to-top button shows once scrolled
+        html = "document.documentElement"
+        assert await page.inner_text("#theme") == "◐ 自动" and await page.evaluate(f"{html}.dataset.theme") is None
+        await page.click("#theme")
+        assert await page.inner_text("#theme") == "☀ 浅色" and await page.evaluate(f"{html}.dataset.theme") == "light"
+        await page.click("#theme")
+        assert await page.evaluate(f"{html}.dataset.theme") == "dark" and await page.evaluate("localStorage.getItem('theme')") == '"dark"'
+        assert await page.evaluate("getComputedStyle(document.body).backgroundColor") == "rgb(13, 16, 20)"
+        await page.reload(); await page.wait_for_selector(".card .odds")
+        assert await page.evaluate(f"{html}.dataset.theme") == "dark" and await page.inner_text("#theme") == "☾ 深色"
+        await page.click("#theme")
+        assert await page.evaluate(f"{html}.dataset.theme") is None and await page.evaluate("localStorage.getItem('theme')") == '"auto"'
+        assert await page.evaluate("getComputedStyle(document.body).backgroundColor") == "rgb(242, 244, 248)"
+        assert await page.evaluate(f"parseFloat({fb}.style.getPropertyValue('--prog'))") >= 0 and await page.locator(".skel").count() == 0
+        assert not await page.evaluate("document.getElementById('totop').classList.contains('show')")
+        await page.evaluate("scrollTo(0, 1500)"); await page.wait_for_timeout(100)
+        assert await page.evaluate("document.getElementById('totop').classList.contains('show')")
+        await page.click("#totop"); await page.wait_for_timeout(1000)
+        assert await page.evaluate("scrollY") == 0 and not await page.evaluate("document.getElementById('totop').classList.contains('show')")
         assert await page.get_attribute("#g-contract .name", "title") == "UNITREEUSDT" and "上证指数" in await page.inner_text("#g-index")
         await page.click("#g-index details summary"); assert await page.is_visible("#g-index dl")
         await page.wait_for_timeout(10500)  # survives one data refresh

@@ -150,7 +150,7 @@ async def run():
         extras = rm.card_extras(NOW)
         assert extras["range_word"] == "窗口内" and extras["session"] == "美股交易中（常规时段 09:30–16:00 ET）" and "TradingView" in extras["rule_note"]
         assert rm.card_extras(sat)["session"] == "美股已收盘，10-12 09:30 ET（北京 10-12 21:30）开盘；收盘期间现价为最后成交价，概率按剩余交易时段计算"
-        assert rm.close_label() == "12-31 23:59 ET（北京 01-01 12:59）截止；TradingView 1 分钟 K 的最高价 ≥ 档位即 Yes"
+        assert rm.close_label() == "12-31 23:59 ET（北京 01-01 12:59）前触及即 Yes，到期未触及为 No（TradingView 1 分钟 K 的最高价 ≥ 档位算触及）"
         assert rm.window_label() == "市场创建 06-17 20:16 ET（北京 06-18 08:16）起" and rm.sigma_note() == "60 个交易日收盘，按 252 个交易日年化"
         assert rm.source_name() == "Yahoo 行情（NASDAQ:STRC）" and "TradingView" in rm.extremes_source()
         # the running session reaches the level: Yes at once (the finished days are persisted, today counts live)
@@ -215,6 +215,7 @@ async def run():
     assert bot.range_level(srm, rows[0]) == ("up", "规则")
     waiting = bot.range_payload(srm, NOW)  # before refresh_ranges: the window is not learnt yet
     assert waiting["missing"] == "等待 Predict 的创建时间和截止日期" and waiting["close_ms"] == 0 and waiting["ladder"]["hold"].startswith("等待 Predict")
+    assert waiting["ladder"]["question"].startswith("STRC 在截止日（待 Predict 确认）之前是否触及 "), waiting["ladder"]["question"]
     answers = {"1m": chart(*minutes(TODAY, [99.6, 99.8, 99.7]), price=99.6, when=NOW // 1000 - 30),
                "1d": chart(*days(dt.date(2025, 10, 6), TODAY, {dt.date(2026, 7, 10): 99.95}))}
     async def fake_source(url, extra=None):
@@ -230,7 +231,7 @@ async def run():
     assert {k: item[k] for k in ("name", "symbol", "group", "kind", "close_ms", "quote_ms", "source")} == {
         "name": "STRC 触及 $100", "symbol": "STRC-100", "group": "levels", "kind": "ladder", "close_ms": dec31, "quote_ms": NOW - 30_000,
         "source": "Yahoo 行情（NASDAQ:STRC）"} and "missing" not in item, item
-    assert item["close_label"] == "12-31 23:59 ET（北京 01-01 12:59）截止；TradingView 1 分钟 K 的最高价 ≥ 档位即 Yes"
+    assert item["close_label"] == "12-31 23:59 ET（北京 01-01 12:59）前触及即 Yes，到期未触及为 No（TradingView 1 分钟 K 的最高价 ≥ 档位算触及）"
     assert item["predict"]["url"].startswith(f"https://predict.fun/zh-cn/market/{STRC.slug}")
     L = item["ladder"]
     assert {k: L[k] for k in ("kind", "price", "high", "low", "symbol", "venue", "window", "hold", "error", "range_word", "sigma_note")} == {
@@ -238,6 +239,7 @@ async def run():
         "window": "市场创建 06-17 20:16 ET（北京 06-18 08:16）起", "hold": "", "error": "", "range_word": "窗口内",
         "sigma_note": "60 个交易日收盘，按 252 个交易日年化"}, L
     assert L["session"] == "美股交易中（常规时段 09:30–16:00 ET）" and "TradingView" in L["rule_note"] and "创建当日按整日计" in L["extremes_note"]
+    assert L["question"] == "STRC 在 12-31 23:59 ET（北京 01-01 12:59）之前是否触及 $100：窗口内任一 1 分钟 K 的最高价达到即 Yes，到期没碰到为 No", L["question"]
     assert L["spot"] == 99.6 and abs(L["years"] - m.us_trading_years(NOW, dec31 + 60_000)) < 1e-12 and L["sigma"] == srm.sigma
     r100, = L["rows"]
     assert r100["label"] == "↑ $100" and (r100["dir"], r100["dir_source"]) == ("up", "规则") and r100["dir_note"] == ""
