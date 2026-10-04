@@ -314,23 +314,42 @@ async def run():
     gs = m.Store(":memory:"); g = m.CapMarket(gs, PONS); g.price = D("0.5")
     T0 = PONS.start_ms + 3 * H * 1000
     g.observe(T0)
-    assert g.history["gaps"] == [[PONS.start_ms // 1000, T0 // 1000]] and g.history["gap_s"] == 3 * H and g.history["seen"] == T0 // 1000
+    # the window before the bot began monitoring the ladder is "not watched", not a sampling gap
+    assert g.history["gaps"] == [] and g.history["gap_s"] == 0 and g.history["seen"] == T0 // 1000 and g.history["monitored_from"] == T0 // 1000
     g.observe(T0 + 10_000)
-    assert g.history["seen"] == T0 // 1000 and len(g.history["gaps"]) == 1  # the mark is persisted once a minute, not every sample
+    assert g.history["seen"] == T0 // 1000 and g.history["gaps"] == []  # the mark is persisted once a minute, not every sample
     g.observe(T0 + 70_000)
-    assert g.history["seen"] == (T0 + 70_000) // 1000 and len(g.history["gaps"]) == 1
+    assert g.history["seen"] == (T0 + 70_000) // 1000 and g.history["gaps"] == []
     g.observe(T0 + 70_000 + 10 * 60_000)  # ten minutes without a sample
-    assert g.history["gaps"][-1] == [(T0 + 70_000) // 1000, (T0 + 670_000) // 1000] and g.history["gap_s"] == 3 * H + 600
+    assert g.history["gaps"] == [[(T0 + 70_000) // 1000, (T0 + 670_000) // 1000]] and g.history["gap_s"] == 600
     g2 = m.CapMarket(gs, PONS); g2.price = D("0.5")  # a restart half an hour later: the gap is read from the persisted mark
     g2.observe(T0 + 670_000 + 30 * 60_000)
-    assert len(g2.history["gaps"]) == 3 and g2.history["gap_s"] == 3 * H + 600 + 1800
+    assert len(g2.history["gaps"]) == 2 and g2.history["gap_s"] == 600 + 1800
     note = g2.gaps_note()
-    assert note == (f"窗口内有 3 段没有采样，共 3.7 小时（最长 3.0 小时：{m.stamp(PONS.start_ms, seconds=False)} → {m.stamp(T0, seconds=False)}）"
-                    "；这些时段碰没碰到档位无法判断"), note
-    assert bot.cap_payload(g2, NOW)["ladder"]["gaps"] == note
+    assert note == (f"机器人从 {m.stamp(T0, seconds=False)} 起才监控这张卡，开窗后的前 3.0 小时没有任何记录；监控以来有 2 段没有采样，共 40 分钟"
+                    f"（最长 30 分钟：{m.stamp(T0 + 670_000, seconds=False)} → {m.stamp(T0 + 670_000 + 1800_000, seconds=False)}）"
+                    "；这些时段碰没碰到档位无法判断（Predict 已结算的档位除外）"), note
+    assert bot.cap_payload(g2, NOW)["ladder"]["gaps"] == note and bot.cap_payload(g2, NOW)["ladder"]["monitored_from"] == m.stamp(T0, seconds=False)
+    # a few short breaks (restarts) are summed up, not timetabled
+    g3s = m.Store(":memory:"); g3 = m.CapMarket(g3s, PONS); g3.price = D("0.5"); g3.observe(T0); t = T0
+    for k in range(3):  # ten minutes of samples every minute, then a 3-minute break, three times over
+        for _ in range(10):
+            t += 60_000; g3.observe(t)
+        t += 180_000; g3.observe(t)
+    assert g3.gaps_note().endswith("监控以来有 3 次短暂中断（重启或行情接口失败），共 9 分钟，最长 3 分钟；这些时段碰没碰到档位无法判断（Predict 已结算的档位除外）"), g3.gaps_note()
     bars = m.CapMarket(m.Store(":memory:"), NIU); bars.price = D("0.5"); bars.observe(T0 + 3 * H * 1000)
     assert "gaps" not in bars.history and "seen" not in bars.history and bars.gaps_note() == ""  # hourly bars cover the window
-    assert bot.cap_payload(pons, NOW)["ladder"]["gaps"].startswith("窗口内有 1 段没有采样")  # pons above: from the opening to its first sample
+    assert bot.cap_payload(pons, NOW)["ladder"]["gaps"].startswith("机器人从"), bot.cap_payload(pons, NOW)["ladder"]["gaps"]  # pons above: watched from its first sample
+    # a record from before the coverage marks (or one the first build of them gave the whole window as a gap) is rebuilt from the
+    # 5-minute samples: monitoring began at the first sample, breaks over 15 minutes between samples are the gaps
+    old = m.Store(":memory:"); S0 = PONS.start_ms // 1000 + 20 * 3600
+    old.put(f"capsamples:{PONS.slug}", [[S0 + i * 300, 0.5] for i in range(12)] + [[S0 + 3600 + 3000 + i * 300, 0.5] for i in range(6)])
+    old.put(f"cap:{PONS.slug}", {"start": PONS.start_ms, "high": 0.6, "at": S0 + 600, "seen_high": 0.6, "seen_at": S0 + 600,
+                                 "gaps": [[PONS.start_ms // 1000, S0 + 7000]], "gap_s": S0 + 7000 - PONS.start_ms // 1000, "seen": S0 + 8350})
+    rebuilt = m.CapMarket(old, PONS); rebuilt.price = D("0.5"); rebuilt.observe((S0 + 8400) * 1000)
+    hist = rebuilt.history
+    assert hist["monitored_from"] == S0 and hist["coverage_v"] == 2 and hist["gaps"] == [[S0 + 3300, S0 + 6600]] and hist["gap_s"] == 3300, hist
+    assert rebuilt.gaps_note().startswith(f"机器人从 {m.stamp(S0 * 1000, seconds=False)} 起才监控这张卡，开窗后的前 20.0 小时没有任何记录；监控以来有 1 段没有采样，共 55 分钟"), rebuilt.gaps_note()
     pons_item = bot.cap_payload(pons, NOW)
     assert pons_item["name"] == "$PONS FDV" and pons_item["ladder"]["metric"] == "FDV" and pons_item["ladder"]["settle"] == "DexScreener"
     assert pons_item["ladder"]["bars"] is False and "FDV ÷ 价格" in pons_item["ladder"]["supply_note"], pons_item["ladder"]
@@ -509,10 +528,11 @@ async def browser_check():
     payload = bot.odds_payload()
     payload["items"] = [item]
     bot.odds_payload = lambda: payload
-    web = m.WebServer(bot, 0, "t" * 20); port = await web.start()
+    web = m.WebServer(bot, 0, "t" * 20); web.CACHE_SECONDS = {}; port = await web.start()  # the tests change the payload and reload at once
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         page = await browser.new_page(viewport={"width": 390, "height": 900})
+        errs = []; page.on("pageerror", lambda e: errs.append(str(e)))  # a script error anywhere on the page fails the check at the end
         await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
         await page.wait_for_selector("#g-ladder .pg")
         assert "⚠️ 窗口内有 2 段没有采样，共 1.5 小时" in await page.inner_text("#g-ladder .lstat")  # the unobserved stretches, on the card
@@ -521,16 +541,50 @@ async def browser_check():
         assert await page.locator("#g-ladder .pg .lh").all_inner_texts() == ["目标", "模型", "挂单", "吃单"]
         cells = await page.locator("#g-ladder .pg .paction").evaluate_all(
             "els => els.map(e => [e.className.replace('pcell paction', '').trim(), e.innerText.replace(/\\s+/g, ' ').trim(), e.title])")
-        assert [c[:2] for c in cells] == [["", "No 63.8¢ +5.8¢"], ["", "No 64.8¢ +4.1¢"],                    # $200M: nothing clears 6.7¢
-                                         ["", "No 93.2¢ +3.2¢"], ["", "No 94.0¢ +2.3¢"],                    # $500M: 3.2¢ under a 3.24¢ bar
+        assert [c[:2] for c in cells] == [["", "No 63.8¢ +5.8¢ 低于门槛"], ["", "No 64.8¢ +4.1¢ 低于门槛"],    # $200M: nothing clears 6.7¢ (said on the cell)
+                                         ["", "No 93.2¢ +3.2¢ 低于门槛"], ["", "No 94.0¢ +2.3¢ 低于门槛"],    # $500M: 3.2¢ under a 3.24¢ bar
                                          ["pos", "No 97.4¢ +2.2¢"], ["pos", "No 97.5¢ +2.1¢"],              # $1B: both clear 2¢
                                          ["", "No 98.0¢ +1.9¢ 盘口过期"], ["", "No 99.0¢ +0.9¢ 盘口过期"],    # $2B: a stale book
                                          ["", "No 97.4¢ +2.2¢ 暂不建议"], ["", "No 97.5¢ +2.1¢ 暂不建议"],      # $3B: a prior σ
                                          ["", "—"], ["", "—"]], cells                                          # $5B: no book
         assert cells[10][2] == cells[11][2] == "Predict 暂无盘口", cells[10:]  # not a points-gate tooltip
-        assert cells[0][2] == "挂No @ 63.8¢；净优势 +5.8¢，挂单排队，成交不保证；未过建议门槛", cells[0][2]
+        assert cells[0][2] == "挂No @ 63.8¢；净优势 +5.8¢，挂单排队，成交不保证；未过建议门槛 6.7¢（σ ×/÷1.25 的模型误差）", cells[0][2]
         assert cells[8][2].endswith("；σ 是先验值，只作参考"), cells[8][2]
-        assert "门槛" not in await page.inner_text("#g-ladder")
+        assert "低于门槛" in await page.inner_text("#g-ladder") and "6.7¢" not in await page.inner_text("#g-ladder .pg")  # the bar itself only in the tooltip / note
+        # the red-frame bar can be this card's own (hotmap, per browser): 2¢ makes the $1B 挂No +2.2¢ a red frame and a strip entry
+        await page.evaluate("localStorage.setItem('hotmap', JSON.stringify({'card:NIULAI': 2}))")
+        await page.reload(); await page.wait_for_selector("#g-ladder .pg")
+        strip = await page.inner_text("#opps")  # one card, listed on both rows: the $1B maker and taker
+        assert await page.locator("#g-ladder .card.hot").count() == 1 and strip.startswith("🔥 机会 2") and "$1B 挂No 97.4" in strip and "$1B 吃No 97.5" in strip, strip
+        assert "另有 1 处单独设置" in await page.inner_text("#legend")
+        # a level's own bar wins over the card's: 3¢ on $1B puts it back under; the box shows the inherited 2 as its placeholder
+        await page.click("#g-ladder .pg .lt:text-is('$1B')")
+        hotrow = page.locator("#g-ladder .lrow .hotrow input")
+        assert await hotrow.get_attribute("placeholder") == "2"
+        await hotrow.fill("3"); await hotrow.dispatch_event("change"); await page.wait_for_timeout(200)
+        assert await page.locator("#g-ladder .card.hot").count() == 0 and await page.evaluate("JSON.parse(localStorage.getItem('hotmap'))") == {"card:NIULAI": 2, "row:NIULAI#$1B": 3}
+        await page.click("#g-ladder .pg .lt:text-is('$1B')")  # close the row again
+        await page.evaluate("localStorage.removeItem('hotmap')"); await page.reload(); await page.wait_for_selector("#g-ladder .pg")
+        assert await page.locator("#g-ladder .card.hot").count() == 0
+        # 自定义: the section title and every card's edit bar carry a ¢ box of their own (栏目 < 卡 < 档位); an empty box inherits,
+        # and shows what it inherits as its placeholder
+        hotmap = lambda: page.evaluate("JSON.parse(localStorage.getItem('hotmap') || '{}')")
+        set_box = lambda sel, v: page.locator(sel).fill(v)
+        await page.click("#edit")
+        sec, crd = "#h-ladder .hotset input", "#g-ladder .card .ctl .hotset input"
+        assert await page.get_attribute(sec, "placeholder") == "10" and await page.input_value(sec) == ""  # the global 10¢
+        await set_box(sec, "2"); await page.dispatch_event(sec, "change"); await page.wait_for_timeout(200)
+        assert await hotmap() == {"sec:ladder": 2} and await page.get_attribute(crd, "placeholder") == "2"  # the card inherits the section's
+        await set_box(crd, "4"); await page.dispatch_event(crd, "change"); await page.wait_for_timeout(200)
+        assert await hotmap() == {"sec:ladder": 2, "card:NIULAI": 4}
+        await page.click("#done")
+        assert await page.locator("#g-ladder .card.hot").count() == 0 and "另有 2 处单独设置" in await page.inner_text("#legend")  # 4¢ > 2.2¢
+        await page.click("#edit"); await set_box(crd, ""); await page.dispatch_event(crd, "change"); await page.wait_for_timeout(200)
+        assert await hotmap() == {"sec:ladder": 2}
+        await page.click("#done")
+        assert await page.locator("#g-ladder .card.hot").count() == 1  # the section's 2¢ again
+        await page.evaluate("localStorage.removeItem('hotmap')"); await page.reload(); await page.wait_for_selector("#g-ladder .pg")
+        assert await page.locator("#g-ladder .card.hot").count() == 0 and "另有" not in await page.inner_text("#legend")
         # points on a cap-ladder level: ● with the rate when a quote would earn, a faint ○ when not, nothing while unknown
         assert await page.locator("#g-ladder .pg .ptarget .ppoints").evaluate_all("els => els.map(e => [e.className, e.textContent, e.title])") == \
             [["ppoints active", "● 50 PP/h", "积分可得：这个市场的挂单每小时发 50 PP（价差不超过 6.0¢、至少 100 份）"], ["ppoints off", "○", "积分未激活"]]
@@ -617,6 +671,7 @@ async def browser_check():
         await page.reload(); await page.wait_for_selector("#g-ladder .card")
         assert "等待 Predict 档位" in await page.inner_text("#g-ladder .lstat") and await page.locator("#g-ladder .pg").count() == 0
         assert "暂无待触及的档位" not in await page.inner_text("#g-ladder .card")
+        assert not errs, errs
         await browser.close()
     await web.stop()
 

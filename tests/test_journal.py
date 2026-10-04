@@ -116,7 +116,7 @@ async def browser_check(bot, data):
     if async_playwright is None or not (chrome or os.environ.get("PLAYWRIGHT_BROWSERS_PATH")):
         print("browser check skipped (no Playwright/Chromium)")
         return
-    web = m.WebServer(bot, 0, TOKEN); port = await web.start()
+    web = m.WebServer(bot, 0, TOKEN); web.CACHE_SECONDS = {}; port = await web.start()
     url = f"http://127.0.0.1:{port}/p/{TOKEN}/journal"
     hsi_maker, mismatch = f"{HSI_SLUG}|up|挂", f"{KOSPI_SLUG}|down|吃"
     async with async_playwright() as pw:
@@ -127,7 +127,8 @@ async def browser_check(bot, data):
         await page.goto(url)
         await page.wait_for_selector("#list .tr")
         assert await page.get_attribute("#back", "href") == f"/p/{TOKEN}"
-        assert await page.get_attribute("#csv", "href") == "journal.csv" and await page.get_attribute("#json", "href") == "journal.json"
+        # the exports are addressed from the page's own path, so they also work when the page was opened as /journal/
+        assert await page.get_attribute("#csv", "href") == f"/p/{TOKEN}/journal.csv" and await page.get_attribute("#json", "href") == f"/p/{TOKEN}/journal.json"
         tiles = await page.inner_text("#tiles")
         tot = data["total"]
         for want in ("已结算", f"{tot['settled']} 笔", "模型预期（下单时）", "模型预期（成交时）", f"已确认 {tot['confirmed']}",

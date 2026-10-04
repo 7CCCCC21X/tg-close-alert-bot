@@ -503,7 +503,7 @@ async def browser_check(bot):
     btc = next(i for i in payload["items"] if i["name"] == "BTC 10月价格")
     tk = next(e for e in next(r for r in btc["ladder"]["rows"] if r["label"] == "↑ $120k")["edges"] if e["best"])
     bot.odds_payload = lambda: payload
-    web = m.WebServer(bot, 0, "t" * 20); port = await web.start()
+    web = m.WebServer(bot, 0, "t" * 20); web.CACHE_SECONDS = {}; port = await web.start()  # the tests change the payload and reload at once
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         page = await browser.new_page(viewport={"width": 390, "height": 900})
@@ -579,8 +579,13 @@ async def browser_check(bot):
         assert await rows.count() == 2 and (await rows.nth(0).inner_text()).startswith("🔥 机会 2\n挂单 1") and "吃单" not in await rows.nth(0).inner_text()
         assert (await rows.nth(1).inner_text()).startswith("吃单 1") and await page.locator("#opps > .ok, #opps > .og, #opps > .opp").count() == 0
         assert (await rows.nth(0).bounding_box())["y"] + (await rows.nth(0).bounding_box())["height"] <= (await rows.nth(1).bounding_box())["y"]
-        await page.locator("#opps .opp").nth(1).click(); await page.wait_for_timeout(300)
+        # each entry is a link to the market on Predict (a new tab); the tap also brings the card into view here
+        opp = page.locator("#opps .opp").nth(1)
+        assert (await opp.get_attribute("href") or "").startswith("https://predict.fun/") and await opp.get_attribute("target") == "_blank"
+        await opp.click(); await page.wait_for_timeout(300)
         assert await card.evaluate("c => c.classList.contains('flash') && c.style.scrollMarginTop !== ''")
+        for extra in page.context.pages[1:]:  # the new tab the link opened (no network here): closed again
+            await extra.close()
         # 自定义: leaving makers out drops 甲 (its edges are maker ones); a section can be left out; takers can go too; hidden while customising
         await page.click("#edit"); assert await page.is_hidden("#opps")
         await page.uncheck("#opp-maker"); await page.click("#done")

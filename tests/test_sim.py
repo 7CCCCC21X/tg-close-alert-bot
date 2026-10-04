@@ -536,7 +536,7 @@ async def browser_check(bot):
     if async_playwright is None or not (chrome or os.environ.get("PLAYWRIGHT_BROWSERS_PATH")):
         print("browser check skipped (no Playwright/Chromium)")
         return
-    web = m.WebServer(bot, 0, "t" * 20); port = await web.start()
+    web = m.WebServer(bot, 0, "t" * 20); web.CACHE_SECONDS = {}; port = await web.start()  # the tests change the payload and reload at once
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         page = await browser.new_page(viewport={"width": 390, "height": 900})
