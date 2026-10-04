@@ -41,7 +41,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.26.4"
+VERSION = "1.27.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5867,6 +5867,20 @@ class SimMarket:
 
 SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": "月度涨跌", "flip": "反超", "range": "价格阶梯",
              "ladder": "市值阶梯"}
+# A resting paper order is placed only on a book it could fill in: both sides quoted, no further apart than this. A lone
+# 0.2¢ bid under an 80¢ ask is not a quote anyone sells into: an order joining it would rest until the result and tell
+# nothing (10-03: 54 such price-ladder orders sat as 挂单中 0/100 for weeks).
+SIM_MAKER_SPREAD = 0.10
+
+
+def sim_maker_block(book: PredictBook, spread: float = SIM_MAKER_SPREAD) -> str:
+    """Why no resting paper order is placed on this book (one-sided, or a spread wider than ``spread``); "" when it may be."""
+    if not book.bid or not book.ask:
+        return "盘口只有一边"
+    gap = float(book.ask[0]) - float(book.bid[0])
+    if gap > spread + 1e-9:
+        return f"买卖价差 {cents(gap)} 超过 {cents(spread)}"
+    return ""
 
 
 def sim_scope(config: Config) -> tuple[str, str]:
@@ -6086,17 +6100,18 @@ def sim_stats(trades: list[dict]) -> dict:
             "open": sum(t["status"] == "filled" for t in trades), "open_cost": sum(t["price"] * t["shares"] for t in held),
             "resting": sum(t["status"] == "resting" for t in trades),
             "partial": sum(bool(t.get("maker")) and 0 < float(t.get("shares") or 0) < float(t.get("order") or 0) - 1e-9
-                           for t in trades if t["status"] != "expired"),
-            "expired": sum(t["status"] == "expired" for t in trades)}
+                           for t in trades if t["status"] not in {"expired", "cancelled"}),
+            "expired": sum(t["status"] == "expired" for t in trades),
+            "cancelled": sum(t["status"] == "cancelled" for t in trades)}
 
 
 def sim_status(trade: dict) -> str:
-    """'持仓' / '挂单中' / '挂单中（推定成交 30/100 份）' / '未成交' / '赢 +$38.00' / '输 −$62.00' / '平局 −$12.00'."""
+    """'持仓' / '挂单中' / '挂单中（推定成交 30/100 份）' / '未成交' / '已撤单' / '赢 +$38.00' / '输 −$62.00' / '平局 −$12.00'."""
     status = trade["status"]
     if status != "settled":
         if status == "resting" and float(trade.get("shares") or 0) > 0:
             return f"挂单中（推定成交 {float(trade['shares']):g}/{float(trade['order']):g} 份）"
-        return {"resting": "挂单中", "filled": "持仓", "expired": "未成交"}.get(status, status)
+        return {"resting": "挂单中", "filled": "持仓", "expired": "未成交", "cancelled": "已撤单"}.get(status, status)
     pnl = (trade["payout"] - trade["price"]) * trade["shares"]
     word = "赢" if trade["payout"] == 1 else "输" if trade["payout"] == 0 else "平局"
     return f"{word} {'+' if pnl >= 0 else '−'}${abs(pnl):,.2f}"
@@ -6492,7 +6507,7 @@ function simCard(c,it){
   // paper trading: would buying every suggestion of 10¢ or more have made money? Results only, nothing is ever ordered
   const s=it.sim,t=s.total,cents=(s.edge*100).toFixed(0),money=x=>(x>=0?"+$":"−$")+Math.abs(x).toFixed(2),usd=x=>"$"+x.toFixed(2);
   const col=x=>x>0?upColor():x<0?downColor():"var(--muted)";
-  const how=[];if(s.ways!=="只挂单")how.push("吃单按这么多份吃到的均价和手续费成交");if(s.ways!=="只吃单")how.push("挂单只按盘口出现的卖单数量推定成交，出结果时没成交的部分作废");
+  const how=[];if(s.ways!=="只挂单")how.push("吃单按这么多份吃到的均价和手续费成交");if(s.ways!=="只吃单")how.push("挂单只挂在价差不超过 10¢ 的双边盘口，只按盘口出现的卖单数量推定成交，出结果时没成交的部分作废，不再做的挂单撤掉");
   c.append($("div","small mut","净优势 ≥"+cents+"¢ 时按卡片建议买 "+s.shares+" 份，只记账不下单。"+(s.scope?"范围："+s.scope+"；"+s.ways+"。":"")+how.join("；")+"。先预结算，再以 Predict 结果确认。"));
   const jl=$("a","simj","完整复盘（每笔证据、导出）↗");jl.href=location.pathname.replace(/\\/$/,"")+"/journal";c.append(jl);
   if(!t.trades){c.append($("p","","还没有触发过：等有卡片的净优势达到 "+cents+"¢ 就开始记录。"));return c}
@@ -6503,7 +6518,7 @@ function simCard(c,it){
   line("已确认 "+t.confirmed+" 笔","预结算 "+t.local+" 笔",...(t.mismatch?[$("b","warn","结果不一致 "+t.mismatch+" 笔")]:[]));
   const exp=$("span","","模型预期 "+money(t.expected));exp.title="同一批已结算的交易，按下单时的净优势 × 份数加总：实际盈亏长期应接近它，差得多说明模型有偏差";
   const expf=$("span","","成交时 "+money(t.expected_fill));expf.title="按每份成交那一刻的公平价算：比下单时低很多，说明挂单常在行情转向时被成交";line(exp,expf);
-  line("持仓 "+t.open+" 笔（"+usd(t.open_cost)+"）","挂单中 "+t.resting+" 笔",...(t.partial?["部分成交 "+t.partial+" 笔"]:[]),"未成交作废 "+t.expired+" 笔");
+  line("持仓 "+t.open+" 笔（"+usd(t.open_cost)+"）","挂单中 "+t.resting+" 笔",...(t.partial?["部分成交 "+t.partial+" 笔"]:[]),"未成交作废 "+t.expired+" 笔",...(t.cancelled?["撤单 "+t.cancelled+" 笔"]:[]));
   const groups=[...s.kinds,...(s.modes.length>1?s.modes:[])];
   if(groups.length>1){const g=$("div","simg");g.append(...["类别","结算","盈亏","预期"].map(x=>$("span","lh",x)));
     groups.forEach(r=>{const v=$("span","ln",money(r.pnl));v.style.color=col(r.pnl);g.append($("span","",r.name),$("span","ln",r.settled+" 笔"),v,$("span","ln mut",money(r.expected)))});c.append(g)}
@@ -6917,6 +6932,7 @@ th{color:var(--faint);font-weight:600;font-size:11.5px;letter-spacing:.03em;back
 .row{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:2px 12px;padding:10px 14px;cursor:pointer;width:100%;border-radius:var(--r);
   background:none;border:0;font:inherit;color:inherit;text-align:left}
 .row .l{min-width:0;flex:1 1 220px}.row .t1{font-weight:650}.row .t2{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.row .t3{font-size:12px;color:var(--warn);margin-top:3px;line-height:1.4}
 .row .r{text-align:right;font-variant-numeric:tabular-nums;flex:0 0 auto}.row .r b{display:block;font-size:16px;font-weight:750}
 .badge{font-size:11.5px;border-radius:999px;padding:1px 8px;background:var(--chip);color:var(--muted);white-space:nowrap;font-weight:600}
 .badge.ok{color:var(--best);background:var(--best-bg)}.badge.bad{color:#fff;background:var(--hot)}.badge.pre{color:var(--warn);background:var(--warn-bg)}
@@ -6969,7 +6985,7 @@ function dl(obj,skip){const d=$("dl");Object.entries(obj||{}).forEach(([k,v])=>{
 function table(head,rows){const w=$("div","tbl"),t=$("table"),h=$("tr");head.forEach(x=>h.append($("th","",x)));t.append(h);
   rows.forEach(r=>{const tr=$("tr");r.forEach((x,i)=>{const td=$("td",i===r.length-1&&head[i]==="说明"?"wrap":"");td.append(x instanceof Node?x:String(x??"—"));tr.append(td)});t.append(tr)});w.append(t);return w}
 function sec(title,...kids){const s=$("div","sec"),h=$("h3","",title);s.append(h,...kids.filter(Boolean));return s}
-function cat(t){if(t.status==="resting"||t.status==="filled")return"open";if(t.status==="expired")return"exp";
+function cat(t){if(t.status==="resting")return"rest";if(t.status==="filled")return"open";if(t.status==="expired"||t.status==="cancelled")return"exp";
   return t.confirm==="confirmed"?"ok":t.confirm==="mismatch"?"bad":"pre"}
 function badge(t){const c=cat(t),b=$("span","badge"+(c==="ok"?" ok":c==="bad"?" bad":c==="pre"?" pre":""),t.state||t.text);return b}
 function perShare(t){return t.shares>0?t.expected_fill/t.shares:null}
@@ -6997,6 +7013,7 @@ function detail(t){
   // 4. how it filled
   const fx=$("div"),fl=$("dl"),add=(k,v)=>fl.append($("dt","",k),$("dd","",v));
   add("下单份数",num(t.order));add("成交份数",num(t.shares)+(t.unfilled?"（未成交 "+num(t.unfilled)+" 份已作废）":""));
+  if(t.withdrawn)add("撤单",when(t.withdrawn.at)+"："+(t.withdrawn.why||"")+"，没成交的 "+num(t.withdrawn.unfilled)+" 份作废");
   if(t.maker){add("成交方式","推定成交：盘口出现卖到挂价或更低的卖单才算，按看到的数量、取最多看到的一次");
     if(t.queue_ahead!=null)add("排队假设","排在挂单时该价位已有的 "+num(t.queue_ahead)+" 份之后；之后最少剩 "+num(t.queue_min)+" 份")}
   else{add("成交方式","吃单立即成交");add("成交均价",cent(t.avg));add("最优价",cent(t.best));add("深度滑点",sg(t.slip));add("手续费",cent(t.fee)+" /份")}
@@ -7015,6 +7032,7 @@ function detail(t){
   if(t.final){put("Predict 结果",res(t.final)+" · "+(t.final.name||"")+"（"+(t.final.how||"")+"）");put("确认时间",when(t.final.at))}
   else if(t.status==="settled"||t.local)put("Predict 结果","待确认"+(t.final_error?"（读取失败："+t.final_error+"）":t.final_check?"（市场状态："+(t.final_check.status||"未知")+"）":""));
   put("状态",t.text+(t.state?" · "+t.state:""));
+  if(t.wait)put("现在等什么",t.wait);
   st.append(sl);
   if(t.local&&t.local.evidence&&Object.keys(t.local.evidence).length)st.append($("div","sub","本地结算依据"),dl(t.local.evidence));
   if((t.revisions||[]).length)st.append($("div","sub","修订记录"),table(["时间","依据","回款/份","说明"],t.revisions.map(r=>[when(r.at),r.by,num(r.from)+" → "+num(r.to),r.note||""])));
@@ -7029,6 +7047,7 @@ function row(t){
   const l=$("div","l"),r=$("div","r");
   l.append($("div","t1",t.item+" "+t.label+" @ "+cent(t.price)+" × "+num(t.shares)+(t.maker&&t.shares<t.order?"/"+num(t.order):"")));
   l.append($("div","t2",when(t.opened)+" · "+(KINDS[t.kind]||t.kind)+" · 下单时 "+sg(t.edge)+" · 成交时 "+sg(perShare(t))+" /份"));
+  if(t.wait)l.append($("div","t3","⏳ "+t.wait));
   const pn=$("b","",t.pnl==null?"":money(t.pnl));if(t.pnl!=null)pn.className=t.pnl>=0?"ok":"bad";r.append(pn,badge(t));
   b.append(l,r);b.addEventListener("click",()=>{openId=openId===t.id?"":t.id;history.replaceState(null,"",openId?"#"+encodeURIComponent(openId):location.pathname);render()});
   w.append(b);if(openId===t.id)w.append(detail(t));return w}
@@ -7040,21 +7059,21 @@ function tiles(){
     tile("模型预期（下单时）",money(s.expected),"按下单时的净优势 × 份数"),
     tile("模型预期（成交时）",money(s.expected_fill),"按成交那一刻的公平价；比下单时低很多 = 挂单常在行情转向时被成交"),
     tile("结算确认","已确认 "+s.confirmed,conf),
-    tile("进行中","持仓 "+s.open,"挂单中 "+s.resting+" · 部分成交 "+s.partial+" · 作废 "+s.expired))}
+    tile("进行中","持仓 "+s.open,"挂单中 "+s.resting+" · 部分成交 "+s.partial+" · 作废 "+s.expired+(s.cancelled?" · 撤单 "+s.cancelled:"")))}
 function groups(){
   const rows=[...data.kinds,...(data.modes.length>1?data.modes:[])],g=document.getElementById("groups"),h=document.getElementById("h-groups");
   g.hidden=h.hidden=rows.length<2;if(rows.length<2)return;
   g.replaceChildren(table(["分组","已结算","盈亏","下单时预期","成交时预期","不一致"],rows.map(r=>[r.name,r.settled+" 笔",money(r.pnl),money(r.expected),money(r.expected_fill),r.mismatch])).firstChild)}
 function filters(){
   const f=document.getElementById("filters"),chip=(t,on,fn)=>{const b=$("button","chip"+(on?" on":""),t);b.type="button";b.addEventListener("click",fn);return b};
-  const sts=[["all","全部"],["open","持仓/挂单"],["pre","预结算"],["ok","已确认"],["bad","结果不一致"],["exp","未成交"]];
+  const sts=[["all","全部"],["open","持仓"],["rest","挂单中"],["pre","预结算"],["ok","已确认"],["bad","结果不一致"],["exp","未成交/撤单"]];
   const ways=[["all","全部"],["maker","挂单"],["taker","吃单"]];
   const kinds=[["all","全部"],...Object.entries(KINDS).filter(([k])=>data.trades.some(t=>t.kind===k))];
   f.replaceChildren($("span","","状态"),...sts.map(([k,t])=>chip(t,stateF===k,()=>{stateF=k;render()})),$("span","","　方式"),
     ...ways.map(([k,t])=>chip(t,wayF===k,()=>{wayF=k;render()})),...(kinds.length>2?[$("span","","　市场"),...kinds.map(([k,t])=>chip(t,kindF===k,()=>{kindF=k;render()}))]:[]))}
 function render(){
   if(!data)return;
-  const how=[];if(data.ways!=="只挂单")how.push("吃单按这么多份吃到的均价和手续费判断并成交");if(data.ways!=="只吃单")how.push("挂单排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交");
+  const how=[];if(data.ways!=="只挂单")how.push("吃单按这么多份吃到的均价和手续费判断并成交");if(data.ways!=="只吃单")how.push("挂单只挂在双边都有报价、价差不超过 10¢ 的盘口，排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交；不再做的挂单撤掉");
   document.getElementById("intro").textContent="净优势 ≥"+(data.edge*100).toFixed(0)+"¢ 时按卡片建议买 "+data.shares+" 份。"+(data.scope?"范围："+data.scope+"；"+data.ways+"。":"")+how.join("；")+"。先用机器人数据预结算，再以 Predict 的结果确认，不一致时按 Predict 重新结算并留下修订记录。";
   tiles();groups();filters();
   const list=document.getElementById("list"),shown=data.trades.filter(t=>(stateF==="all"||cat(t)===stateF)&&(wayF==="all"||(wayF==="maker")===t.maker)&&(kindF==="all"||t.kind===kindF));
@@ -9173,6 +9192,73 @@ class Bot:
         if credited >= float(trade["order"]) - 1e-9:
             trade["status"] = "filled"
 
+    def sim_withdraw_reason(self, trade: dict, mk: SimMarket | None) -> str:
+        """Why a resting paper order is withdrawn now rather than left to the result: the trader no longer places such
+        orders (SIM_WAYS, SIM_MARKETS, a kind that is taker-only such as the price ladders). "" while it stands."""
+        kind = str(trade.get("kind") or "")
+        if self.config.sim_ways == "taker":
+            return "模拟交易已改为只吃单"
+        if kind not in self.config.sim_markets:
+            return f"模拟交易范围已不含{SIM_KINDS.get(kind, kind)}"
+        if (kind == "range" and not RANGE_SIM_MAKERS) or (mk is not None and not mk.makers):
+            return f"{SIM_KINDS.get(kind, kind)}只做吃单"
+        return ""
+
+    def sim_withdraw(self, trade: dict, why: str, now_ms: int) -> None:
+        """Withdraw a resting order: the shares it had filled stay a position, the rest lapses now, not at the result."""
+        shares, order = float(trade["shares"]), float(trade["order"])
+        trade["withdrawn"] = {"at": now_ms, "why": why, "unfilled": order - shares}
+        if shares > 1e-9:
+            trade.update(status="filled", unfilled=order - shares,
+                         note=f"撤单：{why}；已推定成交的 {shares:g} 份继续持有，其余 {order - shares:g} 份作废")
+        else:
+            trade.update(status="cancelled", unfilled=order, note=f"撤单：{why}，一份都没成交")
+
+    def sim_wait(self, trade: dict, mk: SimMarket | None, now_ms: int) -> str:
+        """What an open trade is waiting for, in words: a resting order, where the sellers stand against its price; a
+        position, the result it settles on and when the bot can decide it. "" once settled, expired or withdrawn."""
+        status, s = trade["status"], trade.get("settle") or {}
+        at = lambda ms: stamp(ms, seconds=False)
+        if status == "resting":
+            if mk is None:
+                return "这个市场现在没有报价（卡片未定价或盘口没读到），挂单原地等着"
+            if mk.book.stale(now_ms):
+                return "盘口已过期，等新盘口"
+            price, fair = float(trade["price"]), (mk.fair_up if trade["side"] == "up" else 1 - mk.fair_up)
+            levels = side_levels(mk.book, trade["side"])
+            if not levels:
+                return f"挂 {cents(price)}，盘口这一边没有卖单：要有人卖到挂价或更低才算成交；现在公平价 {cents(fair)}"
+            best = levels[0][0]
+            if best > price + 1e-9:
+                return (f"挂 {cents(price)}，最低卖价 {cents(best)}（高出 {cents(best - price)}）：要有人卖到挂价或更低才算成交；"
+                        f"现在公平价 {cents(fair)}")
+            return f"盘口有卖到挂价的卖单，已按看到的数量推定成交；现在公平价 {cents(fair)}"
+        if status != "filled":
+            return ""
+        kind = str(trade.get("kind") or "")
+        end = int(s.get("close_ms") or s.get("deadline") or s.get("end") or 0)
+        if not end:
+            return "等市场出结果"
+        settle_at = end + self.SIM_SETTLE_MS
+        if now_ms > settle_at:
+            check = trade.get("final_check") or {}
+            tail = (f"（读取失败：{trade['final_error']}）" if trade.get("final_error")
+                    else f"（Predict 市场状态：{check.get('status') or '未知'}）" if check else "")
+            if kind == "close":
+                return f"收盘（{at(end)}）已过 1 小时，官方收盘还没读到，等 Predict 结算{tail}"
+            return f"窗口已结束（{at(end)}），本地数据还定不了结果，等 Predict 结算{tail}"
+        if kind == "close":
+            return f"等 {str(s.get('target') or '')[5:]} 收盘（{at(end)}）后 1 小时（{at(settle_at)}），按官方收盘预结算，再等 Predict 确认"
+        if kind == "touch":
+            return f"先碰到哪条线就按那条线结算；都没碰到的话等截止 {at(end)} 后按 50/50（{at(settle_at)} 起核验）"
+        if kind == "updown":
+            return f"等窗口结束 {at(end)}，按终点 1 分钟 K 结算（{at(settle_at)} 起）"
+        if kind == "flip":
+            return f"窗口内任一分钟反超即 Yes；否则等窗口结束 {at(end)} 后按 No（{at(settle_at)} 起）"
+        if kind in {"range", "ladder"}:
+            return f"碰到档位即 Yes；否则等窗口结束 {at(end)} 后按 No（{at(settle_at)} 起）"
+        return f"等市场出结果（{at(end)}）"
+
     def sim_result(self, trade: dict, now_ms: int) -> tuple[float, str, dict] | None:
         """The market's result from the bot's own data, once it is decided: (the 涨 / Yes side's result: 1, 0 or ½ for a
         tie, how it was decided, the evidence). None while undecided or while the data cannot decide it (a window not yet
@@ -9279,7 +9365,7 @@ class Bot:
 
     def sim_due(self, trade: dict, now_ms: int) -> bool:
         """Should Predict have a final result for this trade's market by now (or has the local data decided it)?"""
-        if trade.get("final") or trade["status"] == "expired" and not float(trade.get("shares") or 0):
+        if trade.get("final") or trade["status"] in {"expired", "cancelled"} and not float(trade.get("shares") or 0):
             return False
         if trade.get("local"):
             return True
@@ -9352,9 +9438,10 @@ class Bot:
         """Paper trading: whenever a card suggests a trade whose net edge reaches SIM_EDGE_CENTS, buy SIM_SHARES of it.
         The best maker (挂) and the best taker (吃) are judged apart, as the suggestions are, each once per market and
         side. A taker is judged on the very fill it would get for SIM_SHARES (not on the card's PREDICT_TRADE_USD view):
-        signal, cost and net edge are one figure. A resting order fills only as far as sellers show at or through its
-        price. Every position is pre-settled on the bot's own data, then confirmed (or corrected) by Predict's result.
-        Nothing is ever sent to Predict."""
+        signal, cost and net edge are one figure. A resting order is placed only on a two-sided book no wider than
+        SIM_MAKER_SPREAD, fills only as far as sellers show at or through its price, and is withdrawn once the trader no
+        longer places such orders. Every position is pre-settled on the bot's own data, then confirmed (or corrected) by
+        Predict's result. Nothing is ever sent to Predict."""
         if time.monotonic() - self.sim_ran < self.SIM_SECONDS:
             return False
         self.sim_ran = time.monotonic()
@@ -9365,10 +9452,10 @@ class Bot:
         ways, kinds = self.config.sim_ways, self.config.sim_markets
         for mk in markets.values():
             if mk.hold or mk.book.stale(now_ms) or mk.kind not in kinds:
-                continue  # positions already open in other kinds (SIM_MARKETS narrowed) still fill and settle below
+                continue  # positions filled in other kinds (SIM_MARKETS narrowed) still settle below; resting ones are withdrawn
             maker = (best_edge([e for e in book_edges(mk.fair_up, mk.book, costs) if e.maker], mk.need)
                      if mk.makers and ways != "taker" else None)
-            if maker is not None and maker.edge >= bar - 1e-9:
+            if maker is not None and maker.edge >= bar - 1e-9 and not sim_maker_block(mk.book):
                 side = "up" if maker.side == "涨" else "down"
                 tid = f"{mk.market}|{side}|挂"
                 if tid not in trades:  # one position per market, side and way of trading, however long the edge lasts
@@ -9390,8 +9477,12 @@ class Bot:
         for tid, trade in trades.items():
             before = json.dumps(trade, sort_keys=True, default=str)
             mk = markets.get(trade["market"])
-            if trade["status"] == "resting" and mk is not None and not mk.book.stale(now_ms):
-                self.sim_fill(trade, mk, now_ms)
+            if trade["status"] == "resting":
+                why = self.sim_withdraw_reason(trade, mk)
+                if why:
+                    self.sim_withdraw(trade, why, now_ms)
+                elif mk is not None and not mk.book.stale(now_ms):
+                    self.sim_fill(trade, mk, now_ms)
             if not trade.get("final") and (trade["status"] in {"resting", "filled"} or trade.get("confirm") == "local"):
                 result = self.sim_result(trade, now_ms)
                 local = trade.get("local")
@@ -9432,7 +9523,8 @@ class Bot:
         t, edge, shares = r["total"], r["edge"] * 100, f"{r['shares']:g}"
         how = [f"吃单按 {shares} 份吃到的均价和手续费判断并成交"] if r["ways"] != "只挂单" else []
         if r["ways"] != "只吃单":
-            how.append("挂单排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交，出结果时没成交的部分作废")
+            how.append("挂单只挂在双边都有报价、价差不超过 10¢ 的盘口，排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交，"
+                       "出结果时没成交的部分作废；不再做的挂单撤掉")
         lines = [f"🧪 {bold('模拟交易')}（净优势 ≥{edge:g}¢ 时按卡片建议买 {shares} 份，只记账不下单）",
                  f"范围：{r['scope']}；{r['ways']}。" + "；".join(how) + "。先按机器人数据预结算，再以 Predict 的结果确认。"]
         if not t["trades"]:
@@ -9445,7 +9537,7 @@ class Bot:
                   + (f"（{t['roi'] * 100:+.1f}%）" if t["cost"] else ""),
                   f"模型预期：下单时 {money(t['expected'])}｜成交时 {money(t['expected_fill'])}",
                   f"持仓 {t['open']} 笔（成本 ${t['open_cost']:,.2f}）｜挂单中 {t['resting']} 笔｜部分成交 {t['partial']} 笔"
-                  f"｜未成交作废 {t['expired']} 笔"]
+                  f"｜未成交作废 {t['expired']} 笔" + (f"｜撤单 {t['cancelled']} 笔" if t["cancelled"] else "")]
         for group in (r["kinds"], r["modes"]):
             if len(group) > 1:
                 lines.append("｜".join(f"{g['name']} {g['settled']} 笔 {money(g['pnl'])}" for g in group))
@@ -9462,9 +9554,16 @@ class Bot:
         now_ms = self.market.now_ms()
         trades = sorted(self.sim_trades().items(), key=lambda kv: kv[1].get("opened", 0), reverse=True)
         values = [t for _, t in trades]
+        markets: dict[str, SimMarket] = {}
+        if any(t["status"] in {"resting", "filled"} for t in values):
+            try:
+                markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
+            except Exception as error:  # the journal is still served; open trades just cannot say where the book stands
+                LOG.warning("journal: markets unavailable: %s", clean_error(error) or type(error).__name__)
         rows = [{**t, "id": tid, "text": sim_status(t), "state": sim_state(t),
                  "pnl": (t["payout"] - t["price"]) * t["shares"] if t["status"] == "settled" else None,
-                 "expected_fill": sim_fill_expectation(t) if float(t.get("shares") or 0) else 0.0, "url": self.sim_url(t)}
+                 "expected_fill": sim_fill_expectation(t) if float(t.get("shares") or 0) else 0.0, "url": self.sim_url(t),
+                 "wait": self.sim_wait(t, markets.get(t["market"]), now_ms)}
                 for tid, t in trades]
         return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）",
                 "enabled": self.config.sim and self.config.predict, "edge": self.config.sim_edge,
