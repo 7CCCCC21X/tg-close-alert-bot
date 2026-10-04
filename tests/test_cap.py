@@ -60,9 +60,11 @@ for cs, c_start, c_pair, c_token in ((MEME, dt.datetime(2026, 9, 4, 10, 0, tzinf
     assert cs.start_ms == int(c_start.timestamp() * 1000) and cs.end_ms == PONS.end_ms and cs.pair == c_pair and cs.token == c_token, cs.key
     assert cs.chain == "robinhood" and cs.supply == "fdv" and cs.gecko == "" and cs.metric == "FDV" and cs.settle == "DexScreener"
     assert cs.targets == () and cs.name == f"${cs.key} FDV" and cs.slug.startswith(f"what-fdv-will-{cs.key.lower()}-hit-before-")
-# STONK (Solana, settled on its DexScreener STONK/SOL pair, no bars) and STONKBROKER (Robinhood chain): levels read from Predict
+# STONK (Solana, settled on its DexScreener STONK/SOL pair; bars from the mint's most liquid GeckoTerminal pool, since the
+# pair is spelt in lower case) and STONKBROKER (Robinhood chain, no bars): levels read from Predict
 assert STONK.start_ms == int(dt.datetime(2026, 9, 6, 8, 0, tzinfo=dt.timezone.utc).timestamp() * 1000) and STONK.end_ms == PONS.end_ms
-assert STONK.chain == "solana" and STONK.pair == "afrddtgywcveqb1gxcahr8i48o6qtxyqksdvkeludehg" and STONK.gecko == ""
+assert STONK.chain == "solana" and STONK.pair == "afrddtgywcveqb1gxcahr8i48o6qtxyqksdvkeludehg" and STONK.gecko == "solana"
+assert all(s.gecko_pool == "" for s in m.CAP_MARKETS) and [s.key for s in m.CAP_MARKETS if not s.gecko] == ["PONS", "MEME", "CASHCAT", "AI", "STONKBROKER"]
 assert STONK.token == "6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx" and STONK.supply == "fdv" and STONK.targets == ()
 assert STONK.name == "$STONK FDV" and STONK.slug == "what-fdv-will-stonk-hit-before-november-2026" and STONK.settle == "DexScreener"
 assert STONKBROKER.start_ms == int(dt.datetime(2026, 9, 1, 7, 45, tzinfo=dt.timezone.utc).timestamp() * 1000) and STONKBROKER.end_ms == PONS.end_ms
@@ -305,6 +307,29 @@ async def run():
     high, at = pons.window_high()
     assert high == D("0.61") * D("985000000") and at == (NOW + 60_000) // 1000, (high, at)  # the 0.61 seen a minute ago
     assert pons.probability(D("6e8"), NOW) == 1.0 and 0 < pons.probability(D("7e8"), NOW) < 1
+    # no bars: the price is read every 10 s (three times as often), and the window's unobserved stretches are kept: from its
+    # opening to the first sample, then every break longer than 2 minutes between samples (the bot down, the feed failing)
+    assert pons.price_seconds == 10 and m.CapMarket(m.Store(":memory:"), NIU).price_seconds == 30
+    gs = m.Store(":memory:"); g = m.CapMarket(gs, PONS); g.price = D("0.5")
+    T0 = PONS.start_ms + 3 * H * 1000
+    g.observe(T0)
+    assert g.history["gaps"] == [[PONS.start_ms // 1000, T0 // 1000]] and g.history["gap_s"] == 3 * H and g.history["seen"] == T0 // 1000
+    g.observe(T0 + 10_000)
+    assert g.history["seen"] == T0 // 1000 and len(g.history["gaps"]) == 1  # the mark is persisted once a minute, not every sample
+    g.observe(T0 + 70_000)
+    assert g.history["seen"] == (T0 + 70_000) // 1000 and len(g.history["gaps"]) == 1
+    g.observe(T0 + 70_000 + 10 * 60_000)  # ten minutes without a sample
+    assert g.history["gaps"][-1] == [(T0 + 70_000) // 1000, (T0 + 670_000) // 1000] and g.history["gap_s"] == 3 * H + 600
+    g2 = m.CapMarket(gs, PONS); g2.price = D("0.5")  # a restart half an hour later: the gap is read from the persisted mark
+    g2.observe(T0 + 670_000 + 30 * 60_000)
+    assert len(g2.history["gaps"]) == 3 and g2.history["gap_s"] == 3 * H + 600 + 1800
+    note = g2.gaps_note()
+    assert note == (f"窗口内有 3 段没有采样，共 3.7 小时（最长 3.0 小时：{m.stamp(PONS.start_ms, seconds=False)} → {m.stamp(T0, seconds=False)}）"
+                    "；这些时段碰没碰到档位无法判断"), note
+    assert bot.cap_payload(g2, NOW)["ladder"]["gaps"] == note
+    bars = m.CapMarket(m.Store(":memory:"), NIU); bars.price = D("0.5"); bars.observe(T0 + 3 * H * 1000)
+    assert "gaps" not in bars.history and "seen" not in bars.history and bars.gaps_note() == ""  # hourly bars cover the window
+    assert bot.cap_payload(pons, NOW)["ladder"]["gaps"].startswith("窗口内有 1 段没有采样")  # pons above: from the opening to its first sample
     pons_item = bot.cap_payload(pons, NOW)
     assert pons_item["name"] == "$PONS FDV" and pons_item["ladder"]["metric"] == "FDV" and pons_item["ladder"]["settle"] == "DexScreener"
     assert pons_item["ladder"]["bars"] is False and "FDV ÷ 价格" in pons_item["ladder"]["supply_note"], pons_item["ladder"]
@@ -425,6 +450,7 @@ async def browser_check():
                                   points_why="积分未激活", dist=15),
                               row("$3B", 0.004, 0.025, 0.026, e1b, 0.02, hold="σ 是先验值，只作参考", fetched_ms=now - 30_000, dist=24),
                               {"label": "$5B", "fair": 0.001, "error": "", "dist": 4.0, "touched": False}]  # no Predict book: cap_payload's bare row
+    item["ladder"]["gaps"] = "窗口内有 2 段没有采样，共 1.5 小时（最长 1.0 小时：09-20 10:00 → 09-20 11:00）；这些时段碰没碰到档位无法判断"
     payload = bot.odds_payload()
     payload["items"] = [item]
     bot.odds_payload = lambda: payload
@@ -434,6 +460,7 @@ async def browser_check():
         page = await browser.new_page(viewport={"width": 390, "height": 900})
         await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}")
         await page.wait_for_selector("#g-ladder .pg")
+        assert "⚠️ 窗口内有 2 段没有采样，共 1.5 小时" in await page.inner_text("#g-ladder .lstat")  # the unobserved stretches, on the card
         # the same four-column table as the price ladders: 目标 / 模型 / 挂单 (the best maker) / 吃单 (the best taker); blue =
         # suggested, grey = not big enough (the bar itself is never shown), 盘口过期 / 暂不建议 as text
         assert await page.locator("#g-ladder .pg .lh").all_inner_texts() == ["目标", "模型", "挂单", "吃单"]

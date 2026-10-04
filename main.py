@@ -41,7 +41,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.25.0"
+VERSION = "1.25.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4561,6 +4561,7 @@ class CapSpec:
     metric: str = "市值"
     settle: str = "Flap.sh"
     prior_sigma: float = 3.0  # annualised σ assumed when there are no bars to measure it
+    gecko_pool: str = ""  # the GeckoTerminal pool for the bars; "" = the token's most liquid pool, looked up by its address
 
 
 CAP_MARKETS = (
@@ -4598,10 +4599,11 @@ CAP_MARKETS = (
             metric="FDV", settle="DexScreener"),
     # "between market creation on September 6 at 04:00 AM ET, 2026 to October 31, 2026 at 11:59 PM ET" (STONK/SOL on Solana);
     # the rules' own DexScreener pair settles it, FDV = (total − burned) × price; the pair is spelt as the rules' link spells it
-    # (DexScreener reads it either way), which GeckoTerminal would not accept, so no hourly bars: σ prior, live-observed high
+    # (DexScreener reads it either way), which GeckoTerminal would not accept, so the hourly bars (σ, the window's high since
+    # 09-06) come from the mint's most liquid Solana pool on GeckoTerminal instead: the same token, all but surely the same pool
     CapSpec("STONK", "what-fdv-will-stonk-hit-before-november-2026", "$STONK FDV", "6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
             et_ms(2026, 9, 6, 4, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
-            chain="solana", pair="afrddtgywcveqb1gxcahr8i48o6qtxyqksdvkeludehg", supply="fdv", gecko="", metric="FDV", settle="DexScreener"),
+            chain="solana", pair="afrddtgywcveqb1gxcahr8i48o6qtxyqksdvkeludehg", supply="fdv", gecko="solana", metric="FDV", settle="DexScreener"),
     # "between market creation on September 1, 2026 at 3:45 AM ET to October 31, 2026 at 11:59 PM ET" (STONKBROKER/WETH)
     CapSpec("STONKBROKER", "what-fdv-will-stonkbroker-hit-by-november-2026", "$STONKBROKER FDV", "0xe934e36A439C94017B64a3FecE66AF12099aBF50",
             et_ms(2026, 9, 1, 3, 45, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
@@ -4725,6 +4727,10 @@ class CapMarket:
 
     Settlement reads the rules' own chart (Flap.sh, pump.fun, DexScreener); these feeds are a close stand-in."""
     PRICE_SECONDS = 30
+    FAST_PRICE_SECONDS = 10  # without bars the bot's own samples are the only record of the window: sample three times as often
+    GAP_S = 120           # without bars, an unobserved stretch of the window longer than this is recorded (a touch inside it is unknown)
+    GAPS_KEEP = 40        # the longest such stretches kept per window
+    SEEN_WRITE_S = 60     # the "last sampled" mark is persisted this often (a restart then sees at most a minute too much gap)
     SUPPLY_SECONDS = 600
     VOL_SECONDS = 3600
     SCAN_SECONDS = 300
@@ -4751,8 +4757,14 @@ class CapMarket:
         self.vol_error = ""               # why hourly bars could not be read (shown with a prior σ)
         self.sampled_ms = 0
         self.priced_ms = 0                # when the price was last read successfully
+        self.seen_written_s = 0           # when the "last sampled" mark was last persisted
         self.error = ""
         self.times = {"price": -1e9, "supply": -1e9, "vol": -1e9, "scan": -1e9}
+
+    @property
+    def price_seconds(self) -> int:
+        """How often the price is read: every 10 s where the bot's own samples are the window's only record."""
+        return self.PRICE_SECONDS if self.spec.gecko else self.FAST_PRICE_SECONDS
 
     PRICE_STALE_MS = 5 * 60_000  # a price older than this prices nothing (only a level already reached stays settled)
 
@@ -4800,7 +4812,7 @@ class CapMarket:
     async def ohlcv(self, frame: str, before_s: int, limit: int) -> list[tuple[int, float, float, float, float]]:
         base = f"{GECKO}/{self.spec.gecko}"
         if not self.pool:
-            self.pool = self.spec.pair or gecko_pool(await self.get(f"{base}/tokens/{self.spec.token}/pools?page=1"))
+            self.pool = self.spec.gecko_pool or gecko_pool(await self.get(f"{base}/tokens/{self.spec.token}/pools?page=1"))
         return gecko_bars(await self.get(f"{base}/pools/{self.pool}/ohlcv/{frame}?aggregate=1&limit={limit}"
                                          f"&before_timestamp={before_s}&currency=usd&token={self.spec.token}"))
 
@@ -4834,13 +4846,37 @@ class CapMarket:
         self.store.put(f"capsamples:{self.spec.slug}", rows)
 
     def observe(self, now_ms: int) -> None:
-        """Keep the highest price the bot itself has seen inside the window (persisted with the scan)."""
+        """Keep the highest price the bot itself has seen inside the window (persisted with the scan). Without bars, also
+        keep where the window went unobserved: from its opening to the first sample, and every later stretch longer than
+        GAP_S between samples (the bot down, the feed failing). A touch inside those cannot be known."""
         if self.price is None or not self.spec.start_ms <= now_ms <= self.spec.end_ms:
             return
         hist = dict(self.history) or {"start": self.spec.start_ms, "high": 0.0, "at": 0}
+        now_s, changed = now_ms // 1000, False
         if float(self.price) > float(hist.get("high") or 0):
-            hist["high"], hist["at"] = float(self.price), now_ms // 1000
+            hist["high"], hist["at"], changed = float(self.price), now_s, True
+        if not self.spec.gecko:
+            since = int(hist.get("seen") or 0) or self.spec.start_ms // 1000
+            if now_s - since > self.GAP_S:
+                gaps = [g for g in hist.get("gaps") or [] if isinstance(g, list) and len(g) == 2] + [[since, now_s]]
+                hist["gaps"] = sorted(sorted(gaps, key=lambda g: g[1] - g[0])[-self.GAPS_KEEP:])  # the longest kept, in time order
+                hist["gap_s"] = int(hist.get("gap_s") or 0) + (now_s - since)
+                changed = True
+            if changed or now_s - self.seen_written_s >= self.SEEN_WRITE_S:
+                hist["seen"], changed, self.seen_written_s = now_s, True, now_s
+        if changed:
             self.store.put(f"cap:{self.spec.slug}", hist)
+
+    def gaps_note(self) -> str:
+        """Without bars: the window's unobserved stretches so far, in words ("" when none, or when bars cover the window)."""
+        hist = self.history
+        gaps = sorted(g for g in hist.get("gaps") or [] if isinstance(g, list) and len(g) == 2)
+        if self.spec.gecko or not gaps:
+            return ""
+        span = lambda seconds: f"{seconds / 3600:.1f} 小时" if seconds >= 3600 else f"{seconds // 60} 分钟"
+        longest = max(gaps, key=lambda g: g[1] - g[0])
+        return (f"窗口内有 {len(gaps)} 段没有采样，共 {span(int(hist.get('gap_s') or 0))}（最长 {span(longest[1] - longest[0])}："
+                f"{stamp(longest[0] * 1000, seconds=False)} → {stamp(longest[1] * 1000, seconds=False)}）；这些时段碰没碰到档位无法判断")
 
     @property
     def cap(self) -> D | None:
@@ -4856,7 +4892,7 @@ class CapMarket:
 
     async def refresh(self, now_ms: int) -> None:
         mono, failures = time.monotonic(), []
-        if mono - self.times["price"] >= self.PRICE_SECONDS:
+        if mono - self.times["price"] >= self.price_seconds:
             self.times["price"] = mono
             try:
                 url = (f"https://api.dexscreener.com/latest/dex/pairs/{self.spec.chain}/{self.spec.pair}" if self.spec.pair
@@ -6331,13 +6367,14 @@ function ladder(c,it){
   if(L.sigma)sm.append($("span","rd","σ"),$("span","v",(L.sigma*100).toFixed(0)+"%"));
   det.append(sm);const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("窗口",L.window+" → "+it.close_label);row("价格",L.price+" USD（"+L.source+"）");row("供应量",L.supply+"（"+L.supply_note+"）");
-  row("窗口最高",L.high+(L.high_at?"（"+L.high_at+"）":"")+"："+(L.bars?"GeckoTerminal 小时 K 近似":"只含机器人运行以来看到的价格")+"，结算以 "+L.settle+" 1 分钟 K 为准；Predict 已结算的档位算已触及"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
+  row("窗口最高",L.high+(L.high_at?"（"+L.high_at+"）":"")+"："+(L.bars?"GeckoTerminal 小时 K 近似（最活跃的池子）":"只含机器人运行以来每 10 秒看到的价格")+(L.gaps?"；"+L.gaps:"")+"，结算以 "+L.settle+" 1 分钟 K 为准；Predict 已结算的档位算已触及"+(L.first_skipped?"；开窗首个半小时的分钟 K 未取得，未计入":""));
   if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
   row("模型",(L.sigma_kind==="prior"?"σ 为先验值，仅供参考。":"")+"碰到即 Yes：零漂移、固定波动率的单边触及概率 Φ((−h−s²/2)/s) + (M/K)·Φ((−h+s²/2)/s)，h = ln(K/M)，s = σ√T");
   det.append(dl);c.append(det);
   const st=$("div","lstat");  // status lines (missing / errors / prior σ / reached): a fixed band so tables line up
   if(it.missing)st.append($("p","","概率暂缺："+it.missing));else if(L.error)st.append($("div","warn small","⚠️ "+L.error));
   if(L.waiting)st.append($("div","mut small",L.waiting));  // a spec without levels of its own, before Predict lists them
+  if(L.gaps&&!it.missing){const g=$("div","warn small","⚠️ "+L.gaps);g.title="这张卡没有 K 线来源，窗口最高只含机器人自己采到的价格；没采到的时段里碰到档位不会被发现，以 Predict 为准";st.append(g)}
   const prior=L.sigma_kind==="prior";
   if(prior&&!it.missing){const prog=(L.sigma_note||"").match(/自采价格 ([0-9.]+)/);
     const w=$("div","warn small","⚠️ σ 暂用先验 "+(L.sigma*100).toFixed(0)+"%"+(prog?"（自采 "+prog[1]+"/12 小时）":"")+"，优势仅供参考");
@@ -9341,7 +9378,7 @@ class Bot:
                        "supply": fmt(cap.supply.quantize(D(1))) if cap.supply else "—",
                        "window": f"{start:%m-%d %H:%M} ET（北京 {bj(spec.start_ms)}）起",
                        "years": max(0.0, (spec.end_ms - max(now_ms, spec.start_ms)) / YEAR_MS),
-                       "first_skipped": cap.history.get("first") == "skipped",
+                       "first_skipped": cap.history.get("first") == "skipped", "gaps": cap.gaps_note(),
                        "metric": spec.metric, "settle": spec.settle, "bars": bool(spec.gecko),
                        "sigma_kind": cap.sigma_kind, "vol_error": cap.vol_error,
                        "supply_note": "总量 − 销毁" if spec.supply == "rpc" else f"DexScreener {spec.metric} ÷ 价格"},
