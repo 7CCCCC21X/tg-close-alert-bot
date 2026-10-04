@@ -40,7 +40,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.23.0"
+VERSION = "1.24.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4576,6 +4576,17 @@ CAP_MARKETS = (
             et_ms(2026, 9, 1, 5, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
             chain="robinhood", pair="0xcbdfea90430a30ee4469c9902e120a77e7c7e4711d5643671c1d1957f2f1ce27", supply="fdv", gecko="",
             metric="FDV", settle="DexScreener"),
+    # "between market creation on September 6 at 04:00 AM ET, 2026 to October 31, 2026 at 11:59 PM ET" (STONK/SOL on Solana);
+    # the rules' own DexScreener pair settles it, FDV = (total − burned) × price; the pair is spelt as the rules' link spells it
+    # (DexScreener reads it either way), which GeckoTerminal would not accept, so no hourly bars: σ prior, live-observed high
+    CapSpec("STONK", "what-fdv-will-stonk-hit-before-november-2026", "$STONK FDV", "6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
+            et_ms(2026, 9, 6, 4, 0, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
+            chain="solana", pair="afrddtgywcveqb1gxcahr8i48o6qtxyqksdvkeludehg", supply="fdv", gecko="", metric="FDV", settle="DexScreener"),
+    # "between market creation on September 1, 2026 at 3:45 AM ET to October 31, 2026 at 11:59 PM ET" (STONKBROKER/WETH)
+    CapSpec("STONKBROKER", "what-fdv-will-stonkbroker-hit-by-november-2026", "$STONKBROKER FDV", "0xe934e36A439C94017B64a3FecE66AF12099aBF50",
+            et_ms(2026, 9, 1, 3, 45, -4), et_ms(2026, 10, 31, 23, 59, -4), (),
+            chain="robinhood", pair="0xd33c8fd38b06e989cdbd4dffdefab71c4bdd415b24964c8d69e38ff35b068f92", supply="fdv", gecko="",
+            metric="FDV", settle="DexScreener"),
 )
 BSC_RPC = ("https://bsc-dataseed.bnbchain.org", "https://bsc-dataseed.binance.org", "https://bsc-rpc.publicnode.com")
 BURN_ADDRESSES = ("0x000000000000000000000000000000000000dead", "0x0000000000000000000000000000000000000000")
@@ -5632,7 +5643,7 @@ body.flatview .wrap>h2:not(#h-flat),body.flatview .wrap>.grid:not(#g-flat){displ
 a.simrow{display:grid;grid-template-columns:auto 1fr auto auto;gap:2px 8px;font-size:12.5px;color:inherit;text-decoration:none;font-variant-numeric:tabular-nums;padding:2px 0;border-top:1px dashed var(--line)}
 a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);text-decoration:none;align-self:flex-start}.simj:hover{text-decoration:underline}.panel a.cb{text-decoration:none;color:var(--best)}
 .small{font-size:12px;margin-top:3px}.mut{color:var(--faint)}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:14px;line-height:1.6;max-width:760px}
-#opps{display:flex;flex-wrap:wrap;align-items:center;gap:5px 6px;margin:6px 0 2px;font-size:12px}#opps .ok{color:var(--hot);font-weight:650;white-space:nowrap}#opps .og{color:var(--muted);font-weight:600;white-space:nowrap;margin-left:2px}
+#opps{display:flex;flex-direction:column;align-items:stretch;gap:4px;margin:6px 0 2px;font-size:12px}#opps .orow{display:flex;flex-wrap:wrap;align-items:center;gap:5px 6px}#opps .ok{color:var(--hot);font-weight:650;white-space:nowrap}#opps .og{color:var(--muted);font-weight:600;white-space:nowrap;margin-left:2px}
 .opp{display:inline-flex;align-items:baseline;gap:4px;max-width:100%;border:1px solid var(--hot);background:var(--hot-bg);color:var(--text);border-radius:999px;padding:2px 9px;font:inherit;font-size:12px;line-height:1.4;cursor:pointer;font-variant-numeric:tabular-nums}
 .opp b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46vw}.opp span{color:var(--muted);white-space:nowrap}.opp i{font-style:normal;color:var(--hot);font-weight:650}
 .opp:hover{border-color:var(--hot);box-shadow:0 0 0 2px var(--hot-bg)}body.olddata #opps{display:none}
@@ -6006,7 +6017,7 @@ function priceLadderBook(c,it,L,live){
     const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);
     hots.push({key,name:it.name,group:it.group||"levels",maker:hotMk?{text:text(hotMk),edge:hotMk.edge,points:hotMk.points}:null,taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
   return c}
-function drawOpps(){  // every red-framed suggestion on the page in one strip on top: makers (挂单) first, then takers (吃单), largest first; tap one to jump to its card.
+function drawOpps(){  // every red-framed suggestion on the page in one strip on top: makers (挂单) on one row, takers (吃单) on the next, largest first; tap one to jump to its card.
   // 自定义 leaves sections out, drops either side, or lists makers whatever their points; by default a maker is listed only where a
   // quote placed now earns points (a maker's edge is only real once it fills: the points are what makes the wait pay)
   const el=document.getElementById("opps"),seen=new Set(),byEdge=(a,b)=>b.pick.edge-a.pick.edge;
@@ -6014,15 +6025,16 @@ function drawOpps(){  // every red-framed suggestion on the page in one strip on
   const makers=oppMakers?pool.filter(h=>h.maker&&(!oppPoints||h.maker.points)).map(h=>({...h,pick:h.maker})).sort(byEdge):[];
   const takers=oppTakers?pool.filter(h=>h.taker).map(h=>({...h,pick:h.taker})).sort(byEdge):[];
   const n=makers.length+takers.length;el.hidden=editing||!n;if(el.hidden){el.replaceChildren();return}
-  el.replaceChildren($("span","ok","🔥 机会 "+n));
+  el.replaceChildren();let head=$("span","ok","🔥 机会 "+n);
   const jump=h=>{const find=()=>[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);let c=find();if(!c)return;
     const g=c.parentElement.id.slice(2);if(folded.includes(g)){folded=folded.filter(x=>x!==g);keep("folded",folded);if(last)render(last);c=find()}
     c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+8)+"px";c.scrollIntoView({behavior:"smooth",block:"start"});
     c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")};
-  const group=(label,list,title)=>{if(!list.length)return;const t=$("span","og",label+" "+list.length);t.title=title;el.append(t);
+  const group=(label,list,title)=>{if(!list.length)return;const row=$("div","orow");if(head){row.append(head);head=null}
+    const t=$("span","og",label+" "+list.length);t.title=title;row.append(t);
     list.slice(0,6).forEach(h=>{const b=$("button","opp");b.type="button";b.title="跳到这张卡";b.append($("b","",h.name),$("span","",h.pick.text),$("i","",sg(h.pick.edge)));
-      b.addEventListener("click",()=>jump(h));el.append(b)});
-    if(list.length>6)el.append($("span","mut","还有 "+(list.length-6)+" 个"))};
+      b.addEventListener("click",()=>jump(h));row.append(b)});
+    if(list.length>6)row.append($("span","mut","还有 "+(list.length-6)+" 个"));el.append(row)};
   group("挂单",makers,"挂单机会：排队等成交，不保证成交"+(oppPoints?"；只列现在挂单能拿积分的市场":""));
   group("吃单",takers,"吃单机会：立即成交，已扣手续费与滑点")}
 function rowNote(r,L){  // one line about a ladder level itself, above its four directions: on a phone nothing hovers
