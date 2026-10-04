@@ -66,7 +66,7 @@ async def build():
     answers["102"] = {"outcomes": ["Up", "Down"], "status": "RESOLVED", "resolved": {"index": 1, "name": "Down", "split": False, "how": "outcomes.status"}}
     await step(CLOSE + 72 * 60_000)
     # an open order on another market, and an old record kept before evidence was saved
-    flip = m.SimMarket("hype-flip#1", "HYPE 反超 SOL", "flip", "HYPE", 0.30, book([("0.15", "200")], [("0.40", "50")], CLOSE + 73 * 60_000,
+    flip = m.SimMarket("hype-flip#1", "HYPE 反超 SOL", "flip", "HYPE", 0.30, book([("0.20", "200")], [("0.30", "50")], CLOSE + 73 * 60_000,
                        "will-hype-flip-sol-by-nov-26", "HYPE", "300"), 0.02, "", ("Yes", "No"), {"end": BJ(11, 1, 11, 59)},
                        {"basis": {"a": 41.2, "b": 160.5}, "sources": [{"what": "HYPE", "source": "Hyperliquid", "price": 41.2}]})
     await step(CLOSE + 73 * 60_000, flip)
@@ -90,6 +90,9 @@ async def run():
     status, ctype, body = web.route("GET", f"/p/{TOKEN}/journal.json")
     data = json.loads(body)
     assert status == 200 and ctype.startswith("application/json") and len(data["trades"]) == 6 and data["total"]["mismatch"] == 1
+    waits = {t["id"]: t["wait"] for t in data["trades"]}  # every open trade says what it waits for; a settled one nothing
+    assert waits["hype-flip#1|up|挂"] == "挂 20.0¢，最低卖价 30.0¢（高出 10.0¢）：要有人卖到挂价或更低才算成交；现在公平价 30.0¢", waits
+    assert waits[hsi_maker] == "" and data["total"]["cancelled"] == 0
     status, ctype, body = web.route("GET", f"/p/{TOKEN}/journal.csv")
     text = body.decode("utf-8")
     assert status == 200 and ctype == "text/csv; charset=utf-8" and text.startswith("﻿编号,下单时间,市场")
@@ -134,8 +137,12 @@ async def browser_check(bot, data):
         # filters: by how the result stands, by way of trading
         await page.click("#filters button:text-is('结果不一致')")
         assert await page.locator("#list .tr").count() == 1
-        await page.click("#filters button:text-is('未成交')")
+        await page.click("#filters button:text-is('未成交/撤单')")
         assert await page.locator("#list .tr").count() == 1  # the KOSPI maker: no seller ever reached it
+        await page.click("#filters button:text-is('挂单中')")
+        assert await page.locator("#list .tr").count() == 1 and "⏳ 挂 20.0¢，最低卖价 30.0¢（高出 10.0¢）" in await page.inner_text("#list .tr .t3")
+        await page.click("#filters button:text-is('持仓')")
+        assert await page.locator("#list .tr").count() == sum(t["status"] == "filled" for t in data["trades"])
         await page.click("#filters button:text-is('全部') >> nth=0")
         await page.click("#filters button:text-is('吃单')")
         assert await page.locator("#list .tr").count() == 2
@@ -159,6 +166,8 @@ async def browser_check(bot, data):
         # an old record says what it lacks
         await page.click(f"#list .tr:has-text('上证指数 挂涨') button.row")
         assert "旧版本记下的交易" in await page.locator("#list .tr.open .det").inner_text()
+        await page.click(f"#list .tr:has-text('HYPE 反超 SOL') button.row")
+        assert "现在等什么\n挂 20.0¢，最低卖价 30.0¢" in await page.locator("#list .tr.open .det").inner_text()
         assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "no sideways scroll"
         if os.environ.get("WEB_SCREENSHOT"):
             await page.screenshot(path=os.environ["WEB_SCREENSHOT"], full_page=True)

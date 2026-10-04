@@ -173,6 +173,9 @@ async def run():
     await step(bot, NOW + 120_000, hsi(0.70, [("0.55", "120")], [("0.57", "400")], NOW + 120_000))
     t = bot.sim_trades()[hsi_maker]
     assert t["status"] == "resting" and t["shares"] == 0 and t["queue_min"] == 120  # the queue ahead shrank, nothing traded with us
+    wait = {x["id"]: x["wait"] for x in bot.journal_payload()["trades"]}  # the review page says what each open trade waits for
+    assert wait[hsi_maker] == "挂 55.0¢，最低卖价 57.0¢（高出 2.0¢）：要有人卖到挂价或更低才算成交；现在公平价 70.0¢", wait[hsi_maker]
+    assert wait["deep|up|吃"] == "等市场出结果" and wait[f"{HSI_SLUG}|up|吃"].startswith("等 10-05 收盘（10-05 16:10）后 1 小时（10-05 17:10），按官方收盘预结算")
     await step(bot, NOW + 180_000, hsi(0.70, [("0.54", "200")], [("0.55", "30"), ("0.60", "100")], NOW + 180_000))
     await step(bot, NOW + 240_000, hsi(0.70, [("0.54", "200")], [("0.55", "30"), ("0.60", "100")], NOW + 240_000))  # same seller
     t = bot.sim_trades()[hsi_maker]
@@ -201,6 +204,19 @@ async def run():
     assert down_taker["shares"] == 100 and abs(down_taker["price"] - k_cost) < 1e-12 and abs(down_taker["slip"] - (k_avg - 0.65)) < 1e-12
     await step(bot, NOW + 460_000, kospi([("0.39", "25")], [("0.41", "100")], NOW + 460_000))  # a 跌 seller at 61¢ ≤ 62¢
     assert bot.sim_trades()[f"{KOSPI_SLUG}|down|挂"]["shares"] == 25
+    wait = {x["id"]: x["wait"] for x in bot.journal_payload()["trades"]}
+    assert wait[f"{KOSPI_SLUG}|down|挂"] == "盘口有卖到挂价的卖单，已按看到的数量推定成交；现在公平价 80.0¢", wait
+    assert wait[f"{KOSPI_SLUG}|down|吃"] == "等 10-05 收盘（10-05 14:30）后 1 小时（10-05 15:30），按官方收盘预结算，再等 Predict 确认"
+    assert wait[hsi_maker] == "等 10-05 收盘（10-05 16:10）后 1 小时（10-05 17:10），按官方收盘预结算，再等 Predict 确认"  # filled by now
+    assert bot.sim_wait({"status": "resting"}, None, NOW) == "这个市场现在没有报价（卡片未定价或盘口没读到），挂单原地等着"
+    assert bot.sim_wait({"status": "resting", "side": "up", "price": 0.55}, hsi(0.70, [], [], NOW - 600_000), NOW) == "盘口已过期，等新盘口"
+    assert bot.sim_wait({"status": "resting", "side": "up", "price": 0.55}, hsi(0.70, [("0.50", "9")], [], NOW), NOW) == (
+        "挂 55.0¢，盘口这一边没有卖单：要有人卖到挂价或更低才算成交；现在公平价 70.0¢")
+    past = {"status": "filled", "kind": "close", "settle": SETTLE_HSI, "final_check": {"status": "REGISTERED"}}
+    assert bot.sim_wait(past, None, CLOSE + 2 * 3_600_000) == "收盘（10-05 16:10）已过 1 小时，官方收盘还没读到，等 Predict 结算（Predict 市场状态：REGISTERED）"
+    assert bot.sim_wait({**past, "kind": "range", "settle": {"end": CLOSE}, "final_check": None, "final_error": "HTTP 500"}, None, CLOSE + 2 * 3_600_000) == (
+        "窗口已结束（10-05 16:10），本地数据还定不了结果，等 Predict 结算（读取失败：HTTP 500）")
+    assert bot.sim_wait({"status": "settled"}, None, NOW) == "" and bot.sim_wait({"status": "cancelled"}, None, NOW) == ""
 
     # --- local pre-settlement on the official close (an hour after it), with where the close came from ----------------------
     bot.note_outcome("HSI", "2026-10-05", 24650.0, "tencent 日K")
@@ -445,7 +461,58 @@ async def run():
     mbot.sim_markets = lambda now: world["markets"]
     await step(mbot, NOW, hsi(0.70, [(0.55, 100)], [(0.58, 100)], NOW), far)
     assert sorted(mbot.sim_trades()) == ["will-bnb-hit-700-or-900|up|挂"], sorted(mbot.sim_trades())
-    assert "范围：先触价；只挂单。挂单排在已有挂单之后" in mbot.cmd_sim(None).text
+    assert "范围：先触价；只挂单。挂单只挂在双边都有报价、价差不超过 10¢ 的盘口，排在已有挂单之后" in mbot.cmd_sim(None).text
+
+    # --- a resting order is placed only on a book it could fill in: two-sided, no wider than SIM_MAKER_SPREAD ---------------
+    assert m.SIM_MAKER_SPREAD == 0.10 and m.sim_maker_block(book([("0.55", "100")], [("0.58", "100")])) == ""
+    assert m.sim_maker_block(book([("0.55", "100")], [])) == "盘口只有一边" and m.sim_maker_block(book([], [("0.58", "100")])) == "盘口只有一边"
+    assert m.sim_maker_block(book([("0.003", "50")], [("0.80", "100")])) == "买卖价差 79.7¢ 超过 10.0¢"
+    gbot = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                    "SIM_WAYS": "both", "SIM_MARKETS": "all"}), m.Store(":memory:"), FM(NOW), None)
+    gbot.sim_markets = lambda now: world["markets"]
+    lone = lambda name, bids, asks, fair: m.SimMarket(name, name, "close", "X", fair, book(bids, asks, NOW, name, mid=name), 0.03, "", ("涨", "跌"), {})
+    # the 10-03 price-ladder case: a lone 0.3¢ bid under an 80¢ ask shows 挂涨 +58.7¢, but nobody sells into it: no order;
+    # a one-sided book neither; a 10¢ spread is still a book
+    await step(gbot, NOW, lone("lone", [("0.003", "50")], [("0.80", "100")], 0.59), lone("oneside", [("0.55", "100")], [], 0.70),
+               lone("tight", [("0.55", "100")], [("0.65", "100")], 0.70))
+    assert sorted(gbot.sim_trades()) == ["tight|up|挂"], sorted(gbot.sim_trades())
+
+    # --- a resting order the trader no longer places is withdrawn, not left to the result ----------------------------------
+    # (10-03: 54 price-ladder makers at 0.1–0.3¢ from before the ladders went taker-only sat as 挂单中 0/100 until month end)
+    resting = lambda market, kind, shares=0.0: {
+        "v": 2, "market": market, "slug": market.partition("#")[0], "market_id": market.partition("#")[2], "item": market, "kind": kind,
+        "key": "X", "side": "down", "label": "挂No", "maker": True, "fair": 0.59, "opened": NOW - 3_600_000, "settle": {"end": BJ(11, 1, 11, 59)},
+        "order": 100.0, "fills": [{"at": NOW - 1_800_000, "shares": shares, "fair": 0.5, "how": "推定成交"}] if shares else [], "revisions": [],
+        "entry": {}, "version": {}, "price": 0.003, "signal": 0.587, "shares": shares, "status": "resting",
+        "filled": NOW - 1_800_000 if shares else None, "queue_ahead": 50.0, "queue_min": 50.0, "edge": 0.587}
+    for b in (dbot, gbot):
+        b.store.put("sim:sol#11|down|挂", resting("sol#11", "range"))
+        b.store.put("sim:sol#12|down|挂", resting("sol#12", "range", 30.0))
+    gbot.store.put("sim:hsi-x|up|挂", resting("hsi-x", "close"))  # a kind and a way gbot still trades
+    mbot.store.put("sim:hsi-y|up|挂", resting("hsi-y", "close"))  # mbot trades touch markets only
+    world["markets"] = []
+    for b in (dbot, gbot, mbot):
+        await step(b, NOW + 60_000)
+    t = dbot.sim_trades()["sol#11|down|挂"]
+    assert t["status"] == "cancelled" and t["note"] == "撤单：模拟交易已改为只吃单，一份都没成交", t
+    assert t["withdrawn"] == {"at": NOW + 60_000, "why": "模拟交易已改为只吃单", "unfilled": 100.0} and t["unfilled"] == 100
+    assert m.sim_status(t) == "已撤单" and m.sim_state(t) == "" and not dbot.sim_due(t, BJ(12, 1, 0, 0))  # nothing to confirm, ever
+    t = dbot.sim_trades()["sol#12|down|挂"]  # what had filled stays a position, the rest lapses now
+    assert t["status"] == "filled" and t["shares"] == 30 and t["unfilled"] == 70 and m.sim_status(t) == "持仓"
+    assert t["note"] == "撤单：模拟交易已改为只吃单；已推定成交的 30 份继续持有，其余 70 份作废", t["note"]
+    g = gbot.sim_trades()
+    assert g["sol#11|down|挂"]["withdrawn"]["why"] == "价格阶梯只做吃单" and g["sol#12|down|挂"]["status"] == "filled"
+    assert g["hsi-x|up|挂"]["status"] == "resting" and "withdrawn" not in g["hsi-x|up|挂"]  # still traded: it stands
+    assert mbot.sim_trades()["hsi-y|up|挂"]["withdrawn"]["why"] == "模拟交易范围已不含指数/个股日涨跌"
+    await step(dbot, NOW + 120_000)  # withdrawn once: the record does not change again
+    assert dbot.sim_trades()["sol#11|down|挂"]["withdrawn"]["at"] == NOW + 60_000
+    tot = dbot.sim_report()["total"]
+    assert tot["cancelled"] == 1 and tot["resting"] == 0 and tot["open"] == 2 and tot["partial"] == 1 and tot["expired"] == 0, tot
+    assert "｜撤单 1 笔" in dbot.cmd_sim(None).text and "撤单" not in bot.cmd_sim(None).text  # counted only when there are any
+    j = {x["id"]: x for x in dbot.journal_payload()["trades"]}
+    assert j["sol#11|down|挂"]["wait"] == "" and j["sol#11|down|挂"]["text"] == "已撤单"
+    assert j["sol#12|down|挂"]["wait"] == "碰到档位即 Yes；否则等窗口结束 11-01 11:59 后按 No（11-01 12:59 起）"
+    assert "已撤单" in dbot.journal_csv() and json.dumps(dbot.journal_payload())
 
     await browser_check(bot)
     print("SIM_OK")
