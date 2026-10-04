@@ -200,7 +200,7 @@ async def run():
     bot.predict.books["SSE"] = m.dataclasses.replace(sse_book, fetched_ms=now_ms)
     bot.predict.slugs["SSE"] = want["SSE"]
     bot.predict.errors.pop("SSE", None)
-    web = m.WebServer(bot, 0, "t" * 20); port = await web.start()
+    web = m.WebServer(bot, 0, "t" * 20); web.CACHE_SECONDS = {}; port = await web.start()  # the tests change the payload and reload at once
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         page = await browser.new_page(viewport={"width": 390, "height": 900})

@@ -44,7 +44,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.28.0"
+VERSION = "1.28.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -5017,6 +5017,7 @@ class CapMarket:
     FAST_PRICE_SECONDS = 10  # without bars the bot's own samples are the only record of the window: sample three times as often
     GAP_S = 120           # without bars, an unobserved stretch of the window longer than this is recorded (a touch inside it is unknown)
     GAPS_KEEP = 40        # the longest such stretches kept per window
+    SAMPLE_GAP_S = 900    # rebuilding the coverage from the 5-minute samples: a break longer than this between them is a gap
     SEEN_WRITE_S = 60     # the "last sampled" mark is persisted this often (a restart then sees at most a minute too much gap)
     SUPPLY_SECONDS = 600
     VOL_SECONDS = 3600
@@ -5151,7 +5152,10 @@ class CapMarket:
             hist["seen_high"], hist["seen_at"], changed = float(self.price), now_s, True
             top_high(hist)
         if not self.spec.gecko:
-            since = int(hist.get("seen") or 0) or self.spec.start_ms // 1000
+            if hist.get("coverage_v") != 2:
+                self.rebuild_coverage(hist, now_s)  # once: a record older than the coverage marks (or wrongly given the whole window as a gap)
+                changed = True
+            since = int(hist.get("seen") or 0) or int(hist.get("monitored_from") or now_s)
             if now_s - since > self.GAP_S:
                 gaps = [g for g in hist.get("gaps") or [] if isinstance(g, list) and len(g) == 2] + [[since, now_s]]
                 hist["gaps"] = sorted(sorted(gaps, key=lambda g: g[1] - g[0])[-self.GAPS_KEEP:])  # the longest kept, in time order
@@ -5161,6 +5165,24 @@ class CapMarket:
                 hist["seen"], changed, self.seen_written_s = now_s, True, now_s
         if changed:
             self.store.put(f"cap:{self.spec.slug}", hist)
+
+    def rebuild_coverage(self, hist: dict, now_s: int) -> None:
+        """What the bot has actually watched of this window, from the 5-minute price samples it keeps for σ (and the
+        time of its highest sample): the first sample is when it began monitoring the ladder (monitored_from; the window
+        before that was never watched, which is not the same as a sampling gap), and every break longer than
+        SAMPLE_GAP_S between samples is a gap. Replaces a record from before the coverage marks existed, which the first
+        build of those marks had wrongly given the whole window (opening → its first run) as one gap."""
+        start_s = self.spec.start_ms // 1000
+        stamps = sorted(int(r[0]) for r in self.store.get(f"capsamples:{self.spec.slug}", [])
+                        if isinstance(r, list) and len(r) == 2 and start_s <= int(r[0]) <= now_s)
+        first = min([s for s in (stamps[:1] + [int(hist.get("seen_at") or 0), int(hist.get("at") or 0)]) if s >= start_s] or [now_s])
+        gaps = [[a, b] for a, b in zip(stamps, stamps[1:]) if b - a > self.SAMPLE_GAP_S]
+        if stamps and now_s - stamps[-1] > self.SAMPLE_GAP_S:
+            gaps.append([stamps[-1], now_s])
+        hist["monitored_from"] = min(first, now_s)
+        hist["gaps"] = sorted(sorted(gaps, key=lambda g: g[1] - g[0])[-self.GAPS_KEEP:])
+        hist["gap_s"] = sum(b - a for a, b in gaps)
+        hist["coverage_v"] = 2
 
     def spike_note(self) -> str:
         """The window's high came from a wick: an hourly bar whose high is more than double its open and close ("" when
@@ -5172,15 +5194,29 @@ class CapMarket:
                 "K 线池子里的一笔异常成交也会留下这样的影子，结算图上是否真有这根请核实")
 
     def gaps_note(self) -> str:
-        """Without bars: the window's unobserved stretches so far, in words ("" when none, or when bars cover the window)."""
+        """Without bars: what the bot has not watched of the window, in words — the stretch before it began monitoring
+        the ladder, and the breaks in its sampling since ("" when it has watched the whole window; "" with bars)."""
         hist = self.history
-        gaps = sorted(g for g in hist.get("gaps") or [] if isinstance(g, list) and len(g) == 2)
-        if self.spec.gecko or not gaps:
+        if self.spec.gecko or not hist:
             return ""
-        span = lambda seconds: f"{seconds / 3600:.1f} 小时" if seconds >= 3600 else f"{seconds // 60} 分钟"
-        longest = max(gaps, key=lambda g: g[1] - g[0])
-        return (f"窗口内有 {len(gaps)} 段没有采样，共 {span(int(hist.get('gap_s') or 0))}（最长 {span(longest[1] - longest[0])}："
-                f"{stamp(longest[0] * 1000, seconds=False)} → {stamp(longest[1] * 1000, seconds=False)}）；这些时段碰没碰到档位无法判断")
+        start_s = self.spec.start_ms // 1000
+        from_s = int(hist.get("monitored_from") or 0)
+        gaps = sorted(g for g in hist.get("gaps") or [] if isinstance(g, list) and len(g) == 2)
+        span = lambda seconds: f"{seconds / 3600:.1f} 小时" if seconds >= 3600 else f"{max(1, seconds // 60)} 分钟"
+        parts = []
+        if from_s and from_s - start_s > self.GAP_S:
+            parts.append(f"机器人从 {stamp(from_s * 1000, seconds=False)} 起才监控这张卡，开窗后的前 {span(from_s - start_s)}没有任何记录")
+        if gaps:
+            longest = max(gaps, key=lambda g: g[1] - g[0])
+            total = span(int(hist.get("gap_s") or sum(b - a for a, b in gaps)))
+            if longest[1] - longest[0] < 600:  # restarts and failed reads: a few minutes each, not worth a timetable
+                parts.append(f"监控以来有 {len(gaps)} 次短暂中断（重启或行情接口失败），共 {total}，最长 {span(longest[1] - longest[0])}")
+            else:
+                parts.append(f"监控以来有 {len(gaps)} 段没有采样，共 {total}（最长 {span(longest[1] - longest[0])}："
+                             f"{stamp(longest[0] * 1000, seconds=False)} → {stamp(longest[1] * 1000, seconds=False)}）")
+        if not parts:
+            return ""
+        return "；".join(parts) + "；这些时段碰没碰到档位无法判断（Predict 已结算的档位除外）"
 
     @property
     def cap(self) -> D | None:
@@ -6563,6 +6599,8 @@ a.simrow>*{min-width:0}a.simrow>:nth-child(2){overflow:hidden;text-overflow:elli
 .opp{display:inline-flex;align-items:baseline;gap:4px;max-width:100%;border:1px solid var(--hot-soft);background:var(--card);color:var(--text);border-radius:999px;padding:3px 10px;font:inherit;font-size:12px;line-height:1.4;cursor:pointer;font-variant-numeric:tabular-nums;box-shadow:var(--shadow);transition:border-color .15s,box-shadow .15s}
 .opp b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46vw}.opp span{color:var(--muted);white-space:nowrap}.opp i{font-style:normal;color:var(--hot);font-weight:700}
 .opp:hover{border-color:var(--hot);box-shadow:0 0 0 3px var(--hot-bg)}body.olddata #opps{display:none}
+a.opp{text-decoration:none}a.opp.link:after{content:"↗";color:var(--best);font-size:11px;align-self:center}
+h2 .secsort{margin-left:auto;font-weight:400;font-size:12px;color:var(--muted);letter-spacing:0}h2 .secsort select{font-size:12px;padding:2px 5px}
 .card.flash{animation:flash 1.4s ease-out}@keyframes flash{from{outline:3px solid var(--best);outline-offset:3px}to{outline:3px solid transparent;outline-offset:3px}}
 #g-levels{grid-template-columns:repeat(auto-fill,minmax(min(100%,440px),1fr))}
 .card.price-lad{gap:8px}.price-top{display:flex;flex-wrap:wrap;align-items:baseline;gap:5px 9px;font-variant-numeric:tabular-nums}.price-top b{font-size:26px;font-weight:750;letter-spacing:-.02em}.price-top .plabel{font-size:12px;color:var(--muted)}
@@ -6739,6 +6777,23 @@ const sg=x=>(x>=0?"+":"")+cent(x);
 // --- the trade size taker edges are priced for (0 = the server's own), the filter / sort bar, data freshness ----------
 let amount=stored("amount",0,v=>typeof v==="number"&&v>=0&&v<=1e6);
 let filt=stored("filt",[],strs),sortBy=stored("sort","",v=>["","edge","time"].includes(v));
+// the ladder sections' own card order (per browser): by market cap, LP points, best edge, closeness, σ or time left
+const SEC_SORTS={ladder:[["","默认顺序"],["cap","市值 高→低"],["capasc","市值 低→高"],["pp","PP/h 高→低"],["edge","最大净优势"],["near","离下一档 近→远"],["sigma","σ 低→高"],["time","剩余时间 短→长"]],
+  levels:[["","默认顺序"],["pp","PP/h 高→低"],["edge","最大净优势"],["near","离下一档 近→远"],["sigma","σ 低→高"],["time","剩余时间 短→长"]]};
+let secSort=stored("secsort",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Object.values(v).every(x=>typeof x==="string"));
+function secMetric(it,k){  // the number a section sort key reads off a card: its ladder block and its open levels
+  const L=it.ladder||{},rows=(L.rows||[]).filter(r=>!r.touched);
+  if(k==="cap"||k==="capasc")return L.cap_usd??null;
+  if(k==="pp"){const v=rows.filter(r=>r.points_active===true&&r.points_rate!=null).map(r=>r.points_rate);return v.length?Math.max(...v):null}
+  if(k==="edge"){const b=view(it).best;return b?b.edge:null}
+  if(k==="near"){const v=rows.filter(r=>r.dist!=null&&r.dist>0).map(r=>r.dist);return v.length?Math.min(...v):null}
+  if(k==="sigma")return L.sigma??null;
+  if(k==="time")return it.close_ms||null;
+  return null}
+function sortSection(items,g){  // cards without the number go last, ties keep the viewer's own order
+  const k=secSort[g]||"";if(!k||!SEC_SORTS[g])return items;
+  const desc=["cap","pp","edge"].includes(k);
+  return items.map((it,i)=>({it,i,v:secMetric(it,k)})).sort((a,b)=>{if(a.v==null&&b.v==null)return a.i-b.i;if(a.v==null)return 1;if(b.v==null)return -1;return(desc?b.v-a.v:a.v-b.v)||a.i-b.i}).map(x=>x.it)}
 const FILTERS=[["sug","有建议","只看现在有建议的卡片"],["no","仅 No/跌","只看建议买 No（或 跌、后一个结果）的"],["maker","仅挂单","只看建议挂单的"],
   ["taker","仅吃单","只看建议吃单的"],["soon","3 小时内收盘","只看 3 小时内收盘或截止的"]];
 const SOON_MS=3*3600e3,STALE_MS=60e3;  // no successful refresh for a minute: every highlight comes off
@@ -6944,7 +6999,9 @@ function priceLadderBook(c,it,L,live){
         if(ok){a.classList.add("pos");if(e.edge>=HOT)a.classList.add("hot")}
         const line=$("span","pa");line.append($("b","",e.up?"Yes":"No"),$("span","",cent(e.price)),$("span","pv",sg(e.edge)));a.append(line);
         if(r.error||r.hold||r.stale)a.append($("span","pwhy",r.stale?"盘口过期":"暂不建议"));else if(ok&&!maker&&e.short)a.append($("span","pwhy","深度不足"));
-        a.title=e.label+" @ "+cent(e.price)+"；净优势 "+sg(e.edge)+(maker?"，挂单排队，成交不保证":"，约 "+qty(e.size)+" 份；已扣手续费与滑点")+(r.error?"；"+r.error:r.hold?"；"+r.hold:r.stale?"；盘口过期":!ok?"；未过建议门槛":"");return a};
+        else if(!ok&&e.edge>0)a.append($("span","pwhy","低于门槛"));  // a positive edge the model's own error swallows: say so without a hover
+        const bar=r.need!=null?"未过建议门槛 "+cent(r.need)+"（"+(r.swing!=null&&r.swing>=r.need-1e-9&&r.swing>0?"σ ×/÷1.25 的模型误差":"最低净优势")+"）":"未过建议门槛";
+        a.title=e.label+" @ "+cent(e.price)+"；净优势 "+sg(e.edge)+(maker?"，挂单排队，成交不保证":"，约 "+qty(e.size)+" 份；已扣手续费与滑点")+(r.error?"；"+r.error:r.hold?"；"+r.hold:r.stale?"；盘口过期":!ok?"；"+bar:"");return a};
       g.append(target,model,action(true),action(false));
       if(openChip[rk]){const d=$("div","lrow");d.append(rowNote(r,L));if(v.edges.length)d.append(chips(rk+"/",v,ctxOf(r)));g.append(d)}});
     if(!marked&&L.spot!=null)g.append(spot());w.append(g)
@@ -6952,7 +7009,7 @@ function priceLadderBook(c,it,L,live){
   c.append(w);const ag=ages(it);if(ag)c.append(ag);
   if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" "+sg(hot.edge);
     const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);
-    hots.push({key,name:it.name,group:it.group||"levels",maker:hotMk?{text:text(hotMk),edge:hotMk.edge,points:hotMk.points}:null,taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
+    hots.push({key,name:it.name,group:it.group||"levels",url:it.predict&&it.predict.url||"",maker:hotMk?{text:text(hotMk),edge:hotMk.edge,points:hotMk.points}:null,taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
   return c}
 function drawOpps(){  // every red-framed suggestion on the page in one strip on top: makers (挂单) on one row, takers (吃单) on the next, largest first; tap one to jump to its card.
   // 自定义 leaves sections out, drops either side, or lists makers whatever their points; by default a maker is listed only where a
@@ -6969,7 +7026,9 @@ function drawOpps(){  // every red-framed suggestion on the page in one strip on
     c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")};
   const group=(label,list,title)=>{if(!list.length)return;const row=$("div","orow");if(head){row.append(head);head=null}
     const t=$("span","og",label+" "+list.length);t.title=title;row.append(t);
-    list.slice(0,6).forEach(h=>{const b=$("button","opp");b.type="button";b.title="跳到这张卡";b.append($("b","",h.name),$("span","",h.pick.text),$("i","",sg(h.pick.edge)));
+    list.slice(0,6).forEach(h=>{  // a tap opens the market on Predict (a new tab) and brings its card into view here
+      const b=h.url?$("a","opp link"):$("button","opp");if(h.url){b.href=h.url;b.target="_blank";b.rel="noopener noreferrer"}else b.type="button";
+      b.title=h.url?"在新标签页打开这个 Predict 市场，并定位到它的卡片":"跳到这张卡";b.append($("b","",h.name),$("span","",h.pick.text),$("i","",sg(h.pick.edge)));
       b.addEventListener("click",()=>jump(h));row.append(b)});
     if(list.length>6)row.append($("span","mut","还有 "+(list.length-6)+" 个"));el.append(row)};
   group("挂单",makers,"挂单机会：排队等成交，不保证成交"+(oppPoints?"；只列现在挂单能拿积分的市场":""));
@@ -6980,6 +7039,7 @@ function rowNote(r,L){  // one line about a ladder level itself, above its four 
   if(L.kind==="price"&&r.dist!=null&&Math.abs(r.dist)<0.02&&L.range_word)parts.push("离档位很近，差几分钱的触及以 Predict 为准");
   if(r.fair!=null)parts.push("模型 Yes "+cent(r.fair));
   if(r.bid!=null||r.ask!=null)parts.push("Yes 盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1)));
+  if(r.need!=null&&r.fair!=null&&!r.touched)parts.push("建议门槛 "+cent(r.need)+(r.swing!=null&&r.swing>=r.need-1e-9&&r.swing>0?"（σ ×/÷1.25 的模型误差）":"（最低净优势）"));
   d.append($("b","",r.label),$("span","",parts.length?"："+parts.join(" · "):""));
   if(r.points_active!==undefined){const point=r.points_note||"积分状态暂缺",why=r.maker_note||r.points_why;d.append($("div","",point+(r.points_active===true&&r.points_rate!=null?" · "+qty(r.points_rate)+" PP/小时":"")));
     if(r.points_ok===false&&why&&why!==point)d.append($("div","warn",why))}
@@ -7015,7 +7075,7 @@ function card(it,g){
   const v=view(it),best=v.best;  // for the trade size picked in the bar
   if(best&&best.edge>=HOT){c.classList.add("hot");c.title="净优势 ≥"+hotCents+"¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge);
     const by=(a,b)=>b.edge-a.edge,mk=v.ok.filter(e=>e.maker).sort(by)[0],tk=v.ok.filter(e=>!e.maker).sort(by)[0],text=e=>e.label+" "+(e.price*100).toFixed(1);
-    hots.push({key:fk,name:it.name,group:it.group||"contract",maker:mk&&mk.edge>=HOT?{text:text(mk),edge:mk.edge,points:!!(it.predict&&it.predict.points_ok===true)}:null,
+    hots.push({key:fk,name:it.name,group:it.group||"contract",url:it.predict&&it.predict.url||"",maker:mk&&mk.edge>=HOT?{text:text(mk),edge:mk.edge,points:!!(it.predict&&it.predict.points_ok===true)}:null,
                taker:tk&&tk.edge>=HOT?{text:text(tk),edge:tk.edge}:null})}
   if(it.missing){c.append($("p","","概率暂缺："+it.missing));tail(c,it);return c}
   const o=$("div","odds"),a=$("b",style==="us"?"d":"u"),b=$("b",style==="us"?"u":"d");
@@ -7100,7 +7160,7 @@ function render(d){
   // hidden cards and sections are left out, except in 自定义 where they show faded so they can be brought back
   const shown=i=>editing||!hidden.includes(favKey(i));
   const lists={fav:favs.map(k=>d.items.find(i=>favKey(i)===k)).filter(i=>i&&shown(i))};
-  for(const g of SECTIONS)lists[g]=arrange(d.items.filter(i=>(i.group||"contract")===g&&!favs.includes(favKey(i))&&shown(i)),g);
+  for(const g of SECTIONS){const own=arrange(d.items.filter(i=>(i.group||"contract")===g&&!favs.includes(favKey(i))&&shown(i)),g);lists[g]=editing?own:sortSection(own,g)}
   plan=Object.fromEntries(Object.entries(lists).map(([g,l])=>[g,l.map(favKey)]));
   const vis=secOrder.filter(s=>lists[s].length),foot=document.getElementById("foot");
   for(const[g,items]of Object.entries(lists)){
@@ -7116,7 +7176,11 @@ function render(d){
     const sg=editing&&g!=="fav"?$("button","grip","⠿"):null;  // 自定义: drag the title to move the whole section (↑ ↓ do the same)
     if(sg){sg.type="button";sg.title="按住拖动，调整栏目顺序";sg.setAttribute("aria-label","拖动栏目");sg.addEventListener("pointerdown",e=>startSecDrag(e,g))}
     h.replaceChildren(...(sg?[sg]:[]),head,...(sum?[sum]:[]),
-      ...(editing&&g!=="fav"?[ctlBtn("↑","栏目上移",()=>moveSec(g,-1),i<=0),ctlBtn("↓","栏目下移",()=>moveSec(g,1),i<0||i>=vis.length-1)]:[]))}
+      ...(editing&&g!=="fav"?[ctlBtn("↑","栏目上移",()=>moveSec(g,-1),i<=0),ctlBtn("↓","栏目下移",()=>moveSec(g,1),i<0||i>=vis.length-1)]:[]));
+    if(!editing&&SEC_SORTS[g]&&items.length>1){  // the ladder sections: a sort of their own (the filter bar's sort flattens the page instead)
+      const l=$("label","fsort secsort"),s=$("select");l.append("排序 ",s);SEC_SORTS[g].forEach(([v,t])=>{const o=$("option","",t);o.value=v;s.append(o)});s.value=secSort[g]||"";
+      s.title="这一栏卡片的排列顺序（只影响本浏览器；默认顺序 = 自定义里拖出来的顺序）";l.addEventListener("click",e=>e.stopPropagation());
+      s.addEventListener("change",()=>{secSort={...secSort,[g]:s.value};keep("secsort",secSort);if(last)render(last)});h.append(l)}}
   const now=[...document.querySelectorAll(".wrap>.grid")].map(e=>e.id.slice(2)).filter(g=>g!=="fav");
   if(now.join()!==secOrder.join())for(const g of secOrder)foot.before(document.getElementById("h-"+g),document.getElementById("g-"+g));
   restoreScroll(marks);drawOpps();tick()}
@@ -7168,8 +7232,8 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;folded=[];oneRow=[];
-  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","folded","oneRow"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
+  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;folded=[];oneRow=[];secSort={};
+  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","folded","oneRow","secsort"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 let loading=null,lastSig="",dead=false;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
 const LOAD_TIMEOUT_MS=8000;
@@ -7183,7 +7247,7 @@ function load(){
     if(last)for(const it of d.items){const k=favKey(it),o=last.items.find(x=>favKey(x)===k);  // a fair price that moved since the last refresh
       if(o&&o.fair_up!=null&&it.fair_up!=null&&Math.abs(o.fair_up-it.fair_up)>=5e-4)changedAt[k]={at:Date.now(),up:it.fair_up>o.fair_up}}
     const sig=JSON.stringify(d.items),same=!!last&&sig===lastSig;lastSig=sig;  // books move every 15 s, quotes every 30 s: most 10-second
-    last=d;if(!same)render(d);                                                  // answers repeat the last one, and a repeat rebuilds nothing
+    last=d;if(!same||drag)render(d);                                            // answers repeat the last one, and a repeat rebuilds nothing (a drag still notes it)
     const ago=$("span","","");ago.id="ago";
     document.getElementById("meta").replaceChildren(...(d.today?[$("span","","今天 "+d.today)]:[]),$("span","","数据 "+d.generated_at),ago,$("span","","基准 "+d.mode),$("span","","v"+d.version));
     if(!same)drawLegend();
@@ -10276,6 +10340,9 @@ class Bot:
             "quote_ms": cap.priced_ms if cap.price is not None else 0, "source": cap.source or "",
             "close_label": f"{end:%m-%d %H:%M} ET（北京 {bj(spec.end_ms)}）截止" + (f"；{spec.trade_end}" if spec.trade_end else ""),
             "ladder": {"cap": usd_short(cap.cap), "high": usd_short(high), "high_at": stamp(high_at * 1000, seconds=False) if high_at else "",
+                       "cap_usd": float(cap.cap) if cap.cap is not None else None, "high_usd": float(high) if high is not None else None,
+                       "monitored_from": (stamp(int(cap.history.get("monitored_from") or 0) * 1000, seconds=False)
+                                          if cap.history.get("monitored_from") else ""),
                        "sigma": cap.sigma, "sigma_note": cap.sigma_note, "rows": rows, "error": cap.error,
                        "price": f"{cap.price:.10g}" if cap.price is not None else "—", "source": cap.source or "—",
                        "supply": fmt(cap.supply.quantize(D(1))) if cap.supply else "—",

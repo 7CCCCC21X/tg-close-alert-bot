@@ -209,7 +209,7 @@ async def layout_check():
     bot.predict.slugs[SPEC.key] = SPEC.slug
     touch = bot.touches["BNB"]
     touch.price, touch.priced_ms, touch.sigma, touch.sigma_ms = D("776.55"), now, 0.6, now
-    web = m.WebServer(bot, 0, "t" * 20); port = await web.start()
+    web = m.WebServer(bot, 0, "t" * 20); web.CACHE_SECONDS = {}; port = await web.start()  # the tests change the payload and reload at once
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         for width in (390, 620, 900, 1300):
