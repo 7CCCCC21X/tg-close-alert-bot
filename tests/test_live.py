@@ -67,7 +67,10 @@ async def run():
     assert await bot.stocks.refresh_live(bj(9, 28, 9, 0)) is False and not calls  # not trading yet: no request
     await bot.stocks.refresh_live(now)
     assert len(calls) == 1 and bot.stocks.live["UNITREEUSDT"].last == D("78.00")
-    assert await bot.stocks.refresh_live(now) is False and len(calls) == 1          # 20 s cadence
+    assert await bot.stocks.refresh_live(now) is False and len(calls) == 1          # QUOTE_REFRESH_SECONDS cadence (5 s)
+    assert cfg.quote_refresh == 5 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "QUOTE_REFRESH_SECONDS": "10"}).quote_refresh == 10
+    try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "QUOTE_REFRESH_SECONDS": "1"}); assert False
+    except ValueError as e: assert "QUOTE_REFRESH_SECONDS" in str(e), e
     o = bot.contract_odds("UNITREEUSDT", D("10.80"), now)
     assert isinstance(o, m.CloseOdds) and o.effective == D("78.00") and o.ref == D("76.50") and o.mode == "盘中", o
     assert o.proxy_note == "上交所现货 78（腾讯·盘中直接用现货）" and o.ref_note.endswith("·腾讯") and o.unit == "CNY", o

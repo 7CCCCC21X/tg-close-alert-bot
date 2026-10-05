@@ -76,6 +76,26 @@ assert a.last == D("14120") and a.prev_close == D("14100") and a.name == "A50期
 acfd = m.CnIndex.parse_a50("新浪CFD", 'var hq_str_hf_CHA50CFD="14118.5,,1,1,14200,14000,22:01:05,14100,14150,0,0,0,0,富时A50,2026-09-30";'.encode("gbk"), 0)
 assert acfd.last == D("14118.5") and acfd.quoted_ms == bj(2026, 9, 30, 22, 1) + 5000
 assert m.a50_session(bj(2026, 9, 30, 22, 0)) == "夜盘" and m.a50_session(bj(2026, 10, 1, 5, 14)) == "夜盘" and m.a50_session(bj(2026, 9, 30, 10, 0)) == "日盘" and m.a50_session(bj(2026, 9, 30, 16, 45)) == "夜盘"
+# SGX's own calendar (HOLIDAYS_SG / SG_HALF_DAYS): a Singapore holiday has no A50 session although Shanghai trades (11-09,
+# Deepavali observed); a half day (12-24) trades the morning only and has no night session
+assert dt.date(2026, 11, 9) in c.holidays["sg"] and dt.date(2026, 12, 25) in c.holidays["sg"] and m.CALENDAR.half_day("sg", dt.date(2026, 12, 24))
+assert m.a50_session(bj(2026, 11, 7, 3, 0)) == "夜盘" and m.a50_session(bj(2026, 11, 9, 10, 0)) == "休市" and m.a50_session(bj(2026, 11, 9, 22, 0)) == "休市"
+assert m.a50_session(bj(2026, 11, 10, 2, 0)) == "休市" and m.a50_session(bj(2026, 11, 10, 9, 0)) == "日盘"
+assert m.a50_next_open(bj(2026, 11, 9, 10, 0)) == bj(2026, 11, 10, 9, 0) and m.a50_next_open(bj(2026, 11, 9, 16, 40)) == bj(2026, 11, 10, 9, 0)
+assert m.a50_last_session_end(bj(2026, 11, 9, 12, 0)) == bj(2026, 11, 7, 5, 15) and m.a50_last_session_end(bj(2026, 11, 10, 8, 0)) == bj(2026, 11, 7, 5, 15)
+assert m.a50_closed_note(bj(2026, 11, 9, 12, 0)) == "新加坡交易所假期休市" and m.a50_closed_note(bj(2026, 11, 7, 12, 0)) == "休市"
+assert m.a50_session(bj(2026, 12, 24, 11, 0)) == "日盘" and m.a50_session(bj(2026, 12, 24, 13, 0)) == "休市" and m.a50_session(bj(2026, 12, 24, 22, 0)) == "休市"
+assert m.a50_session(bj(2026, 12, 25, 3, 0)) == "休市" and m.a50_next_open(bj(2026, 12, 24, 13, 0)) == bj(2026, 12, 28, 9, 0)  # 12-25 holiday, then the weekend
+assert m.a50_last_session_end(bj(2026, 12, 24, 13, 0)) == bj(2026, 12, 24, 12, 0) and m.a50_last_session_end(bj(2026, 12, 24, 11, 0)) == bj(2026, 12, 24, 5, 15)
+assert m.a50_closed_note(bj(2026, 12, 24, 13, 0)) == "新加坡半日市休市（当晚无夜盘）" and m.a50_closed_note(bj(2026, 12, 24, 11, 0)) == "休市"
+assert m.a50_next_open(bj(2026, 12, 24, 16, 40)) == bj(2026, 12, 28, 9, 0)  # no 16:30–16:45 "break" on a half day: it is shut
+m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "HOLIDAYS_SG": "", "SG_HALF_DAYS": ""})  # overrides reach the calendar
+assert m.a50_session(bj(2026, 11, 9, 10, 0)) == "日盘" and m.a50_session(bj(2026, 12, 24, 13, 0)) == "日盘" and m.a50_session(bj(2026, 12, 24, 22, 0)) == "夜盘"
+try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "HOLIDAYS_SG": "2026/11/09"}); assert False
+except ValueError as e: assert "HOLIDAYS_SG" in str(e), e
+assert "HOLIDAYS_CN/HK/KR/SG" in m.calendar_warning({}, dt.date(2026, 10, 5))
+c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"})  # defaults back for the rest of the suite
+assert m.a50_session(bj(2026, 11, 9, 10, 0)) == "休市"
 
 async def run():
     minutes = json.dumps({"data": {"code": "CN00Y", "klines": ["2026-09-30 14:59,14150,14155,1,1", "2026-09-30 15:00,14155,14160,1,1", "2026-09-30 15:01,14160,14158,1,1"]}}).encode()
@@ -99,6 +119,21 @@ async def run():
     assert await x.a50_at(dt.date(2026, 9, 30)) == D("14160") and "beg=20260929&end=20261001" in calls[-1]
     try: await x.a50_at(dt.date(2026, 9, 29)); assert False
     except ValueError as e: assert "15:00" in str(e)
+    # refresh cadence: 10 s while Shanghai or the A50 trades, 60 s between sessions (HSI 20 s / KOSPI 10 s in session)
+    f = m.CnIndex(True, cn)
+    assert f.cadence(bj(2026, 9, 26, 18, 30)) == 60 and f.cadence(bj(2026, 9, 28, 10, 0)) == 10 and f.cadence(bj(2026, 9, 28, 22, 0)) == 10
+    assert f.cadence(bj(2026, 9, 28, 16, 35)) == 60 and f.cadence(bj(2026, 11, 9, 20, 0)) == 60 and f.cadence(bj(2026, 10, 1, 10, 0)) == 10
+    k = m.KospiIndex(True, c.holidays["kr"])
+    assert k.cadence(bj(2026, 9, 28, 10, 0)) == 10 and k.cadence(bj(2026, 9, 28, 15, 0)) == 60 and k.cadence(bj(2026, 9, 26, 10, 0)) == 60
+    h = m.IndexFutures(True, c.holidays["hk"])
+    assert h.cadence(bj(2026, 9, 28, 10, 0)) == 20 and h.cadence(bj(2026, 9, 28, 22, 0)) == 20 and h.cadence(bj(2026, 9, 28, 16, 50)) == 60 and h.cadence(bj(2026, 9, 26, 10, 0)) == 60
+    # the 15:00 close is caught at once: a refresh fires right after it, whatever the cadence says (not on a holiday)
+    assert await f.refresh(bj(2026, 9, 30, 14, 59) + 50_000) is not False
+    assert await f.refresh(bj(2026, 9, 30, 14, 59) + 55_000) is False
+    assert await f.refresh(bj(2026, 9, 30, 15, 0) + 2_000) is not False and f.refreshed_ms == bj(2026, 9, 30, 15, 0) + 2_000
+    assert await f.refresh(bj(2026, 9, 30, 15, 0) + 4_000) is False
+    g = m.CnIndex(True, cn)
+    assert await g.refresh(bj(2026, 10, 1, 14, 59) + 50_000) is not False and await g.refresh(bj(2026, 10, 1, 15, 0) + 2_000) is False
     class FakeTelegram:
         def __init__(self): self.sent = []
         async def call(self, *a, **k): return True
@@ -205,6 +240,8 @@ async def run():
     assert "｜<b>收盘价待确认</b>（等待 09-28 日 K）" in m.to_html(x.line(now, "cn", cn))
     # the bar arrives -> confirmed; an older answer later never steps the close back
     feed["rows"] = bars24 + [["2026-09-28", "0", "3901.55", "0", "0", "0"]]
+    assert await x.refresh_daily(now) is None and x.close.day == dt.date(2026, 9, 24)  # pending: re-read once a minute, not every 10-second refresh
+    x.daily_refreshed -= 60
     await x.refresh_daily(now)
     assert x.close.day == dt.date(2026, 9, 28) and x.close.value == D("3901.55") and x.close.prev == D("3888.37")
     feed["rows"] = bars24
@@ -225,9 +262,32 @@ async def run():
         raise m.RemoteError("down")
     m.http_get = wrong_code; z = m.CnIndex(True, cn); await z.refresh_daily(bj(2026, 9, 27, 10, 0))
     assert z.close.source == "东方财富日K" and z.close.value == D("3888.37") and not z.daily_error
+    # ... and with Eastmoney unreachable too (the Railway picture), to Sina's daily bars, then Yahoo 000001.SS
+    SINA_DAY = (b'[{"day":"2026-09-23","open":"3860.000","high":"0","low":"0","close":"3870.100","volume":"1"},'
+                b'{day:"2026-09-24",open:"3871.000",high:"0",low:"0",close:"3888.370",volume:"1"}]')
+    def yahoo_day(symbol="000001.SS"):
+        stamps = [int(dt.datetime(2026, 9, d, 9, 30, tzinfo=m.BEIJING).timestamp()) for d in (23, 24)]
+        return json.dumps({"chart": {"result": [{"meta": {"symbol": symbol, "gmtoffset": 28800}, "timestamp": stamps,
+                                                  "indicators": {"quote": [{"open": [3860.0, 3871.0], "close": [3870.1, 3888.37]}]}}]}}).encode()
+    assert m.parse_cn_daily_ohlc("新浪日K", SINA_DAY) == [(dt.date(2026, 9, 23), D("3860.000"), D("3870.100")), (dt.date(2026, 9, 24), D("3871.000"), D("3888.370"))]
+    assert m.parse_cn_daily("Yahoo日K", yahoo_day()) == [(dt.date(2026, 9, 23), D("3870.10")), (dt.date(2026, 9, 24), D("3888.37"))]
+    for source, raw in [("Yahoo日K", yahoo_day("000300.SS")), ("Yahoo日K", b"{}"), ("新浪日K", b"null"), ("新浪日K", b"<html>")]:
+        try: m.parse_cn_daily(source, raw); assert False, (source, raw)
+        except ValueError as e: assert ("不是上证指数" in str(e)) == (raw == yahoo_day("000300.SS")), e
+    async def sina_only(url, timeout=15, headers=None):
+        if "getKLineData" in url and "symbol=sh000001" in url and "scale=240" in url: return SINA_DAY
+        raise m.RemoteError("down")
+    m.http_get = sina_only; z = m.CnIndex(True, cn); await z.refresh_daily(bj(2026, 9, 27, 10, 0))
+    assert z.close.source == "新浪日K" and z.close.value == D("3888.370") and z.close.prev == D("3870.100") and not z.daily_error, (z.close, z.daily_error)
+    async def yahoo_only(url, timeout=15, headers=None):
+        if "finance.yahoo.com" in url and "000001.SS" in url: return yahoo_day()
+        raise m.RemoteError("down")
+    m.http_get = yahoo_only; z = m.CnIndex(True, cn); await z.refresh_daily(bj(2026, 9, 27, 10, 0))
+    assert z.close.source == "Yahoo日K" and z.close.value == D("3888.37") and z.close.prev == D("3870.10") and not z.daily_error, (z.close, z.daily_error)
     async def all_down(url, timeout=15, headers=None): raise m.RemoteError("down")
+    m.SOURCE_HEALTH.hosts.clear()  # the scenarios above put hosts in cooldown; the failure list below is in preference order
     m.http_get = all_down; w = m.CnIndex(True, cn); await w.refresh_daily(bj(2026, 9, 27, 10, 0))
-    assert w.close is None and "腾讯日K" in w.daily_error and "东方财富日K" in w.daily_error
+    assert w.close is None and all(name in w.daily_error for name in ("腾讯日K", "东方财富日K", "新浪日K", "Yahoo日K")), w.daily_error
     bot.cn = w; w.quote = x.quote
     assert bot.sse_odds(bj(2026, 9, 27, 10, 0)) == "收盘价待确认（等待 09-24 上证日 K）"
     assert "｜<b>收盘价待确认</b>（等待 09-24 日 K；日 K 获取失败：腾讯日K: " in m.to_html(w.line(bj(2026, 9, 27, 10, 0), "cn", cn))
@@ -319,6 +379,15 @@ async def run():
     try: await x.a50_five_minute_at(dt.date(2026, 9, 24)); assert False
     except ValueError as e: assert "代码异常" in str(e)
     m.a50_next_open = a50_next_open
+    x.close = m.DailyClose(dt.date(2026, 9, 28), D("3901.55"), D("3888.37"), "腾讯日K", 0)
+    # a Singapore holiday (SGX shut while Shanghai trades): after the Shanghai close the odds say why A50 is silent and
+    # when it is back, and the last print before the holiday is not called stale
+    x.close = m.DailyClose(dt.date(2026, 11, 9), D("3900"), D("3890"), "腾讯日K", 0)
+    x.a50 = m.IndexQuote("A50期货", D("14000"), D("13990"), None, None, None, bj(2026, 11, 7, 5, 6), "东方财富")
+    bot.anchors["A50"] = (bj(2026, 11, 6, 15, 0), D("13950"))
+    assert bot.sse_odds(bj(2026, 11, 9, 20, 0)) == "A50 新加坡交易所假期休市，11-10 09:00 开盘后恢复概率", bot.sse_odds(bj(2026, 11, 9, 20, 0))
+    assert not x.a50_stale(bj(2026, 11, 9, 20, 0)) and "｜新加坡交易所假期休市" in x.a50_line(bj(2026, 11, 9, 20, 0), "cn", None)
+    assert "新加坡" not in x.a50_line(bj(2026, 11, 7, 12, 0), "cn", None)
     x.close = m.DailyClose(dt.date(2026, 9, 28), D("3901.55"), D("3888.37"), "腾讯日K", 0)
     # no A50 at all -> no probability, labelled
     x.a50 = None
