@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.32.0"
+VERSION = "1.33.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4836,8 +4836,9 @@ def us_eastern_offset(ms: int) -> int:
 
 @dataclass(frozen=True)
 class UpDownSpec:
-    """A "BTC Up/Down <month>" market: Up when the Binance 1-minute candle named for the period's end closes above the
-    one named for its start, Down when below, 50-50 when equal. Candles are named by their open time in US Eastern."""
+    """A "<coin> Up/Down <month>" market (BTC, ETH): Up when the Binance 1-minute candle named for the period's end
+    closes above the one named for its start, Down when below, 50-50 when equal. Candles are named by their open time
+    in US Eastern."""
     key: str        # item / book key, also the card's favourite key (not the bare pair: a 先触 card has that one)
     slug: str
     symbol: str     # Binance spot pair (the resolution source)
@@ -4856,6 +4857,9 @@ UPDOWN_MARKETS = (
     # "the Binance 1 minute candle for BTC/USDT Sep 30 '26 11:59 PM in the ET timezone" against the one for
     # "Oct 31 '26 11:59 PM ET" (both EDT: daylight time ends on Nov 1)
     UpDownSpec("BTC-2026-10", "btc-up-down-october-2026", "BTCUSDT", "BTC 10月涨跌",
+               et_ms(2026, 9, 30, 23, 59, -4), et_ms(2026, 10, 31, 23, 59, -4)),
+    # the same two minutes on ETH/USDT ("ETH closed September at $2,696.07 on Binance": the starting candle's close)
+    UpDownSpec("ETH-2026-10", "eth-up-down-october-2026", "ETHUSDT", "ETH 10月涨跌",
                et_ms(2026, 9, 30, 23, 59, -4), et_ms(2026, 10, 31, 23, 59, -4)),
 )
 

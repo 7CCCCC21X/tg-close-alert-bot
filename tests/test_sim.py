@@ -306,7 +306,7 @@ async def run():
     store.put(f"touch:{touch.spec.slug}", {"kind": "clear", "through": deadline + 60_000, "start": touch.start_ms})
     assert bot.sim_result(trade("touch", "BNB", "up", deadline=deadline), deadline + 30 * 60_000) is None  # settles an hour on
     assert bot.sim_result(trade("touch", "BNB", "up", deadline=deadline), deadline + 61 * 60_000)[:2] == (0.5, "整个窗口都没碰到两条线，按 50/50")
-    (oct_spec,) = m.UPDOWN_MARKETS
+    oct_spec = next(s for s in m.UPDOWN_MARKETS if s.key == "BTC-2026-10")  # BTC 10月涨跌
     assert bot.sim_result(trade("updown", oct_spec.key, "up"), NOW) is None
     store.put(f"updown:{oct_spec.slug}:start", {"open": oct_spec.start_ms, "close": "117234.56"})
     store.put(f"updown:{oct_spec.slug}:end", {"open": oct_spec.end_ms, "close": "110000"})

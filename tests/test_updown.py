@@ -1,12 +1,12 @@
-"""BTC Up/Down October 2026: Up when the Binance BTC/USDT 1-minute candle of Oct 31 '26 23:59 ET closes above the one
-of Sep 30 '26 23:59 ET, Down when below, 50-50 when equal. Both candles are read strictly by their open time and kept;
-the model is log-normal with the 30-day hourly σ and no drift in the price."""
+"""BTC / ETH Up/Down October 2026: Up when the Binance BTC/USDT (ETH/USDT) 1-minute candle of Oct 31 '26 23:59 ET closes
+above the one of Sep 30 '26 23:59 ET, Down when below, 50-50 when equal. Both candles are read strictly by their open
+time and kept; the model is log-normal with the 30-day hourly σ and no drift in the price."""
 import asyncio, sys, math, json, time, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
 D = m.D
-(OCT,) = m.UPDOWN_MARKETS
+OCT, ETH = m.UPDOWN_MARKETS
 UTC = dt.timezone.utc
 utc_ms = lambda *a: int(dt.datetime(*a, tzinfo=UTC).timestamp() * 1000)
 
@@ -17,6 +17,13 @@ assert OCT.label(OCT.start_ms) == "09-30 23:59 ET（北京 10-01 11:59）", OCT.
 assert OCT.label(OCT.end_ms) == "10-31 23:59 ET（北京 11-01 11:59）", OCT.label(OCT.end_ms)
 # its favourite / book key is its own: the BTC 先触 card already uses the bare pair
 assert OCT.key not in {s.symbol for s in m.TOUCH_MARKETS} | {s.key for s in m.TOUCH_MARKETS}
+# ETH: the same two minutes on ETH/USDT ("ETH closed September at $2,696.07 on Binance"), with its own key and records;
+# the bare ETH / ETHUSDT are the ETH 先触 card's, ETH-HIT-10 the ETH price ladder's
+assert (ETH.key, ETH.slug, ETH.symbol, ETH.name) == ("ETH-2026-10", "eth-up-down-october-2026", "ETHUSDT", "ETH 10月涨跌")
+assert (ETH.start_ms, ETH.end_ms) == (OCT.start_ms, OCT.end_ms) and ETH.label(ETH.end_ms) == OCT.label(OCT.end_ms)
+others = [*m.TOUCH_MARKETS, *m.RANGE_MARKETS, *m.FLIP_MARKETS, *m.CAP_MARKETS, *m.STOCK_HIT_MARKETS]
+assert ETH.key not in {s.key for s in others} | {getattr(s, "symbol", "") for s in others}
+assert len({s.key for s in m.UPDOWN_MARKETS}) == len({s.slug for s in m.UPDOWN_MARKETS}) == len(m.UPDOWN_MARKETS) == 2
 # US Eastern offset without a tz database: EDT from 03-08 02:00 EST to 11-01 02:00 EDT in 2026
 assert [m.us_eastern_offset(utc_ms(*t)) for t in [(2026, 3, 8, 6, 59), (2026, 3, 8, 7, 0), (2026, 11, 1, 5, 59), (2026, 11, 1, 6, 0)]] == [-5, -4, -4, -5]
 assert m.us_eastern_offset(utc_ms(2027, 3, 14, 7, 0)) == -4 and m.us_eastern_offset(utc_ms(2027, 3, 14, 6, 59)) == -5
@@ -47,11 +54,11 @@ class Feed:
         self.price, self.candles, self.calls, self.down = "118500.00", {}, [], False
 
     async def get(self, path, **p):
-        self.calls.append((path, p.get("interval"), p.get("startTime")))
+        self.calls.append((path, p.get("interval"), p.get("startTime"), p.get("symbol")))
         if self.down:
             raise m.RemoteError("data-api.binance.vision: timed out")
         if path == "ticker/price":
-            return {"symbol": "BTCUSDT", "price": self.price}
+            return {"symbol": p["symbol"], "price": self.price}
         if p["interval"] == "1h":
             return rows[-p["limit"]:]
         t = p["startTime"]
@@ -186,10 +193,66 @@ async def run():
     store.put(f"updown:{OCT.slug}:end", {"open": OCT.end_ms - 60_000, "close": "1"})
     assert mk.close_of("end") is None
 
+    # --- ETH 10月涨跌: its own pair, records, book, target price, card, paper trades and /edge name --------------------
+    store = m.Store(":memory:")
+    eth = m.UpDownMarket(store, ETH)
+    feed = Feed(); eth.get = feed.get
+    feed.price, feed.candles[ETH.start_ms] = "2750.00", "2696.07"
+    eth.times.update(price=-1e9, candle=-1e9)
+    await eth.refresh(NOW)
+    assert {c[3] for c in feed.calls} == {"ETHUSDT"} and eth.close_of("start") == D("2696.07") and not eth.error, feed.calls
+    assert store.get(f"updown:{ETH.slug}:start")["close"] == "2696.07" and store.get(f"updown:{OCT.slug}:start") is None
+    o = eth.odds(NOW)
+    assert isinstance(o, m.UpDownOdds) and (o.line, o.price) == (D("2696.07"), D("2750.00")) and 0.5 < o.fair_up < 1, o
+    bot = m.Bot(cfg, store, FM(NOW), None)
+    bot.updowns[ETH.key] = eth
+    assert bot.predict_targets(NOW)[ETH.key] == ETH.slug and ETH.slug in bot.predict.want_info
+    items = bot.odds_payload()["items"]
+    names = [i["name"] for i in items]
+    assert names[names.index("BTC 10月涨跌") + 1] == "ETH 10月涨跌", names
+    syms = [i["symbol"] for i in items]
+    assert len(syms) == len(set(syms)), syms  # every card has its own favourite key
+    card = next(i for i in items if i["name"] == "ETH 10月涨跌")
+    assert card["symbol"] == "ETH-2026-10" and card["group"] == "crypto" and card["close_ms"] == ETH.end_ms + 60_000
+    assert card["ref"] == "2,696.07" and card["effective"] == "2,750.00" and card["fair_up"] == o.fair_up and not card["warn"]
+    assert card["ref_note"] == "币安 ETHUSDT 1 分钟 K 收盘：09-30 23:59 ET，北京 10-01 11:59", card["ref_note"]
+    assert card["proxy_note"] == "不用代理：币安 ETHUSDT 现价就是结算源" and card["predict"]["url"].startswith(m.PREDICT_SITE + ETH.slug)
+    # Predict's book and target price are ETH's own: the BTC card stays without a book
+    book = m.PredictBook(ETH.key, ETH.slug, "88", "ETH Up/Down October 2026", ((D("0.40"), D("300")),), ((D("0.45"), D("300")),), NOW)
+    bot.predict.books[ETH.key] = book
+    bot.predict.info[ETH.slug] = {"outcomes": ["Up", "Down"], "created_ms": 0}
+    bot.predict.strikes[ETH.slug] = (D("2696.07"), time.monotonic())
+    items = bot.odds_payload()["items"]
+    card = next(i for i in items if i["name"] == "ETH 10月涨跌")
+    assert card["ref_note"].endswith("；与 Predict 目标价一致") and not card["warn"]
+    assert [e["label"] for e in card["predict"]["edges"] if e["best"]] == ["挂涨"], card["predict"]["edges"]  # 40¢ bid vs fair > 50¢
+    assert "edges" not in next(i for i in items if i["name"] == "BTC 10月涨跌")["predict"]
+    bot.predict.strikes[ETH.slug] = (D("2700"), time.monotonic())
+    card = next(i for i in bot.odds_payload()["items"] if i["name"] == "ETH 10月涨跌")
+    assert card["warn"] == "Predict 目标价 2,700.00 与币安起点 2,696.07 不一致，请核实；暂不给建议", card["warn"]
+    bot.predict.strikes[ETH.slug] = (D("2696.07"), time.monotonic())
+    (sim,) = [x for x in bot.sim_markets(NOW) if x.kind == "updown"]
+    assert (sim.market, sim.item, sim.key, sim.fair_up, sim.settle) == (ETH.slug, "ETH 10月涨跌", ETH.key, o.fair_up, {"end": ETH.end_ms})
+    assert bot.edge_target(["ETH", "10月涨跌"]) == ("key:ETH-2026-10", "ETH 10月涨跌") and bot.edge_target(["eth-2026-10"])[0] == "key:ETH-2026-10"
+    assert bot.edge_target(["ETH"])[0] == "key:ETH"  # still the ETH 先触 card
+    try:
+        bot.edge_target(["10月涨跌"]); assert False, "two markets answer to 10月涨跌"
+    except ValueError as error:
+        assert "BTC 10月涨跌、ETH 10月涨跌" in str(error), error
+    # settles on its own final candle
+    end = ETH.end_ms + 60_000 + 5_000
+    feed.candles[ETH.end_ms] = "2650.00"
+    eth.times.update(price=-1e9, candle=-1e9)
+    await eth.refresh(end)
+    o = eth.odds(end)
+    assert o.settled and (o.up, o.flat, o.down) == (0.0, 0.0, 1.0) and o.price == D("2650.00") and store.get(f"updown:{OCT.slug}:end") is None
+    res = bot.sim_result({"kind": "updown", "key": ETH.key, "side": "up", "settle": {"end": ETH.end_ms}}, end)
+    assert res[0] == 0.0 and res[1] == "终点 2,650.00，起点 2,696.07" and (res[2]["start"], res[2]["end"]) == (2696.07, 2650.0), res
+
     # --- switched off with the rest of the 加密 section ---------------------------------------------------------------
     off = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BNB_TOUCH": "off"}), m.Store(":memory:"), FM(late), None)
-    assert OCT.key not in off.predict_targets(late) and "涨跌市场" not in [name for name, _ in off.reference_jobs()]
-    assert not any(i["name"] == "BTC 10月涨跌" for i in off.odds_payload()["items"])
+    assert not {OCT.key, ETH.key} & set(off.predict_targets(late)) and "涨跌市场" not in [name for name, _ in off.reference_jobs()]
+    assert not any(i["name"] in {"BTC 10月涨跌", "ETH 10月涨跌"} for i in off.odds_payload()["items"])
     print("UPDOWN_OK")
 
 
