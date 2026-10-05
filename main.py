@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.31.2"
+VERSION = "1.32.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -242,7 +242,7 @@ EXCHANGE_BASE_HOLD_DAYS = 30  # safety cap for a held exchange-close baseline; N
 DEFAULT_HOLIDAYS = {
     "CN": "2026-09-25,2026-10-01..2026-10-07,2027-01-01",   # SSE notice: Mid-Autumn 9/25, National Day 10/1-10/7; New Year
     "KR": "2026-09-24,2026-09-25,2026-10-05,2026-10-09,2026-12-25,2026-12-31,2027-01-01",  # Chuseok, Foundation Day (substitute), Hangul Day, Christmas, year-end closure, New Year
-    "HK": "2026-10-01,2026-12-25,2027-01-01",  # National Day, Christmas (Boxing Day falls on a Saturday: no weekday off), New Year
+    "HK": "2026-10-01,2026-10-19,2026-12-25,2027-01-01",  # National Day, the day after Chung Yeung (10-18 is a Sunday), Christmas (Boxing Day falls on a Saturday: no weekday off), New Year
     # SGX (the A50 futures): Singapore's gazetted holidays; a weekday one shuts both the day and the night session
     "SG": "2026-01-01,2026-02-17,2026-02-18,2026-04-03,2026-05-01,2026-05-27,2026-06-01,2026-08-10,2026-11-09,2026-12-25,2027-01-01",
 }
@@ -1989,6 +1989,14 @@ def hsi_anchor_key(q: "FuturesQuote") -> str:
     return "HSI" if q.exchange_contract else "HSI:cfd"
 
 
+def hsi_family(source: str) -> str:
+    """The anchor family a futures source's quotes belong to: etnet and Eastmoney print the HKEX contract, Sina a CFD."""
+    return "HSI:cfd" if "CFD" in source else "HSI"
+
+
+HSI_FAMILY_NAMES = {"HSI": "港交所合约", "HSI:cfd": "新浪CFD"}
+
+
 class IndexFutures:
     """Hang Seng Index futures (main contract, incl. the 17:15-03:00 after-hours session) with the
     cash index for the 高水/低水 basis. Eastmoney first, Sina as fallback; read-only, best effort."""
@@ -2003,11 +2011,19 @@ class IndexFutures:
     SPOT_SOURCES = (("东方财富", EM + "100.HSI", {"Referer": "https://quote.eastmoney.com/"}),
                     ("腾讯", "https://qt.gtimg.cn/q=hkHSI", {"Referer": "https://gu.qq.com/"}),
                     ("新浪", "https://hq.sinajs.cn/list=rt_hkHSI", {"Referer": "https://finance.sina.com.cn/"}))
+    # Sina's 5-minute bars of the same hf_HSI record the CFD quote comes from: its 16:10 price when no print was recorded
+    CFD_FIVE_MINUTES = "https://gu.sina.cn/ft/api/jsonp.php/var%20_HSI_5=/GlobalService.getMink?symbol=HSI&type=5"
+    SPOT_SECONDS = 3         # the cash index alone, between the futures page's refreshes, while the cash session runs
+    SPOT_RETRY_SECONDS = 27  # ... but 30 seconds after a round in which no timed feed answered with a current figure
 
     def __init__(self, enabled: bool = True, holidays: frozenset = frozenset()):
         self.enabled = enabled
         self.holidays = holidays
         self.quote: FuturesQuote | None = None
+        self.families: dict[str, FuturesQuote] = {}  # anchor family -> the latest quote read from it (hsi_anchor_key)
+        self.family_errors: dict[str, str] = {}      # anchor family -> why its last read gave nothing current ("" when fine)
+        self.skipped = ""                              # why the preferred sources were passed over when a later one answered
+        self.spot_refreshed = -1e9
         self.error = ""
         self.refreshed = -1e9
         self.refreshed_ms = 0    # market clock of the last refresh (the 16:10 cash close is caught at once)
@@ -2130,30 +2146,113 @@ class IndexFutures:
         live = self.cash_open(now_ms) or hk_futures_session(now_ms, self.holidays) != "休市"
         return self.SESSION_SECONDS if live else self.REFRESH_SECONDS
 
+    def with_spot(self, quote: FuturesQuote, s: IndexQuote) -> FuturesQuote:
+        """``quote`` carrying another feed's cash index: etnet's published premium (水位) belonged to its own spot."""
+        return dataclasses.replace(quote, spot=s.last, spot_prev=s.prev_close, spot_source=s.source, spot_ms=s.quoted_ms,
+                                   water=None)
+
+    async def refresh_spot(self, now_ms: int) -> Refreshed:
+        """The cash index alone (Tencent / Sina, each with its own quote time) every SPOT_SECONDS during the cash session,
+        so the in-session odds follow the index within seconds; the futures page itself is read every SESSION_SECONDS."""
+        self.spot_refreshed = time.monotonic()
+        base = self.quote
+        spot, _, error = await pick_quote(self.SPOT_SOURCES, lambda n, r: self.parse_spot_quote(n, r, now_ms),
+                                          lambda s: self.spot_problem(self.with_spot(base, s), now_ms))
+        if spot is None or error:
+            self.spot_refreshed += self.SPOT_RETRY_SECONDS  # the timed feeds are failing: look again in half a minute
+            if self.quote is not None and not self.spot_problem(self.quote, now_ms):
+                return Refreshed("ok")  # the futures page's own cash index still stands
+            return Refreshed("partial", f"恒指现货：{error or '无报价'}")
+        if self.quote is not None and spot.quoted_ms >= self.quote.spot_time:
+            self.quote = self.with_spot(self.quote, spot)
+            self.spot_at, self.spot_error = time.monotonic(), ""
+        return Refreshed("ok")
+
+    def remember(self, q: FuturesQuote) -> None:
+        """Keep the newest quote of each anchor family, current or not (the odds pick a family that has its 16:10 price)."""
+        family = hsi_anchor_key(q)
+        old = self.families.get(family)
+        if old is None or q.quoted_ms >= old.quoted_ms:
+            self.families[family] = q
+
+    async def read_families(self, now_ms: int, attempted: set[str], parse: Any) -> None:
+        """After the cash close, also read each source whose family the preferred one did not cover (hosts in cooldown
+        aside): every family then has its own current quote, and its own print at 16:10 to anchor it."""
+        current = {family for family, q in self.families.items() if q.fetched_ms == now_ms and not self.futures_problem(q, now_ms)}
+        for name, url, extra in self.FUTURES_SOURCES:
+            family = hsi_family(name)
+            if family in current or name in attempted:
+                continue
+            if SOURCE_HEALTH.cooling(url):
+                if not self.family_errors.get(family):  # say why this family has no current quote
+                    failures, _, last = SOURCE_HEALTH.hosts.get(SOURCE_HEALTH.host(url)) or [0, 0.0, ""]
+                    self.family_errors[family] = (f"{name}: 连续失败 {failures} 次，{int(SOURCE_HEALTH.cooling(url))} 秒后再试"
+                                                  + (f"（{last}）" if last else ""))
+                continue
+            try:
+                q = parse(name, await fetch_source(url, extra))
+            except Exception as error:
+                self.family_errors[family] = f"{name}: {clean_error(error) or type(error).__name__}"
+                continue
+            why = self.futures_problem(q, now_ms)
+            self.family_errors[family] = f"{name}: {why}" if why else ""
+            if not why:
+                current.add(family)
+
+    async def cfd_bar_at(self, close_ms: int) -> D:
+        """The Sina CFD's 5-minute bar stamped at ``close_ms`` (the 16:10 cash close), from the same hf_HSI record."""
+        raw = await fetch_source(self.CFD_FIVE_MINUTES, {"Referer": "https://finance.sina.com.cn/"})
+        bars = parse_sina_bars(raw, "恒指")
+        wanted = dt.datetime.fromtimestamp(close_ms / 1000, BEIJING).strftime("%Y-%m-%d %H:%M")
+        for when, close in bars:
+            if when == wanted:
+                return close
+        span = f"{bars[0][0][5:]}～{bars[-1][0][5:]}" if bars else "无数据"
+        raise ValueError(f"新浪恒指 5分钟K里没有 {wanted}（返回 {len(bars)} 根：{span}）")
+
     async def refresh(self, now_ms: int, force: bool = False) -> Refreshed | bool:
-        if not self.enabled or not (force or time.monotonic() - self.refreshed >= self.cadence(now_ms)
-                                    or self.cash_close_due(now_ms)):
+        if not self.enabled:
+            return False
+        if not (force or time.monotonic() - self.refreshed >= self.cadence(now_ms) or self.cash_close_due(now_ms)):
+            if (self.cash_open(now_ms) and self.quote is not None
+                    and time.monotonic() - self.spot_refreshed >= self.SPOT_SECONDS):
+                return await self.refresh_spot(now_ms)
             return False  # not due yet: nothing fetched
         self.refreshed, self.refreshed_ms = time.monotonic(), now_ms
+        parsed: list[FuturesQuote] = []
+
+        def parse(name: str, raw: bytes) -> FuturesQuote:
+            q = self.dated(self.parse_futures(name, raw, now_ms, self.holidays), now_ms)
+            parsed.append(q)
+            self.remember(q)
+            return q
         # a source whose answer parses but is stale (or undated) does not end the search
-        quote, _, error = await pick_quote(self.FUTURES_SOURCES,
-                                           lambda n, r: self.dated(self.parse_futures(n, r, now_ms, self.holidays), now_ms),
-                                           lambda q: self.futures_problem(q, now_ms))
+        quote, skipped, error = await pick_quote(self.FUTURES_SOURCES, parse, lambda q: self.futures_problem(q, now_ms))
+        for family in {hsi_family(name) for name, _, _ in self.FUTURES_SOURCES}:
+            notes = [note for note in skipped if hsi_family(note.split(":", 1)[0]) == family]
+            got = any(hsi_anchor_key(q) == family and not self.futures_problem(q, now_ms) for q in parsed)
+            self.family_errors[family] = "" if got else "；".join(notes)
+        self.skipped = "" if error else "；".join(skipped)
+        if not self.cash_open(now_ms):
+            attempted = {note.split(":", 1)[0] for note in skipped} | {q.source for q in parsed}
+            await self.read_families(now_ms, attempted, parse)
         if error:  # nothing current: keep the newest quote known, with the reason shown
             self.quote, self.error = newer(quote, self.quote), error
             return Refreshed("failed", error)
+        prev = self.quote
+        if (self.cash_open(now_ms) and prev is not None and prev.spot is not None and prev.spot_source != quote.source
+                and prev.spot_time > (quote.spot_time if quote.spot is not None else 0)):
+            # the 3-second cash index is newer than the one on the futures page: keep it
+            quote = dataclasses.replace(quote, spot=prev.spot, spot_prev=prev.spot_prev, spot_source=prev.spot_source,
+                                        spot_ms=prev.spot_time, water=None)
         why = self.spot_problem(quote, now_ms)
         self.spot_error = ""
         if why:  # no cash index with the futures (Eastmoney, CFD), or etnet's cannot be trusted now: ask the timed feeds
-            def with_spot(s: IndexQuote) -> FuturesQuote:
-                # another feed's cash index: etnet's published premium (水位) belonged to its own spot and goes with it
-                return dataclasses.replace(quote, spot=s.last, spot_prev=s.prev_close, spot_source=s.source,
-                                           spot_ms=s.quoted_ms, water=None)
+            base = quote
             spot, _, spot_error = await pick_quote(self.SPOT_SOURCES, lambda n, r: self.parse_spot_quote(n, r, now_ms),
-                                                   lambda s: self.spot_problem(with_spot(s), now_ms))
-            prev = self.quote
+                                                   lambda s: self.spot_problem(self.with_spot(base, s), now_ms))
             if spot is not None and (not spot_error or quote.spot is None):
-                quote = with_spot(spot)
+                quote = self.with_spot(quote, spot)
             elif (quote.spot is None and prev is not None and prev.spot is not None
                   and time.monotonic() - self.spot_at < self.SPOT_KEEP_SECONDS):
                 # one failed round must not blank the HSI card: keep the last cash index (and its time) for a few minutes
@@ -2192,6 +2291,9 @@ class IndexFutures:
         parts.append(f"{quote_time(q.quoted_ms)} {source}"
                      + (stale_note(q.quoted_ms, now_ms, BEIJING) if q.quoted_ms and self.futures_problem(q, now_ms) else ""))
         line = "｜".join(parts)
+        missed = self.skipped or (self.family_errors.get("HSI", "") if not q.exchange_contract else "")
+        if missed and not self.error:
+            line += f"｜⚠️ 前序源未取到：{brief_error(missed, 90)}"
         if self.spot_error:
             line += f"｜⚠️ 恒指现货刷新失败：{brief_error(self.spot_error)}"
         return line + f"｜⚠️ 刷新失败：{brief_error(self.error)}" if self.error else line
@@ -2514,7 +2616,7 @@ def a50_code_ok(code: Any) -> bool:
     return not code or code.startswith("CN")
 
 
-def parse_sina_bars(raw: bytes) -> list[tuple[str, D]]:
+def parse_sina_bars(raw: bytes, label: str = "A50") -> list[tuple[str, D]]:
     """Sina GlobalService.getMink JSONP: [{"d": "2026-09-24 15:00:00", "o": .., "h": .., "l": .., "c": .., "v": ..}, ...]
     -> [("2026-09-24 15:00", close)], oldest first. Tolerates either quoted or bare keys and numbers."""
     text = raw.decode("utf-8", errors="replace")
@@ -2523,9 +2625,9 @@ def parse_sina_bars(raw: bytes) -> list[tuple[str, D]]:
         when = re.search(r'"?d(?:ay|ate)?"?\s*:\s*"(\d{4}-\d{2}-\d{2} \d{2}:\d{2})', obj)
         close = re.search(r'"?c(?:lose)?"?\s*:\s*"?([\d.]+)', obj)
         if when and close:
-            bars.append((when.group(1), number(close.group(1), "A50")))
+            bars.append((when.group(1), number(close.group(1), label)))
     if not bars:
-        raise ValueError("新浪 A50 5分钟K 格式异常或为空")
+        raise ValueError(f"新浪 {label} 5分钟K 格式异常或为空")
     return sorted(bars)
 
 
@@ -8665,6 +8767,8 @@ class Bot:
         self.pred_last: dict[str, int] = {}  # index -> ms of the last saved prediction snapshot
         self.a50_anchor_note = "15:00"
         self.a50_anchor_error = ""  # why the last anchor lookup failed (shown in /diag and the odds row)
+        self.hsi_cfd_error = ""     # why the Sina CFD's 16:10 bar could not be read (when it was needed)
+        self.hsi_used: FuturesQuote | None = None  # the futures quote the HSI after-hours odds were last mapped from
         self.a50_anchor_source = "东方财富"
         self.anchor_tries: dict[str, float] = {}
         self.deliveries: dict[str, asyncio.Task] = {}  # Telegram sends in flight, by alert / notice key
@@ -9245,8 +9349,9 @@ class Bot:
         kospi, hl = self.kospi.quote, self.hl.quotes.get("KR200")
         if kospi and hl:
             await self.kospi_anchor(kospi, hl)
-        if self.hsi.quote is not None:
-            self.note_hsi_close_print(self.hsi.quote)
+        for q in {id(q): q for q in (self.hsi.quote, *self.hsi.families.values()) if q is not None}.values():
+            self.note_hsi_close_print(q)  # each family keeps its own print at the 16:10 close
+        await self.recover_hsi_cfd_anchor(now_ms)
 
         a50 = self.cn.a50
         if a50 is not None:
@@ -9705,6 +9810,70 @@ class Bot:
         note = "16:10 现货收市时" if late < 1 else f"16:10 后 {late} 分钟首笔近似"
         self.store.put(key, [close_ms, str(q.last), note, q.contract, read_ms])
 
+    async def recover_hsi_cfd_anchor(self, now_ms: int) -> None:
+        """When the CFD has no anchor for the latest cash close (the bot was not running at 16:10) and it is needed (the
+        quote in use is the CFD, or the HKEX contract has no exact print either), take the Sina CFD's price then from its
+        5-minute bars: an approximate anchor for the CFD family, so the after-hours odds need not pause. Retried every
+        5 minutes while it fails."""
+        if not (self.config.hsi_futures and self.config.probability) or self.hsi.cash_open(now_ms):
+            return
+        day = hk_cash_close_date(now_ms, self.hsi.holidays)
+        close_ms = int(dt.datetime.combine(day, CALENDAR.close_time("hk", day), BEIJING).timestamp() * 1000)
+        if now_ms < close_ms + self.HSI_PRINT_MS:
+            return  # the live prints come first
+        def has(family: str, exact: bool) -> bool:
+            saved = self.store.get(f"anchor:{family}")
+            return (isinstance(saved, list) and len(saved) >= 3 and saved[0] == close_ms
+                    and (not exact or "近似" not in str(saved[2])))
+        cfd_in_use = self.hsi.quote is not None and not self.hsi.quote.exchange_contract
+        if has("HSI:cfd", False) or (has("HSI", True) and not cfd_in_use):
+            return  # the CFD has its anchor, or the HKEX contract in use has its own exact price at the close
+        if not self.retry_ok("HSI-cfd", every=300):
+            return
+        try:
+            price = await self.hsi.cfd_bar_at(close_ms)
+        except Exception as error:
+            self.hsi_cfd_error = clean_error(error) or type(error).__name__
+            return
+        self.hsi_cfd_error = ""
+        label = dt.datetime.fromtimestamp(close_ms / 1000, BEIJING).strftime("%H:%M")
+        self.store.put("anchor:HSI:cfd", [close_ms, str(price), f"{label} 五分钟K近似", "", now_ms])
+
+    @staticmethod
+    def anchor_quality(note: str, approximate: bool) -> int:
+        """How close an anchor is to the price at the close: 0 itself, 1 within minutes (a late first print, a 5-minute
+        bar), 2 the 16:30 day close (twenty minutes of futures moves missing)."""
+        return 0 if not approximate else 2 if "16:30" in note else 1
+
+    def hsi_proxy(self, now_ms: int, close_date: dt.date,
+                  choices: list[FuturesQuote]) -> tuple[FuturesQuote | None, D | None, str, bool]:
+        """(the quote, its anchor, the anchor's label, approximate?) the after-hours odds map from: among the current quotes
+        of each family (the one in use first), the one whose own 16:10 price is closest to the close itself. The families
+        never mix: a CFD print is only ever compared with a CFD anchor. Without any, the reason, naming what is missing."""
+        best = None
+        for rank, c in enumerate(choices):
+            anchor, note, approximate = self.hsi_anchor(c, close_date, now_ms)
+            if anchor is not None and (best is None or (self.anchor_quality(note, approximate), rank) < best[0]):
+                best = ((self.anchor_quality(note, approximate), rank), c, anchor, note, approximate)
+        if best is not None:
+            return best[1], best[2], best[3], best[4]
+        q = choices[0]
+        why = self.hsi_anchor(q, close_date, now_ms)[1]
+        if not q.exchange_contract:
+            hkex = self.hsi.family_errors.get("HSI") or self.hsi.skipped
+            why = (f"当前只有新浪CFD报价（港交所合约：{brief_error(hkex, 60) if hkex else '暂无当前报价'}）：{why}"
+                   + (f"；新浪5分钟K也未取到（{brief_error(self.hsi_cfd_error, 60)}）" if self.hsi_cfd_error else ""))
+        return None, None, why, False
+
+    def hsi_choices(self, now_ms: int) -> list[FuturesQuote]:
+        """The futures quotes the after-hours odds may use: the one in use, then each other family's latest quote that
+        still stands for the market now."""
+        q = self.hsi.quote
+        out = [q] if q is not None else []
+        out += [f for f in self.hsi.families.values()
+                if (q is None or hsi_anchor_key(f) != hsi_anchor_key(q)) and not self.hsi.futures_problem(f, now_ms)]
+        return out
+
     def hsi_anchor(self, q: FuturesQuote, close_date: dt.date, now_ms: int) -> tuple[D | None, str, bool]:
         """(the futures price at close_date's 16:10 cash close, its label, approximate?) for mapping q onto that close.
         Prefers the recorded print of the same family and contract month; otherwise the same contract's 16:30 day
@@ -9747,20 +9916,23 @@ class Bot:
             return close_odds("恒生指数", ref, q.spot, sigma, remaining, target, D("0.01"), ref_note,
                               f"恒指现货 {fmt(q.spot)}（盘中直接用现货）", sigma_note)
         close_date = hk_cash_close_date(now_ms, holidays)
-        why = self.hsi.futures_problem(q, now_ms)
-        if why:
-            return f"恒指期货{why}，暂不输出新概率"
+        self.hsi_used = None
+        choices = [c for c in self.hsi_choices(now_ms) if not self.hsi.futures_problem(c, now_ms)]
+        if not choices:
+            return f"恒指期货{self.hsi.futures_problem(q, now_ms)}，暂不输出新概率"
         if close_date not in self.hsi_daily.daily:  # the close comes from the cash quote itself: it must be that day's
             why = self.hsi.spot_problem(q, now_ms)
             if why:
                 return f"{why}，暂不输出概率"
-        anchor, anchor_note, approximate = self.hsi_anchor(q, close_date, now_ms)
-        if anchor is None:
+        used, anchor, anchor_note, approximate = self.hsi_proxy(now_ms, close_date, choices)
+        if used is None or anchor is None:
             return anchor_note
+        self.hsi_used = used
         remaining, target = session_remaining("hk", now_ms, close_date, holidays)
         ref, ref_note = dated_ref(self.hsi_daily.daily, close_date, q.spot)
-        odds = close_odds("恒生指数", ref, ref * q.last / anchor, sigma, remaining, target, D("0.01"), ref_note,
-                          f"恒指期货 {fmt(q.last)} / {anchor_note} {fmt(anchor)} → {percent(q.last, anchor):+.3f}%",
+        label = "恒指期货" if used.exchange_contract else "恒指期货·新浪CFD"
+        odds = close_odds("恒生指数", ref, ref * used.last / anchor, sigma, remaining, target, D("0.01"), ref_note,
+                          f"{label} {fmt(used.last)} / {anchor_note} {fmt(anchor)} → {percent(used.last, anchor):+.3f}%",
                           sigma_note, mode="盘后")
         return dataclasses.replace(odds, warn="期货锚点是近似值，暂不给建议") if approximate else odds
 
@@ -10185,10 +10357,11 @@ class Bot:
                     sources.append(price_evidence("恒指现货", q.spot_source or q.source, "HSI", "现货指数", q.spot,
                                                   q.spot_ms or q.quoted_ms, q.fetched_ms))
                 else:
-                    sources.append(price_evidence("恒指期货", q.source, q.name, "期货最新价", q.last, q.quoted_ms, q.fetched_ms))
-                    anchor, note, approx = self.hsi_anchor(q, day, now_ms)
-                    proxy = {"proxy": "恒指期货", "contract": q.contract or q.name, "exchange_contract": q.exchange_contract,
-                             "session": q.session_name(holidays), "price": float(q.last), "quoted_ms": q.quoted_ms,
+                    fq = self.hsi_used or q  # the family the odds were mapped from
+                    sources.append(price_evidence("恒指期货", fq.source, fq.name, "期货最新价", fq.last, fq.quoted_ms, fq.fetched_ms))
+                    anchor, note, approx = self.hsi_anchor(fq, day, now_ms)
+                    proxy = {"proxy": "恒指期货", "contract": fq.contract or fq.name, "exchange_contract": fq.exchange_contract,
+                             "session": fq.session_name(holidays), "price": float(fq.last), "quoted_ms": fq.quoted_ms,
                              "anchor": float(anchor) if anchor is not None else None, "anchor_note": note, "approx": approx}
         elif title == "KOSPI":
             k, holidays = self.kospi.quote, self.config.holidays.get("kr", frozenset())
@@ -11550,7 +11723,10 @@ class Bot:
         """When the price behind a card's odds was quoted: the index or stock itself while it trades, else its proxy."""
         quote: Any
         if title == "恒生指数":
-            quote = self.hsi.quote
+            q = self.hsi.quote
+            if odds.direct:
+                return q.spot_time if q is not None else 0  # the cash index prices it in session
+            quote = self.hsi_used or q
         elif title == "KOSPI":
             quote = self.kospi.quote if odds.direct else self.hl.quotes.get("KR200")
         elif title == "上证指数":
@@ -12017,6 +12193,18 @@ class Bot:
                     basis = f"｜{'高' if q.basis > 0 else '低' if q.basis < 0 else '平'}水 {abs(q.basis):,.0f}" if q.spot is not None else ""
                     return f"{q.session_name(holidays)} {fmt(q.last)}（前收 {fmt(q.prev_settle) if q.prev_settle else '—'}）{basis}｜{when(q.quoted_ms)}"
                 probes.append(("恒指期货", name, get(url, extra), check_fut))
+            hk_day = hk_cash_close_date(now_ms, holidays)
+            hk_close = f"{hk_day.isoformat()} {CALENDAR.close_time('hk', hk_day):%H:%M}"
+
+            def check_cfd_hist(raw: bytes) -> str:
+                bars = parse_sina_bars(raw, "恒指")
+                hit = next((c for w, c in bars if w == hk_close), None)
+                span = f"{bars[0][0][5:]}～{bars[-1][0][5:]}"
+                if hit is None:
+                    raise ValueError(f"没有 {hk_close} 这一根（返回 {len(bars)} 根：{span}）")
+                return f"{hk_close[5:]} 收 {fmt(hit)}（返回 {len(bars)} 根：{span}）"
+            probes.append(("恒指锚点", f"新浪CFD 5分钟K {hk_close[5:]}", get(IndexFutures.CFD_FIVE_MINUTES,
+                                                                            {"Referer": "https://finance.sina.com.cn/"}), check_cfd_hist))
             for name, url, extra in IndexFutures.SPOT_SOURCES:
                 def check_spot(raw: bytes, name=name) -> str:
                     last, prev = IndexFutures.parse_spot(name, raw)
@@ -12149,6 +12337,24 @@ class Bot:
             q = self.hsi.quote
             lines.append(f"  恒指期货：{f'{q.session_name(self.hsi.holidays)} {fmt(q.last)}｜{quote_time(q.quoted_ms)}｜{q.source}' if q else '无'}"
                          + (f"｜错误：{brief_error(self.hsi.error, 80)}" if self.hsi.error else ""))
+            day = hk_cash_close_date(now_ms, self.hsi.holidays)
+            close_ms = int(dt.datetime.combine(day, CALENDAR.close_time("hk", day), BEIJING).timestamp() * 1000)
+            anchors = []
+            for family, name in HSI_FAMILY_NAMES.items():
+                saved = self.store.get(f"anchor:{family}")
+                fresh = self.hsi.families.get(family)
+                now_text = f"现价 {fmt(fresh.last)}（{fresh.source}·{quote_time(fresh.quoted_ms)}）" if fresh else "无报价"
+                if isinstance(saved, list) and len(saved) >= 3 and saved[0] == close_ms:
+                    anchors.append(f"{name} {fmt(D(str(saved[1])))}（{saved[2]}）·{now_text}")
+                else:
+                    anchors.append(f"{name} 无 {day:%m-%d} 锚点·{now_text}")
+            lines.append(f"  恒指锚点：{'；'.join(anchors)}"
+                         + (f"｜新浪5分钟K：{brief_error(self.hsi_cfd_error, 60)}" if self.hsi_cfd_error else ""))
+            odds = self.hsi_odds(now_ms) if self.config.probability else None
+            if isinstance(odds, CloseOdds):
+                lines.append(f"  恒指概率：涨 {odds.fair_up * 100:.1f}¢（有效 {fmt(odds.effective.quantize(D('0.01')))}·{odds.proxy_note}）")
+            elif odds is not None:
+                lines.append(f"  恒指概率：暂缺——{odds}")
         for symbol in self.config.symbols:
             snap = self.snapshots.get(symbol) or {}
             err = self.stocks.errors.get(symbol)

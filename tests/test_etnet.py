@@ -84,13 +84,19 @@ assert 0.45 < o.fair_up < 0.5, o.fair_up  # a -0.09% move is close to a coin fli
 
 async def run():
     calls = []
+    CFD = 'var hq_str_hf_HSI="24830.5,,24830,24831,24900,24700,16:39:58,24800,24810,0,0,0,2026-09-23,恒生指数期货,1";'.encode("gbk")
     async def fake_get(url, timeout=15, headers=None):
         calls.append(url)
         if "etnet" in url: return PAGE.encode("utf-8")
+        if "hf_HSI" in url: return CFD
         raise AssertionError("spot must not be fetched separately: " + url)
     m.http_get = fake_get
+    m.SOURCE_HEALTH.hosts.clear()
     x = m.IndexFutures(); await x.refresh(ms(23, 16, 40))
-    assert x.quote.source == "etnet" and x.quote.spot == D("24834.12") and len(calls) == 1 and not x.error, (calls, x.error)
+    # after the cash close each family is read once (etnet's page carries the spot, the CFD only its own price)
+    assert x.quote.source == "etnet" and x.quote.spot == D("24834.12") and not x.error, (calls, x.error)
+    assert [u.split("/")[2] for u in calls] == ["www.etnet.com.hk", "hq.sinajs.cn"], calls
+    assert set(x.families) == {"HSI", "HSI:cfd"} and x.families["HSI:cfd"].last == D("24830.5") and not x.skipped, x.families
     print("ETNET_OK")
 asyncio.run(run())
 
