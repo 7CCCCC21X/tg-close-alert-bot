@@ -176,6 +176,8 @@ async def run():
     feed.ladder_keys.add("NIULAI")
     markets = [("11", "$200M"), ("12", "$300M")]
     broken: dict[str, Exception] = {}
+    statuses: dict[str, str] = {}  # market id -> status its details report (OPEN unless set)
+    asked: list[str] = []          # orderbook requests made
 
     async def fetch(url, payload=None):
         if url == m.PREDICT_GRAPHQL:
@@ -185,8 +187,9 @@ async def run():
             return {"data": {"markets": {"edges": [{"node": {"id": i, "conditionId": "0x" + i, "title": t, "question": t}} for i, t in markets]}}}
         for i, _ in markets:
             if url.endswith(f"/markets/{i}"):
-                return {"data": {"id": i, "status": "OPEN", "outcomes": [{"name": "Yes", "indexSet": 1}, {"name": "No", "indexSet": 2}]}}
+                return {"data": {"id": i, "status": statuses.get(i, "OPEN"), "outcomes": [{"name": "Yes", "indexSet": 1}, {"name": "No", "indexSet": 2}]}}
             if url.endswith(f"/markets/{i}/orderbook") or url.endswith(f"/markets/0x{i}/orderbook"):
+                asked.append(url)
                 if i in broken:
                     raise broken[i]
                 return {"data": {"bids": [["0.10", "100"]], "asks": [["0.14", "50"]]}}
@@ -199,7 +202,7 @@ async def run():
     await feed.refresh({"NIULAI": NIU.slug}, force=True)
     rows = feed.ladders["NIULAI"]
     assert rows[1].book is first[1].book and rows[1].error == "网络错误 (TimeoutError)" and rows[0].book is not first[0].book, rows
-    assert feed.errors["NIULAI"] == "1/2 档盘口刷新失败（网络错误 (TimeoutError)）；显示上次盘口", feed.errors
+    assert feed.errors["NIULAI"] == "1/2 档盘口刷新失败（$300M：网络错误 (TimeoutError)）；显示上次盘口", feed.errors
     assert feed.yes_book(rows[1]) == (first[1].book, "")  # priced from the kept book (stale once PREDICT_STALE_MS passes)
     broken["12"] = m.RemoteError("HTTP 404: 接口请求失败")  # no book for this market: an answer, not a failure
     await feed.refresh({"NIULAI": NIU.slug}, force=True)
@@ -207,6 +210,28 @@ async def run():
     broken.clear()
     await feed.refresh({"NIULAI": NIU.slug}, force=True)
     assert "NIULAI" not in feed.errors and not feed.ladders["NIULAI"][1].error
+    # a level Predict has settled has no live book any more: its details say so, its book is not asked for, nothing is
+    # reported; a closed market's HTTP 400 is likewise an answer; an open market's HTTP 400 is a failure, and named
+    statuses["12"], broken["12"] = "RESOLVED", m.RemoteError("HTTP 400: Market is closed")
+    feed.market_meta.clear(); asked.clear()
+    await feed.refresh({"NIULAI": NIU.slug}, force=True)
+    rows = feed.ladders["NIULAI"]
+    assert rows[1].book is None and not rows[1].error and "NIULAI" not in feed.errors, (rows, feed.errors)
+    assert not [u for u in asked if "/12/" in u or "0x12" in u] and [u for u in asked if "/11/" in u], asked
+    statuses["12"] = "CLOSED"; feed.market_meta.clear()
+    await feed.refresh({"NIULAI": NIU.slug}, force=True)
+    assert "NIULAI" not in feed.errors and feed.ladders["NIULAI"][1].error == "HTTP 400: Market is closed" and feed.book_absent(feed.ladders["NIULAI"][1])
+    statuses.pop("12"); feed.market_meta.clear()
+    await feed.refresh({"NIULAI": NIU.slug}, force=True)
+    assert feed.errors["NIULAI"] == "1/2 档盘口刷新失败（$300M：HTTP 400: Market is closed）；显示上次盘口", feed.errors
+    assert not feed.book_absent(feed.ladders["NIULAI"][1]) and m.PredictFeed.market_closed({"status": "PENDING"}) is False
+    assert m.PredictFeed.market_closed({"status": "OPEN", "trading_status": "CLOSED"}) and m.PredictFeed.market_settled({"status": "RESOLVED"})
+    assert not m.PredictFeed.market_settled({"status": "CLOSED"}) and m.PredictFeed.market_closed({"status": "Cancelled"})
+    broken.clear(); statuses.clear()
+    # what an API says in an error body reaches the message (Predict's REST is NestJS-style: message / error)
+    assert m.http_error_text({"statusCode": 400, "message": "Market is closed", "error": "Bad Request"}) == "Market is closed"
+    assert m.http_error_text({"message": ["a must be x", "b too"]}) == "a must be x；b too" and m.http_error_text({"error": {"message": "nope"}}) == "nope"
+    assert m.http_error_text([1]) == "" and m.http_error_text({"description": "Bad Request: chat not found"}) == "Bad Request: chat not found"
 
     # --- Binance spot: a rate limit pauses every spot request; a plain failure still moves to the next host ---------------
     calls = []

@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.31.1"
+VERSION = "1.31.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -686,6 +686,22 @@ def _inflate(raw: bytes, encoding: str) -> bytes:
     return out
 
 
+def http_error_text(body: Any) -> str:
+    """The reason an API puts in an error body: Telegram's description, Binance's msg, a NestJS-style message (a string
+    or a list of them) or detail, else its error field (a string or {message}); "" when nothing readable is there."""
+    if not isinstance(body, dict):
+        return ""
+    for key in ("description", "msg", "message", "detail", "error"):
+        value = body.get(key)
+        if isinstance(value, dict):
+            value = value.get("message") or value.get("msg") or value.get("detail") or ""
+        if isinstance(value, list):
+            value = "；".join(str(v) for v in value if v)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:200]
+    return ""
+
+
 def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
               headers: dict[str, str] | None = None) -> bytes:
     """GET (or POST ``payload`` as JSON) and return the body; HTTP/network failures become RemoteError."""
@@ -711,7 +727,7 @@ def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
         description = ""
         try:
             body = json.loads(_inflate(error.read(4096), error.headers.get("Content-Encoding", "")))
-            description = str(body.get("description") or body.get("msg") or "")
+            description = http_error_text(body)
             retry = max(retry, int(body.get("parameters", {}).get("retry_after", 0)))
         except (ValueError, TypeError, AttributeError, RemoteError):
             pass
@@ -4168,6 +4184,27 @@ class PredictFeed:
         details = await self.market_details(market_id)
         self.info[slug] = {"outcomes": details["outcomes"], "created_ms": details["created_ms"]}
 
+    CLOSED_WORDS = re.compile(r"\b(RESOLV\w*|SETTL\w*|FINAL\w*|CLOSED|ENDED|EXPIR\w*|CANCEL\w*)\b")
+
+    @classmethod
+    def market_closed(cls, meta: dict | None) -> bool:
+        """The market no longer trades, by its details: resolved, settled, closed, ended, expired or cancelled."""
+        meta = meta or {}
+        return bool(cls.CLOSED_WORDS.search(f"{meta.get('status', '')} {meta.get('trading_status', '')}".upper()))
+
+    @staticmethod
+    def market_settled(meta: dict | None) -> bool:
+        """Predict has settled the market (what the cards call 已结算)."""
+        return bool(re.search(r"RESOLV|SETTL|FINAL", str((meta or {}).get("status", "")).upper()))
+
+    def book_absent(self, row: "LadderRow") -> bool:
+        """The level's error is an answer rather than a failure: the market has no book (HTTP 404), or it no longer
+        trades by its details and the API refuses its book (HTTP 400 / 410)."""
+        if "HTTP 404" in row.error:
+            return True
+        meta = (self.market_meta.get(row.market_id) or ({}, 0))[0]
+        return self.market_closed(meta) and bool(re.search(r"HTTP 4(00|10)\b", row.error))
+
     async def ladder_row(self, key: str, slug: str, market: dict) -> "LadderRow | None":
         parse = self.ladder_parse.get(key, cap_target)
         target = parse(market.get("title", "")) or parse(market.get("question", ""))
@@ -4181,6 +4218,9 @@ class PredictFeed:
                 self.meta_errors.pop(market["id"], None)
             except (RemoteError, TimeoutError, OSError) as error:
                 self.meta_errors[market["id"]] = clean_error(error) or type(error).__name__
+        if self.market_settled((self.market_meta.get(market["id"]) or ({}, 0))[0]):
+            # Predict has settled this level: it has no live book any more (asking gets HTTP 400) and the card needs none
+            return LadderRow(target, market["id"], market["title"], None, "", market.get("question", ""))
         try:
             bids, asks, _ = await self.orderbook(market)
         except (RemoteError, TimeoutError, OSError) as error:
@@ -4207,9 +4247,10 @@ class PredictFeed:
         if key in self.ladder_pick:
             rows = self.ladder_pick[key](rows, self.market_meta)
         self.ladders[key] = sorted(rows, key=lambda row: row.target)
-        failed = [row for row in rows if row.error and "HTTP 404" not in row.error]  # 404: this market has no book (an answer)
+        failed = [row for row in rows if row.error and not self.book_absent(row)]  # no book at all is an answer, not a failure
         if failed:
-            self.errors[key] = f"{len(failed)}/{len(rows)} 档盘口刷新失败（{brief_error(failed[0].error, 60)}）；显示上次盘口"
+            which = "、".join(brief_error(row.title or str(row.target), 14) for row in failed[:3]) + ("…" if len(failed) > 3 else "")
+            self.errors[key] = f"{len(failed)}/{len(rows)} 档盘口刷新失败（{which}：{brief_error(failed[0].error, 60)}）；显示上次盘口"
         else:
             self.errors.pop(key, None)
 
