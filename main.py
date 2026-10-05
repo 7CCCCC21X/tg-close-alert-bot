@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.29.0"
+VERSION = "1.31.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -231,25 +231,30 @@ DEFAULT_TICKERS = "UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:68
 NOTICE_GRACE_SECONDS = 30  # a data fault must last this long before subscribers hear of it (one failed request is not an outage)
 WATCHDOG_SECONDS = 600     # the sampling loop not starting a cycle for this long means it is stuck: the process exits, Railway restarts it
 SHUTDOWN_GRACE_SECONDS = 8  # at shutdown, how long messages already on their way may take to finish
-REFERENCE_TICK = 5        # seconds between checks in each reference task (each feed has its own cadence)
+REFERENCE_TICK = 1        # seconds between checks in each reference task (each feed has its own cadence; stock quotes run at 1 s)
 REFERENCE_TIMEOUT = 300   # one reference refresh may take this long before it is abandoned
 EXCHANGE_BASE_HOLD_DAYS = 30  # safety cap for a held exchange-close baseline; National Day / Chuseok fit easily
 
 
-# Exchange holidays on weekdays (official 2026 notices where known); override with HOLIDAYS_CN/HK/KR.
+# Exchange holidays on weekdays (official 2026 notices where known); override with HOLIDAYS_CN/HK/KR/SG.
 # Only dates that are certain are listed: a holiday missing here costs a "close pending" evening, a wrong one would
 # skip a real session. 2027 Lunar New Year closures are added once the exchanges publish them.
 DEFAULT_HOLIDAYS = {
     "CN": "2026-09-25,2026-10-01..2026-10-07,2027-01-01",   # SSE notice: Mid-Autumn 9/25, National Day 10/1-10/7; New Year
     "KR": "2026-09-24,2026-09-25,2026-10-05,2026-10-09,2026-12-25,2026-12-31,2027-01-01",  # Chuseok, Foundation Day (substitute), Hangul Day, Christmas, year-end closure, New Year
     "HK": "2026-10-01,2026-12-25,2027-01-01",  # National Day, Christmas (Boxing Day falls on a Saturday: no weekday off), New Year
+    # SGX (the A50 futures): Singapore's gazetted holidays; a weekday one shuts both the day and the night session
+    "SG": "2026-01-01,2026-02-17,2026-02-18,2026-04-03,2026-05-01,2026-05-27,2026-06-01,2026-08-10,2026-11-09,2026-12-25,2027-01-01",
 }
 # Days whose session differs from the usual one (verified notices; override with HK_HALF_DAYS / KR_LATE_DAYS):
 #   HKEX half days (the eves of Christmas, New Year and Lunar New Year): morning session only, closing auction
 #     12:00–12:10, HSI futures day session ends 12:30 and there is no after-hours session that evening.
 #   KRX CSAT day (the college entrance exam, third Thursday of November): everything one hour later, regular
 #     session 10:00–16:30 KST, close fixed at 16:30, Nextrade after-hours from 16:40.
-DEFAULT_SPECIAL_DAYS = {"HK_HALF": "2026-12-24,2026-12-31,2027-02-05", "KR_LATE": "2026-11-19"}
+#   SGX half days (the eves of Lunar New Year, Christmas and New Year): the A50 day session ends at noon
+#     (A50_HALF_DAY_END) and there is no T+1 session that evening.
+DEFAULT_SPECIAL_DAYS = {"HK_HALF": "2026-12-24,2026-12-31,2027-02-05", "KR_LATE": "2026-11-19",
+                        "SG_HALF": "2026-02-16,2026-12-24,2026-12-31"}
 HOLIDAY_WARN_DAYS = 30  # warn this many days before the configured calendar runs out
 
 
@@ -273,7 +278,8 @@ def parse_dates(spec: str, label: str) -> frozenset:
 def parse_holidays(env: dict[str, str]) -> dict[str, frozenset]:
     cn = parse_dates(env.get("HOLIDAYS_CN", DEFAULT_HOLIDAYS["CN"]), "HOLIDAYS_CN")
     return {"sh": cn, "sz": cn, "hk": parse_dates(env.get("HOLIDAYS_HK", DEFAULT_HOLIDAYS["HK"]), "HOLIDAYS_HK"),
-            "kr": parse_dates(env.get("HOLIDAYS_KR", DEFAULT_HOLIDAYS["KR"]), "HOLIDAYS_KR")}
+            "kr": parse_dates(env.get("HOLIDAYS_KR", DEFAULT_HOLIDAYS["KR"]), "HOLIDAYS_KR"),
+            "sg": parse_dates(env.get("HOLIDAYS_SG", DEFAULT_HOLIDAYS["SG"]), "HOLIDAYS_SG")}
 
 
 def calendar_until(holidays: dict[str, frozenset]) -> dt.date | None:
@@ -283,13 +289,13 @@ def calendar_until(holidays: dict[str, frozenset]) -> dt.date | None:
 
 
 def calendar_warning(holidays: dict[str, frozenset], today: dt.date) -> str:
-    """A reminder to extend HOLIDAYS_CN/HK/KR before the table runs out ("" while it reaches far enough)."""
+    """A reminder to extend HOLIDAYS_CN/HK/KR/SG before the table runs out ("" while it reaches far enough)."""
     until = calendar_until(holidays)
     if until is None:
-        return "⚠️ 未配置任何交易所假期（HOLIDAYS_CN/HK/KR），假期会被当成交易日"
+        return "⚠️ 未配置任何交易所假期（HOLIDAYS_CN/HK/KR/SG），假期会被当成交易日"
     if (until - today).days < HOLIDAY_WARN_DAYS:
         return (f"⚠️ 假期表只配置到 {until.isoformat()}" + ("（已过期）" if until < today else "") +
-                "，请在 Railway 变量 HOLIDAYS_CN/HK/KR 补充之后的休市日，否则假期会被当成交易日")
+                "，请在 Railway 变量 HOLIDAYS_CN/HK/KR/SG 补充之后的休市日，否则假期会被当成交易日")
     return ""
 
 
@@ -454,6 +460,8 @@ class Config:
     holidays: dict[str, frozenset] = field(default_factory=dict)  # market -> non-trading weekdays
     hk_half_days: frozenset = frozenset()  # HKEX half days (close 12:10, futures 12:30, no night session)
     kr_late_days: frozenset = frozenset()  # KRX days that run one hour late (CSAT day: 10:00–16:30)
+    quote_refresh: int = 1   # seconds between realtime stock quotes while a stock's session runs (QUOTE_REFRESH_SECONDS)
+    a50_beta_dynamic: bool = True  # fit the A50 → Composite coefficient from the bot's own after-hours record (A50_BETA is the prior)
     web_port: int = 0        # Read-only probability web page; 0 = disabled. Railway injects PORT.
     web_token: str = ""      # Secret path segment; generated and persisted when empty.
     web_base: str = ""       # Public base URL, e.g. https://xxx.up.railway.app
@@ -515,8 +523,10 @@ class Config:
         if style not in {"cn", "us"}:
             raise ValueError("COLOR_STYLE 只能是 cn（红涨绿跌）或 us（绿涨红跌）")
         # The session helpers consult one process-wide calendar (a half day is one fact, not a dozen call sites).
+        holidays = parse_holidays(e)
         CALENDAR.configure(parse_dates(e.get("HK_HALF_DAYS", DEFAULT_SPECIAL_DAYS["HK_HALF"]), "HK_HALF_DAYS"),
-                           parse_dates(e.get("KR_LATE_DAYS", DEFAULT_SPECIAL_DAYS["KR_LATE"]), "KR_LATE_DAYS"))
+                           parse_dates(e.get("KR_LATE_DAYS", DEFAULT_SPECIAL_DAYS["KR_LATE"]), "KR_LATE_DAYS"),
+                           holidays["sg"], parse_dates(e.get("SG_HALF_DAYS", DEFAULT_SPECIAL_DAYS["SG_HALF"]), "SG_HALF_DAYS"))
         return cls(
             token=e.get("TELEGRAM_BOT_TOKEN", "").strip(),
             admin_id=bounded_int(e, "ADMIN_USER_ID", 0, 0, 10**15),
@@ -524,6 +534,7 @@ class Config:
             threshold=threshold,
             cooldown=bounded_int(e, "ALERT_COOLDOWN_SECONDS", 300, 0, 86400),
             poll=bounded_int(e, "POLL_SECONDS", 5, 3, 3600),
+            quote_refresh=bounded_int(e, "QUOTE_REFRESH_SECONDS", 1, 1, 300),
             step=number(e.get("ALERT_STEP_PCT", "1"), "ALERT_STEP_PCT", zero_ok=True),
             min_gap=bounded_int(e, "MIN_ALERT_GAP_SECONDS", 30, 0, 3600),
             max_age=bounded_int(e, "MAX_PRICE_AGE_SECONDS", 120, 5, 3600),
@@ -557,8 +568,9 @@ class Config:
             prob_vol=parse_prob_vol(e.get("PROB_VOL", "")),
             sse_index=e.get("SSE_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
             a50_beta=parse_beta(e.get("A50_BETA", "0.8")),
+            a50_beta_dynamic=e.get("A50_BETA_DYNAMIC", "on").strip().lower() not in {"off", "0", "false", "no"},
             kospi_beta=parse_beta(e.get("KOSPI_BETA", "1"), "KOSPI_BETA"),
-            holidays=parse_holidays(e),
+            holidays=holidays,
             hk_half_days=parse_dates(e.get("HK_HALF_DAYS", DEFAULT_SPECIAL_DAYS["HK_HALF"]), "HK_HALF_DAYS"),
             kr_late_days=parse_dates(e.get("KR_LATE_DAYS", DEFAULT_SPECIAL_DAYS["KR_LATE"]), "KR_LATE_DAYS"),
             web_port=0 if e.get("WEB", "on").strip().lower() in {"off", "0", "false", "no"}
@@ -1239,6 +1251,14 @@ def stock_live_window(market: str, now_ms: int, holidays: frozenset = frozenset(
     return int(start.timestamp() * 1000), int(final.timestamp() * 1000)
 
 
+def split_quote_records(source: str, raw: bytes) -> dict[str, str]:
+    """A Tencent / Sina answer for several codes -> {code: record text}: 'v_sh688836="..."; v_r_hk00625="..."' and
+    'var hq_str_sh688836="..."; var hq_str_rt_hk00625="..."'. A code the feed does not know comes back empty."""
+    prefix = "v_" if source == "腾讯" else "hq_str_"
+    text = raw.decode("gbk", errors="ignore")
+    return {name.removeprefix(prefix): body for name, body in re.findall(r'(\w+)="([^"]*)"', text)}
+
+
 def parse_stock_live(source: str, market: str, raw: bytes, now_ms: int) -> IndexQuote:
     """Realtime stock quote -> IndexQuote(last, previous close, quote time). Naver for KRX, Tencent/Sina otherwise."""
     if source == "Naver":
@@ -1248,7 +1268,14 @@ def parse_stock_live(source: str, market: str, raw: bytes, now_ms: int) -> Index
     match = re.search(r'="([^"]*)"', text)
     if not match or not match.group(1).strip():
         raise ValueError(f"{source}行情为空（代码可能不存在）")
-    fields = match.group(1).split("~" if source == "腾讯" else ",")
+    return parse_stock_record(source, market, match.group(1), now_ms)
+
+
+def parse_stock_record(source: str, market: str, record: str, now_ms: int) -> IndexQuote:
+    """One Tencent ('~'-separated) or Sina (','-separated) quote record -> IndexQuote."""
+    if not record.strip():
+        raise ValueError(f"{source}行情为空（代码可能不存在）")
+    fields = record.split("~" if source == "腾讯" else ",")
     try:
         if source == "腾讯":
             name, current, previous, opened = fields[1], fields[3], fields[4], fields[5]
@@ -1322,15 +1349,26 @@ class StockMarket:
         ]
 
     @staticmethod
-    def live_sources(ticker: StockTicker) -> list[tuple[str, str, dict[str, str]]]:
-        code = urllib.parse.quote(ticker.code)
+    def live_code(source: str, ticker: StockTicker) -> str:
+        """The code a realtime feed knows the stock by: Tencent r_hk00625 / sh688836 (plain hkXXXXX is 15 minutes
+        delayed), Sina rt_hk00625 / sh688836."""
+        if source == "腾讯":
+            return ("r_hk" if ticker.market == "hk" else ticker.market) + ticker.code
+        return ("rt_hk" if ticker.market == "hk" else ticker.market) + ticker.code
+
+    @classmethod
+    def live_batch_sources(cls, tickers: list[StockTicker]) -> list[tuple[str, str, dict[str, str]]]:
+        """(name, url, headers) asking Tencent, then Sina, for every A-share / HK ticker in one request."""
+        codes = lambda source: ",".join(dict.fromkeys(urllib.parse.quote(cls.live_code(source, t)) for t in tickers))
+        return [("腾讯", f"https://qt.gtimg.cn/q={codes('腾讯')}", {"Referer": "https://gu.qq.com/"}),
+                ("新浪", f"https://hq.sinajs.cn/list={codes('新浪')}", {"Referer": "https://finance.sina.com.cn/"})]
+
+    @classmethod
+    def live_sources(cls, ticker: StockTicker) -> list[tuple[str, str, dict[str, str]]]:
         if ticker.market == "kr":
-            return [("Naver", f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}",
+            return [("Naver", f"https://polling.finance.naver.com/api/realtime/domestic/stock/{urllib.parse.quote(ticker.code)}",
                      {"Referer": "https://finance.naver.com/"})]
-        sina = ("rt_hk" if ticker.market == "hk" else ticker.market) + ticker.code
-        tencent = ("r_hk" if ticker.market == "hk" else ticker.market) + code  # plain hkXXXXX is 15 minutes delayed
-        return [("腾讯", f"https://qt.gtimg.cn/q={tencent}", {"Referer": "https://gu.qq.com/"}),
-                ("新浪", f"https://hq.sinajs.cn/list={sina}", {"Referer": "https://finance.sina.com.cn/"})]
+        return cls.live_batch_sources([ticker])
 
     @staticmethod
     def vol_sources(ticker: StockTicker) -> list[tuple[str, str, dict[str, str], str]]:
@@ -1363,40 +1401,68 @@ class StockMarket:
                 failures.append(f"{name}: {clean_error(error) or type(error).__name__}")
         raise ValueError("；".join(failures))
 
-    LIVE_SECONDS = 20
     LIVE_STALE_MS = 10 * 60_000
 
     async def refresh_live(self, now_ms: int, force: bool = False) -> Refreshed | bool:
-        """Realtime quotes, only for the stocks whose session is running now."""
+        """Realtime quotes, only for the stocks whose session is running now, every QUOTE_REFRESH_SECONDS (1 s by
+        default). The A-share / HK stocks share one request per source (Tencent, then Sina for the ones it left
+        stale or unknown); each Korean stock is one Naver request. A lagging or undated feed (delayed quotes) does
+        not end the search, and the round keeps the newest print it saw."""
         due = {symbol: ticker for symbol, ticker in self.config.tickers.items()
                if stock_live_window(ticker.market, now_ms, self.config.holidays.get(ticker.market, frozenset()))}
-        if not due or (not force and time.monotonic() - self.live_refreshed < self.LIVE_SECONDS):
+        if not due or (not force and time.monotonic() - self.live_refreshed < self.config.quote_refresh):
             return False  # nothing trading / not due: nothing fetched
         self.live_refreshed = time.monotonic()
-        got = 0
-        for index, (symbol, ticker) in enumerate(due.items()):
+        failures: dict[str, list[str]] = {symbol: [] for symbol in due}
+        fresh: set[str] = set()
+        newest: dict[str, IndexQuote] = {}
+
+        def consider(symbol: str, name: str, q: IndexQuote) -> None:
+            if symbol not in newest or q.quoted_ms > newest[symbol].quoted_ms:
+                newest[symbol] = q
+            self.live[symbol] = newest[symbol]
+            if self.live_quote(symbol, now_ms)[1]:
+                failures[symbol].append(f"{name}: " + (f"报价停在 {stamp(q.quoted_ms, seconds=False)}" if q.quoted_ms else "缺少报价时间"))
+            else:
+                fresh.add(symbol)
+
+        batch = {symbol: ticker for symbol, ticker in due.items() if ticker.market != "kr"}
+        for name, _, extra in SOURCE_HEALTH.order(self.live_batch_sources(list(batch.values()))) if batch else []:
+            wanted = {symbol: ticker for symbol, ticker in batch.items() if symbol not in fresh}
+            if not wanted:
+                break
+            url = next(u for n, u, _ in self.live_batch_sources(list(wanted.values())) if n == name)
+            try:
+                records = split_quote_records(name, await fetch_source(url, extra))
+            except Exception as error:
+                for symbol in wanted:
+                    failures[symbol].append(f"{name}: {clean_error(error)}")
+                continue
+            for symbol, ticker in wanted.items():
+                try:
+                    q = parse_stock_record(name, ticker.market, records.get(self.live_code(name, ticker), ""), now_ms)
+                except Exception as error:
+                    failures[symbol].append(f"{name}: {clean_error(error)}")
+                    continue
+                consider(symbol, name, q)
+        for index, (symbol, ticker) in enumerate((s, t) for s, t in due.items() if t.market == "kr"):
             if index:
-                await asyncio.sleep(0.3)
-            failures, best = [], None
+                await asyncio.sleep(0.3)  # spread requests out; feeds drop bursts from one IP
             for name, url, extra in SOURCE_HEALTH.order(self.live_sources(ticker)):
                 try:
                     q = parse_stock_live(name, ticker.market, await fetch_source(url, extra), now_ms)
                 except Exception as error:
-                    failures.append(f"{name}: {clean_error(error)}")
+                    failures[symbol].append(f"{name}: {clean_error(error)}")
                     continue
-                if best is None or q.quoted_ms > best.quoted_ms:
-                    best = q
-                self.live[symbol] = best
-                if not self.live_quote(symbol, now_ms)[1]:
-                    break  # fresh: done
-                # A lagging or undated feed (delayed quotes): try the next source, keep the newest print
-                failures.append(f"{name}: " + (f"报价停在 {stamp(q.quoted_ms, seconds=False)}" if q.quoted_ms else "缺少报价时间"))
-            if best is not None and not self.live_quote(symbol, now_ms)[1]:
+                consider(symbol, name, q)
+                if symbol in fresh:
+                    break
+        for symbol in due:
+            if symbol in fresh:
                 self.live_errors.pop(symbol, None)
-                got += 1
             else:
-                self.live_errors[symbol] = "；".join(failures)
-        return refreshed([f"{symbol}：{self.live_errors[symbol]}" for symbol in due if symbol in self.live_errors], got)
+                self.live_errors[symbol] = "；".join(failures[symbol])
+        return refreshed([f"{symbol}：{self.live_errors[symbol]}" for symbol in due if symbol in self.live_errors], len(fresh))
 
     def live_quote(self, symbol: str, now_ms: int) -> tuple[IndexQuote | None, str]:
         """(today's fresh realtime quote, why not) while the stock trades; (None, "") outside its session."""
@@ -1910,7 +1976,8 @@ def hsi_anchor_key(q: "FuturesQuote") -> str:
 class IndexFutures:
     """Hang Seng Index futures (main contract, incl. the 17:15-03:00 after-hours session) with the
     cash index for the 高水/低水 basis. Eastmoney first, Sina as fallback; read-only, best effort."""
-    REFRESH_SECONDS = 60
+    REFRESH_SECONDS = 60   # between sessions
+    SESSION_SECONDS = 20   # while the cash index or a futures session trades (etnet is a scraped page, not a feed)
     EM = "https://push2.eastmoney.com/api/qt/stock/get?fltt=2&invt=2&fields=f43,f44,f45,f46,f57,f58,f60,f86&secid="
     # etnet is the HKEX-designated free real-time site the user checks against; Sina hf_HSI is a CFD,
     # not the HKEX contract (it prints decimals), so it is only a last-resort, clearly labelled fallback.
@@ -2042,8 +2109,13 @@ class IndexFutures:
         close = int(dt.datetime.combine(local.date(), CALENDAR.close_time("hk", local.date()), BEIJING).timestamp() * 1000)
         return hk_trading_day(local.date(), self.holidays) and self.refreshed_ms < close <= now_ms
 
+    def cadence(self, now_ms: int) -> int:
+        """Seconds between refreshes: SESSION_SECONDS while the cash index or the futures trade, else REFRESH_SECONDS."""
+        live = self.cash_open(now_ms) or hk_futures_session(now_ms, self.holidays) != "休市"
+        return self.SESSION_SECONDS if live else self.REFRESH_SECONDS
+
     async def refresh(self, now_ms: int, force: bool = False) -> Refreshed | bool:
-        if not self.enabled or not (force or time.monotonic() - self.refreshed >= self.REFRESH_SECONDS
+        if not self.enabled or not (force or time.monotonic() - self.refreshed >= self.cadence(now_ms)
                                     or self.cash_close_due(now_ms)):
             return False  # not due yet: nothing fetched
         self.refreshed, self.refreshed_ms = time.monotonic(), now_ms
@@ -2321,19 +2393,54 @@ def krx_session(now_ms: int, holidays: frozenset = frozenset()) -> str:
     return "交易中" if start <= local.time() <= end else "已收盘"
 
 
+# SGX FTSE China A50 futures, Beijing time (= Singapore time): T session 09:00–16:30, T+1 session 16:45–05:15.
+A50_DAY_START, A50_DAY_END = dt.time(9, 0), dt.time(16, 30)
+A50_NIGHT_START, A50_NIGHT_END = dt.time(16, 45), dt.time(5, 15)
+A50_HALF_DAY_END = dt.time(12, 0)  # SGX half days (SG_HALF_DAYS): the morning only, and no T+1 session that evening
+
+
+def a50_trading_day(day: dt.date) -> bool:
+    """SGX trades the A50 on weekdays that are not Singapore exchange holidays (HOLIDAYS_SG)."""
+    return day.weekday() < 5 and day not in CALENDAR.sg_holidays
+
+
+def a50_day_end(day: dt.date) -> dt.time:
+    return A50_HALF_DAY_END if CALENDAR.half_day("sg", day) else A50_DAY_END
+
+
+def a50_night(day: dt.date) -> bool:
+    """A T+1 (night) session starts on ``day`` evening: every full trading day, never a half day or a holiday."""
+    return a50_trading_day(day) and not CALENDAR.half_day("sg", day)
+
+
 def a50_session(now_ms: int) -> str:
     """FTSE China A50 futures (SGX): day 09:00-16:30, night 16:45-05:15 Beijing time.
 
-    Friday's night session ends Saturday 05:15; Sunday night has no session.
+    Sessions only start on SGX trading days: Friday's night session ends Saturday 05:15, Sunday night has none,
+    a Singapore holiday (HOLIDAYS_SG) has neither session, and a half day (SG_HALF_DAYS) trades the morning only.
     """
     moment = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
-    local, weekday = moment.time(), moment.weekday()
-    if weekday == 6 or (weekday == 5 and local >= dt.time(5, 15)) or (weekday == 0 and local < dt.time(9, 0)):
-        return "休市"
-    if local >= dt.time(16, 45) or local < dt.time(5, 15):
+    local, today = moment.time(), moment.date()
+    if local < A50_NIGHT_END and a50_night(today - dt.timedelta(days=1)):
         return "夜盘"
-    if dt.time(9, 0) <= local <= dt.time(16, 30):
+    if not a50_trading_day(today):
+        return "休市"
+    if A50_DAY_START <= local <= a50_day_end(today):
         return "日盘"
+    if local >= A50_NIGHT_START and a50_night(today):
+        return "夜盘"
+    return "休市"
+
+
+def a50_closed_note(now_ms: int) -> str:
+    """'休市', or why A50 is shut when the reason is Singapore's calendar rather than the clock: the status line
+    and the odds say '新加坡交易所假期休市' / '新加坡半日市休市（当晚无夜盘）' instead of a stale-quote warning."""
+    local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+    day = local.date()
+    if day.weekday() < 5 and day in CALENDAR.sg_holidays:
+        return "新加坡交易所假期休市"
+    if CALENDAR.half_day("sg", day) and local.time() > A50_HALF_DAY_END:
+        return "新加坡半日市休市（当晚无夜盘）"
     return "休市"
 
 
@@ -2355,27 +2462,33 @@ def a50_next_open(now_ms: int) -> int | None:
     if a50_session(now_ms) != "休市":
         return None
     local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
-    day, clock, weekday = local.date(), local.time(), local.weekday()
-    if weekday < 5 and dt.time(16, 30) < clock < dt.time(16, 45):
+    day, clock = local.date(), local.time()
+    if a50_night(day) and A50_DAY_END < clock < A50_NIGHT_START:
         return None
-    if weekday >= 5:  # Saturday after 05:15 or Sunday: Monday's day session
-        day += dt.timedelta(days=7 - weekday)
-    return int(dt.datetime.combine(day, dt.time(9, 0), BEIJING).timestamp() * 1000)
+    if not (a50_trading_day(day) and clock < A50_DAY_START):
+        day += dt.timedelta(days=1)  # the next SGX trading day's day session (weekends and HOLIDAYS_SG skipped)
+    for _ in range(30):
+        if a50_trading_day(day):
+            break
+        day += dt.timedelta(days=1)
+    return int(dt.datetime.combine(day, A50_DAY_START, BEIJING).timestamp() * 1000)
 
 
 def a50_last_session_end(now_ms: int) -> int:
-    """Most recent SGX A50 session end, including Friday night's Saturday morning close."""
+    """Most recent SGX A50 session end at or before now_ms, including Friday night's Saturday morning close
+    (a holiday or a half day has no night session, so the end before it is the one that counts)."""
     local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
-    day, clock, weekday = local.date(), local.time(), local.weekday()
-    if weekday < 5 and dt.time(16, 30) <= clock < dt.time(16, 45):
-        end_day, end_time = day, dt.time(16, 30)
-    elif weekday == 6 or (weekday == 0 and clock < dt.time(9, 0)):
-        end_day, end_time = day - dt.timedelta(days=1 if weekday == 6 else 2), dt.time(5, 15)
-    elif weekday == 5:
-        end_day, end_time = day, dt.time(5, 15)
-    else:  # Weekday morning gap after the night session.
-        end_day, end_time = day, dt.time(5, 15)
-    return int(dt.datetime.combine(end_day, end_time, BEIJING).timestamp() * 1000)
+    day = local.date()
+    for _ in range(30):
+        if a50_trading_day(day):
+            ends = [dt.datetime.combine(day, a50_day_end(day), BEIJING)]
+            if a50_night(day):
+                ends.append(dt.datetime.combine(day + dt.timedelta(days=1), A50_NIGHT_END, BEIJING))
+            past = [end for end in ends if end <= local]
+            if past:
+                return int(max(past).timestamp() * 1000)
+        day -= dt.timedelta(days=1)
+    return now_ms
 
 
 def a50_code_ok(code: Any) -> bool:
@@ -2398,6 +2511,18 @@ def parse_sina_bars(raw: bytes) -> list[tuple[str, D]]:
     if not bars:
         raise ValueError("新浪 A50 5分钟K 格式异常或为空")
     return sorted(bars)
+
+
+def a50_print_note(quoted_ms: int, close_ms: int) -> str:
+    """Label of an A50 anchor taken from the first live print after the 15:00 close: within a minute it is the price
+    at the close for all practical purposes ('15:00 后 12 秒首笔'), later it is an approximation and says so."""
+    late = max(0, quoted_ms - close_ms) // 1000
+    return f"15:00 后 {late} 秒首笔" if late < 60 else f"15:00 后 {late // 60} 分钟首笔近似"
+
+
+def a50_anchor_exact(note: str) -> bool:
+    """The anchor is the A50 price at the 15:00 close itself (the 15:00 one-minute bar or a print within a minute)."""
+    return note == "15:00" or note.endswith("秒首笔")
 
 
 def a50_family(source: str) -> str:
@@ -2444,20 +2569,42 @@ def parse_cn_daily(source: str, raw: bytes) -> list[tuple[dt.date, D]]:
     return [(day, close) for day, _, close in parse_cn_daily_ohlc(source, raw)]
 
 
+def sina_daily_rows(raw: bytes) -> list[tuple[str, str, str]]:
+    """Sina CN_MarketData.getKLineData (scale=240): [{"day":"2026-09-24","open":"3871.000",...,"close":"3888.370",...}, ...]
+    -> [(day, open, close)]. Keys may come quoted or bare; the record names no code (the request does)."""
+    rows = []
+    for obj in re.findall(r"\{[^{}]*\}", raw.decode("utf-8", errors="replace")):
+        day = re.search(r'"?day"?\s*:\s*"(\d{4}-\d{2}-\d{2})', obj)
+        opening = re.search(r'"?open"?\s*:\s*"?([\d.]+)', obj)
+        close = re.search(r'"?close"?\s*:\s*"?([\d.]+)', obj)
+        if day and close:
+            rows.append((day.group(1), opening.group(1) if opening else "", close.group(1)))
+    return rows
+
+
 def parse_cn_daily_ohlc(source: str, raw: bytes) -> list[tuple[dt.date, D | None, D]]:
-    """As parse_cn_daily, with each bar's open (None when missing)."""
+    """As parse_cn_daily, with each bar's open (None when missing). Tencent and Eastmoney name the code and it is
+    checked, Yahoo's meta names the symbol; Sina's daily bars carry no code (the request names it)."""
     try:
-        data = json.loads(raw)["data"]
-        if source == "腾讯日K":  # {"data": {"sh000001": {"day": [["2026-09-24", open, close, high, low, vol], ...]}}}
-            if "sh000001" not in data:
-                raise ValueError("腾讯日 K 没有返回 sh000001")
-            rows = [(r[0], r[1], r[2]) for r in data["sh000001"].get("day") or [] if len(r) > 2]
-        else:  # Eastmoney: {"data": {"code": "000001", "market": 1, "klines": ["2026-09-24,open,close", ...]}}
-            if str(data.get("code")) != "000001" or int(data.get("market", -1)) != 1:
-                raise ValueError(f"东方财富日 K 代码不是上证指数（{data.get('market')}.{data.get('code')}）")
-            rows = [tuple(str(line).split(",")[:3]) for line in data.get("klines") or []]
+        if source == "Yahoo日K":  # v8 chart of 000001.SS: exchange-local dates, closes to 0.01
+            meta = json.loads(raw)["chart"]["result"][0]["meta"]
+            if str(meta.get("symbol", "")).upper() != "000001.SS":
+                raise ValueError(f"Yahoo 日 K 代码不是上证指数 000001.SS（{clean_error(str(meta.get('symbol') or '空'))}）")
+            return parse_yahoo_daily(raw)
+        if source == "新浪日K":
+            rows = sina_daily_rows(raw)
+        else:
+            data = json.loads(raw)["data"]
+            if source == "腾讯日K":  # {"data": {"sh000001": {"day": [["2026-09-24", open, close, high, low, vol], ...]}}}
+                if "sh000001" not in data:
+                    raise ValueError("腾讯日 K 没有返回 sh000001")
+                rows = [(r[0], r[1], r[2]) for r in data["sh000001"].get("day") or [] if len(r) > 2]
+            else:  # Eastmoney: {"data": {"code": "000001", "market": 1, "klines": ["2026-09-24,open,close", ...]}}
+                if str(data.get("code")) != "000001" or int(data.get("market", -1)) != 1:
+                    raise ValueError(f"东方财富日 K 代码不是上证指数（{data.get('market')}.{data.get('code')}）")
+                rows = [tuple(str(line).split(",")[:3]) for line in data.get("klines") or []]
         bars = sorted((dt.date.fromisoformat(day), _open_price(opening), number(close, "上证收盘")) for day, opening, close in rows)
-    except (ValueError, KeyError, TypeError, AttributeError) as error:
+    except (ValueError, KeyError, TypeError, AttributeError, IndexError) as error:
         raise ValueError(f"{source}格式异常：{clean_error(error)}") from None
     if not bars:
         raise ValueError(f"{source}没有返回任何交易日")
@@ -2519,18 +2666,24 @@ class CnIndex:
     """Shanghai Composite (000001) plus FTSE China A50 futures (SGX) as its after-hours proxy.
 
     Composite: Tencent → Sina → Eastmoney. A50: Eastmoney 104.CN00Y (month-continuous contract)
-    then Sina's CFD as a labelled last resort. Refreshed every 60 s, best effort.
-    The close used as the after-hours reference comes only from a dated daily bar (Tencent,
-    then Eastmoney): a realtime "last price" says nothing reliable about which session it closed.
+    then Sina's CFD as a labelled last resort. Refreshed every 10 s while either trades, else every 60 s.
+    The close used as the after-hours reference comes only from a dated daily bar (Tencent, then Eastmoney,
+    Sina, Yahoo 000001.SS): a realtime "last price" says nothing reliable about which session it closed.
     """
-    REFRESH_SECONDS = 60
+    REFRESH_SECONDS = 60      # between sessions
+    SESSION_SECONDS = 10      # while Shanghai trades (its own index) or an A50 session runs (the after-hours proxy)
     DAILY_SECONDS = 600       # re-read the daily bars this often once the expected close is confirmed
+    PENDING_SECONDS = 60      # ...and this often while the close the calendar expects is not confirmed yet
     STALE_MS = 10 * 60_000    # a live quote older than this is not used for new probabilities
     DAILY_SOURCES = (("腾讯日K", "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh000001,day,,,40,",
                       {"Referer": "https://gu.qq.com/"}),
                      ("东方财富日K", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101"
                                     "&lmt=40&fields1=f1,f2,f3&fields2=f51,f52,f53&secid=1.000001",
-                      {"Referer": "https://quote.eastmoney.com/"}))
+                      {"Referer": "https://quote.eastmoney.com/"}),
+                     # the same dated bars from two more hosts, for the evenings the first two are unreachable
+                     ("新浪日K", "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+                                "?symbol=sh000001&scale=240&ma=no&datalen=40", {"Referer": "https://finance.sina.com.cn/"}),
+                     ("Yahoo日K", yahoo_url("000001.SS", "3mo"), {}))
     SSE_SOURCES = (("腾讯", "https://qt.gtimg.cn/q=sh000001", {"Referer": "https://gu.qq.com/"}),
                    ("新浪", "https://hq.sinajs.cn/list=sh000001", {"Referer": "https://finance.sina.com.cn/"}),
                    ("东方财富", IndexFutures.EM + "1.000001", {"Referer": "https://quote.eastmoney.com/"}))
@@ -2562,6 +2715,7 @@ class CnIndex:
         self.a50_skipped = ""  # why earlier A50 sources failed when a later one answered
         self.daily_error = ""
         self.refreshed = -1e9
+        self.refreshed_ms = 0  # market clock of the last refresh (the 15:00 close is caught at once)
         self.daily_refreshed = -1e9
 
     @staticmethod
@@ -2614,10 +2768,24 @@ class CnIndex:
         """Why q cannot stand for A50 now ("" when it can): a print from the session running, or from the last one."""
         return quote_problem(q.quoted_ms, now_ms, a50_session(now_ms) != "休市", a50_last_session_end(now_ms))
 
+    def cadence(self, now_ms: int) -> int:
+        """Seconds between refreshes: SESSION_SECONDS while the Composite or the A50 trades, else REFRESH_SECONDS."""
+        live = stock_live_window("sh", now_ms, self.holidays) or a50_session(now_ms) != "休市"
+        return self.SESSION_SECONDS if live else self.REFRESH_SECONDS
+
+    def close_due(self, now_ms: int) -> bool:
+        """The first refresh after the 15:00 close is not left to the cadence: the Composite's closing print stands
+        in for the daily bar, and the first A50 print after the close is the anchor when no dated bar can be had."""
+        local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+        if local.weekday() >= 5 or local.date() in self.holidays:
+            return False
+        close = int(dt.datetime.combine(local.date(), CALENDAR.close_time("sh", local.date()), BEIJING).timestamp() * 1000)
+        return self.refreshed_ms < close <= now_ms
+
     async def refresh(self, now_ms: int, force: bool = False) -> Refreshed | bool:
-        if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
+        if not self.enabled or not (force or time.monotonic() - self.refreshed >= self.cadence(now_ms) or self.close_due(now_ms)):
             return False  # not due yet: nothing fetched
-        self.refreshed = time.monotonic()
+        self.refreshed, self.refreshed_ms = time.monotonic(), now_ms
         # a source whose answer parses but is stale or undated does not end the search; nothing current keeps the newest
         quote, _, self.error = await pick_quote(self.SSE_SOURCES, lambda n, r: parse_cn_index(n, r, now_ms),
                                                 lambda q: self.sse_problem(q, now_ms))
@@ -2647,10 +2815,11 @@ class CnIndex:
                 and (self.close is None or self.close.day < local.date()))
 
     async def refresh_daily(self, now_ms: int, force: bool = False) -> str | None:
-        """Read the dated daily bars: every refresh while the expected close is unconfirmed, else every 10 min.
+        """Read the dated daily bars: every minute while the expected close is unconfirmed, else every 10 min.
         An answer that lags (its newest finished bar is older than the calendar expects) does not stop the search;
         answers are merged and the close never steps back. None = not due; "" = read; else what failed."""
-        if not force and self.confirmed(now_ms) and time.monotonic() - self.daily_refreshed < self.DAILY_SECONDS:
+        every = self.DAILY_SECONDS if self.confirmed(now_ms) else self.PENDING_SECONDS
+        if not force and time.monotonic() - self.daily_refreshed < every:
             return None
         self.daily_refreshed = time.monotonic()
         expected, today = self.expected_close(now_ms), dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
@@ -2760,7 +2929,7 @@ class CnIndex:
             return f"📈 A50期货 ⚠️ 获取失败（{brief_error(self.a50_error)}）" if self.a50_error else "📈 A50期货 ⏳ 等待首次获取"
         line = f"📈 {bold('A50期货 ' + a50_session(a.quoted_ms))} {bold(fmt(a.last))}"
         if anchor:
-            label = "上证收盘时" if anchor_note == "15:00" else "上证收盘附近"
+            label = "上证收盘时" if a50_anchor_exact(anchor_note) else "上证收盘附近"
             line += f" → {label} {bold(fmt(anchor))} {pct_text(percent(a.last, anchor), style)}"
             if anchor_note != "15:00":
                 line += f"（{anchor_note}）"
@@ -2770,6 +2939,8 @@ class CnIndex:
         line += f"｜{stamp(a.quoted_ms, seconds=False)} {source}" + stale_note(a.quoted_ms, now_ms, BEIJING)
         if self.a50_stale(now_ms):
             line += "｜⚠️ 报价已超 10 分钟未更新"
+        if a50_closed_note(now_ms) != "休市":
+            line += f"｜{a50_closed_note(now_ms)}"
         if self.a50_skipped and not self.a50_error:
             line += f"｜⚠️ 前序源未取到：{brief_error(self.a50_skipped, 90)}"
         return line + f"｜⚠️ 刷新失败：{brief_error(self.a50_error)}" if self.a50_error else line
@@ -2854,7 +3025,8 @@ def dated_ref(daily: dict[dt.date, D], day: dt.date, live: D | None) -> tuple[D 
 
 class KospiIndex:
     """KOSPI composite index: Naver's realtime index feed first, Eastmoney (100.KS11) as fallback."""
-    REFRESH_SECONDS = 60
+    REFRESH_SECONDS = 60   # between sessions
+    SESSION_SECONDS = 10   # while the KRX regular session runs (to 15 minutes after the close)
     SOURCES = (("Naver", "https://polling.finance.naver.com/api/realtime/domestic/index/KOSPI",
                 {"Referer": "https://finance.naver.com/"}),
                ("东方财富", IndexFutures.EM + "100.KS11", {"Referer": "https://quote.eastmoney.com/"}))
@@ -2932,8 +3104,12 @@ class KospiIndex:
         self.daily_error = "" if got else "；".join(failures)
         return "" if expected in self.daily else "；".join(failures)
 
+    def cadence(self, now_ms: int) -> int:
+        """Seconds between refreshes: SESSION_SECONDS while the KRX session runs, else REFRESH_SECONDS."""
+        return self.SESSION_SECONDS if stock_live_window("kr", now_ms, self.holidays) else self.REFRESH_SECONDS
+
     async def refresh(self, now_ms: int, force: bool = False) -> Refreshed | bool:
-        if not self.enabled or (not force and time.monotonic() - self.refreshed < self.REFRESH_SECONDS):
+        if not self.enabled or (not force and time.monotonic() - self.refreshed < self.cadence(now_ms)):
             return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
         self.quote, self.error = await self._fetch(self.SOURCES, now_ms, self.quote)
@@ -3008,12 +3184,16 @@ class SessionCalendar:
     def __init__(self) -> None:
         self.hk_half: frozenset = frozenset()
         self.kr_late: frozenset = frozenset()
+        self.sg_holidays: frozenset = frozenset()  # SGX closures (the A50 futures trade neither session)
+        self.sg_half: frozenset = frozenset()      # SGX half days (A50 morning only, no T+1 session)
 
-    def configure(self, hk_half: frozenset, kr_late: frozenset) -> None:
+    def configure(self, hk_half: frozenset, kr_late: frozenset, sg_holidays: frozenset = frozenset(),
+                  sg_half: frozenset = frozenset()) -> None:
         self.hk_half, self.kr_late = frozenset(hk_half), frozenset(kr_late)
+        self.sg_holidays, self.sg_half = frozenset(sg_holidays), frozenset(sg_half)
 
     def half_day(self, market: str, day: dt.date) -> bool:
-        return market == "hk" and day in self.hk_half
+        return (market == "hk" and day in self.hk_half) or (market == "sg" and day in self.sg_half)
 
     def late_day(self, market: str, day: dt.date) -> bool:
         return market == "kr" and day in self.kr_late
@@ -3057,7 +3237,8 @@ class SessionCalendar:
 
 
 CALENDAR = SessionCalendar()
-CALENDAR.configure(parse_dates(DEFAULT_SPECIAL_DAYS["HK_HALF"], "HK_HALF_DAYS"), parse_dates(DEFAULT_SPECIAL_DAYS["KR_LATE"], "KR_LATE_DAYS"))
+CALENDAR.configure(parse_dates(DEFAULT_SPECIAL_DAYS["HK_HALF"], "HK_HALF_DAYS"), parse_dates(DEFAULT_SPECIAL_DAYS["KR_LATE"], "KR_LATE_DAYS"),
+                   parse_dates(DEFAULT_HOLIDAYS["SG"], "HOLIDAYS_SG"), parse_dates(DEFAULT_SPECIAL_DAYS["SG_HALF"], "SG_HALF_DAYS"))
 PRIOR_VOL = {"sh": 0.035, "sz": 0.035, "hk": 0.03, "kr": 0.03, "HSI": 0.013, "KOSPI": 0.02, "SSE": 0.011}
 PRIOR_WEIGHT = 10  # pseudo-observations given to the prior when blending with estimated volatility
 
@@ -3225,6 +3406,11 @@ def model_swing(odds: CloseOdds) -> float:
 
 
 PRED_EVERY_MS = 30 * 60_000   # one saved prediction snapshot per index per 30 minutes
+BETA_WINDOW_DAYS = 60         # the after-hours β regression uses snapshots of the last this many days
+BETA_PRIOR_DAYS = 10          # weight (in days) of the configured β when it is blended with the fitted slope
+BETA_MIN_DAYS = 5             # fewer closed target days than this: the configured β stands
+BETA_BOUNDS = (0.3, 1.2)      # the blended β stays in this range (a proxy never moves the index several times over)
+BETA_REFRESH_SECONDS = 3600   # the fit is redone this often (new outcomes arrive once a day)
 PRED_KEEP_DAYS = 400          # snapshots older than this are pruned (a year of /calib history, not an ever-growing table)
 CALIB_MIN_DAYS = 10           # walk-forward: target days used only for training before the first test day
 
@@ -7413,10 +7599,9 @@ function load(){
     const d=await r.json();if(d.server_ms)skew=d.server_ms-Date.now();fetchedAt=okAt=Date.now();failMsg="";style=d.color_style||"cn";
     if(last)for(const it of d.items){const k=favKey(it),o=last.items.find(x=>favKey(x)===k);  // a fair price that moved since the last refresh
       if(o&&o.fair_up!=null&&it.fair_up!=null&&Math.abs(o.fair_up-it.fair_up)>=5e-4)changedAt[k]={at:Date.now(),up:it.fair_up>o.fair_up}}
-    const sig=JSON.stringify(d.items),same=!!last&&sig===lastSig;lastSig=sig;  // books move every 15 s, quotes every 30 s: most 10-second
-    last=d;if(!same||drag)render(d);                                            // answers repeat the last one, and a repeat rebuilds nothing (a drag still notes it)
-    const ago=$("span","","");ago.id="ago";
-    document.getElementById("meta").replaceChildren(...(d.today?[$("span","","今天 "+d.today)]:[]),$("span","","数据 "+d.generated_at),ago,$("span","","基准 "+d.mode),$("span","","v"+d.version));
+    const sig=JSON.stringify(d.items),same=!!last&&sig===lastSig;lastSig=sig;  // books move every 15 s, crypto quotes every 30 s: a repeat
+    last=d;if(!same||drag)render(d);                                            // rebuilds nothing (a drag still notes it); the stream patches the daily cards between answers
+    drawMeta(d);
     if(!same)drawLegend();
     document.getElementById("foot").textContent=d.note;tick();
   }catch(e){failMsg=e.name==="AbortError"?"超过 "+LOAD_TIMEOUT_MS/1000+" 秒没有响应":(e.message||"网络错误");
@@ -7424,6 +7609,28 @@ function load(){
     if(!okAt){document.getElementById("meta").replaceChildren($("span","warn","刷新失败："+failMsg+(dead?"":"，稍后自动重试")));document.querySelectorAll(".skel").forEach(e=>e.remove())}drawStale()}
   finally{clearTimeout(timer);loading=null}})();
   return loading}
+function drawMeta(d){const ago=$("span","","");ago.id="ago";
+  document.getElementById("meta").replaceChildren(...(d.today?[$("span","","今天 "+d.today)]:[]),$("span","","数据 "+d.generated_at),ago,
+    ...(live?[$("span","","实时推送")]:[]),$("span","","基准 "+d.mode),$("span","","v"+d.version))}
+// The event stream (/events): the index and contract cards' numbers arrive within a second of a change and are patched into the
+// last full answer; data.json still brings the books, the crypto cards and the texts every 10 seconds, and is the fallback.
+let es=null,live=false;
+const LIVE_KEYS=["quote_ms","effective","move","ref","up","flat","down","z","fair_up","fair_down","sigma","remaining","warn","proxy_note","source","eff_label","missing"];
+function patchLive(d){
+  if(!last||!Array.isArray(d.items))return;if(d.server_ms)skew=d.server_ms-Date.now();
+  let changed=false;
+  for(const li of d.items){const it=last.items.find(x=>x.name===li.name&&(x.symbol||"")===(li.symbol||""));if(!it)continue;
+    if(!!li.missing!==!!it.missing)continue;  // a card that just appeared or paused: the next full answer draws it whole
+    for(const k of LIVE_KEYS){if(!(k in li)||JSON.stringify(li[k])===JSON.stringify(it[k]))continue;
+      if(k==="fair_up"&&it.fair_up!=null&&li.fair_up!=null&&Math.abs(li.fair_up-it.fair_up)>=5e-4)changedAt[favKey(it)]={at:Date.now(),up:li.fair_up>it.fair_up};
+      it[k]=li[k];changed=true}}
+  if(!changed)return;if(d.generated_at)last.generated_at=d.generated_at;fetchedAt=okAt=Date.now();failMsg="";
+  if(document.visibilityState!=="hidden")render(last);drawMeta(last);tick()}
+function connectLive(){
+  if(!("EventSource" in window)||dead||es)return;
+  try{es=new EventSource(location.pathname.replace(/\\/$/,"")+"/events")}catch(e){es=null;return}
+  es.addEventListener("live",e=>{live=true;try{patchLive(JSON.parse(e.data))}catch(err){}});
+  es.onerror=()=>{live=false;if(last)drawMeta(last);if(dead&&es){es.close();es=null}}}  // EventSource reconnects on its own; the polling carries on meanwhile
 function drawBar(){  // the filter chips, the sort and the trade size, as this browser keeps them
   const fc=document.getElementById("fchips");fc.replaceChildren(...FILTERS.map(([k,t,tip])=>{const b=$("button","tog"+(filt.includes(k)?" on":""),t);b.type="button";b.title=tip;
     b.setAttribute("aria-pressed",filt.includes(k)?"true":"false");
@@ -7447,7 +7654,7 @@ if("IntersectionObserver" in window)new IntersectionObserver(([e])=>fbarEl.class
 const totop=document.getElementById("totop");addEventListener("scroll",()=>totop.classList.toggle("show",scrollY>600),{passive:true});
 totop.addEventListener("click",()=>scrollTo({top:0,behavior:matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth"}));
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once
-load();setInterval(()=>{if(document.visibilityState!=="hidden")load()},10000);setInterval(tick,1000);  // a hidden tab waits: visibilitychange fetches at once on return
+load();connectLive();setInterval(()=>{if(document.visibilityState!=="hidden")load()},10000);setInterval(tick,1000);  // a hidden tab waits: visibilitychange fetches at once on return
 </script></body></html>"""
 
 
@@ -7695,17 +7902,23 @@ def page_payload(payload: dict) -> dict:
 class WebServer:
     """Tiny read-only HTTP server (stdlib asyncio) for the probability page.
 
-    Routes: /health, /p/<token> (HTML), /p/<token>/data.json (JSON), /p/<token>/journal (the paper trades' review page)
-    with journal.json / journal.csv (exports). Everything else is 404, the token is compared in constant time, and
-    responses are no-store with a restrictive CSP. Text bodies are gzip-compressed for a client that accepts it
+    Routes: /health, /p/<token> (HTML), /p/<token>/data.json (JSON), /p/<token>/events (server-sent events: the daily
+    cards' live numbers whenever they change, checked every second), /p/<token>/journal (the paper trades' review
+    page) with journal.json / journal.csv (exports). Everything else is 404, the token is compared in constant time,
+    and responses are no-store with a restrictive CSP. Text bodies are gzip-compressed for a client that accepts it
     (the page is ~80 KB, data.json is fetched every 10 seconds by every open tab).
     """
     MAX_HEADER_BYTES = 8192
     GZIP_MIN_BYTES = 512  # below this a gzip header costs about as much as it saves
-    CACHE_SECONDS = {"data.json": 2.0, "journal.json": 5.0}  # several tabs (or a scanner) share one build per interval
+    CACHE_SECONDS = {"data.json": 1.0, "journal.json": 5.0, "live.json": 1.0}  # several tabs (or a scanner) share one build per interval
+    STREAM_SECONDS = 1.0        # an event stream looks for a change this often
+    STREAM_PING_SECONDS = 20    # a comment keeps a quiet stream (and any proxy in front of it) open
+    STREAM_LIFE_SECONDS = 3600  # then the stream ends; the browser's EventSource reconnects by itself
+    STREAM_MAX = 32             # concurrent streams; beyond it a request is told to retry later
 
     def __init__(self, bot: "Bot", port: int, token: str):
         self.bot, self.port, self.token = bot, port, token
+        self.streams = 0  # event streams open now
         self.server: asyncio.base_events.Server | None = None
         self.pages = {"page": WEB_PAGE.encode("utf-8"), "journal": JOURNAL_PAGE.encode("utf-8")}
         self.cache: dict[str, tuple[float, bytes]] = {}  # name -> (expires, body): the JSON is built once per interval
@@ -7767,7 +7980,11 @@ class WebServer:
             request_line, _, rest = head.decode("latin-1").partition("\r\n")
             method, target, _ = request_line.split(" ", 2)
             gzip_ok = accepts_gzip(rest)
-            status, ctype, body = self.route(method.upper(), urllib.parse.urlsplit(target).path)
+            path = urllib.parse.urlsplit(target).path
+            if method.upper() == "GET" and self.is_stream(path):
+                await self.stream(writer)
+                return
+            status, ctype, body = self.route(method.upper(), path)
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ValueError):
             status, ctype, body, method, gzip_ok = 400, "text/plain; charset=utf-8", b"bad request", "GET", False
         except Exception as error:  # Never let a page request touch the bot's loops.
@@ -7787,6 +8004,51 @@ class WebServer:
         with contextlib.suppress(Exception):
             writer.close()
             await writer.wait_closed()
+
+    def is_stream(self, path: str) -> bool:
+        parts = path.strip("/").split("/")
+        return (len(parts) == 3 and parts[0] == "p" and parts[2] == "events" and parts[1].isascii()
+                and hmac.compare_digest(parts[1], self.token))
+
+    async def stream(self, writer: asyncio.StreamWriter) -> None:
+        """Server-sent events: Bot.live_payload as an ``event: live`` whenever it changes, checked every second (one build
+        per second shared by every open stream), a comment every STREAM_PING_SECONDS otherwise. Ends when the viewer
+        leaves, the bot stops, or after STREAM_LIFE_SECONDS (the browser reconnects)."""
+        if self.streams >= self.STREAM_MAX:
+            with contextlib.suppress(Exception):
+                writer.write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 4\r\n"
+                             b"Retry-After: 5\r\nCache-Control: no-store\r\nConnection: close\r\n\r\nbusy")
+                await writer.drain()
+                writer.close()
+            return
+        self.streams += 1
+        try:
+            writer.write(("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-store\r\n"
+                          "X-Accel-Buffering: no\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
+                          "X-Robots-Tag: noindex\r\nConnection: close\r\n\r\nretry: 2000\n\n").encode("latin-1"))
+            await writer.drain()
+            sent, wrote, started = b"", time.monotonic(), time.monotonic()
+            while not writer.is_closing() and not self.bot.stopping.is_set() and time.monotonic() - started < self.STREAM_LIFE_SECONDS:
+                try:
+                    body = self.cached("live.json", lambda: json.dumps(self.bot.live_payload(), ensure_ascii=False, default=str).encode("utf-8"))
+                except Exception as error:  # a broken card must not end every stream: try again next second
+                    self.bot.log_limited("web", f"event stream build failed: {clean_error(error) or type(error).__name__}")
+                    body = sent
+                if body != sent:
+                    writer.write(b"event: live\ndata: " + body + b"\n\n")
+                    sent, wrote = body, time.monotonic()
+                elif time.monotonic() - wrote >= self.STREAM_PING_SECONDS:
+                    writer.write(b": ping\n\n")
+                    wrote = time.monotonic()
+                await writer.drain()
+                await asyncio.sleep(self.STREAM_SECONDS)
+        except Exception:  # the viewer left (reset / broken pipe): nothing to report
+            pass
+        finally:
+            self.streams -= 1
+            with contextlib.suppress(Exception):
+                writer.close()
+                await writer.wait_closed()
 
 
 # --- diagnostics (/diag, --diag) --------------------------------------------------------------------
@@ -8373,6 +8635,7 @@ class Bot:
         self.notice_cache: dict[str, dict] | None = None  # in-memory view of the notice: records
         self.notice_gen = -1
         self.pred_pruned = 0.0  # when old prediction snapshots were last pruned
+        self.beta_cache: dict[str, tuple[float, float, str]] = {}  # index -> (fitted at, β, how it was obtained)
         self.vol_errors: dict[str, str] = {}  # symbol -> why its exchange daily bars could not be read (σ is the prior)
         self.stopping = asyncio.Event()
         self.started = time.time()
@@ -8961,9 +9224,7 @@ class Bot:
                 with contextlib.suppress(ValueError, TypeError, decimal.InvalidOperation):
                     if int(saved[0]) == close_ms and D(str(saved[1])) > 0:
                         self.anchors["A50"] = (close_ms, D(str(saved[1])))
-                        if (len(saved) >= 4 and saved[2] in
-                                {"15:00", "15:00 五分钟K近似", "15:00 后五分钟首笔近似"}
-                                and saved[3] in {"东方财富", "新浪CFD"}):
+                        if len(saved) >= 4 and str(saved[2]).startswith("15:00") and saved[3] in {"东方财富", "新浪CFD"}:
                             self.a50_anchor_note, self.a50_anchor_source = saved[2], saved[3]
                         else:
                             # Old records could be either the futures feed or a CFD: recheck before using.
@@ -8988,9 +9249,9 @@ class Bot:
                 printed = self.store.get(f"a50_print:{day.isoformat()}:{live}")
                 if price is None and printed:
                     with contextlib.suppress(ValueError, TypeError, IndexError, decimal.InvalidOperation):
-                        price, note = D(str(printed[1])), "15:00 后五分钟首笔近似"  # recorded when it happened
+                        price, note = D(str(printed[1])), a50_print_note(int(printed[0]), close_ms)  # recorded as it happened
                 if price is None and a50 and 0 <= a50.quoted_ms - close_ms <= 5 * 60_000:
-                    price, note = a50.last, "15:00 后五分钟首笔近似"
+                    price, note = a50.last, a50_print_note(a50.quoted_ms, close_ms)
                 self.a50_anchor_error = "；".join(failures) if price is None else ""
                 if price is not None:
                     self.anchors["A50"] = (close_ms, price)
@@ -9163,6 +9424,45 @@ class Bot:
         close = self.sse_close(self.market.now_ms() if now_ms is None else now_ms)
         return close.close_ms if close else 0
 
+    def proxy_beta(self, key: str, prior: float, now_ms: int) -> tuple[float, str]:
+        """The after-hours proxy coefficient for ``key`` ("SSE": A50 → Composite) and how it was obtained.
+
+        The slope b of ln(close / reference close) on the proxy's log move since that close, fitted (fit_proxy: every
+        target day weighted once) on the bot's own after-hours snapshots of the last BETA_WINDOW_DAYS days whose close
+        is known, blended with the configured prior as BETA_PRIOR_DAYS pseudo-days, β = (n·b + N0·prior) / (n + N0),
+        and kept within BETA_BOUNDS. Below BETA_MIN_DAYS closed target days the prior stands. Redone hourly."""
+        cached = self.beta_cache.get(key)
+        if cached and time.monotonic() - cached[0] < BETA_REFRESH_SECONDS:
+            return cached[1], cached[2]
+        beta, note, days = prior, "", 0
+        try:
+            outcomes = {k.rsplit(":", 1)[-1]: float(v) for k, v in self.store.items(f"outcome:{key}:") if isinstance(v, (int, float))}
+            since = now_ms - (BETA_WINDOW_DAYS + 7) * DAY_MS
+            rows = []
+            for k, v in self.store.items(f"pred:{key}:"):
+                saved = k.rsplit(":", 1)[-1]
+                if (not saved.isdigit() or int(saved) < since or not isinstance(v, dict) or v.get("mode") != "盘后"
+                        or v.get("warn")):
+                    continue
+                close, ref, move, remaining = outcomes.get(str(v.get("target"))), v.get("ref_raw", v.get("ref")), v.get("move"), v.get("R")
+                if close is None or not ref or close <= 0 or move is None or not remaining or remaining <= 0:
+                    continue
+                rows.append({"target": str(v["target"]), "move": float(move), "y": math.log(close / float(ref)), "R": float(remaining)})
+            days = len({r["target"] for r in rows})
+            fit = fit_proxy(rows) if days >= BETA_MIN_DAYS else None
+            if fit:
+                slope = fit[1]
+                blended = (days * slope + BETA_PRIOR_DAYS * prior) / (days + BETA_PRIOR_DAYS)
+                beta = min(BETA_BOUNDS[1], max(BETA_BOUNDS[0], blended))
+                note = (f"β {beta:.2f}（近 {days} 日盘后回归 {slope:.2f}，与先验 {prior:g} 按 {BETA_PRIOR_DAYS} 日权重合成"
+                        + ("，已限幅" if beta != blended else "") + "）")
+        except Exception as error:  # a damaged snapshot must not take the odds down: the prior stands
+            self.log_limited("beta", f"{key} β 回归失败：{clean_error(error) or type(error).__name__}")
+        if not note:
+            note = f"β {prior:g}（暂定，未校准）·盘后样本 {days} 日，满 {BETA_MIN_DAYS} 日起自动回归"
+        self.beta_cache[key] = (time.monotonic(), beta, note)
+        return beta, note
+
     def sse_odds(self, now_ms: int) -> CloseOdds | str | None:
         q = self.cn.quote
         if not self.config.probability or not self.config.sse_index:
@@ -9203,7 +9503,7 @@ class Bot:
         reopen = a50_next_open(now_ms)
         if reopen:
             # No A50 trading, so nothing new to map: pause rather than keep showing the last session's odds.
-            return f"A50 休市，{stamp(reopen, seconds=False)} 开盘后恢复概率"
+            return f"A50 {a50_closed_note(now_ms)}，{stamp(reopen, seconds=False)} 开盘后恢复概率"
         if a50 is None:
             return "暂无 A50 报价，暂不输出概率"
         warn = ""
@@ -9235,14 +9535,16 @@ class Bot:
             why = f"：{brief_error(self.a50_anchor_error, 90)}" if self.a50_anchor_error else ""
             return (f"缺少 {close_date.strftime('%m-%d')} 15:00 的 A50 锚点（{which}均未取得{why}）；"
                     "下一个上证收盘 15:00 后会自动记录，暂不输出概率")
-        beta = self.config.a50_beta
+        if self.config.a50_beta_dynamic:
+            beta, beta_note = self.proxy_beta("SSE", self.config.a50_beta, now_ms)
+        else:
+            beta, beta_note = self.config.a50_beta, f"β {self.config.a50_beta:g}（A50_BETA 固定）"
         move = math.log(float(a50.last / base))
         effective = close.value * D(str(math.exp(beta * move)))
         odds = close_odds("上证指数", close.value, effective, sigma, remaining, target, D("0.01"),
                           f"{ref_note}·{close.source}",
-                          f"A50 {fmt(a50.last)} / {base_note} {fmt(base)} → {percent(a50.last, base):+.3f}% × β {beta:g}"
-                          + ("（暂定，未校准）" if beta == 0.8 else ""), sigma_note,
-                          beta=beta, mode="盘后")
+                          f"A50 {fmt(a50.last)} / {base_note} {fmt(base)} → {percent(a50.last, base):+.3f}% × {beta_note}",
+                          sigma_note, beta=beta, mode="盘后")
         return dataclasses.replace(odds, warn=warn) if warn else odds
 
     @staticmethod
@@ -9544,16 +9846,10 @@ class Bot:
             items.append({
                 **base, **day_fields(odds.target, now_ms), "ref_day": ref_day.group(0) if ref_day else "",
                 "ref_rel": ref_relative(ref_day.group(0) if ref_day else "", odds.target, now_ms),
-                "eff_label": "今日" if odds.direct else "隐含" if name == "上证指数" else "估算",  # A50-implied, not an SSE print
-                "quote_ms": self.odds_quote_ms(title, odds),
-                "source": "现货" if odds.direct else "代理估算·近似锚点" if "近似" in odds.warn else "代理估算",
                 "target": odds.target.strftime("%m-%d"), "unit": odds.unit or self.card_currency(symbol),
-                "close_ms": close_ms, "close_label": close_label,
-                "ref": fmt(odds.ref), "ref_note": odds.ref_note, "effective": fmt(odds.effective.quantize(D("0.0001"))),
-                "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note, "warn": odds.warn,
-                "sigma_daily": odds.sigma_daily, "sigma": odds.sigma, "remaining": odds.remaining, "sigma_note": odds.sigma_note,
-                "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
-                "fair_up": odds.fair_up, "fair_down": odds.fair_down,
+                "close_ms": close_ms, "close_label": close_label, "ref_note": odds.ref_note,
+                "sigma_daily": odds.sigma_daily, "sigma_note": odds.sigma_note,
+                **self.odds_numbers(title, name, odds),
             })
         if self.config.touch:  # one broken card must not take the whole page down with it
             items.extend(self.safe_card(f"{t.spec.symbol.removesuffix('USDT')} 先触", t.spec.key, "crypto", self.touch_payload, t, now_ms)
@@ -9573,6 +9869,33 @@ class Bot:
                 "note": ("模型参考，非投资建议。有效价 = 参考收盘 × 代理现价 ÷ 代理在参考收盘时刻的价格；"
                          "P(涨) = 1 − Φ(ln((参考+半跳)/有效)/σ剩余)，平盘两边各计一半。目标日跳过周末和已配置的交易所假期。"
                          if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")}
+
+    def odds_numbers(self, title: str, name: str, odds: CloseOdds) -> dict:
+        """A daily card's figures that move with every quote: shared by data.json and the event stream (live.json), so
+        the page can patch a card's headline in place between full answers."""
+        return {
+            "eff_label": "今日" if odds.direct else "隐含" if name == "上证指数" else "估算",  # A50-implied, not an SSE print
+            "quote_ms": self.odds_quote_ms(title, odds),
+            "source": "现货" if odds.direct else "代理估算·近似锚点" if "近似" in odds.warn else "代理估算",
+            "ref": fmt(odds.ref), "effective": fmt(odds.effective.quantize(D("0.0001"))),
+            "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note, "warn": odds.warn,
+            "sigma": odds.sigma, "remaining": odds.remaining, "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
+            "fair_up": odds.fair_up, "fair_down": odds.fair_down,
+        }
+
+    def live_payload(self) -> dict:
+        """The index and contract cards' live numbers for the page's event stream (/events): every item data.json has
+        for them, keyed the same way (name + symbol), with only the figures that change between quotes. A card whose
+        odds are paused carries the reason instead. The crypto cards and the books keep to data.json."""
+        now_ms = self.market.now_ms()
+        items = []
+        for title, odds in (self.odds_items(now_ms) if self.config.probability else []):
+            name, _, symbol = title.partition("｜")
+            if isinstance(odds, str):
+                items.append({"name": name, "symbol": symbol, "missing": odds})
+            else:
+                items.append({"name": name, "symbol": symbol, **self.odds_numbers(title, name, odds)})
+        return {"server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）", "items": items}
 
     def safe_card(self, name: str, key: str, group: str, build: Any, *args: Any) -> dict:
         """One card's payload, or a placeholder saying it could not be built (logged, rate-limited): a feed changing

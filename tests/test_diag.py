@@ -89,6 +89,7 @@ async def run():
     assert "🚨 整组全部失败（该数据当前拿不到）：交易所收盘·UNITREE、美股触及·STRC、Hyperliquid、汇率" in text, text
     partial = [l for l in text.splitlines() if l.startswith("⚠️ 其余失败的源")][0]
     assert partial == ("⚠️ 其余失败的源（同组有别的源顶上）：上证实时·新浪、上证实时·东方财富、上证日K·东方财富日K、"
+                       "上证日K·新浪日K、上证日K·Yahoo日K、"
                        "A50实时·东方财富、A50实时·新浪CFD、A50锚点·东方财富1分钟K 09-24 15:00、A50锚点·新浪5分钟K 09-24 15:00"), partial
     assert "【A50实时】\n❌ 东方财富（" in text and "🔄 后台刷新：未启动" in text and "📌 当前使用中的数据" in text
 

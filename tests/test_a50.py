@@ -117,7 +117,7 @@ async def run():
     bot3 = make_bot()
     close_ms = bot3.sse_close_ms()
     bot3.anchors["A50"] = (close_ms, D("14190"))
-    bot3.a50_anchor_note, bot3.a50_anchor_source = "15:00 后五分钟首笔近似", "新浪CFD"
+    bot3.a50_anchor_note, bot3.a50_anchor_source = "15:00 后 3 分钟首笔近似", "新浪CFD"
     m.http_get = feed()
     await bot3.refresh_odds_inputs(NOW)
     assert bot3.anchors["A50"] == (close_ms, D("14180.0")) and bot3.a50_anchor_source == "东方财富", (bot3.anchors, bot3.a50_anchor_source)
@@ -186,8 +186,18 @@ async def run():
     bot.cn.a50 = m.IndexQuote("A50期货", D("14300"), D("14181"), None, None, None, bj(9, 28, 15, 19), "新浪CFD")
     bot.anchor_tries.clear()
     await bot.refresh_odds_inputs(bj(9, 28, 15, 20))
-    assert bot.anchors["A50"] == (bj(9, 28, 15, 0), D("14250")) and bot.a50_anchor_note == "15:00 后五分钟首笔近似"
+    assert bot.anchors["A50"] == (bj(9, 28, 15, 0), D("14250")) and bot.a50_anchor_note == "15:00 后 40 秒首笔", bot.a50_anchor_note
     assert bot.a50_anchor_source == "新浪CFD" and isinstance(bot.sse_odds(bj(9, 28, 15, 20)), m.CloseOdds)
+    # a print within a minute of the close is the close-time price for all practical purposes; later ones say they are approximate
+    line = m.to_html(bot.cn.a50_line(bj(9, 28, 15, 20), "cn", bot.anchors["A50"][1], bot.a50_anchor_note))
+    assert "→ 上证收盘时 <b>14,250</b>" in line and "（15:00 后 40 秒首笔）" in line, line
+    assert m.a50_print_note(bj(9, 28, 15, 0) + 12_000, bj(9, 28, 15, 0)) == "15:00 后 12 秒首笔"
+    assert m.a50_print_note(bj(9, 28, 15, 3), bj(9, 28, 15, 0)) == "15:00 后 3 分钟首笔近似" and not m.a50_anchor_exact("15:00 后 3 分钟首笔近似")
+    assert m.a50_anchor_exact("15:00") and m.a50_anchor_exact("15:00 后 59 秒首笔") and not m.a50_anchor_exact("15:00 五分钟K近似")
+    # restart: the note comes back from the store as recorded
+    bot4 = make_bot(bot.store); bot4.cn.close = bot.cn.close; bot4.cn.a50 = bot.cn.a50
+    await bot4.refresh_odds_inputs(bj(9, 28, 15, 20))
+    assert bot4.a50_anchor_note == "15:00 后 40 秒首笔" and bot4.a50_anchor_source == "新浪CFD" and isinstance(bot4.sse_odds(bj(9, 28, 15, 20)), m.CloseOdds)
     # a print on an SSE holiday (A50 trades on 09-25) is not recorded
     bot.cn.a50 = m.IndexQuote("A50期货", D("1"), None, None, None, None, bj(9, 25, 15, 1), "新浪CFD")
     await bot.refresh_odds_inputs(bj(9, 25, 15, 2))

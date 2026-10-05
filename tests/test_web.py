@@ -361,6 +361,22 @@ async def run():
     st, head, body = await request(port, f"GET /p/{token}/data.json?x=1 HTTP/1.1\r\nHost: x\r\n\r\n".encode())
     assert st == 200 and json.loads(body)["items"][0]["name"] == "上证指数" and "application/json" in head
     assert "Content-Encoding" not in head and "Vary: Accept-Encoding" in head  # no Accept-Encoding: plain
+    # the event stream: the daily cards' live numbers as server-sent events (the first at once), behind the same token
+    r, w = await asyncio.open_connection("127.0.0.1", port)
+    w.write(f"GET /p/{token}/events HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n".encode()); await w.drain()
+    shead = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 5)
+    assert shead.startswith(b"HTTP/1.1 200") and b"text/event-stream" in shead and b"Cache-Control: no-store" in shead and b"Content-Length" not in shead, shead
+    assert await asyncio.wait_for(r.readuntil(b"\n\n"), 5) == b"retry: 2000\n\n"
+    event = await asyncio.wait_for(r.readuntil(b"\n\n"), 5)
+    assert event.startswith(b"event: live\ndata: ") and event.count(b"\n") == 3, event[:80]
+    live = json.loads(event[len(b"event: live\ndata: "):])
+    assert live["server_ms"] == bot.market.now_ms() and live["items"][0]["name"] == "上证指数", live
+    assert {"fair_up", "fair_down", "effective", "quote_ms", "move", "proxy_note", "warn"} <= set(live["items"][0]) and "ref_note" not in live["items"][0]
+    assert live["items"][1] == {"name": "宇树 UNITREE", "symbol": "UNITREEUSDT", "missing": "等待行情"} and len(live["items"]) == 2, live["items"]
+    assert live["items"][0]["fair_up"] == json.loads(body)["items"][0]["fair_up"] and web.streams == 1
+    w.close(); await w.wait_closed()
+    st, _, _ = await request(port, b"GET /p/" + b"x" * len(token) + b"/events HTTP/1.1\r\nHost: x\r\n\r\n"); assert st == 404
+    st, _, _ = await request(port, f"POST /p/{token}/events HTTP/1.1\r\nHost: x\r\n\r\n".encode()); assert st == 405
     st, _, body = await request(port, f"HEAD /p/{token} HTTP/1.1\r\n\r\n".encode()); assert st == 200 and body == b""
     # gzip for a client that accepts it (the page on every open, data.json every 10 seconds per tab); plain when it does not; a HEAD carries the headers only
     st, head, body = await request(port, f"GET /p/{token} HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, deflate, br\r\n\r\n".encode())
