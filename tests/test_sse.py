@@ -157,6 +157,39 @@ async def run():
     assert abs(float(o.effective) - 3850.12 * math.exp(0.8 * move)) < 1e-6 and o.fair_up < 0.5, o
     assert "A50 14,020 / 15:00 14,160 → -0.989% × β 0.8" in o.proxy_note
     assert "（暂定，未校准）" in o.proxy_note
+    # dynamic β: the slope of the bot's own after-hours record (snapshots against the closes they were scored on), blended
+    # with the A50_BETA prior by sample size; below 5 closed target days the prior stands, as above
+    assert bot.proxy_beta("SSE", 0.8, bot.market.now_ms()) == (0.8, "β 0.8（暂定，未校准）·盘后样本 0 日，满 5 日起自动回归")
+    moves = (0.004, -0.006, 0.01, 0.002, -0.011, 0.007, -0.003, 0.009)
+    for i, mv in enumerate(moves):  # 8 target days whose close moved exactly 0.6 × the A50 move
+        day = (dt.date(2026, 8, 4) + dt.timedelta(days=i)).isoformat()
+        store.put(f"pred:SSE:{bj(2026, 8, 3, 20, 0) + i * 86_400_000}", {"key": "SSE", "target": day, "mode": "盘后", "ref_raw": 3800.0, "ref": 3800.0, "move": mv, "R": 1.0, "beta": 0.8})
+        store.put(f"outcome:SSE:{day}", 3800.0 * math.exp(0.6 * mv))
+    # a 盘中 snapshot and one taken from a stale A50 print do not count
+    store.put(f"pred:SSE:{bj(2026, 8, 12, 10, 0)}", {"key": "SSE", "target": "2026-08-12", "mode": "盘中", "ref_raw": 3800.0, "move": 0.05, "R": 0.5})
+    store.put(f"pred:SSE:{bj(2026, 8, 12, 20, 0)}", {"key": "SSE", "target": "2026-08-13", "mode": "盘后", "ref_raw": 3800.0, "move": 0.05, "R": 1.0, "warn": "A50 11 分钟未更新"})
+    store.put("outcome:SSE:2026-08-12", 3900.0); store.put("outcome:SSE:2026-08-13", 3900.0)
+    bot.beta_cache.clear()
+    beta, note = bot.proxy_beta("SSE", 0.8, bot.market.now_ms())
+    assert abs(beta - (8 * 0.6 + 10 * 0.8) / 18) < 1e-9 and note == "β 0.71（近 8 日盘后回归 0.60，与先验 0.8 按 10 日权重合成）", (beta, note)
+    store.put("outcome:SSE:2026-08-11", 1.0); assert bot.proxy_beta("SSE", 0.8, bot.market.now_ms())[0] == beta  # cached for an hour
+    store.put("outcome:SSE:2026-08-11", 3800.0 * math.exp(0.6 * moves[7]))
+    o2 = bot.sse_odds(bot.market.now_ms())
+    assert abs(float(o2.effective) - 3850.12 * math.exp(beta * move)) < 1e-6 and o2.beta == beta and "× β 0.71（近 8 日盘后回归 0.60" in o2.proxy_note, o2.proxy_note
+    # the blend is bounded; A50_BETA_DYNAMIC=off keeps the configured β
+    for i in range(30):
+        day = (dt.date(2026, 8, 20) + dt.timedelta(days=i)).isoformat()
+        store.put(f"pred:SSE:{bj(2026, 8, 19, 20, 0) + i * 86_400_000}", {"key": "SSE", "target": day, "mode": "盘后", "ref_raw": 3800.0, "move": moves[i % 8], "R": 1.0})
+        store.put(f"outcome:SSE:{day}", 3800.0 * math.exp(3.0 * moves[i % 8]))
+    bot.beta_cache.clear()
+    beta3, note3 = bot.proxy_beta("SSE", 0.8, bot.market.now_ms())
+    assert beta3 == 1.2 and "已限幅" in note3 and "近 38 日" in note3, (beta3, note3)
+    kept_cfg, bot.config = bot.config, m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                                                          "HL_TICKERS": "off", "HL_INDEX": "off", "A50_BETA_DYNAMIC": "off", "A50_BETA": "0.7"})
+    assert "× β 0.7（A50_BETA 固定）" in bot.sse_odds(bot.market.now_ms()).proxy_note
+    bot.config = kept_cfg
+    store.delete_keys([k for k, _ in store.items("pred:SSE:")] + [k for k, _ in store.items("outcome:SSE:")]); bot.beta_cache.clear()
+    assert bot.proxy_beta("SSE", 0.8, bot.market.now_ms())[0] == 0.8
     # the A50 contract-roll evening: the 15:00 anchor is the expiring month, the night quote the next -> no estimate
     assert m.a50_expiry(dt.date(2026, 9, 29)) and m.a50_expiry(dt.date(2026, 11, 27)) and not m.a50_expiry(dt.date(2026, 9, 30))
     real = m.a50_expiry; m.a50_expiry = lambda d: d == dt.date(2026, 9, 30)

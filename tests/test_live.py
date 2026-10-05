@@ -68,8 +68,8 @@ async def run():
     await bot.stocks.refresh_live(now)
     assert len(calls) == 1 and bot.stocks.live["UNITREEUSDT"].last == D("78.00")
     assert await bot.stocks.refresh_live(now) is False and len(calls) == 1          # QUOTE_REFRESH_SECONDS cadence (5 s)
-    assert cfg.quote_refresh == 5 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "QUOTE_REFRESH_SECONDS": "10"}).quote_refresh == 10
-    try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "QUOTE_REFRESH_SECONDS": "1"}); assert False
+    assert cfg.quote_refresh == 1 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "QUOTE_REFRESH_SECONDS": "10"}).quote_refresh == 10
+    try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "QUOTE_REFRESH_SECONDS": "0"}); assert False
     except ValueError as e: assert "QUOTE_REFRESH_SECONDS" in str(e), e
     o = bot.contract_odds("UNITREEUSDT", D("10.80"), now)
     assert isinstance(o, m.CloseOdds) and o.effective == D("78.00") and o.ref == D("76.50") and o.mode == "盘中", o
@@ -141,6 +141,51 @@ async def run():
     await hbot.stocks.refresh_live(t, force=True)
     o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
     assert "现货行情已超 10 分钟未更新" in o.proxy_note and "报价停在 09-28 09:33" in hbot.stocks.live_errors["HK0625USDT"], hbot.stocks.live_errors
+
+    # Several A-share / HK stocks: one Tencent request for all of them per round (1-second polling); Sina is asked only
+    # for the codes Tencent left stale or unknown, and only for those
+    m.SOURCE_HEALTH.hosts.clear()
+    assert m.split_quote_records("腾讯", b'v_sh688836="1~a";\nv_r_hk00625="2~b";\nv_pv_none_match="1";') == {"sh688836": "1~a", "r_hk00625": "2~b", "pv_none_match": "1"}
+    assert m.split_quote_records("新浪", 'var hq_str_sh688836="x,1";\nvar hq_str_rt_hk00625="";'.encode("gbk")) == {"sh688836": "x,1", "rt_hk00625": ""}
+    assert m.StockMarket.live_batch_sources([m.StockTicker("sh", "688836"), m.StockTicker("hk", "00625")])[0][1].endswith("q=sh688836,r_hk00625")
+    assert m.StockMarket.live_batch_sources([m.StockTicker("sh", "688836"), m.StockTicker("hk", "00625")])[1][1].endswith("list=sh688836,rt_hk00625")
+    bcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT,CXMTUSDT,HK0625USDT"})
+    bbot = m.Bot(bcfg, m.Store(":memory:"), FakeMarket(bcfg), None)
+    hk_rec = lambda when: ('v_r_hk00625="100~希音~00625~35.20~35.10~35.00~' + "~".join(["0"] * 24) + f'~{when}~x";').encode("gbk")
+    three = tencent("sh688836", "78.00", "76.50", "20260928100003") + tencent("sh688825", "54.00", "55.00", "20260928100002") + hk_rec("2026/09/28 10:00:01")
+    calls = []
+    async def batch_get(url, timeout=15, headers=None):
+        calls.append(url)
+        if "gtimg" in url: return three
+        raise AssertionError(url)
+    m.http_get = batch_get
+    t = bj(9, 28, 10, 0, 5)
+    await bbot.stocks.refresh_live(t, force=True)
+    codes = lambda url: sorted(url.split("=")[-1].split(","))  # the request lists the tickers in EXCHANGE_TICKERS order
+    assert len(calls) == 1 and codes(calls[0]) == ["r_hk00625", "sh688825", "sh688836"], calls
+    assert [bbot.stocks.live[s].last for s in ("UNITREEUSDT", "CXMTUSDT", "HK0625USDT")] == [D("78.00"), D("54.00"), D("35.20")] and not bbot.stocks.live_errors
+    stale_one = tencent("sh688836", "78.00", "76.50", "20260928100003") + tencent("sh688825", "54.00", "55.00", "20260925150001") + hk_rec("2026/09/28 10:00:01")
+    sina_one = ('var hq_str_sh688825="长鑫科技,55.00,55.00,54.50,' + ",".join(["0"] * 26) + ',2026-09-28,10:00:04,00";').encode("gbk")
+    calls.clear()
+    async def mixed_get(url, timeout=15, headers=None):
+        calls.append(url)
+        if "gtimg" in url: return stale_one
+        if "sinajs" in url: return sina_one
+        raise AssertionError(url)
+    m.http_get = mixed_get
+    await bbot.stocks.refresh_live(t, force=True)
+    assert len(calls) == 2 and calls[1].endswith("list=sh688825"), calls
+    assert bbot.stocks.live["CXMTUSDT"].last == D("54.50") and bbot.stocks.live["CXMTUSDT"].source == "新浪" and not bbot.stocks.live_errors, bbot.stocks.live_errors
+    calls.clear()  # a code neither feed knows is reported as such; the others are unaffected
+    async def missing_get(url, timeout=15, headers=None):
+        calls.append(url)
+        if "gtimg" in url: return tencent("sh688836", "78.00", "76.50", "20260928100003") + b'v_pv_none_match="1";'
+        if "sinajs" in url: return b'var hq_str_sh688825="";\nvar hq_str_rt_hk00625="";'
+        raise AssertionError(url)
+    m.http_get = missing_get
+    await bbot.stocks.refresh_live(t, force=True)
+    assert codes(calls[1]) == ["rt_hk00625", "sh688825"] and bbot.stocks.live["UNITREEUSDT"].last == D("78.00"), calls
+    assert "腾讯: 腾讯行情为空" in bbot.stocks.live_errors["CXMTUSDT"] and "新浪: 新浪行情为空" in bbot.stocks.live_errors["HK0625USDT"], bbot.stocks.live_errors
 
     # KOSPI trading: today's 15:30 anchor is in the future, so HL is not asked for it (no bogus error)
     asked = []
