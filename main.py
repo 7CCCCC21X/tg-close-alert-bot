@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.31.0"
+VERSION = "1.31.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -12416,6 +12416,8 @@ class Bot:
             for task in core:
                 if task.done() and not task.cancelled():  # a core loop never ends on its own: let Railway restart us
                     error = task.exception()
+                    if error is None and self.stopping.is_set():
+                        continue  # the stop request ended this loop a moment before run() woke up: the ordinary exit, not a fault
                     LOG.error("核心循环 %s 意外结束：%s；进程退出等待重启", task.get_name(),
                               clean_error(error) if error else "监控循环卡住" if task.get_name() == "watchdog" else "无异常")
                     exit_code = 1
