@@ -100,14 +100,14 @@ async def layout_check(browser, page):
     await page.evaluate("localStorage.removeItem('favs')"); await page.reload(); await page.wait_for_selector(".card .odds")
     assert not await page.is_visible("#custom") and await page.locator(".ctl").count() == 0
     await page.click("#edit")
-    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == 22
+    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == 23
     lad = "#g-ladder .card"
     assert await page.is_disabled(f"{lad}:nth-child(1) .ctl button[title='前移']") and await page.is_disabled(f"{lad}:nth-child(8) .ctl button[title='后移']")
     await page.click(f"{lad}:nth-child(1) .ctl button[title='后移']")
     assert await names("ladder") == ["$ANSEM FDV", "$牛来 市值", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV"]
     assert json.loads(await stored("order")) == {"ladder": ["ANSEM", "NIULAI", "PONS", "MEME", "CASHCAT", "AI", "STONK", "STONKBROKER"]}
     await page.click("#g-crypto .card:nth-child(4) .ctl button[title='前移']")
-    crypto = ["BNB 先触 700/900", "SOL 先触 60/140", "ETH 先触 1k/3k", "BTC 先触 70k/90k", "BTC 10月涨跌", "HYPE 反超 SOL"]
+    crypto = ["BNB 先触 700/900", "SOL 先触 60/140", "ETH 先触 1k/3k", "BTC 先触 70k/90k", "BTC 10月涨跌", "ETH 10月涨跌", "HYPE 反超 SOL"]
     assert await names("crypto") == crypto
     # hidden cards and sections show faded while customising and are gone once done, also after a reload
     await page.click("#g-index .card .ctl button:has-text('隐藏')")
@@ -199,7 +199,7 @@ async def layout_check(browser, page):
     assert await names("fav") == ["BTC 先触 70k/90k"]
     await page.click("#done"); await page.click("#g-fav .card .star")
     assert not await page.is_visible("#h-fav") and await names("crypto") == ["BNB 先触 700/900", "SOL 先触 60/140", "BTC 先触 70k/90k",
-                                                                            "ETH 先触 1k/3k", "BTC 10月涨跌", "HYPE 反超 SOL"]
+                                                                            "ETH 先触 1k/3k", "BTC 10月涨跌", "ETH 10月涨跌", "HYPE 反超 SOL"]
 
 
 async def browser_check(async_playwright, chrome, port, token):
@@ -289,7 +289,7 @@ async def browser_check(async_playwright, chrome, port, token):
         assert not await page.is_visible("#h-fav") and await page.locator("#g-contract .card").count() == 1
         # a section title folds its cards away: the title stays, with the count; kept in this browser across reloads
         await page.click("#h-crypto .fold")
-        assert not await page.is_visible("#g-crypto") and await page.is_visible("#h-crypto") and await page.inner_text("#h-crypto .fs") == "6 张"
+        assert not await page.is_visible("#g-crypto") and await page.is_visible("#h-crypto") and await page.inner_text("#h-crypto .fs") == "7 张"
         assert await page.get_attribute("#h-crypto .fold", "aria-expanded") == "false" and await page.evaluate("localStorage.getItem('folded')") == '["crypto"]'
         await page.reload(); await page.wait_for_selector("#g-index .card")
         assert not await page.is_visible("#g-crypto") and await page.inner_text("#h-index") == "指数" and await page.is_visible("#g-index .card")
@@ -330,8 +330,8 @@ async def run():
     bot.anchors["A50"] = (bot.sse_close_ms(), D("14160"))
     payload = bot.odds_payload()
     names = [i["name"] for i in payload["items"]]
-    assert names == ["上证指数", "宇树 UNITREE", "BNB 先触 700/900", "SOL 先触 60/140", "BTC 先触 70k/90k", "ETH 先触 1k/3k", "BTC 10月涨跌", "HYPE 反超 SOL",
-                     "BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格", "STRC 触及 $100", "$牛来 市值", "$ANSEM FDV", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV", "模拟交易"], names
+    assert names == ["上证指数", "宇树 UNITREE", "BNB 先触 700/900", "SOL 先触 60/140", "BTC 先触 70k/90k", "ETH 先触 1k/3k", "BTC 10月涨跌", "ETH 10月涨跌",
+                     "HYPE 反超 SOL", "BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格", "STRC 触及 $100", "$牛来 市值", "$ANSEM FDV", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV", "模拟交易"], names
     bnb = payload["items"][2]
     assert bnb["group"] == "crypto" and bnb["labels"] == ["$900", "$700"] and bnb["missing"].startswith("等待币安行情"), bnb
     assert payload["items"][0]["group"] == "index" and payload["items"][1]["symbol"] == "UNITREEUSDT" and payload["items"][1]["group"] == "contract"
