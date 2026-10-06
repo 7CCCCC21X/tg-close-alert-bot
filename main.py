@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.33.0"
+VERSION = "1.33.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -7522,11 +7522,11 @@ function drawOpps(){  // every red-framed suggestion on the page in one strip on
     c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")};
   const group=(label,list,title)=>{if(!list.length)return;const row=$("div","orow");if(head){row.append(head);head=null}
     const t=$("span","og",label+" "+list.length);t.title=title;row.append(t);
-    list.slice(0,6).forEach(h=>{  // a tap opens the market on Predict (a new tab) and brings its card into view here
+    list.forEach(h=>{  // every one, wrapping onto more lines; a tap opens the market on Predict (a new tab) and brings its card into view here
       const b=h.url?$("a","opp link"):$("button","opp");if(h.url){b.href=h.url;b.target="_blank";b.rel="noopener noreferrer"}else b.type="button";
       b.title=h.url?"在新标签页打开这个 Predict 市场，并定位到它的卡片":"跳到这张卡";b.append($("b","",h.name),$("span","",h.pick.text),$("i","",sg(h.pick.edge)));
       b.addEventListener("click",()=>jump(h));row.append(b)});
-    if(list.length>6)row.append($("span","mut","还有 "+(list.length-6)+" 个"));el.append(row)};
+    el.append(row)};
   group("挂单",makers,"挂单机会：排队等成交，不保证成交"+(oppPoints?"；只列现在挂单能拿积分的市场":""));
   group("吃单",takers,"吃单机会：立即成交，已扣手续费与滑点")}
 function rowNote(r,L,it){  // one line about a ladder level itself, above its four directions: on a phone nothing hovers

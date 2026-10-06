@@ -579,6 +579,20 @@ async def browser_check(bot):
         assert await rows.count() == 2 and (await rows.nth(0).inner_text()).startswith("🔥 机会 2\n挂单 1") and "吃单" not in await rows.nth(0).inner_text()
         assert (await rows.nth(1).inner_text()).startswith("吃单 1") and await page.locator("#opps > .ok, #opps > .og, #opps > .opp").count() == 0
         assert (await rows.nth(0).bounding_box())["y"] + (await rows.nth(0).bounding_box())["height"] <= (await rows.nth(1).bounding_box())["y"]
+        # however many there are, every one is listed (no "还有 N 个"): nine makers and seven takers wrap onto more lines,
+        # largest first, all inside the strip at phone width; the next render puts the page's own back
+        await page.evaluate("""() => { hots = Array.from({length: 9}, (_, i) => ({key: "X" + i, name: "市场" + i, group: "index", url: "",
+            maker: {text: "挂跌 50.0", edge: 0.3 - i / 100, points: 1}, taker: i < 7 ? {text: "吃跌 52.0", edge: 0.2 - i / 100} : null})); drawOpps() }""")
+        strip = await page.inner_text("#opps")
+        assert strip.startswith("🔥 机会 16\n挂单 9") and "吃单 7" in strip and "还有" not in strip, strip
+        assert await rows.nth(0).locator(".opp b").all_inner_texts() == [f"市场{i}" for i in range(9)]
+        assert await rows.nth(1).locator(".opp b").all_inner_texts() == [f"市场{i}" for i in range(7)]
+        assert (await rows.nth(0).bounding_box())["height"] > 3 * (await rows.nth(0).locator(".opp").first.bounding_box())["height"]
+        assert await page.evaluate("""[...document.querySelectorAll('#opps .opp')].every(b => { const s = document.getElementById('opps')
+            .getBoundingClientRect(), r = b.getBoundingClientRect(); return r.left >= s.left - 0.5 && r.right <= s.right + 0.5 })""")
+        assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        await page.evaluate("render(last)")
+        assert (await page.inner_text("#opps")).startswith("🔥 机会 2\n挂单 1") and await page.locator("#opps .opp").count() == 2
         # each entry is a link to the market on Predict (a new tab); the tap also brings the card into view here
         opp = page.locator("#opps .opp").nth(1)
         assert (await opp.get_attribute("href") or "").startswith("https://predict.fun/") and await opp.get_attribute("target") == "_blank"
