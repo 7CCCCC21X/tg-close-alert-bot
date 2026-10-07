@@ -202,10 +202,58 @@ async def run():
     await step(again, z + MIN, m.dataclasses.replace(lad, book=m.dataclasses.replace(lad.book, fetched_ms=z + MIN)))
     assert len(tg.sent) == 8 and tg.sent[7][1].startswith("🟢 新机会｜$牛来 市值 $300M\n挂Yes @ 10.0¢｜净优势 +20.0¢（模型 30.0¢）"), tg.sent[7]
     assert tg.sent[7][1].endswith(m.predict_url("niulai-fdv", "B00EA"))
+    # /status counts the day's interruptions by kind (the bot's clock still stands on 10-05; the next day it is "昨日")
+    assert "📣 今日优势提醒 8 条（新机会 4｜失效 3｜反转 1）｜昨日 0 条" in bot.status("1:0"), bot.status("1:0")
+    assert store.get("alerts:2026-10-05") == {"appear": 4, "flip": 1, "gone": 3}
     # a market no card has priced for a day is forgotten, with its delivery records
     await step(again, z + m.DAY_MS + 2 * MIN)
     assert SLUG not in store.get("edgealerts") and "pons#77" not in store.get("edgealerts")
     assert not list(store.items("edgesent:"))
+    assert "📣 今日优势提醒 0 条｜昨日 8 条" in again.status("1:0"), again.status("1:0")
+
+    # --- digest mode: 新机会 gathered into one message per period, by driver; 失效 / 反转 still at once --------------------
+    dcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off",
+                              "EDGE_ALERT_DIGEST_MINUTES": "30"})
+    assert dcfg.edge_alert_digest == 30 and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).edge_alert_digest == 0
+    try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "EDGE_ALERT_DIGEST_MINUTES": "2000"}); assert False
+    except ValueError: pass
+    dtg, dstore = FakeTelegram(), m.Store(":memory:")
+    dbot = m.Bot(dcfg, dstore, FM(NOW), dtg)
+    dstore.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
+    assert "摘要模式：新机会每 30 分钟合并一条" in dbot.status("1:0")
+    level = lambda mid, label, at: m.SimMarket(f"pons#{mid}", f"$牛来 市值 {label}", "ladder", "NIULAI", 0.30,
+                                               m.PredictBook("NIULAI", "niulai-fdv", mid, "t", ((D("0.10"), D("100")),), ((D("0.12"), D("100")),), at, 200),
+                                               0.02, "", ("Yes", "No"), {"target": "300000000" if label == "$300M" else "500000000", "end": BJ(11, 1, 0)})
+    d0 = NOW
+    await step(dbot, d0, level("1", "$300M", d0), level("2", "$500M", d0), hsi(0.28, [("0.45", "300")], [("0.48", "300")], d0))
+    assert dtg.sent == []
+    await step(dbot, d0 + MIN, level("1", "$300M", d0 + MIN), level("2", "$500M", d0 + MIN), hsi(0.28, [("0.45", "300")], [("0.48", "300")], d0 + MIN))
+    assert len(dtg.sent) == 1, dtg.sent  # three 新机会 confirmed: one message, not three
+    text = dtg.sent[0][1]
+    assert text.startswith("📬 机会摘要｜最近 30 分钟出现、现在仍成立的新机会 3 个（2 组）\n▪ $牛来 市值（2 个）：同一标的，一次行情一起变\n"
+                           "· $300M：挂Yes @ 10.0¢ +20.0¢（模型 30.0¢）\n· $500M：挂Yes @ 10.0¢ +20.0¢（模型 30.0¢）\n"
+                           + m.predict_url("niulai-fdv", "B00EA") + "\n▪ 恒生指数（10-05）（1 个）\n· 恒生指数：挂跌 @ 52.0¢ +20.0¢（模型 72.0¢）\n"
+                           + m.predict_url(SLUG, "B00EA")), text
+    assert text.endswith("建议失效 / 方向反转仍会即时提醒。") and dstore.get("alerts:2026-10-05") == {"digest": 1, "digest_items": 3}
+    assert all(dstore.get(f"edgesent:{k}:1:0") == 1 for k in ("pons#1", "pons#2", SLUG)) and dstore.get("edgedigest:1:0") == d0 + MIN
+    # the HSI flip goes at once; a new 新机会 inside the period waits for the next digest, which lists it alone
+    await step(dbot, d0 + 2 * MIN, hsi(0.49, [("0.45", "300")], [("0.48", "300")], d0 + 2 * MIN), level("1", "$300M", d0 + 2 * MIN), level("2", "$500M", d0 + 2 * MIN))
+    await step(dbot, d0 + 3 * MIN, hsi(0.49, [("0.45", "300")], [("0.48", "300")], d0 + 3 * MIN), level("1", "$300M", d0 + 3 * MIN),
+               level("2", "$500M", d0 + 3 * MIN), level("3", "$1B", d0 + 3 * MIN))
+    assert len(dtg.sent) == 2 and dtg.sent[1][1].startswith("🔄 方向反转｜恒生指数（10-05）"), dtg.sent[1:]
+    await step(dbot, d0 + 4 * MIN, level("1", "$300M", d0 + 4 * MIN), level("2", "$500M", d0 + 4 * MIN), level("3", "$1B", d0 + 4 * MIN))
+    await step(dbot, d0 + 10 * MIN, level("1", "$300M", d0 + 10 * MIN), level("2", "$500M", d0 + 10 * MIN), level("3", "$1B", d0 + 10 * MIN))
+    assert len(dtg.sent) == 2  # the $1B 新机会 is confirmed but held for the digest
+    await step(dbot, d0 + 32 * MIN, level("1", "$300M", d0 + 32 * MIN), level("2", "$500M", d0 + 32 * MIN), level("3", "$1B", d0 + 32 * MIN))
+    assert len(dtg.sent) == 3 and dtg.sent[2][1].startswith("📬 机会摘要｜最近 30 分钟出现、现在仍成立的新机会 1 个（1 组）\n▪ $牛来 市值（1 个）\n· $1B：挂Yes"), dtg.sent[2]
+    assert "📣 今日优势提醒 3 条（反转 1｜摘要 2 条含 4 个）｜昨日 0 条｜摘要模式" in dbot.status("1:0"), dbot.status("1:0")
+    # a chance gone before the digest is sent is left out of it; nothing left = nothing sent, the period stays open
+    await step(dbot, d0 + 33 * MIN, level("1", "$300M", d0 + 33 * MIN), level("2", "$500M", d0 + 33 * MIN), level("3", "$1B", d0 + 33 * MIN),
+               hsi(0.28, [("0.45", "300")], [("0.48", "300")], d0 + 33 * MIN))
+    await step(dbot, d0 + 34 * MIN, level("1", "$300M", d0 + 34 * MIN), level("2", "$500M", d0 + 34 * MIN), level("3", "$1B", d0 + 34 * MIN),
+               hsi(0.28, [("0.45", "300")], [("0.48", "300")], d0 + 34 * MIN))  # HSI 挂跌 is new again (cooldown long over)
+    await step(dbot, d0 + 63 * MIN, level("1", "$300M", d0 + 63 * MIN), level("2", "$500M", d0 + 63 * MIN), level("3", "$1B", d0 + 63 * MIN))
+    assert len(dtg.sent) == 3  # at the next period the HSI card is gone: its pending line is dropped and no digest goes out
 
     # --- /edge: the bar per section, market or level (most specific wins), announced accordingly ------------------------
     class AnyTelegram(FakeTelegram):
