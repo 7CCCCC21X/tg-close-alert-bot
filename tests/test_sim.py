@@ -138,7 +138,7 @@ async def run():
     assert entry["sources"] == [{"what": "恒指期货", "source": "etnet"}] and entry["proxy"]["anchor"] == 24500.0
     assert entry["book"] == {"bids": [[0.55, 300.0]], "asks": [[0.58, 400.0]], "fetched_ms": NOW, "market_id": "101", "fee_bps": None}
     assert [(e["label"], e["best"]) for e in entry["card"]] == [("挂涨", True), ("挂跌", False), ("吃涨", False), ("吃跌", False)]
-    assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "min_edge": 0.02, "fee_bps": 200,
+    assert maker["version"] == {"code": m.VERSION, "sim_edge": 0.10, "sim_shares": 100, "sim_ways": "挂单和吃单", "sim_markets": "全部市场", "sim_group_usd": 300, "min_edge": 0.02, "fee_bps": 200,
                                 "trade_usd": 100, "a50_beta": 0.8, "kospi_beta": 1.0, "sigma_error": m.MODEL_SIGMA_ERROR,
                                 "beta_error": m.MODEL_BETA_ERROR} and maker["market_id"] == "101"
     # the edge lasting for hours buys nothing more
