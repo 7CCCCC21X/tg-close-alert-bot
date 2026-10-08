@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.35.1"
+VERSION = "1.35.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -7384,6 +7384,9 @@ a.simrow{display:grid;grid-template-columns:auto 1fr auto auto;gap:2px 8px;font-
 a.simrow>*{min-width:0}a.simrow>:nth-child(2){overflow:hidden;text-overflow:ellipsis;white-space:nowrap}a.simrow:hover{background:var(--chip)}.simj{font-size:12.5px;color:var(--best);text-decoration:none;align-self:flex-start}.simj:hover{text-decoration:underline}.panel a.cb{text-decoration:none;color:var(--best)}
 .small{font-size:12px;margin-top:3px}.mut{color:var(--faint)}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:22px;padding-top:12px;border-top:1px solid var(--line);line-height:1.6;max-width:760px}
 #opps{display:flex;flex-direction:column;align-items:stretch;gap:5px;margin:8px 0 4px;padding:8px 11px;font-size:12px;border-radius:12px;border:1px solid var(--hot-soft);background:linear-gradient(90deg,var(--hot-bg),var(--card) 85%)}
+#opps.pin{position:sticky;top:var(--top-h,46px);z-index:4;max-height:36vh;overflow-y:auto;overscroll-behavior:contain;box-shadow:var(--shadow)}
+#opps .ofold{margin-left:auto;border:0;background:none;color:var(--muted);font:inherit;font-size:11.5px;cursor:pointer;padding:2px 4px;white-space:nowrap;border-radius:6px}#opps .ofold:hover{color:var(--text);background:var(--chip)}
+#opps .osum{display:flex;flex-wrap:wrap;align-items:center;gap:5px 10px}
 #opps .orow{display:flex;flex-wrap:wrap;align-items:center;gap:5px 6px}#opps .ok{color:var(--hot);font-weight:700;white-space:nowrap}#opps .og{color:var(--muted);font-weight:600;white-space:nowrap;margin-left:2px}
 .opp{display:inline-flex;align-items:baseline;gap:4px;max-width:100%;border:1px solid var(--hot-soft);background:var(--card);color:var(--text);border-radius:999px;padding:3px 10px;font:inherit;font-size:12px;line-height:1.4;cursor:pointer;font-variant-numeric:tabular-nums;box-shadow:var(--shadow);transition:border-color .15s,box-shadow .15s}
 .opp b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46vw}.opp span{color:var(--muted);white-space:nowrap}.opp i{font-style:normal;color:var(--hot);font-weight:700}
@@ -7520,6 +7523,7 @@ const isBool=v=>typeof v==="boolean";
 let oppOff=stored("oppOff",[],strs),oppMakers=stored("oppMakers",true,isBool),oppTakers=stored("oppTakers",true,isBool),oppPoints=stored("oppPoints",true,isBool);  // the strip on top: sections left out, which sides, makers only where points are earned
 try{if(localStorage.getItem("oppTaker")==="true"){oppMakers=false;keep("oppMakers",false)}localStorage.removeItem("oppTaker")}catch(e){}  // the old "只列吃单" switch carries over, once
 let folded=stored("folded",[],strs);  // sections folded away: the title stays, with how many cards it holds and how many are red-framed
+let oppPin=stored("oppPin",true,isBool),oppFold=stored("oppFold",false,isBool);  // the strip stays under the filter bar while scrolling; folded to one line
 function toggleFold(g){folded=folded.includes(g)?folded.filter(x=>x!==g):[...folded,g];keep("folded",folded);if(last)render(last)}
 let secOrder=stored("secs",SECTIONS,strs);secOrder=[...new Set(secOrder.filter(g=>SECTIONS.includes(g)))];
 SECTIONS.forEach((g,i)=>{if(!secOrder.includes(g)){const prev=SECTIONS.slice(0,i).reverse().find(x=>secOrder.includes(x));  // a new section joins after its default neighbour
@@ -7845,11 +7849,14 @@ function drawOpps(){  // every red-framed suggestion on the page in one strip on
   const pool=hots.filter(h=>!oppOff.includes(h.group)&&!seen.has(h.key)&&seen.add(h.key));
   const makers=oppMakers?pool.filter(h=>h.maker&&(!oppPoints||h.maker.points)).map(h=>({...h,pick:h.maker})).sort(byEdge):[];
   const takers=oppTakers?pool.filter(h=>h.taker).map(h=>({...h,pick:h.taker})).sort(byEdge):[];
-  const n=makers.length+takers.length;el.hidden=editing||!n;if(el.hidden){el.replaceChildren();return}
+  const n=makers.length+takers.length;el.hidden=editing||!n;el.classList.toggle("pin",oppPin);if(el.hidden){el.replaceChildren();return}
+  const foldBtn=()=>{const b=$("button","ofold",oppFold?"展开 ▾":"收起 ▴");b.type="button";b.title=oppFold?"展开机会条":"把机会条折成一行（只剩数量）";
+    b.addEventListener("click",()=>{oppFold=!oppFold;keep("oppFold",oppFold);drawOpps()});return b};
+  if(oppFold){const sum=$("div","osum");sum.append($("span","ok","🔥 机会 "+n),$("span","og","挂单 "+makers.length),$("span","og","吃单 "+takers.length),foldBtn());el.replaceChildren(sum);return}
   el.replaceChildren();let head=$("span","ok","🔥 机会 "+n);
   const jump=h=>{const find=()=>[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);let c=find();if(!c)return;
     const g=c.parentElement.id.slice(2);if(folded.includes(g)){folded=folded.filter(x=>x!==g);keep("folded",folded);if(last)render(last);c=find()}
-    c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+8)+"px";c.scrollIntoView({behavior:matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth",block:"start"});
+    c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+(oppPin&&!el.hidden?el.offsetHeight:0)+8)+"px";c.scrollIntoView({behavior:matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth",block:"start"});
     c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")};
   const group=(label,list,title)=>{if(!list.length)return;const row=$("div","orow");if(head){row.append(head);head=null}
     const t=$("span","og",label+" "+list.length);t.title=title;row.append(t);
@@ -7859,7 +7866,8 @@ function drawOpps(){  // every red-framed suggestion on the page in one strip on
       b.addEventListener("click",()=>jump(h));row.append(b)});
     el.append(row)};
   group("挂单",makers,"挂单机会：排队等成交，不保证成交"+(oppPoints?"；只列现在挂单能拿积分的市场":""));
-  group("吃单",takers,"吃单机会：立即成交，已扣手续费与滑点")}
+  group("吃单",takers,"吃单机会：立即成交，已扣手续费与滑点");
+  if(el.firstChild)el.firstChild.append(foldBtn())}
 function rowNote(r,L,it){  // one line about a ladder level itself, above its four directions: on a phone nothing hovers
   const d=$("div","lnote"),parts=[];
   if(r.dist!=null)parts.push((L.kind==="price"?"现价还要"+(r.dist>=0?"涨 ":"跌 "):L.metric+"还要涨 ")+(Math.abs(r.dist)*100).toFixed(1)+"% 才碰到");
@@ -8044,7 +8052,8 @@ function drawPanel(){
   const ow=document.getElementById("oppway");ow.replaceChildren($("span","mut","机会条的方向："));
   [["opp-maker","挂单",oppMakers,v=>{oppMakers=v;keep("oppMakers",v)},"列出挂单机会（排队等成交，不保证成交）"],
    ["opp-taker","吃单",oppTakers,v=>{oppTakers=v;keep("oppTakers",v)},"列出吃单机会（立即成交，已扣手续费与滑点）"],
-   ["opp-points","挂单只列积分可得的",oppPoints,v=>{oppPoints=v;keep("oppPoints",v)},"挂单机会只列现在挂单能拿积分的市场（蓝色 ● 的那些）；勾掉则所有标红框的挂单都列"]
+   ["opp-points","挂单只列积分可得的",oppPoints,v=>{oppPoints=v;keep("oppPoints",v)},"挂单机会只列现在挂单能拿积分的市场（蓝色 ● 的那些）；勾掉则所有标红框的挂单都列"],
+   ["opp-pin","固定在顶部",oppPin,v=>{oppPin=v;keep("oppPin",v)},"滚动时机会条一直贴在筛选栏下面（右侧“收起”可折成一行）；勾掉则随页面滚走"]
   ].forEach(([id,label,on,set,title])=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.id=id;i.checked=on;l.title=title;
     i.addEventListener("change",()=>{set(i.checked);if(last)render(last)});l.append(i,label);ow.append(l)});
   document.getElementById("hotin").value=hotCents;
@@ -8065,8 +8074,8 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;folded=[];oneRow=[];secSort={};hotMap={};
-  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","folded","oneRow","secsort","hotmap"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
+  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;oppPin=true;oppFold=false;folded=[];oneRow=[];secSort={};hotMap={};
+  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","oppPin","oppFold","folded","oneRow","secsort","hotmap"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 let loading=null,lastSig="",dead=false;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
 const LOAD_TIMEOUT_MS=8000;
@@ -8131,6 +8140,8 @@ document.getElementById("retry").addEventListener("click",()=>load());
 document.getElementById("theme").addEventListener("click",()=>{const ks=Object.keys(THEMES);theme=ks[(ks.indexOf(theme)+1)%ks.length];keep("theme",theme);applyTheme()});applyTheme();
 const fbarEl=document.getElementById("fbar");  // a shadow under the bar once it sticks to the top
 if("IntersectionObserver" in window)new IntersectionObserver(([e])=>fbarEl.classList.toggle("stuck",!e.isIntersecting),{threshold:0}).observe(document.getElementById("fsent"));
+function setTopH(){const st=document.getElementById("stale");document.documentElement.style.setProperty("--top-h",(fbarEl.offsetHeight+(st.hidden?0:st.offsetHeight))+"px")}  // the pinned strip sits right under the bar
+setTopH();addEventListener("resize",setTopH);if("ResizeObserver" in window)new ResizeObserver(setTopH).observe(fbarEl);
 const totop=document.getElementById("totop");addEventListener("scroll",()=>totop.classList.toggle("show",scrollY>600),{passive:true});
 totop.addEventListener("click",()=>scrollTo({top:0,behavior:matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth"}));
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once
