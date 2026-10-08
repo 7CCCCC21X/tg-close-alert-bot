@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.34.0"
+VERSION = "1.35.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -485,6 +485,8 @@ class Config:
     sim_group_usd: float = 300.0  # the most one driver's positions may lose on a single move (paper $); 0 = no limit
     touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
     auction_alert: bool = True  # Telegram reminder when a market's closing auction starts
+    preopen_alert: bool = True  # Telegram reminder before a market's pre-open auction (its first direction signal)
+    preopen_lead: int = 5       # minutes before the pre-open auction starts (0 = as it starts)
     edge_alert: bool = True  # Telegram: a suggestion reaching edge_alert_edge; later, that suggestion going away or turning
     edge_alert_edge: float = 0.10  # net edge (per $1 share) a suggestion needs before it is announced
     edge_alert_confirm: int = 60   # seconds a change has to hold before it is announced (a one-refresh blip is not)
@@ -563,6 +565,8 @@ class Config:
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
             ladder_deadlines=parse_deadlines(e.get("LADDER_DEADLINES", "")),
             auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
+            preopen_alert=e.get("PREOPEN_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
+            preopen_lead=bounded_int(e, "PREOPEN_ALERT_LEAD_MINUTES", 5, 0, 60),
             edge_alert=e.get("EDGE_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
             edge_alert_edge=parse_bounded(e, "EDGE_ALERT_CENTS", "10", 1, 50) / 100,
             edge_alert_confirm=bounded_int(e, "EDGE_ALERT_CONFIRM_SECONDS", 60, 0, 3600),
@@ -1255,8 +1259,8 @@ def parse_quote_close(source: str, market: str, raw: bytes, info: StockMarketInf
 def stock_live_window(market: str, now_ms: int, holidays: frozenset = frozenset()) -> tuple[int, int] | None:
     """(open, final) epoch ms of today's session while the stock trades, else None.
 
-    Runs from the first continuous-trading minute until the close is final (close time + 15 minutes),
-    so the pre-open auction's indicative prices are never read as trades.
+    Runs from the first continuous-trading minute until the close is final (close time + 15 minutes):
+    the pre-open auction's indicative prices are not trades (stock_quote_window covers them, labelled).
     """
     info = STOCK_MARKETS[market]
     tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
@@ -1265,6 +1269,26 @@ def stock_live_window(market: str, now_ms: int, holidays: frozenset = frozenset(
     if today.weekday() >= 5 or today in holidays:
         return None
     start = dt.datetime.combine(today, CALENDAR.sessions(market, today)[0][0], tz)
+    final = dt.datetime.combine(today, CALENDAR.close_time(market, today), tz) + dt.timedelta(minutes=15)
+    if not start <= local < final:
+        return None
+    return int(start.timestamp() * 1000), int(final.timestamp() * 1000)
+
+
+def stock_quote_window(market: str, now_ms: int, holidays: frozenset = frozenset()) -> tuple[int, int] | None:
+    """(start, final) epoch ms of the stretch in which the stock's own quote is read: from the pre-open auction's
+    start (its indicative price, HKEX's 参考平衡价, is the day's first direction signal; the matched print follows)
+    until the close is final. A market without a pre-open auction in PRE_AUCTIONS starts at its open."""
+    info = STOCK_MARKETS[market]
+    tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
+    local = dt.datetime.fromtimestamp(now_ms / 1000, tz)
+    today = local.date()
+    if today.weekday() >= 5 or today in holidays:
+        return None
+    start = dt.datetime.combine(today, CALENDAR.sessions(market, today)[0][0], tz)
+    window = preopen_window(market, now_ms)
+    if window:  # the table keeps Beijing time; the venue's own day is the same day
+        start = min(start, dt.datetime.combine(dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date(), window[0], BEIJING).astimezone(tz))
     final = dt.datetime.combine(today, CALENDAR.close_time(market, today), tz) + dt.timedelta(minutes=15)
     if not start <= local < final:
         return None
@@ -1429,7 +1453,7 @@ class StockMarket:
         stale or unknown); each Korean stock is one Naver request. A lagging or undated feed (delayed quotes) does
         not end the search, and the round keeps the newest print it saw."""
         due = {symbol: ticker for symbol, ticker in self.config.tickers.items()
-               if stock_live_window(ticker.market, now_ms, self.config.holidays.get(ticker.market, frozenset()))}
+               if stock_quote_window(ticker.market, now_ms, self.config.holidays.get(ticker.market, frozenset()))}
         if not due or (not force and time.monotonic() - self.live_refreshed < self.config.quote_refresh):
             return False  # nothing trading / not due: nothing fetched
         self.live_refreshed = time.monotonic()
@@ -1485,9 +1509,13 @@ class StockMarket:
         return refreshed([f"{symbol}：{self.live_errors[symbol]}" for symbol in due if symbol in self.live_errors], len(fresh))
 
     def live_quote(self, symbol: str, now_ms: int) -> tuple[IndexQuote | None, str]:
-        """(today's fresh realtime quote, why not) while the stock trades; (None, "") outside its session."""
+        """(today's fresh realtime quote, why not) while the stock trades or its pre-open auction runs; (None, "")
+        outside. In the auction the quote is the indicative price: it must be stamped today in the auction and have
+        moved off the previous close (a feed that still shows yesterday's close at 0% has no indicative price yet),
+        and it may sit still for minutes without going stale."""
         ticker = self.config.tickers.get(symbol)
-        window = ticker and stock_live_window(ticker.market, now_ms, self.config.holidays.get(ticker.market, frozenset()))
+        holidays = self.config.holidays.get(ticker.market, frozenset()) if ticker else frozenset()
+        window = ticker and stock_quote_window(ticker.market, now_ms, holidays)
         if not window:
             return None, ""
         q = self.live.get(symbol)
@@ -1496,8 +1524,13 @@ class StockMarket:
             return None, f"现货行情未取得（{brief_error(error, 60)}）" if error else "等待现货行情"
         if q.quoted_ms <= 0:
             return None, "现货行情缺少报价时间"
-        if q.quoted_ms < window[0] - 30 * 60_000:  # still yesterday's print (pre-open auction may stamp minutes early)
-            return None, "现货今日尚未开盘成交"
+        preopen = preopen_running(ticker.market, now_ms, holidays)
+        if q.quoted_ms < window[0]:  # still yesterday's print (the window opens with the pre-open auction)
+            return None, "开市前竞价进行中，行情源还没给出今日参考价" if preopen else "现货今日尚未开盘成交"
+        if preopen:
+            if q.prev_close and q.last == q.prev_close:
+                return None, "开市前竞价进行中，现价仍等于昨收（尚无参考平衡价）"
+            return q, ""
         info = STOCK_MARKETS[ticker.market]
         tz = dt.timezone(dt.timedelta(hours=info.utc_offset))
         day = dt.datetime.fromtimestamp(now_ms / 1000, tz).date()
@@ -3457,8 +3490,14 @@ class CloseOdds:
 
     @property
     def direct(self) -> bool:
-        """The effective price is the underlying's own live print, not a proxy-mapped estimate."""
-        return "直接用现货" in self.proxy_note
+        """The effective price is the underlying's own live print (or its pre-open auction's indicative price), not a
+        proxy-mapped estimate."""
+        return "直接用现货" in self.proxy_note or self.preopen
+
+    @property
+    def preopen(self) -> bool:
+        """The effective price is the pre-open auction's indicative price (参考平衡价): the open is not matched yet."""
+        return "开市前竞价参考价" in self.proxy_note
 
     @property
     def move(self) -> float:
@@ -3484,7 +3523,7 @@ class CloseOdds:
     def row(self) -> str:
         """Compact status row: '🎲 09-28收 涨 41.0¢｜跌 59.0¢（有效 6,958.67·σ 3.02%）'."""
         return (f"🎲 {self.target.strftime('%m-%d')}收 涨 {bold(f'{self.fair_up * 100:.1f}¢')}｜跌 {bold(f'{self.fair_down * 100:.1f}¢')}"
-                f"（有效 {fmt(self.effective.quantize(D('0.01')))}·σ {self.sigma * 100:.2f}%）")
+                f"（{'竞价参考' if self.preopen else '有效'} {fmt(self.effective.quantize(D('0.01')))}·σ {self.sigma * 100:.2f}%）")
 
     def detail(self) -> list[str]:
         unit = f" {self.unit}" if self.unit else ""
@@ -4020,6 +4059,67 @@ AUCTIONS = {
     "sh": (dt.time(14, 57), dt.time(15, 0), "沪深收盘集合竞价（14:57–15:00）"),
 }
 AUCTIONS["sz"] = AUCTIONS["sh"]
+# Pre-open auctions, Beijing time like AUCTIONS: the indicative price (HKEX's 参考平衡价 IEP, the A-share 虚拟撮合价, KRX's
+# 예상체결가) forms from the start and is the day's first direction signal; HK matches at a random moment in 09:20–09:22,
+# A-shares at 09:25, KRX at 09:00 Seoul. An opening gap is not the day's close.
+PRE_AUCTIONS = {
+    "hk": (dt.time(9, 0), dt.time(9, 30), "港交所开市前竞价（09:00–09:30，09:20–09:22 随机撮合，09:30 连续交易）"),
+    "sh": (dt.time(9, 15), dt.time(9, 30), "沪深开盘集合竞价（09:15–09:25，09:25 撮合开盘价，09:30 连续交易）"),
+    "kr": (dt.time(7, 30), dt.time(8, 0), "韩交所开盘同时呼价（首尔 08:30–09:00，09:00 撮合开盘价）"),
+}
+PRE_AUCTIONS["sz"] = PRE_AUCTIONS["sh"]
+# The indicative price keeps moving until the match: worth about this much continuous trading on top of the whole
+# session still ahead (a 0.5–1% swing of a stock's indicative price before the match is usual).
+PREOPEN_VARIANCE_MINUTES = {"hk": 30.0, "sh": 30.0, "sz": 30.0, "kr": 30.0}
+
+
+def preopen_window(market: str, now_ms: int) -> tuple[dt.time, dt.time, str] | None:
+    """(start, end, description) of ``market``'s pre-open auction on the day of ``now_ms``, Beijing time: the usual
+    window (a HK half day keeps it), or the KRX late day's (an hour later)."""
+    base = PRE_AUCTIONS.get(market)
+    info = STOCK_MARKETS.get(market)
+    if not base or not info:
+        return None
+    day = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset))).date()
+    if CALENDAR.late_day(market, day):
+        start, end = (dt.datetime.combine(day, t, BEIJING) + KR_LATE_SHIFT for t in base[:2])
+        return start.time(), end.time(), "韩交所开盘同时呼价（高考日延后：首尔 09:30–10:00，10:00 撮合开盘价）"
+    return base
+
+
+def preopen_running(market: str, now_ms: int, holidays: frozenset = frozenset()) -> bool:
+    """Whether ``market``'s pre-open auction is under way now (a weekday that is not a configured holiday)."""
+    window = preopen_window(market, now_ms)
+    if not window:
+        return False
+    local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+    day = local.date()
+    if STOCK_MARKETS[market].utc_offset != 8:
+        day = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=STOCK_MARKETS[market].utc_offset))).date()
+    return day.weekday() < 5 and day not in holidays and window[0] <= local.time() < window[1]
+
+
+def session_minutes(market: str) -> float:
+    """Minutes of continuous trading in an ordinary session (the unit of a day's variance)."""
+    return sum((dt.datetime.combine(dt.date(2000, 1, 1), b) - dt.datetime.combine(dt.date(2000, 1, 1), a)).seconds
+               for a, b in SESSIONS[market]) / 60
+
+
+def quote_pages(ticker: "StockTicker") -> list[dict]:
+    """Where a person can watch the stock's own quote (the pre-open auction's indicative price and its update time
+    among them): the venue-side pages that show it, first the one that shows the most."""
+    code = ticker.code
+    if ticker.market == "hk":
+        return [{"name": "富途", "url": f"https://www.futunn.com/stock/{code}-HK"},
+                {"name": "etnet", "url": f"https://www.etnet.com.hk/www/tc/stocks/realtime/quote.php?code={int(code)}"},
+                {"name": "腾讯", "url": f"https://gu.qq.com/hk{code}"}]
+    if ticker.market == "kr":
+        return [{"name": "Naver", "url": f"https://finance.naver.com/item/main.naver?code={code}"}]
+    return [{"name": "腾讯", "url": f"https://gu.qq.com/{ticker.market}{code}"},
+            {"name": "东方财富", "url": f"https://quote.eastmoney.com/{ticker.market}{code}.html"},
+            {"name": "富途", "url": f"https://www.futunn.com/stock/{code}-{ticker.market.upper()}"}]
+
+
 # How much of a session's variance a running closing auction is still worth, in minutes of continuous trading: the
 # indicative price keeps moving until the match (HSI: a 0.1–0.2% move against the 16:00 level is usual, about the
 # variance of 5 continuous minutes at σ 1.3% a day), so the odds must not treat the 16:00 print as the close.
@@ -7235,7 +7335,7 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:7px 0 3px;fon
 .card.missing p{margin:0;color:var(--muted);font-size:12.5px}
 .pb{margin-top:auto;border-top:1px solid var(--line2);padding-top:8px;font-size:12.5px;font-variant-numeric:tabular-nums}
 .quote a.open{font-weight:650;color:var(--best);text-decoration:none;white-space:nowrap;border:1px solid var(--best-soft);border-radius:999px;padding:1px 10px;background:var(--best-bg);transition:background .15s,color .15s}
-.quote a.open:hover{background:var(--best);color:#fff;border-color:var(--best)}@media (pointer:coarse){.quote a.open{padding:4px 11px}}
+.quote a.open:hover{background:var(--best);color:#fff;border-color:var(--best)}.quote a.pg{font-size:11.5px;color:var(--muted);text-decoration:none;border:1px solid var(--line);border-radius:999px;padding:1px 8px;white-space:nowrap}.quote a.pg:hover{color:var(--best);border-color:var(--best-soft)}@media (pointer:coarse){.quote a.open{padding:4px 11px}}
 .quote{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;color:var(--muted)}.quote span{white-space:nowrap}.quote b{color:var(--text);font-weight:600}.quote .pt{font-weight:600;color:var(--best)}
 .edges{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-top:6px}
 .edge{display:flex;flex-direction:column;align-items:center;justify-content:center;background:var(--chip);border:1.5px solid transparent;border-radius:10px;padding:5px 3px;min-width:0;line-height:1.25;overflow:hidden;font:inherit;color:inherit;cursor:pointer;min-height:44px;transition:border-color .15s,background .15s}
@@ -7578,8 +7678,9 @@ function pointsPill(p){  // LP points: blue ● with the hourly rate when a quot
     x.title="积分可得：这个市场的挂单每小时发 "+(rate||"?")+" PP"+(p.points_spread!=null?"（价差不超过 "+cent(p.points_spread)+(p.points_min_shares?"、至少 "+p.points_min_shares+" 份":"")+"）":"");return x}
   const x=unit($("span","ppoints off","○"+(rate?" "+rate:"")));
   x.title=(rate?"有积分（每小时 "+rate+" PP），但现在拿不到：":"")+(p.points_why||p.points_note||"积分未激活");x.setAttribute("aria-label",x.title);return x}
-function book(p,key){
+function book(p,key,pages){
   const w=$("div","pb"),q=$("div","quote");q.append(openLink(p.url));w.append(q);
+  (pages||[]).forEach(g=>{const a=$("a","pt pg",g.name+" ↗");a.href=g.url;a.target="_blank";a.rel="noopener noreferrer";a.title="在新标签页打开 "+g.name+" 的行情页：竞价时看当前价（参考平衡价）和更新时间，别只看逐笔成交";q.append(a)});
   const has=p.bids||p.asks;
   if(has&&!(p.bids||[]).length&&!(p.asks||[]).length){q.append($("span","mut","暂无挂单"));if(p.stale)q.append($("span","warn",p.age+" 秒前"))}
   else if(has){const b=p.bids[0],k=p.asks[0],lv=(t,l)=>{const x=$("span","",t+" ");x.append($("b","",l?cent(l[0]):"无"));if(l)x.append("×"+qk(l[1]));if(l)x.title=qty(l[1])+" 份";return x};
@@ -7789,6 +7890,7 @@ function card(it,g){
     const k=it.name+"|"+(it.symbol||"");if(seen[k]&&seen[k]<it.day)rolled[k]=Date.now();seen[k]=it.day;
     if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");t.className="tag new";t.textContent+=" 新"}}
   if(it.auction){const a=$("span","tag auc","集合竞价");a.title=it.auction+"：此时价格基本就是收盘价";tg.append(a)}
+  else if(it.preopen){const a=$("span","tag auc","开市前竞价");a.title=it.preopen+"：现价是参考平衡价，撮合前仍会变动；竞价高开或低开不等于当天收涨或收跌";tg.append(a)}
   else if(it.trading){const a=$("span","tag "+(it.trading==="开盘中"?"open":"lunch"),it.trading);
     a.title={"开盘中":"交易所连续交易中：直接用现货相对昨收","午休":"午间休市","未开盘":"今日尚未开盘：按代理估算",
       "已收盘":"今日已收盘","休市":"今天不是交易日"}[it.trading]||"";tg.append(a)}
@@ -7836,7 +7938,7 @@ function card(it,g){
   // 昨收 1,768,000 · 今日 1,769,000 (while trading) / 今收 … · 估算 … (after the close: the proxy's view of the next close)
   sm.append($("span","rd",it.ref_rel||it.ref_day||"参考"),$("span","v",it.ref),$("span","rd sep",it.eff_label||"→"),$("span","v",like(it.effective,it.ref)));
   if(it.unit)sm.append($("span","un",it.unit));
-  sm.title=(it.ref_day?it.ref_day+" 收盘 ":"参考 ")+it.ref+unit+"；"+(it.eff_label==="今日"?"今日现价":"按代理估算的下一收盘")+" "+it.effective+unit+"；点开看计算明细";
+  sm.title=(it.ref_day?it.ref_day+" 收盘 ":"参考 ")+it.ref+unit+"；"+(it.eff_label==="今日"?"今日现价":it.eff_label==="竞价"?"开市前竞价参考价（撮合前会变）":"按代理估算的下一收盘")+" "+it.effective+unit+"；点开看计算明细";
   const chip=$("span","chip",(it.move>=0?"+":"")+it.move.toFixed(2)+"%");chip.style.color=it.move>0?upColor():it.move<0?downColor():"var(--muted)";sm.append(chip);det.append(sm);
   const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("目标",it.close_label);row("参考",it.ref+unit+"（"+it.ref_note+"）");row("有效",it.effective+unit);row("代理",it.proxy_note);
@@ -7844,7 +7946,7 @@ function card(it,g){
   row("σ 来源",it.sigma_note);row("涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%");row("z",it.z.toFixed(3));
   det.append(dl);c.append(det);if(it.warn){const w=$("div","warn small","⚠️ "+it.warn);c.append(w)}
   tail(c,it);return c}
-function tail(c,it){const ag=ages(it);if(ag)c.append(ag);if(it.predict)c.append(book(it.predict,favKey(it)))}
+function tail(c,it){const ag=ages(it);if(ag)c.append(ag);if(it.predict)c.append(book(it.predict,favKey(it),it.pages))}
 function tick(){
   const now=Date.now()+skew;
   document.querySelectorAll(".cd").forEach(el=>{const left=Math.floor((Number(el.dataset.close)-now)/1000);
@@ -10096,9 +10198,16 @@ class Bot:
                 return "缺少昨收"
             remaining, target = session_remaining(ticker.market, now_ms, None, holidays)
             sigma, sigma_note = self.stock_sigma(symbol, ticker.market, intraday=True)  # today's opening gap has happened
+            if preopen_running(ticker.market, now_ms, holidays):
+                # the auction's indicative price: the gap it shows can still move until the match, worth some minutes
+                # of trading on top of the whole session ahead
+                remaining += PREOPEN_VARIANCE_MINUTES.get(ticker.market, 0.0) / session_minutes(ticker.market)
+                note = (f"{info.name}开市前竞价参考价 {fmt_price(live.last)}（{live.source}·{hhmm(live.quoted_ms)} 更新；"
+                        f"撮合前仍会变动）")
+            else:
+                note = f"{info.name}现货 {fmt_price(live.last)}（{live.source}·盘中直接用现货）"
             return close_odds(NAMES.get(symbol, symbol), base, live.last, sigma, remaining, target,
-                              price_tick(ticker.market, base), base_note,
-                              f"{info.name}现货 {fmt_price(live.last)}（{live.source}·盘中直接用现货）", sigma_note, unit)
+                              price_tick(ticker.market, base), base_note, note, sigma_note, unit)
         if anchor is None or anchor[0] != base_ms:
             return "等待币安在收盘时刻的价格"
         if quote_ms and now_ms - quote_ms > self.config.max_age * 1000:
@@ -10371,8 +10480,12 @@ class Bot:
                 holidays = self.config.holidays.get(market, frozenset())
                 if auction_running(market, now_ms, holidays):
                     base["auction"] = (auction_window(market, now_ms) or AUCTIONS[market])[2]
+                elif symbol and preopen_running(market, now_ms, holidays):
+                    base["preopen"] = (preopen_window(market, now_ms) or PRE_AUCTIONS[market])[2]
                 elif state := session_state(market, now_ms, holidays):
                     base["trading"] = state
+            if symbol and symbol in self.config.tickers:
+                base["pages"] = quote_pages(self.config.tickers[symbol])  # where to watch the stock's own quote
             if isinstance(odds, str):
                 target = self.predict_day(title, now_ms)
                 items.append({**base, "missing": odds, **(day_fields(target, now_ms) if target else {})})
@@ -10410,9 +10523,9 @@ class Bot:
         """A daily card's figures that move with every quote: shared by data.json and the event stream (live.json), so
         the page can patch a card's headline in place between full answers."""
         return {
-            "eff_label": "今日" if odds.direct else "隐含" if name == "上证指数" else "估算",  # A50-implied, not an SSE print
+            "eff_label": "竞价" if odds.preopen else "今日" if odds.direct else "隐含" if name == "上证指数" else "估算",  # A50-implied, not an SSE print
             "quote_ms": self.odds_quote_ms(title, odds),
-            "source": "现货" if odds.direct else "代理估算·近似锚点" if "近似" in odds.warn else "代理估算",
+            "source": "竞价参考价" if odds.preopen else "现货" if odds.direct else "代理估算·近似锚点" if "近似" in odds.warn else "代理估算",
             "ref": fmt(odds.ref), "effective": fmt(odds.effective.quantize(D("0.0001"))),
             "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note, "warn": odds.warn,
             "sigma": odds.sigma, "remaining": odds.remaining, "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
@@ -12064,20 +12177,92 @@ class Bot:
         lines = [f"🔔 {bold(label + ' 开始')}", "竞价最后几分钟的价格基本就是收盘价，涨跌大体已定："]
         for title, odds in items:
             lines.append("\n" + bold(f"📍 {title}"))
-            if not isinstance(odds, CloseOdds):
-                lines.extend(tree([f"概率暂缺：{odds}"]))
+            lines.extend(tree(self.card_rows(title, odds, now_ms, "现")))
+        return "\n".join(lines)
+
+    def card_rows(self, title: str, odds: CloseOdds | str, now_ms: int, word: str) -> list[str]:
+        """A card's state for a reminder: its reference close against the price the odds rest on (``word``: 现 /
+        估算), the model's fair prices, and the Predict book with its best way when one clears the bar."""
+        if not isinstance(odds, CloseOdds):
+            return [f"概率暂缺：{odds}"]
+        unit = f" {odds.unit}" if odds.unit else ""
+        rows = [f"昨收 {fmt(odds.ref)}{unit} → {word} {fmt(odds.effective)}{unit}（{percent(odds.effective, odds.ref):+.2f}%）",
+                f"模型 涨 {bold(cents(odds.fair_up))}｜跌 {bold(cents(odds.fair_down))}"
+                + ("（按币安代理估算，竞价参考价出来后会更新）" if not odds.direct else "")]
+        book = self.predict.books.get(self.predict_key(title))
+        if book is not None and not book.stale(now_ms):
+            need = self.edge_need(model_swing(odds))
+            best = None if odds.warn else best_edge(book_edges(odds.fair_up, book, self.edge_costs()), need)
+            quote = f"Predict 买1 {cents(float(book.bid[0])) if book.bid else '无'}｜卖1 {cents(float(book.ask[0])) if book.ask else '无'}"
+            rows.append(quote + (f"｜👉 {bold(best.label)} @ {cents(best.price)} 净优势 {cents(best.edge, True)}" if best
+                                 else f"｜{odds.warn}，暂不给建议" if odds.warn
+                                 else f"｜扣除费用和模型误差后没有方向超过门槛 {cents(need)}"))
+        return rows
+
+    PREOPEN_JOIN_MS = 2 * 60_000  # the pre-open reminder is (re)tried only this soon after its moment
+
+    async def preopen_reminders(self, now_ms: int) -> None:
+        """Once per market, day and subscription, PREOPEN_ALERT_LEAD_MINUTES before the market's pre-open auction: the
+        auction is the day's first direction signal and HK matches at 09:20–09:22, before the 09:30 open, so an order
+        resting in a prediction market on yesterday's view wants checking before 09:00. Each of the venue's contract
+        cards: its close, the Binance-mapped estimate and the model, the Predict book's best way, and where to watch
+        the indicative price. Delivered like the closing-auction reminder (recorded per subscription once Telegram
+        accepted it; a copy that aged in the queue is dropped and rebuilt)."""
+        if not self.config.preopen_alert:
+            return
+        for market in PRE_AUCTIONS:
+            if market == "sz":
                 continue
-            unit = f" {odds.unit}" if odds.unit else ""
-            rows = [f"昨收 {fmt(odds.ref)}{unit} → 现 {fmt(odds.effective)}{unit}（{percent(odds.effective, odds.ref):+.2f}%）",
-                    f"模型 涨 {bold(cents(odds.fair_up))}｜跌 {bold(cents(odds.fair_down))}"]
-            book = self.predict.books.get(self.predict_key(title))
-            if book is not None and not book.stale(now_ms):
-                need = self.edge_need(model_swing(odds))
-                best = None if odds.warn else best_edge(book_edges(odds.fair_up, book, self.edge_costs()), need)
-                quote = f"Predict 买1 {cents(float(book.bid[0])) if book.bid else '无'}｜卖1 {cents(float(book.ask[0])) if book.ask else '无'}"
-                rows.append(quote + (f"｜👉 {bold(best.label)} @ {cents(best.price)} 净优势 {cents(best.edge, True)}" if best
-                                     else f"｜{odds.warn}，暂不给建议" if odds.warn
-                                     else f"｜扣除费用和模型误差后没有方向超过门槛 {cents(need)}"))
+            window = preopen_window(market, now_ms)
+            info = STOCK_MARKETS[market]
+            venue_day = dt.datetime.fromtimestamp(now_ms / 1000, dt.timezone(dt.timedelta(hours=info.utc_offset))).date()
+            if not window or venue_day.weekday() >= 5 or venue_day in self.config.holidays.get(market, frozenset()):
+                continue
+            local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+            start = dt.datetime.combine(local.date(), window[0], BEIJING)
+            due_at = start - dt.timedelta(minutes=self.config.preopen_lead)
+            if not due_at <= local <= due_at + dt.timedelta(milliseconds=self.PREOPEN_JOIN_MS):
+                continue
+            day_key = f"preopen:{market}:{local.date().isoformat()}"
+            if self.store.get(day_key):
+                continue
+            venues = {market, "sz"} if market == "sh" else {market}
+            symbols = [symbol for symbol in self.config.symbols
+                       if symbol in self.config.tickers and self.config.tickers[symbol].market in venues]
+            if not symbols:
+                continue
+            due = [(sub_id, sub) for sub_id, sub in self.subscriptions().items() if sub.get("active")
+                   and not self.store.get(f"{day_key}:{sub_id}") and not self.delivering(f"{day_key}:{sub_id}")]
+            if not due:
+                continue
+            odds = dict(self.odds_items(now_ms)) if self.config.probability else {}
+            text = self.preopen_text(window, start, symbols, odds, now_ms)
+
+            def fresh(built: int = now_ms, end: dt.datetime = dt.datetime.combine(local.date(), window[1], BEIJING)) -> bool:
+                current = self.market.now_ms()
+                return current - built <= self.AUCTION_FRESH_MS and dt.datetime.fromtimestamp(current / 1000, BEIJING) < end
+            for sub_id, sub in due:
+                key = f"{day_key}:{sub_id}"
+
+                async def send(sub: dict = sub, key: str = key, text: str = text, fresh: Any = fresh) -> None:
+                    if await self.tell(sub["chat"], sub["thread"], text, html_mode=True, fresh=fresh):
+                        self.store.put(key, self.market.now_ms())
+                self.deliver(key, send)
+
+    def preopen_text(self, window: tuple, start: dt.datetime, symbols: list[str], odds: dict, now_ms: int) -> str:
+        lead = self.config.preopen_lead
+        label = window[2]
+        head, detail = (label.partition("（") + ("",))[:2], label.partition("（")[2]
+        when = f"{lead} 分钟后开始" if lead else "开始"
+        lines = [f"🔔 {bold(head[0] + ' ' + when)}（{detail}" if detail else f"🔔 {bold(label + ' ' + when)}",
+                 "竞价一开始就有方向信息，撮合可能早于连续交易：按昨日判断挂在预测市场的单，请在竞价前核对或撤掉。"
+                 "竞价参考价会随即更新到网页和 /status；竞价高开或低开不等于当天收涨或收跌。"]
+        for symbol in symbols:
+            title = f"{NAMES.get(symbol, symbol)}｜{symbol}"
+            lines.append("\n" + bold(f"📍 {title}"))
+            rows = self.card_rows(title, odds.get(title, "概率功能未开启"), now_ms, "估算")
+            pages = quote_pages(self.config.tickers[symbol])
+            rows.append("看竞价行情：" + "｜".join(f"{g['name']} {g['url']}" for g in pages))
             lines.extend(tree(rows))
         return "\n".join(lines)
 
@@ -12554,6 +12739,7 @@ class Bot:
                 await self.refresh_odds_inputs(now_ms)
         try:
             await self.auction_reminders(now_ms)
+            await self.preopen_reminders(now_ms)
         except Exception as error:  # a reminder must never block price alerts
             self.log_limited("auction", f"集合竞价提醒失败：{clean_error(error)}")
         try:
