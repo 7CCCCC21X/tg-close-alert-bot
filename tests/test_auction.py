@@ -1,4 +1,4 @@
-import asyncio, re, sys, time, datetime as dt
+import asyncio, html, re, sys, time, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
@@ -89,8 +89,10 @@ async def run():
     assert m.preopen_window("kr", bj(11, 18, 8, 30))[:2] == (dt.time(7, 30), dt.time(8, 0))
     assert m.quote_pages(m.StockTicker("hk", "00625")) == [
         {"name": "富途", "url": "https://www.futunn.com/stock/00625-HK"},
+        {"name": "AAStocks", "url": "https://www.aastocks.com/tc/stocks/quote/detail-quote.aspx?symbol=00625"},
+        {"name": "腾讯", "url": "https://gu.qq.com/hk00625"},
         {"name": "etnet", "url": "https://www.etnet.com.hk/www/tc/stocks/realtime/quote.php?code=625"},
-        {"name": "腾讯", "url": "https://gu.qq.com/hk00625"}]
+        {"name": "港交所", "url": "https://www.hkex.com.hk/Market-Data/Securities-Prices/Equities/Equities-Quote?sym=625&sc_lang=zh-HK"}]
     assert m.quote_pages(m.StockTicker("sh", "688836"))[0] == {"name": "腾讯", "url": "https://gu.qq.com/sh688836"}
     assert m.quote_pages(m.StockTicker("kr", "000660")) == [{"name": "Naver", "url": "https://finance.naver.com/item/main.naver?code=000660"}]
     pcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "HK0625USDT,UNITREEUSDT,SKHYNIXUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
@@ -111,12 +113,14 @@ async def run():
     now["ms"] = bj(10, 8, 8, 55, 30)  # five minutes before 09:00: the HK reminder, with the HK card only
     await pbot.preopen_reminders(now["ms"]); await pbot.drain_deliveries()
     assert len(sent) == 1, sent
-    plain = lambda t: re.sub(r"</?b>", "", t)  # the bold tags of the HTML message
+    plain = lambda t: html.unescape(re.sub(r"</?b>", "", t))  # the bold tags and escapes of the HTML message
     text = plain(sent[0])
     assert text.startswith("🔔 港交所开市前竞价 5 分钟后开始（09:00–09:30，09:20–09:22 随机撮合，09:30 连续交易）\n竞价一开始就有方向信息，撮合可能早于连续交易："), text
     assert "📍 SHEIN 希音｜HK0625USDT" in text and "昨收 38.1 → 估算 38.3（+0.52%）" in text and "（按币安代理估算，竞价参考价出来后会更新）" in text, text
     assert "Predict 买1 50.0¢｜卖1 53.0¢" in text and "宇树" not in text and "海力士" not in text, text
-    assert text.endswith("└ 看竞价行情：富途 https://www.futunn.com/stock/00625-HK｜etnet https://www.etnet.com.hk/www/tc/stocks/realtime/quote.php?code=625｜腾讯 https://gu.qq.com/hk00625"), text
+    assert text.endswith("└ 看竞价行情：富途 https://www.futunn.com/stock/00625-HK｜AAStocks https://www.aastocks.com/tc/stocks/quote/detail-quote.aspx?symbol=00625"
+                         "｜腾讯 https://gu.qq.com/hk00625｜etnet https://www.etnet.com.hk/www/tc/stocks/realtime/quote.php?code=625"
+                         "｜港交所 https://www.hkex.com.hk/Market-Data/Securities-Prices/Equities/Equities-Quote?sym=625&sc_lang=zh-HK"), text
     now["ms"] = bj(10, 8, 8, 56)
     await pbot.preopen_reminders(now["ms"]); await pbot.drain_deliveries(); assert len(sent) == 1  # not again the same day
     # the A-share one ten minutes later (09:10) lists the A-share card; Korea's came at 07:25 Beijing (08:25 Seoul)
@@ -148,7 +152,7 @@ async def run():
     now["ms"] = bj(10, 8, 9, 5)
     items = {i["name"]: i for i in pbot.odds_payload()["items"]}
     assert items["SHEIN 希音"]["preopen"].startswith("港交所开市前竞价") and "trading" not in items["SHEIN 希音"], items["SHEIN 希音"]
-    assert items["SHEIN 希音"]["pages"][0] == {"name": "富途", "url": "https://www.futunn.com/stock/00625-HK"} and len(items["SHEIN 希音"]["pages"]) == 3
+    assert items["SHEIN 希音"]["pages"][0] == {"name": "富途", "url": "https://www.futunn.com/stock/00625-HK"} and len(items["SHEIN 希音"]["pages"]) == 5
     assert items["宇树 UNITREE"]["trading"] == "未开盘" and "preopen" not in items["宇树 UNITREE"] and items["宇树 UNITREE"]["pages"][0]["name"] == "腾讯"
     now["ms"] = bj(10, 8, 9, 20)
     items = {i["name"]: i for i in pbot.odds_payload()["items"]}
@@ -156,6 +160,30 @@ async def run():
     now["ms"] = bj(10, 8, 9, 31)
     items = {i["name"]: i for i in pbot.odds_payload()["items"]}
     assert "preopen" not in items["SHEIN 希音"] and items["SHEIN 希音"]["trading"] == "开盘中"
+
+    # --- the indicative price's own message: sent once the card prices off it, once per venue and day -----------------
+    now["ms"] = bj(10, 8, 9, 5)
+    await pbot.preopen_price_alerts(now["ms"]); await pbot.drain_deliveries(); assert len(sent) == 4  # the card still rests on Binance
+    iep = m.close_odds("SHEIN 希音", D("38.10"), D("38.30"), 0.025, 1.09, dt.date(2026, 10, 8), D("0.01"), "10-07 收盘",
+                       "港交所开市前竞价参考价 38.3（腾讯·09:06 更新；撮合前仍会变动）", "σ")
+    assert iep.preopen and iep.direct
+    pbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", iep), ("宇树 UNITREE｜UNITREEUSDT", uni), ("SK 海力士｜SKHYNIXUSDT", "等待行情")]
+    pbot.predict.books["HK0625USDT"] = m.dataclasses.replace(pbot.predict.books["HK0625USDT"], fetched_ms=now["ms"])
+    await pbot.preopen_price_alerts(now["ms"]); await pbot.drain_deliveries()
+    assert len(sent) == 5, sent[4:]
+    text = plain(sent[4])
+    assert text.startswith("📊 港交所开市前竞价：参考平衡价出现（09:05）\n这是今天第一个方向信号，撮合前还会变"), text
+    assert "📍 SHEIN 希音｜HK0625USDT\n├ 昨收 38.1 → 竞价参考 38.3（+0.52%）｜腾讯·09:06 更新；撮合前仍会变动\n├ 模型 涨 " in text, text
+    assert "Predict 买1 50.0¢｜卖1 53.0¢" in text and "看竞价行情：富途 https://www.futunn.com/stock/00625-HK" in text and "宇树" not in text, text
+    now["ms"] = bj(10, 8, 9, 12)
+    await pbot.preopen_price_alerts(now["ms"]); await pbot.drain_deliveries(); assert len(sent) == 5  # once a day
+    # the A-share venue: its cards have no indicative price (Unitree still prices off Binance): nothing
+    now["ms"] = bj(10, 8, 9, 16)
+    await pbot.preopen_price_alerts(now["ms"]); await pbot.drain_deliveries(); assert len(sent) == 5
+    # a venue whose auction is over sends none even with such odds lingering
+    fresh_bot = m.Bot(pcfg, m.Store(":memory:"), FakeMarket(), FakeTelegram()); fresh_bot.store.put("subscriptions", pbot.subscriptions()); fresh_bot.odds_items = pbot.odds_items
+    now["ms"] = bj(10, 8, 9, 31)
+    await fresh_bot.preopen_price_alerts(now["ms"]); await fresh_bot.drain_deliveries(); assert len(sent) == 5
 
 asyncio.run(run())
 print("AUCTION_OK")

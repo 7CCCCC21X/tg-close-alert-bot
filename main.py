@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.35.0"
+VERSION = "1.35.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4111,8 +4111,10 @@ def quote_pages(ticker: "StockTicker") -> list[dict]:
     code = ticker.code
     if ticker.market == "hk":
         return [{"name": "富途", "url": f"https://www.futunn.com/stock/{code}-HK"},
+                {"name": "AAStocks", "url": f"https://www.aastocks.com/tc/stocks/quote/detail-quote.aspx?symbol={code}"},
+                {"name": "腾讯", "url": f"https://gu.qq.com/hk{code}"},
                 {"name": "etnet", "url": f"https://www.etnet.com.hk/www/tc/stocks/realtime/quote.php?code={int(code)}"},
-                {"name": "腾讯", "url": f"https://gu.qq.com/hk{code}"}]
+                {"name": "港交所", "url": f"https://www.hkex.com.hk/Market-Data/Securities-Prices/Equities/Equities-Quote?sym={int(code)}&sc_lang=zh-HK"}]
     if ticker.market == "kr":
         return [{"name": "Naver", "url": f"https://finance.naver.com/item/main.naver?code={code}"}]
     return [{"name": "腾讯", "url": f"https://gu.qq.com/{ticker.market}{code}"},
@@ -7658,7 +7660,9 @@ function ages(it){  // when this card's price and book were last read, and what 
   if(it.quote_ms){const s=$("span");s.append("行情 ",ageSpan(it.quote_ms,300e3));row.append(s)}
   if(book&&isFinite(book)){const s=$("span");s.append("盘口 ",ageSpan(book,90e3));row.append(s)}  // a ladder: its oldest level
   if(it.source)row.append($("span","src",it.source));
+  if(it.feed){const s=$("span","src",it.feed+(it.quote_ms?" "+hms(it.quote_ms):""));s.title="这个价格来自哪个行情源，以及该源给出的报价时间（北京时间）；竞价期间这就是参考平衡价的更新时间";row.append(s)}
   return row.childNodes.length?row:null}
+function hms(ms){try{return new Date(ms).toLocaleTimeString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false})}catch(e){const d=new Date(ms);return two(d.getHours())+":"+two(d.getMinutes())+":"+two(d.getSeconds())}}
 function matches(it){  // the filter bar: every chip that is on must hold for one and the same suggestion
   const v=view(it);let pool=v.ok;
   if(filt.includes("no"))pool=pool.filter(e=>!e.up);
@@ -7680,7 +7684,7 @@ function pointsPill(p){  // LP points: blue ● with the hourly rate when a quot
   x.title=(rate?"有积分（每小时 "+rate+" PP），但现在拿不到：":"")+(p.points_why||p.points_note||"积分未激活");x.setAttribute("aria-label",x.title);return x}
 function book(p,key,pages){
   const w=$("div","pb"),q=$("div","quote");q.append(openLink(p.url));w.append(q);
-  (pages||[]).forEach(g=>{const a=$("a","pt pg",g.name+" ↗");a.href=g.url;a.target="_blank";a.rel="noopener noreferrer";a.title="在新标签页打开 "+g.name+" 的行情页：竞价时看当前价（参考平衡价）和更新时间，别只看逐笔成交";q.append(a)});
+  (pages||[]).slice(0,3).forEach(g=>{const a=$("a","pt pg",g.name+" ↗");a.href=g.url;a.target="_blank";a.rel="noopener noreferrer";a.title="在新标签页打开 "+g.name+" 的行情页：竞价时看当前价（参考平衡价）和更新时间，别只看逐笔成交";q.append(a)});
   const has=p.bids||p.asks;
   if(has&&!(p.bids||[]).length&&!(p.asks||[]).length){q.append($("span","mut","暂无挂单"));if(p.stale)q.append($("span","warn",p.age+" 秒前"))}
   else if(has){const b=p.bids[0],k=p.asks[0],lv=(t,l)=>{const x=$("span","",t+" ");x.append($("b","",l?cent(l[0]):"无"));if(l)x.append("×"+qk(l[1]));if(l)x.title=qty(l[1])+" 份";return x};
@@ -10524,13 +10528,22 @@ class Bot:
         the page can patch a card's headline in place between full answers."""
         return {
             "eff_label": "竞价" if odds.preopen else "今日" if odds.direct else "隐含" if name == "上证指数" else "估算",  # A50-implied, not an SSE print
-            "quote_ms": self.odds_quote_ms(title, odds),
+            "quote_ms": self.odds_quote_ms(title, odds), "feed": self.quote_feed(title, odds),
             "source": "竞价参考价" if odds.preopen else "现货" if odds.direct else "代理估算·近似锚点" if "近似" in odds.warn else "代理估算",
             "ref": fmt(odds.ref), "effective": fmt(odds.effective.quantize(D("0.0001"))),
             "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note, "warn": odds.warn,
             "sigma": odds.sigma, "remaining": odds.remaining, "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
             "fair_up": odds.fair_up, "fair_down": odds.fair_down,
         }
+
+    def quote_feed(self, title: str, odds: CloseOdds) -> str:
+        """The feed a contract card's own price came from (腾讯 / 新浪 / Naver) while it prices the stock itself, "" when
+        the price is a proxy's estimate: the card says which source and when it quoted, so the figure can be checked
+        against that source's page."""
+        if not odds.direct or "｜" not in title:
+            return ""
+        q = self.stocks.live.get(title.split("｜")[-1])
+        return q.source if q is not None else ""
 
     def live_payload(self) -> dict:
         """The index and contract cards' live numbers for the page's event stream (/events): every item data.json has
@@ -12249,6 +12262,60 @@ class Bot:
                         self.store.put(key, self.market.now_ms())
                 self.deliver(key, send)
 
+    async def preopen_price_alerts(self, now_ms: int) -> None:
+        """Once per venue, day and subscription, as soon as a contract card prices its stock off the pre-open auction's
+        indicative price (the first direction signal of the day, read while the auction runs): each of the venue's
+        cards with its reference price against that indicative price, the model, the Predict book's best way, and
+        where to watch it. Cards whose feed shows no indicative price yet say so."""
+        if not self.config.preopen_alert or not self.config.probability:
+            return
+        for market in PRE_AUCTIONS:
+            if market == "sz" or not preopen_running(market, now_ms, self.config.holidays.get(market, frozenset())):
+                continue
+            local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+            day_key = f"preopenprice:{market}:{local.date().isoformat()}"
+            if self.store.get(day_key):
+                continue
+            venues = {market, "sz"} if market == "sh" else {market}
+            items = [(title, odds) for title, odds in self.odds_items(now_ms)
+                     if "｜" in title and self.item_market(title) in venues]
+            if not any(isinstance(odds, CloseOdds) and odds.preopen for _, odds in items):
+                continue  # no indicative price read yet
+            due = [(sub_id, sub) for sub_id, sub in self.subscriptions().items() if sub.get("active")
+                   and not self.store.get(f"{day_key}:{sub_id}") and not self.delivering(f"{day_key}:{sub_id}")]
+            if not due:
+                continue
+            window = preopen_window(market, now_ms) or PRE_AUCTIONS[market]
+            text = self.preopen_price_text(window, items, now_ms)
+
+            def fresh(built: int = now_ms, market: str = market) -> bool:
+                current = self.market.now_ms()
+                return current - built <= self.AUCTION_FRESH_MS and preopen_running(market, current, self.config.holidays.get(market, frozenset()))
+            for sub_id, sub in due:
+                key = f"{day_key}:{sub_id}"
+
+                async def send(sub: dict = sub, key: str = key, text: str = text, fresh: Any = fresh) -> None:
+                    if await self.tell(sub["chat"], sub["thread"], text, html_mode=True, fresh=fresh):
+                        self.store.put(key, self.market.now_ms())
+                self.deliver(key, send)
+
+    def preopen_price_text(self, window: tuple, items: list[tuple[str, CloseOdds | str]], now_ms: int) -> str:
+        label = window[2].partition("（")[0]
+        lines = [f"📊 {bold(label + '：参考平衡价出现')}（{hhmm(now_ms)}）",
+                 "这是今天第一个方向信号，撮合前还会变；竞价高开或低开不等于当天收涨或收跌。"]
+        for title, odds in items:
+            lines.append("\n" + bold(f"📍 {title}"))
+            if isinstance(odds, CloseOdds) and odds.preopen:
+                rows = self.card_rows(title, odds, now_ms, "竞价参考")
+                rows[0] += f"｜{odds.proxy_note.partition('（')[2].rstrip('）')}"
+            else:
+                rows = [f"尚无参考平衡价：{odds.proxy_note.rpartition('｜')[2] if isinstance(odds, CloseOdds) else odds}"]
+            symbol = title.split("｜")[-1]
+            if symbol in self.config.tickers:
+                rows.append("看竞价行情：" + "｜".join(f"{g['name']} {g['url']}" for g in quote_pages(self.config.tickers[symbol])))
+            lines.extend(tree(rows))
+        return "\n".join(lines)
+
     def preopen_text(self, window: tuple, start: dt.datetime, symbols: list[str], odds: dict, now_ms: int) -> str:
         lead = self.config.preopen_lead
         label = window[2]
@@ -12740,6 +12807,7 @@ class Bot:
         try:
             await self.auction_reminders(now_ms)
             await self.preopen_reminders(now_ms)
+            await self.preopen_price_alerts(now_ms)
         except Exception as error:  # a reminder must never block price alerts
             self.log_limited("auction", f"集合竞价提醒失败：{clean_error(error)}")
         try:
