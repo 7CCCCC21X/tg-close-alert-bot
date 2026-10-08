@@ -142,6 +142,50 @@ async def run():
     o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
     assert "现货行情已超 10 分钟未更新" in o.proxy_note and "报价停在 09-28 09:33" in hbot.stocks.live_errors["HK0625USDT"], hbot.stocks.live_errors
 
+    # --- the pre-open auction (HK 09:00–09:30): the indicative price is read from 09:00, labelled, never mistaken for a trade
+    assert m.stock_quote_window("hk", bj(9, 28, 8, 59)) is None and m.stock_quote_window("hk", bj(9, 28, 9, 0))[0] == bj(9, 28, 9, 0)
+    assert m.stock_quote_window("sh", bj(9, 28, 9, 14)) is None and m.stock_quote_window("sh", bj(9, 28, 9, 15))[0] == bj(9, 28, 9, 15)
+    assert m.stock_quote_window("kr", kr(9, 28, 8, 29)) is None and m.stock_quote_window("kr", kr(9, 28, 8, 30))[0] == kr(9, 28, 8, 30)
+    assert m.stock_quote_window("hk", bj(9, 28, 16, 24))[1] == bj(9, 28, 16, 25) and m.stock_quote_window("hk", bj(9, 26, 9, 5)) is None
+    assert m.stock_live_window("hk", bj(9, 28, 9, 5)) is None  # continuous trading itself still starts at 09:30
+    hk = lambda cur, prev, when: ('v_r_hk00625="100~希音~00625~' + f"{cur}~{prev}~35.00~" + "~".join(["0"] * 24) + f'~{when}~x";').encode("gbk")
+    feed = {"raw": hk("35.10", "35.10", "2026/09/25 16:08:00")}  # still Friday's close
+    async def hk_now(url, timeout=15, headers=None): return feed["raw"]
+    m.http_get = hk_now
+    t = bj(9, 28, 9, 5)
+    assert await hbot.stocks.refresh_live(t, force=True) is not False  # the auction has started: the quote is read
+    o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
+    assert o.proxy_note.startswith("币安") and o.proxy_note.endswith("｜开市前竞价进行中，行情源还没给出今日参考价，暂用币安"), o.proxy_note
+    feed["raw"] = hk("35.10", "35.10", "2026/09/28 09:02:00")  # stamped today, but 0%: no indicative price yet
+    await hbot.stocks.refresh_live(t, force=True)
+    o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
+    assert o.proxy_note.endswith("｜开市前竞价进行中，现价仍等于昨收（尚无参考平衡价），暂用币安"), o.proxy_note
+    feed["raw"] = hk("35.60", "35.10", "2026/09/28 09:05:10")  # the indicative price: the day's price, with the match still to come
+    await hbot.stocks.refresh_live(t, force=True)
+    o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
+    assert isinstance(o, m.CloseOdds) and o.effective == D("35.60") and o.ref == D("35.10") and o.preopen and o.direct and o.mode == "盘中", o
+    assert o.proxy_note == "港交所开市前竞价参考价 35.6（腾讯·09:05 更新；撮合前仍会变动）", o.proxy_note
+    assert abs(o.remaining - (1.0 + 30 / 330)) < 1e-9 and "（竞价参考 35.6·σ" in o.row(), (o.remaining, o.row())
+    # it may sit still for the whole auction without going stale; from 09:30 the usual ten-minute clock applies
+    o2 = hbot.contract_odds("HK0625USDT", D("35.60"), bj(9, 28, 9, 25))
+    assert o2.preopen and o2.effective == D("35.60")
+    o3 = hbot.contract_odds("HK0625USDT", D("35.60"), bj(9, 28, 9, 31))
+    assert not o3.preopen and "现货行情已超 10 分钟未更新" in o3.proxy_note, o3.proxy_note
+    # the card: the price labelled 竞价, the source 竞价参考价, the tag and the pages to watch the auction on
+    hbot.market.now = t
+    hbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", o)]
+    card = hbot.odds_payload()["items"][0]
+    assert card["eff_label"] == "竞价" and card["source"] == "竞价参考价" and card["effective"] == "35.6" and card["quote_ms"] == bj(9, 28, 9, 5, 10), card
+    assert card["preopen"].startswith("港交所开市前竞价") and "trading" not in card and [g["name"] for g in card["pages"]] == ["富途", "etnet", "腾讯"], card
+    feed["raw"] = hk("35.55", "35.10", "2026/09/28 09:30:40")  # the first continuous print
+    await hbot.stocks.refresh_live(bj(9, 28, 9, 31), force=True)
+    o4 = hbot.contract_odds("HK0625USDT", D("35.60"), bj(9, 28, 9, 31))
+    assert o4.direct and not o4.preopen and o4.proxy_note == "港交所现货 35.55（腾讯·盘中直接用现货）" and abs(o4.remaining - 329 / 330) < 1e-9, o4
+    hbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", o4)]
+    hbot.market.now = bj(9, 28, 9, 31)
+    card = hbot.odds_payload()["items"][0]
+    assert card["eff_label"] == "今日" and card["source"] == "现货" and card["trading"] == "开盘中" and "preopen" not in card, card
+
     # Several A-share / HK stocks: one Tencent request for all of them per round (1-second polling); Sina is asked only
     # for the codes Tencent left stale or unknown, and only for those
     m.SOURCE_HEALTH.hosts.clear()

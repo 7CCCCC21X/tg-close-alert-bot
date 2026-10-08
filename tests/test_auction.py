@@ -1,4 +1,4 @@
-import asyncio, sys, time, datetime as dt
+import asyncio, re, sys, time, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
@@ -77,6 +77,85 @@ async def run():
     off = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "AUCTION_ALERT": "off"}), m.Store(":memory:"), FakeMarket(), FakeTelegram())
     off.store.put("subscriptions", bot.subscriptions()); off.odds_items = bot.odds_items
     await off.auction_reminders(bj(9, 29, 14, 57, 10)); await off.drain_deliveries(); assert len(sent) == 2
+
+    # --- pre-open auctions: the windows (Beijing time), the reminder before them, the card's tag and quote pages --------
+    assert m.preopen_running("hk", bj(10, 8, 9, 0)) and m.preopen_running("hk", bj(10, 8, 9, 29, 59)) and not m.preopen_running("hk", bj(10, 8, 9, 30))
+    assert not m.preopen_running("hk", bj(10, 8, 8, 59, 59)) and not m.preopen_running("hk", bj(10, 10, 9, 5))      # Saturday
+    assert not m.preopen_running("hk", bj(10, 1, 9, 5), frozenset({dt.date(2026, 10, 1)}))                            # holiday
+    assert m.preopen_running("sh", bj(10, 8, 9, 15)) and m.preopen_running("sz", bj(10, 8, 9, 29)) and not m.preopen_running("sh", bj(10, 8, 9, 14))
+    assert m.preopen_running("kr", bj(10, 8, 7, 30)) and not m.preopen_running("kr", bj(10, 8, 8, 0)) and not m.preopen_running("us", bj(10, 8, 9, 5))
+    assert m.preopen_window("hk", bj(10, 8, 9, 0))[2] == "港交所开市前竞价（09:00–09:30，09:20–09:22 随机撮合，09:30 连续交易）"
+    assert m.preopen_window("kr", bj(11, 19, 8, 30))[:2] == (dt.time(8, 30), dt.time(9, 0)) and "高考日" in m.preopen_window("kr", bj(11, 19, 8, 30))[2]
+    assert m.preopen_window("kr", bj(11, 18, 8, 30))[:2] == (dt.time(7, 30), dt.time(8, 0))
+    assert m.quote_pages(m.StockTicker("hk", "00625")) == [
+        {"name": "富途", "url": "https://www.futunn.com/stock/00625-HK"},
+        {"name": "etnet", "url": "https://www.etnet.com.hk/www/tc/stocks/realtime/quote.php?code=625"},
+        {"name": "腾讯", "url": "https://gu.qq.com/hk00625"}]
+    assert m.quote_pages(m.StockTicker("sh", "688836"))[0] == {"name": "腾讯", "url": "https://gu.qq.com/sh688836"}
+    assert m.quote_pages(m.StockTicker("kr", "000660")) == [{"name": "Naver", "url": "https://finance.naver.com/item/main.naver?code=000660"}]
+    pcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "HK0625USDT,UNITREEUSDT,SKHYNIXUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
+    assert pcfg.preopen_alert and pcfg.preopen_lead == 5
+    assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREOPEN_ALERT_LEAD_MINUTES": "0"}).preopen_lead == 0
+    for bad in ({"PREOPEN_ALERT_LEAD_MINUTES": "61"}, {"PREOPEN_ALERT_LEAD_MINUTES": "x"}):
+        try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
+        except ValueError: pass
+    sent.clear()
+    pbot = m.Bot(pcfg, m.Store(":memory:"), FakeMarket(), FakeTelegram())
+    pbot.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
+    shein = m.close_odds("SHEIN 希音", D("38.10"), D("38.30"), 0.025, 1.0, dt.date(2026, 10, 8), D("0.01"), "10-07 收盘",
+                         "币安 38.30 / 收盘时刻 38.10 → +0.525%", "σ")
+    pbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", shein), ("宇树 UNITREE｜UNITREEUSDT", uni), ("SK 海力士｜SKHYNIXUSDT", "等待行情")]
+    pbot.predict.books["HK0625USDT"] = m.PredictBook("HK0625USDT", "s", "1", "t", ((D("0.50"), D("10")),), ((D("0.53"), D("10")),), bj(10, 8, 8, 55))
+    now["ms"] = bj(10, 8, 8, 50)
+    await pbot.preopen_reminders(now["ms"]); await pbot.drain_deliveries(); assert sent == []  # ten minutes early: not yet
+    now["ms"] = bj(10, 8, 8, 55, 30)  # five minutes before 09:00: the HK reminder, with the HK card only
+    await pbot.preopen_reminders(now["ms"]); await pbot.drain_deliveries()
+    assert len(sent) == 1, sent
+    plain = lambda t: re.sub(r"</?b>", "", t)  # the bold tags of the HTML message
+    text = plain(sent[0])
+    assert text.startswith("🔔 港交所开市前竞价 5 分钟后开始（09:00–09:30，09:20–09:22 随机撮合，09:30 连续交易）\n竞价一开始就有方向信息，撮合可能早于连续交易："), text
+    assert "📍 SHEIN 希音｜HK0625USDT" in text and "昨收 38.1 → 估算 38.3（+0.52%）" in text and "（按币安代理估算，竞价参考价出来后会更新）" in text, text
+    assert "Predict 买1 50.0¢｜卖1 53.0¢" in text and "宇树" not in text and "海力士" not in text, text
+    assert text.endswith("└ 看竞价行情：富途 https://www.futunn.com/stock/00625-HK｜etnet https://www.etnet.com.hk/www/tc/stocks/realtime/quote.php?code=625｜腾讯 https://gu.qq.com/hk00625"), text
+    now["ms"] = bj(10, 8, 8, 56)
+    await pbot.preopen_reminders(now["ms"]); await pbot.drain_deliveries(); assert len(sent) == 1  # not again the same day
+    # the A-share one ten minutes later (09:10) lists the A-share card; Korea's came at 07:25 Beijing (08:25 Seoul)
+    now["ms"] = bj(10, 8, 9, 10, 15)
+    await pbot.preopen_reminders(now["ms"]); await pbot.drain_deliveries()
+    assert len(sent) == 2 and plain(sent[1]).startswith("🔔 沪深开盘集合竞价 5 分钟后开始（09:15–09:25") and "宇树 UNITREE" in sent[1] and "SHEIN" not in sent[1], sent[1]
+    assert "看竞价行情：腾讯 https://gu.qq.com/sh688836｜东方财富 https://quote.eastmoney.com/sh688836.html｜富途 https://www.futunn.com/stock/688836-SH" in sent[1], sent[1]
+    now["ms"] = bj(10, 8, 7, 25, 40)
+    await pbot.preopen_reminders(now["ms"]); await pbot.drain_deliveries()
+    assert len(sent) == 3 and plain(sent[2]).startswith("🔔 韩交所开盘同时呼价 5 分钟后开始（首尔 08:30–09:00") and "概率暂缺：等待行情" in sent[2], sent[2]
+    assert "Naver https://finance.naver.com/item/main.naver?code=000660" in sent[2]
+    # a restart that joins late (3 minutes after the moment) does not send a stale reminder; a holiday has none
+    late = m.Bot(pcfg, m.Store(":memory:"), FakeMarket(), FakeTelegram()); late.store.put("subscriptions", pbot.subscriptions()); late.odds_items = pbot.odds_items
+    now["ms"] = bj(10, 8, 8, 58, 30)
+    await late.preopen_reminders(now["ms"]); await late.drain_deliveries(); assert len(sent) == 3
+    now["ms"] = bj(10, 1, 8, 55, 30)  # National Day: HKEX shut
+    await late.preopen_reminders(now["ms"]); await late.drain_deliveries(); assert len(sent) == 3
+    # lead 0: at the start; PREOPEN_ALERT=off: nothing
+    zcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "HK0625USDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "PREOPEN_ALERT_LEAD_MINUTES": "0"})
+    zbot = m.Bot(zcfg, m.Store(":memory:"), FakeMarket(), FakeTelegram()); zbot.store.put("subscriptions", pbot.subscriptions()); zbot.odds_items = pbot.odds_items
+    now["ms"] = bj(10, 9, 9, 0, 20)
+    await zbot.preopen_reminders(now["ms"]); await zbot.drain_deliveries()
+    assert len(sent) == 4 and plain(sent[3]).startswith("🔔 港交所开市前竞价 开始（09:00–09:30"), sent[3]
+    ocfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "HK0625USDT", "PREOPEN_ALERT": "off"})
+    obot = m.Bot(ocfg, m.Store(":memory:"), FakeMarket(), FakeTelegram()); obot.store.put("subscriptions", pbot.subscriptions()); obot.odds_items = pbot.odds_items
+    now["ms"] = bj(10, 12, 8, 55, 20)
+    await obot.preopen_reminders(now["ms"]); await obot.drain_deliveries(); assert len(sent) == 4
+    # the web card: an orange 开市前竞价 tag while the auction runs (the contract cards only), and the quote pages always
+    now["ms"] = bj(10, 8, 9, 5)
+    items = {i["name"]: i for i in pbot.odds_payload()["items"]}
+    assert items["SHEIN 希音"]["preopen"].startswith("港交所开市前竞价") and "trading" not in items["SHEIN 希音"], items["SHEIN 希音"]
+    assert items["SHEIN 希音"]["pages"][0] == {"name": "富途", "url": "https://www.futunn.com/stock/00625-HK"} and len(items["SHEIN 希音"]["pages"]) == 3
+    assert items["宇树 UNITREE"]["trading"] == "未开盘" and "preopen" not in items["宇树 UNITREE"] and items["宇树 UNITREE"]["pages"][0]["name"] == "腾讯"
+    now["ms"] = bj(10, 8, 9, 20)
+    items = {i["name"]: i for i in pbot.odds_payload()["items"]}
+    assert items["宇树 UNITREE"]["preopen"].startswith("沪深开盘集合竞价") and items["SHEIN 希音"]["preopen"]
+    now["ms"] = bj(10, 8, 9, 31)
+    items = {i["name"]: i for i in pbot.odds_payload()["items"]}
+    assert "preopen" not in items["SHEIN 希音"] and items["SHEIN 希音"]["trading"] == "开盘中"
 
 asyncio.run(run())
 print("AUCTION_OK")
