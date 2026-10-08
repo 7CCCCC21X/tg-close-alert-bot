@@ -87,6 +87,13 @@ async def run():
     assert m.preopen_window("hk", bj(10, 8, 9, 0))[2] == "港交所开市前竞价（09:00–09:30，09:20–09:22 随机撮合，09:30 连续交易）"
     assert m.preopen_window("kr", bj(11, 19, 8, 30))[:2] == (dt.time(8, 30), dt.time(9, 0)) and "高考日" in m.preopen_window("kr", bj(11, 19, 8, 30))[2]
     assert m.preopen_window("kr", bj(11, 18, 8, 30))[:2] == (dt.time(7, 30), dt.time(8, 0))
+    # the phases: orders withdrawable, then not, HK's random match, then the matched open until continuous trading
+    assert [m.preopen_phase("hk", bj(10, 8, 9, mi, sec)) for mi, sec in ((0, 0), (14, 59), (15, 0), (19, 59), (20, 0), (21, 59), (22, 0), (29, 59), (30, 0))] == [
+        "可撤单", "可撤单", "不可撤单", "不可撤单", "随机撮合", "随机撮合", "已撮合", "已撮合", ""]
+    assert [m.preopen_phase("sh", bj(10, 8, 9, mi)) for mi in (14, 15, 19, 20, 24, 25, 29, 30)] == ["", "可撤单", "可撤单", "不可撤单", "不可撤单", "已撮合", "已撮合", ""]
+    assert m.preopen_phase("sz", bj(10, 8, 9, 21)) == "不可撤单" and m.preopen_phase("kr", bj(10, 8, 7, 59)) == "可撤单" and m.preopen_phase("kr", bj(10, 8, 8, 0)) == ""
+    assert m.preopen_phase("kr", bj(11, 19, 8, 30)) == "可撤单" and m.preopen_phase("kr", bj(11, 19, 7, 45)) == ""  # the late day, an hour on
+    assert m.preopen_phase("hk", bj(10, 1, 9, 5), frozenset({dt.date(2026, 10, 1)})) == "" and m.preopen_phase("us", bj(10, 8, 9, 5)) == ""
     assert m.quote_pages(m.StockTicker("hk", "00625")) == [
         {"name": "富途", "url": "https://www.futunn.com/stock/00625-HK"},
         {"name": "AAStocks", "url": "https://www.aastocks.com/tc/stocks/quote/detail-quote.aspx?symbol=00625"},
@@ -151,39 +158,54 @@ async def run():
     # the web card: an orange 开市前竞价 tag while the auction runs (the contract cards only), and the quote pages always
     now["ms"] = bj(10, 8, 9, 5)
     items = {i["name"]: i for i in pbot.odds_payload()["items"]}
-    assert items["SHEIN 希音"]["preopen"].startswith("港交所开市前竞价") and "trading" not in items["SHEIN 希音"], items["SHEIN 希音"]
+    assert items["SHEIN 希音"]["preopen"].startswith("港交所开市前竞价") and items["SHEIN 希音"]["preopen_phase"] == "可撤单" and "trading" not in items["SHEIN 希音"], items["SHEIN 希音"]
+    assert "preopen_price" not in items["SHEIN 希音"]  # no quote read: nothing to show
     assert items["SHEIN 希音"]["pages"][0] == {"name": "富途", "url": "https://www.futunn.com/stock/00625-HK"} and len(items["SHEIN 希音"]["pages"]) == 5
     assert items["宇树 UNITREE"]["trading"] == "未开盘" and "preopen" not in items["宇树 UNITREE"] and items["宇树 UNITREE"]["pages"][0]["name"] == "腾讯"
     now["ms"] = bj(10, 8, 9, 20)
     items = {i["name"]: i for i in pbot.odds_payload()["items"]}
-    assert items["宇树 UNITREE"]["preopen"].startswith("沪深开盘集合竞价") and items["SHEIN 希音"]["preopen"]
+    assert items["宇树 UNITREE"]["preopen"].startswith("沪深开盘集合竞价") and items["宇树 UNITREE"]["preopen_phase"] == "不可撤单" and items["SHEIN 希音"]["preopen_phase"] == "随机撮合"
+    now["ms"] = bj(10, 8, 9, 26)
+    assert {i["name"]: i for i in pbot.odds_payload()["items"]}["宇树 UNITREE"]["preopen_phase"] == "已撮合"
     now["ms"] = bj(10, 8, 9, 31)
     items = {i["name"]: i for i in pbot.odds_payload()["items"]}
     assert "preopen" not in items["SHEIN 希音"] and items["SHEIN 希音"]["trading"] == "开盘中"
 
-    # --- the indicative price's own message: sent once the card prices off it, once per venue and day -----------------
+    # --- the indicative price's own message: once orders cannot be withdrawn and a card prices off it; once per venue and day
     now["ms"] = bj(10, 8, 9, 5)
     await pbot.preopen_price_alerts(now["ms"]); await pbot.drain_deliveries(); assert len(sent) == 4  # the card still rests on Binance
     iep = m.close_odds("SHEIN 希音", D("38.10"), D("38.30"), 0.025, 1.09, dt.date(2026, 10, 8), D("0.01"), "10-07 收盘",
-                       "港交所开市前竞价参考价 38.3（腾讯·09:06 更新；撮合前仍会变动）", "σ")
-    assert iep.preopen and iep.direct
+                       "港交所开市前竞价参考价 38.3（腾讯·09:16 更新；不可撤单阶段，撮合前仍会变）", "σ")
+    assert iep.preopen and iep.direct and not iep.matched
     pbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", iep), ("宇树 UNITREE｜UNITREEUSDT", uni), ("SK 海力士｜SKHYNIXUSDT", "等待行情")]
+    pbot.predict.books["HK0625USDT"] = m.dataclasses.replace(pbot.predict.books["HK0625USDT"], fetched_ms=now["ms"])
+    await pbot.preopen_price_alerts(now["ms"]); await pbot.drain_deliveries(); assert len(sent) == 4  # 09:05: orders can still be withdrawn
+    now["ms"] = bj(10, 8, 9, 16)
     pbot.predict.books["HK0625USDT"] = m.dataclasses.replace(pbot.predict.books["HK0625USDT"], fetched_ms=now["ms"])
     await pbot.preopen_price_alerts(now["ms"]); await pbot.drain_deliveries()
     assert len(sent) == 5, sent[4:]
     text = plain(sent[4])
-    assert text.startswith("📊 港交所开市前竞价：参考平衡价出现（09:05）\n这是今天第一个方向信号，撮合前还会变"), text
-    assert "📍 SHEIN 希音｜HK0625USDT\n├ 昨收 38.1 → 竞价参考 38.3（+0.52%）｜腾讯·09:06 更新；撮合前仍会变动\n├ 模型 涨 " in text, text
+    assert text.startswith("📊 港交所开市前竞价：不可撤单阶段，参考平衡价（09:16）\n撤不了单了，参考价比可撤单时可信"), text
+    assert "📍 SHEIN 希音｜HK0625USDT\n├ 昨收 38.1 → 竞价参考 38.3（+0.52%）｜腾讯·09:16 更新；不可撤单阶段，撮合前仍会变\n├ 模型 涨 " in text, text
     assert "Predict 买1 50.0¢｜卖1 53.0¢" in text and "看竞价行情：富途 https://www.futunn.com/stock/00625-HK" in text and "宇树" not in text, text
-    now["ms"] = bj(10, 8, 9, 12)
+    now["ms"] = bj(10, 8, 9, 21)
     await pbot.preopen_price_alerts(now["ms"]); await pbot.drain_deliveries(); assert len(sent) == 5  # once a day
     # the A-share venue: its cards have no indicative price (Unitree still prices off Binance): nothing
-    now["ms"] = bj(10, 8, 9, 16)
+    now["ms"] = bj(10, 8, 9, 21)
     await pbot.preopen_price_alerts(now["ms"]); await pbot.drain_deliveries(); assert len(sent) == 5
+    # a matched open (another day) is announced as such
+    opened = m.close_odds("SHEIN 希音", D("38.10"), D("38.25"), 0.025, 1.0, dt.date(2026, 10, 9), D("0.01"), "10-08 收盘",
+                          "港交所开盘价已撮合 38.25（腾讯·09:21 更新；09:30 起连续交易）", "σ")
+    assert opened.matched and opened.direct and not opened.preopen and "（开盘价 38.25·σ" in opened.row()
+    pbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", opened)]
+    now["ms"] = bj(10, 9, 9, 23)
+    pbot.predict.books["HK0625USDT"] = m.dataclasses.replace(pbot.predict.books["HK0625USDT"], fetched_ms=now["ms"])
+    await pbot.preopen_price_alerts(now["ms"]); await pbot.drain_deliveries()
+    assert len(sent) == 6 and plain(sent[5]).startswith("📊 港交所开市前竞价：开盘价已撮合（09:23）\n开盘价定了") and "昨收 38.1 → 开盘价 38.25（+0.39%）" in plain(sent[5]), sent[5]
     # a venue whose auction is over sends none even with such odds lingering
     fresh_bot = m.Bot(pcfg, m.Store(":memory:"), FakeMarket(), FakeTelegram()); fresh_bot.store.put("subscriptions", pbot.subscriptions()); fresh_bot.odds_items = pbot.odds_items
     now["ms"] = bj(10, 8, 9, 31)
-    await fresh_bot.preopen_price_alerts(now["ms"]); await fresh_bot.drain_deliveries(); assert len(sent) == 5
+    await fresh_bot.preopen_price_alerts(now["ms"]); await fresh_bot.drain_deliveries(); assert len(sent) == 6
 
 asyncio.run(run())
 print("AUCTION_OK")

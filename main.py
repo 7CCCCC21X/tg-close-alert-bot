@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.35.2"
+VERSION = "1.35.3"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -3490,14 +3490,19 @@ class CloseOdds:
 
     @property
     def direct(self) -> bool:
-        """The effective price is the underlying's own live print (or its pre-open auction's indicative price), not a
-        proxy-mapped estimate."""
-        return "直接用现货" in self.proxy_note or self.preopen
+        """The effective price is the underlying's own print (live, the pre-open auction's indicative price once orders
+        cannot be withdrawn, or the matched opening price), not a proxy-mapped estimate."""
+        return "直接用现货" in self.proxy_note or self.preopen or self.matched
 
     @property
     def preopen(self) -> bool:
         """The effective price is the pre-open auction's indicative price (参考平衡价): the open is not matched yet."""
         return "开市前竞价参考价" in self.proxy_note
+
+    @property
+    def matched(self) -> bool:
+        """The effective price is the opening price the auction matched, before continuous trading."""
+        return "开盘价已撮合" in self.proxy_note
 
     @property
     def move(self) -> float:
@@ -3523,7 +3528,7 @@ class CloseOdds:
     def row(self) -> str:
         """Compact status row: '🎲 09-28收 涨 41.0¢｜跌 59.0¢（有效 6,958.67·σ 3.02%）'."""
         return (f"🎲 {self.target.strftime('%m-%d')}收 涨 {bold(f'{self.fair_up * 100:.1f}¢')}｜跌 {bold(f'{self.fair_down * 100:.1f}¢')}"
-                f"（{'竞价参考' if self.preopen else '有效'} {fmt(self.effective.quantize(D('0.01')))}·σ {self.sigma * 100:.2f}%）")
+                f"（{'开盘价' if self.matched else '竞价参考' if self.preopen else '有效'} {fmt(self.effective.quantize(D('0.01')))}·σ {self.sigma * 100:.2f}%）")
 
     def detail(self) -> list[str]:
         unit = f" {self.unit}" if self.unit else ""
@@ -4071,6 +4076,33 @@ PRE_AUCTIONS["sz"] = PRE_AUCTIONS["sh"]
 # The indicative price keeps moving until the match: worth about this much continuous trading on top of the whole
 # session still ahead (a 0.5–1% swing of a stock's indicative price before the match is usual).
 PREOPEN_VARIANCE_MINUTES = {"hk": 30.0, "sh": 30.0, "sz": 30.0, "kr": 30.0}
+
+
+# The auction's phases, Beijing time. While orders can still be withdrawn the indicative price is often a probe: shown,
+# not priced on. Once they cannot (HK 09:15, A-shares 09:20) it is priced on, with the match still to move it (new orders
+# may be added). After the match (HK 09:22 at the latest, A-shares 09:25) the quote is the opening price itself, firm
+# until continuous trading at 09:30. KRX allows withdrawal until its 09:00 match, which opens continuous trading.
+PRE_AUCTION_PHASES = {
+    "hk": ((dt.time(9, 0), "可撤单"), (dt.time(9, 15), "不可撤单"), (dt.time(9, 20), "随机撮合"), (dt.time(9, 22), "已撮合")),
+    "sh": ((dt.time(9, 15), "可撤单"), (dt.time(9, 20), "不可撤单"), (dt.time(9, 25), "已撮合")),
+    "kr": ((dt.time(7, 30), "可撤单"),),
+}
+PRE_AUCTION_PHASES["sz"] = PRE_AUCTION_PHASES["sh"]
+PREOPEN_PRICED = {"不可撤单", "随机撮合", "已撮合"}  # the phases whose indicative / matched price the odds rest on
+
+
+def preopen_phase(market: str, now_ms: int, holidays: frozenset = frozenset()) -> str:
+    """Which phase of ``market``'s pre-open auction is on now ("" when none is): the last one begun, Beijing time, an
+    hour later on the KRX late day."""
+    if not preopen_running(market, now_ms, holidays):
+        return ""
+    local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
+    shift = KR_LATE_SHIFT if CALENDAR.late_day(market, local.date()) else dt.timedelta()
+    phase = ""
+    for start, name in PRE_AUCTION_PHASES.get(market, ()):
+        if (dt.datetime.combine(local.date(), start, BEIJING) + shift).time() <= local.time():
+            phase = name
+    return phase
 
 
 def preopen_window(market: str, now_ms: int) -> tuple[dt.time, dt.time, str] | None:
@@ -7902,7 +7934,8 @@ function card(it,g){
     const k=it.name+"|"+(it.symbol||"");if(seen[k]&&seen[k]<it.day)rolled[k]=Date.now();seen[k]=it.day;
     if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");t.className="tag new";t.textContent+=" 新"}}
   if(it.auction){const a=$("span","tag auc","集合竞价");a.title=it.auction+"：此时价格基本就是收盘价";tg.append(a)}
-  else if(it.preopen){const a=$("span","tag auc","开市前竞价");a.title=it.preopen+"：现价是参考平衡价，撮合前仍会变动；竞价高开或低开不等于当天收涨或收跌";tg.append(a)}
+  else if(it.preopen){const ph=it.preopen_phase||"",a=$("span","tag auc","竞价·"+(ph||"进行中"));
+    a.title=it.preopen+"："+({"可撤单":"还能撤单，参考价常是试探：只展示，概率仍按币安代理算","不可撤单":"不能撤单了，参考价比之前可信，加单仍会改变它，概率按它算","随机撮合":"随机撮合中，概率按参考价算","已撮合":"开盘价已定，概率按它算，连续交易 09:30 开始"}[ph]||"")+"；竞价高开或低开不等于当天收涨或收跌";tg.append(a)}
   else if(it.trading){const a=$("span","tag "+(it.trading==="开盘中"?"open":"lunch"),it.trading);
     a.title={"开盘中":"交易所连续交易中：直接用现货相对昨收","午休":"午间休市","未开盘":"今日尚未开盘：按代理估算",
       "已收盘":"今日已收盘","休市":"今天不是交易日"}[it.trading]||"";tg.append(a)}
@@ -7950,7 +7983,8 @@ function card(it,g){
   // 昨收 1,768,000 · 今日 1,769,000 (while trading) / 今收 … · 估算 … (after the close: the proxy's view of the next close)
   sm.append($("span","rd",it.ref_rel||it.ref_day||"参考"),$("span","v",it.ref),$("span","rd sep",it.eff_label||"→"),$("span","v",like(it.effective,it.ref)));
   if(it.unit)sm.append($("span","un",it.unit));
-  sm.title=(it.ref_day?it.ref_day+" 收盘 ":"参考 ")+it.ref+unit+"；"+(it.eff_label==="今日"?"今日现价":it.eff_label==="竞价"?"开市前竞价参考价（撮合前会变）":"按代理估算的下一收盘")+" "+it.effective+unit+"；点开看计算明细";
+  if(it.preopen_price&&it.eff_label!=="竞价"&&it.eff_label!=="开盘价"){const pv=$("span","v",it.preopen_price);pv.title="开市前竞价的参考价（"+(it.preopen_phase||"")+"阶段）：只展示，概率按币安代理算";sm.append($("span","rd sep","竞价"),pv,$("span","un",it.preopen_phase||""))}
+  sm.title=(it.ref_day?it.ref_day+" 收盘 ":"参考 ")+it.ref+unit+"；"+(it.eff_label==="今日"?"今日现价":it.eff_label==="竞价"?"开市前竞价参考价（撮合前会变）":it.eff_label==="开盘价"?"已撮合的开盘价（连续交易前）":"按代理估算的下一收盘")+" "+it.effective+unit+"；点开看计算明细";
   const chip=$("span","chip",(it.move>=0?"+":"")+it.move.toFixed(2)+"%");chip.style.color=it.move>0?upColor():it.move<0?downColor():"var(--muted)";sm.append(chip);det.append(sm);
   const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("目标",it.close_label);row("参考",it.ref+unit+"（"+it.ref_note+"）");row("有效",it.effective+unit);row("代理",it.proxy_note);
@@ -10202,6 +10236,10 @@ class Bot:
         unit = "" if ticker.same_unit else ((ref.currency if ref else "") or info.currency)
         live, live_why = self.stocks.live_quote(symbol, now_ms)
         closed_today = close_date == dt.datetime.fromtimestamp(now_ms / 1000, tz).date() and base_ms <= now_ms
+        phase = preopen_phase(ticker.market, now_ms, holidays)
+        if live is not None and phase == "可撤单":
+            # orders can still be withdrawn: the indicative price is often a probe. Shown on the card, not priced on.
+            live, live_why = None, f"开市前竞价可撤单阶段，参考价 {fmt_price(live.last)} 常是试探、仅供参考"
         if live is not None and not closed_today:
             # The stock itself is trading: use its own price, not the Binance proxy.
             same_unit = not live.prev_close or abs(percent(base_value, live.prev_close)) < 20  # a manual close in another unit
@@ -10213,12 +10251,17 @@ class Bot:
                 return "缺少昨收"
             remaining, target = session_remaining(ticker.market, now_ms, None, holidays)
             sigma, sigma_note = self.stock_sigma(symbol, ticker.market, intraday=True)  # today's opening gap has happened
-            if preopen_running(ticker.market, now_ms, holidays):
-                # the auction's indicative price: the gap it shows can still move until the match, worth some minutes
-                # of trading on top of the whole session ahead
+            if phase == "已撮合":
+                # the matched opening price: firm until continuous trading, the whole session ahead of it
+                first = CALENDAR.sessions(ticker.market, dt.datetime.fromtimestamp(now_ms / 1000, tz).date())[0][0]
+                note = (f"{info.name}开盘价已撮合 {fmt_price(live.last)}（{live.source}·{hhmm(live.quoted_ms)} 更新；"
+                        f"{first:%H:%M} 起连续交易）")
+            elif phase:
+                # orders cannot be withdrawn any more, but may still be added until the match: the gap the indicative
+                # price shows can move, worth some minutes of trading on top of the whole session ahead
                 remaining += PREOPEN_VARIANCE_MINUTES.get(ticker.market, 0.0) / session_minutes(ticker.market)
                 note = (f"{info.name}开市前竞价参考价 {fmt_price(live.last)}（{live.source}·{hhmm(live.quoted_ms)} 更新；"
-                        f"撮合前仍会变动）")
+                        f"{phase}阶段，撮合前仍会变）")
             else:
                 note = f"{info.name}现货 {fmt_price(live.last)}（{live.source}·盘中直接用现货）"
             return close_odds(NAMES.get(symbol, symbol), base, live.last, sigma, remaining, target,
@@ -10495,8 +10538,11 @@ class Bot:
                 holidays = self.config.holidays.get(market, frozenset())
                 if auction_running(market, now_ms, holidays):
                     base["auction"] = (auction_window(market, now_ms) or AUCTIONS[market])[2]
-                elif symbol and preopen_running(market, now_ms, holidays):
-                    base["preopen"] = (preopen_window(market, now_ms) or PRE_AUCTIONS[market])[2]
+                elif symbol and (phase := preopen_phase(market, now_ms, holidays)):
+                    base["preopen"], base["preopen_phase"] = (preopen_window(market, now_ms) or PRE_AUCTIONS[market])[2], phase
+                    q, window = self.stocks.live.get(symbol), stock_quote_window(market, now_ms, holidays)
+                    if q is not None and window and q.quoted_ms >= window[0] and not (q.prev_close and q.last == q.prev_close):
+                        base["preopen_price"], base["preopen_at"] = fmt_price(q.last), q.quoted_ms  # the indicative price, whatever the odds rest on
                 elif state := session_state(market, now_ms, holidays):
                     base["trading"] = state
             if symbol and symbol in self.config.tickers:
@@ -10538,9 +10584,10 @@ class Bot:
         """A daily card's figures that move with every quote: shared by data.json and the event stream (live.json), so
         the page can patch a card's headline in place between full answers."""
         return {
-            "eff_label": "竞价" if odds.preopen else "今日" if odds.direct else "隐含" if name == "上证指数" else "估算",  # A50-implied, not an SSE print
+            "eff_label": "开盘价" if odds.matched else "竞价" if odds.preopen else "今日" if odds.direct else "隐含" if name == "上证指数" else "估算",  # A50-implied, not an SSE print
             "quote_ms": self.odds_quote_ms(title, odds), "feed": self.quote_feed(title, odds),
-            "source": "竞价参考价" if odds.preopen else "现货" if odds.direct else "代理估算·近似锚点" if "近似" in odds.warn else "代理估算",
+            "source": ("已撮合开盘价" if odds.matched else "竞价参考价" if odds.preopen else "现货" if odds.direct
+                       else "代理估算·近似锚点" if "近似" in odds.warn else "代理估算"),
             "ref": fmt(odds.ref), "effective": fmt(odds.effective.quantize(D("0.0001"))),
             "move": float(percent(odds.effective, odds.ref)), "proxy_note": odds.proxy_note, "warn": odds.warn,
             "sigma": odds.sigma, "remaining": odds.remaining, "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
@@ -12281,8 +12328,9 @@ class Bot:
         if not self.config.preopen_alert or not self.config.probability:
             return
         for market in PRE_AUCTIONS:
-            if market == "sz" or not preopen_running(market, now_ms, self.config.holidays.get(market, frozenset())):
-                continue
+            phase = preopen_phase(market, now_ms, self.config.holidays.get(market, frozenset()))
+            if market == "sz" or phase not in PREOPEN_PRICED:
+                continue  # while orders can still be withdrawn the indicative price is a probe: nothing to announce
             local = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING)
             day_key = f"preopenprice:{market}:{local.date().isoformat()}"
             if self.store.get(day_key):
@@ -12290,14 +12338,14 @@ class Bot:
             venues = {market, "sz"} if market == "sh" else {market}
             items = [(title, odds) for title, odds in self.odds_items(now_ms)
                      if "｜" in title and self.item_market(title) in venues]
-            if not any(isinstance(odds, CloseOdds) and odds.preopen for _, odds in items):
+            if not any(isinstance(odds, CloseOdds) and (odds.preopen or odds.matched) for _, odds in items):
                 continue  # no indicative price read yet
             due = [(sub_id, sub) for sub_id, sub in self.subscriptions().items() if sub.get("active")
                    and not self.store.get(f"{day_key}:{sub_id}") and not self.delivering(f"{day_key}:{sub_id}")]
             if not due:
                 continue
             window = preopen_window(market, now_ms) or PRE_AUCTIONS[market]
-            text = self.preopen_price_text(window, items, now_ms)
+            text = self.preopen_price_text(window, phase, items, now_ms)
 
             def fresh(built: int = now_ms, market: str = market) -> bool:
                 current = self.market.now_ms()
@@ -12310,14 +12358,18 @@ class Bot:
                         self.store.put(key, self.market.now_ms())
                 self.deliver(key, send)
 
-    def preopen_price_text(self, window: tuple, items: list[tuple[str, CloseOdds | str]], now_ms: int) -> str:
+    def preopen_price_text(self, window: tuple, phase: str, items: list[tuple[str, CloseOdds | str]], now_ms: int) -> str:
         label = window[2].partition("（")[0]
-        lines = [f"📊 {bold(label + '：参考平衡价出现')}（{hhmm(now_ms)}）",
-                 "这是今天第一个方向信号，撮合前还会变；竞价高开或低开不等于当天收涨或收跌。"]
+        if phase == "已撮合":
+            lines = [f"📊 {bold(label + '：开盘价已撮合')}（{hhmm(now_ms)}）",
+                     "开盘价定了，连续交易从 09:30 开始；竞价高开或低开不等于当天收涨或收跌。"]
+        else:
+            lines = [f"📊 {bold(label + '：' + phase + '阶段，参考平衡价')}（{hhmm(now_ms)}）",
+                     "撤不了单了，参考价比可撤单时可信，但加单仍会改变它，撮合后才定；竞价高开或低开不等于当天收涨或收跌。"]
         for title, odds in items:
             lines.append("\n" + bold(f"📍 {title}"))
-            if isinstance(odds, CloseOdds) and odds.preopen:
-                rows = self.card_rows(title, odds, now_ms, "竞价参考")
+            if isinstance(odds, CloseOdds) and (odds.preopen or odds.matched):
+                rows = self.card_rows(title, odds, now_ms, "开盘价" if odds.matched else "竞价参考")
                 rows[0] += f"｜{odds.proxy_note.partition('（')[2].rstrip('）')}"
             else:
                 rows = [f"尚无参考平衡价：{odds.proxy_note.rpartition('｜')[2] if isinstance(odds, CloseOdds) else odds}"]
