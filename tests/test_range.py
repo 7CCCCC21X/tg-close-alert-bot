@@ -593,6 +593,23 @@ async def browser_check(bot):
         assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         await page.evaluate("render(last)")
         assert (await page.inner_text("#opps")).startswith("🔥 机会 2\n挂单 1") and await page.locator("#opps .opp").count() == 2
+        # pinned: the strip stays right under the filter bar while the page scrolls; 收起 folds it to one line (kept in
+        # this browser); 自定义 can let it scroll away with the page
+        await page.evaluate("scrollTo(0, document.body.scrollHeight)"); await page.wait_for_timeout(150)
+        assert await page.evaluate("scrollY") > 300 and await page.evaluate("getComputedStyle(document.getElementById('opps')).position") == "sticky"
+        fb, ob = await page.locator("#fbar").bounding_box(), await page.locator("#opps").bounding_box()
+        assert fb["y"] <= 1 and abs(ob["y"] - (fb["y"] + fb["height"])) < 3, (fb, ob)
+        await page.click("#opps .ofold")
+        folded_text = (await page.inner_text("#opps")).replace("\n", " ")
+        assert await page.locator("#opps .opp").count() == 0 and folded_text.startswith("🔥 机会 2 挂单 1 吃单 1") and "展开" in folded_text, folded_text
+        assert await page.evaluate("localStorage.getItem('oppFold')") == "true"
+        await page.click("#opps .ofold")
+        assert await page.locator("#opps .opp").count() == 2 and await page.evaluate("localStorage.getItem('oppFold')") == "false"
+        await page.evaluate("scrollTo(0, 0)")
+        await page.click("#edit"); await page.uncheck("#opp-pin"); await page.click("#done")
+        await page.evaluate("scrollTo(0, document.body.scrollHeight)"); await page.wait_for_timeout(150)
+        assert (await page.locator("#opps").bounding_box())["y"] < 0 and await page.evaluate("localStorage.getItem('oppPin')") == "false"
+        await page.click("#edit"); await page.check("#opp-pin"); await page.click("#done"); await page.evaluate("scrollTo(0, 0)")
         # each entry is a link to the market on Predict (a new tab); the tap also brings the card into view here
         opp = page.locator("#opps .opp").nth(1)
         assert (await opp.get_attribute("href") or "").startswith("https://predict.fun/") and await opp.get_attribute("target") == "_blank"
