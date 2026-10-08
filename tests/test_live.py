@@ -176,7 +176,8 @@ async def run():
     hbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", o)]
     card = hbot.odds_payload()["items"][0]
     assert card["eff_label"] == "竞价" and card["source"] == "竞价参考价" and card["effective"] == "35.6" and card["quote_ms"] == bj(9, 28, 9, 5, 10), card
-    assert card["preopen"].startswith("港交所开市前竞价") and "trading" not in card and [g["name"] for g in card["pages"]] == ["富途", "etnet", "腾讯"], card
+    assert card["feed"] == "腾讯"  # the card names its feed, so the figure can be checked against that source's page
+    assert card["preopen"].startswith("港交所开市前竞价") and "trading" not in card and [g["name"] for g in card["pages"]] == ["富途", "AAStocks", "腾讯", "etnet", "港交所"], card
     feed["raw"] = hk("35.55", "35.10", "2026/09/28 09:30:40")  # the first continuous print
     await hbot.stocks.refresh_live(bj(9, 28, 9, 31), force=True)
     o4 = hbot.contract_odds("HK0625USDT", D("35.60"), bj(9, 28, 9, 31))
@@ -184,7 +185,10 @@ async def run():
     hbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", o4)]
     hbot.market.now = bj(9, 28, 9, 31)
     card = hbot.odds_payload()["items"][0]
-    assert card["eff_label"] == "今日" and card["source"] == "现货" and card["trading"] == "开盘中" and "preopen" not in card, card
+    assert card["eff_label"] == "今日" and card["source"] == "现货" and card["trading"] == "开盘中" and "preopen" not in card and card["feed"] == "腾讯", card
+    hbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", hbot.contract_odds("HK0625USDT", D("35.60"), bj(9, 28, 8, 30)))]
+    hbot.market.now = bj(9, 28, 8, 30)
+    assert hbot.odds_payload()["items"][0]["feed"] == ""  # a Binance-mapped estimate names no stock feed
 
     # Several A-share / HK stocks: one Tencent request for all of them per round (1-second polling); Sina is asked only
     # for the codes Tencent left stale or unknown, and only for those
