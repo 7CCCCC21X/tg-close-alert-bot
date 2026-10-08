@@ -160,28 +160,48 @@ async def run():
     await hbot.stocks.refresh_live(t, force=True)
     o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
     assert o.proxy_note.endswith("｜开市前竞价进行中，现价仍等于昨收（尚无参考平衡价），暂用币安"), o.proxy_note
-    feed["raw"] = hk("35.60", "35.10", "2026/09/28 09:05:10")  # the indicative price: the day's price, with the match still to come
+    feed["raw"] = hk("35.60", "35.10", "2026/09/28 09:05:10")  # an indicative price while orders can still be withdrawn: shown, not priced on
     await hbot.stocks.refresh_live(t, force=True)
     o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
+    assert isinstance(o, m.CloseOdds) and not o.direct and not o.preopen and o.proxy_note.startswith("币安 35.6 / 收盘时刻 35.63"), o
+    assert o.proxy_note.endswith("｜开市前竞价可撤单阶段，参考价 35.6 常是试探、仅供参考，暂用币安"), o.proxy_note
+    hbot.market.now = t
+    hbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", o)]
+    card = hbot.odds_payload()["items"][0]
+    assert card["eff_label"] == "估算" and card["source"] == "代理估算" and card["feed"] == "" and card["preopen_phase"] == "可撤单", card
+    assert card["preopen_price"] == "35.6" and card["preopen_at"] == bj(9, 28, 9, 5, 10)  # the probe, beside the estimate
+    # once orders cannot be withdrawn (09:15) the indicative price is the day's price, with the match still to come
+    t = bj(9, 28, 9, 16)
+    o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
     assert isinstance(o, m.CloseOdds) and o.effective == D("35.60") and o.ref == D("35.10") and o.preopen and o.direct and o.mode == "盘中", o
-    assert o.proxy_note == "港交所开市前竞价参考价 35.6（腾讯·09:05 更新；撮合前仍会变动）", o.proxy_note
+    assert o.proxy_note == "港交所开市前竞价参考价 35.6（腾讯·09:05 更新；不可撤单阶段，撮合前仍会变）", o.proxy_note
     assert abs(o.remaining - (1.0 + 30 / 330)) < 1e-9 and "（竞价参考 35.6·σ" in o.row(), (o.remaining, o.row())
-    # it may sit still for the whole auction without going stale; from 09:30 the usual ten-minute clock applies
-    o2 = hbot.contract_odds("HK0625USDT", D("35.60"), bj(9, 28, 9, 25))
-    assert o2.preopen and o2.effective == D("35.60")
-    o3 = hbot.contract_odds("HK0625USDT", D("35.60"), bj(9, 28, 9, 31))
-    assert not o3.preopen and "现货行情已超 10 分钟未更新" in o3.proxy_note, o3.proxy_note
+    o2 = hbot.contract_odds("HK0625USDT", D("35.60"), bj(9, 28, 9, 21))  # the random match under way: still the indicative price
+    assert o2.preopen and "随机撮合阶段" in o2.proxy_note
     # the card: the price labelled 竞价, the source 竞价参考价, the tag and the pages to watch the auction on
     hbot.market.now = t
     hbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", o)]
     card = hbot.odds_payload()["items"][0]
     assert card["eff_label"] == "竞价" and card["source"] == "竞价参考价" and card["effective"] == "35.6" and card["quote_ms"] == bj(9, 28, 9, 5, 10), card
-    assert card["feed"] == "腾讯"  # the card names its feed, so the figure can be checked against that source's page
+    assert card["feed"] == "腾讯" and card["preopen_phase"] == "不可撤单" and card["preopen_price"] == "35.6"
     assert card["preopen"].startswith("港交所开市前竞价") and "trading" not in card and [g["name"] for g in card["pages"]] == ["富途", "AAStocks", "腾讯", "etnet", "港交所"], card
-    feed["raw"] = hk("35.55", "35.10", "2026/09/28 09:30:40")  # the first continuous print
+    # matched (09:22 on): the quote is the opening price, firm, the whole session ahead and nothing added for the match
+    feed["raw"] = hk("35.55", "35.10", "2026/09/28 09:21:30")
+    await hbot.stocks.refresh_live(bj(9, 28, 9, 23), force=True)
+    o = hbot.contract_odds("HK0625USDT", D("35.60"), bj(9, 28, 9, 23))
+    assert o.matched and o.direct and not o.preopen and o.effective == D("35.55") and abs(o.remaining - 1.0) < 1e-9, o
+    assert o.proxy_note == "港交所开盘价已撮合 35.55（腾讯·09:21 更新；09:30 起连续交易）" and "（开盘价 35.55·σ" in o.row(), o
+    hbot.market.now = bj(9, 28, 9, 23)
+    hbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", o)]
+    card = hbot.odds_payload()["items"][0]
+    assert card["eff_label"] == "开盘价" and card["source"] == "已撮合开盘价" and card["preopen_phase"] == "已撮合" and card["feed"] == "腾讯", card
+    # it may sit still for the whole auction without going stale; from 09:30 the usual ten-minute clock applies
+    o3 = hbot.contract_odds("HK0625USDT", D("35.60"), bj(9, 28, 9, 35))
+    assert not o3.preopen and not o3.matched and "现货行情已超 10 分钟未更新" in o3.proxy_note, o3.proxy_note
+    feed["raw"] = hk("35.58", "35.10", "2026/09/28 09:30:40")  # the first continuous print
     await hbot.stocks.refresh_live(bj(9, 28, 9, 31), force=True)
     o4 = hbot.contract_odds("HK0625USDT", D("35.60"), bj(9, 28, 9, 31))
-    assert o4.direct and not o4.preopen and o4.proxy_note == "港交所现货 35.55（腾讯·盘中直接用现货）" and abs(o4.remaining - 329 / 330) < 1e-9, o4
+    assert o4.direct and not o4.preopen and o4.proxy_note == "港交所现货 35.58（腾讯·盘中直接用现货）" and abs(o4.remaining - 329 / 330) < 1e-9, o4
     hbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", o4)]
     hbot.market.now = bj(9, 28, 9, 31)
     card = hbot.odds_payload()["items"][0]
