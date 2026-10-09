@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.35.3"
+VERSION = "1.35.4"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4085,8 +4085,8 @@ PREOPEN_VARIANCE_MINUTES = {"hk": 30.0, "sh": 30.0, "sz": 30.0, "kr": 30.0}
 PRE_AUCTION_PHASES = {
     "hk": ((dt.time(9, 0), "可撤单"), (dt.time(9, 15), "不可撤单"), (dt.time(9, 20), "随机撮合"), (dt.time(9, 22), "已撮合")),
     "sh": ((dt.time(9, 15), "可撤单"), (dt.time(9, 20), "不可撤单"), (dt.time(9, 25), "已撮合")),
-    "kr": ((dt.time(7, 30), "可撤单"),),
-}
+    "kr": ((dt.time(7, 30), "可撤单"),),  # withdrawable to the 09:00 Seoul match, which opens continuous trading; the 08:30–08:40
+}                                       # off-hours trades at the previous close show as "no indicative price yet" (price = close)
 PRE_AUCTION_PHASES["sz"] = PRE_AUCTION_PHASES["sh"]
 PREOPEN_PRICED = {"不可撤单", "随机撮合", "已撮合"}  # the phases whose indicative / matched price the odds rest on
 
@@ -4149,8 +4149,10 @@ def quote_pages(ticker: "StockTicker") -> list[dict]:
                 {"name": "港交所", "url": f"https://www.hkex.com.hk/Market-Data/Securities-Prices/Equities/Equities-Quote?sym={int(code)}&sc_lang=zh-HK"}]
     if ticker.market == "kr":
         return [{"name": "Naver", "url": f"https://finance.naver.com/item/main.naver?code={code}"}]
-    return [{"name": "腾讯", "url": f"https://gu.qq.com/{ticker.market}{code}"},
-            {"name": "东方财富", "url": f"https://quote.eastmoney.com/{ticker.market}{code}.html"},
+    # the A-share auction's matched price, matched volume and unmatched volume: the free quote pages show them
+    return [{"name": "东方财富", "url": f"https://quote.eastmoney.com/{ticker.market}{code}.html"},
+            {"name": "同花顺", "url": f"https://stockpage.10jqka.com.cn/{code}/"},
+            {"name": "腾讯", "url": f"https://gu.qq.com/{ticker.market}{code}"},
             {"name": "富途", "url": f"https://www.futunn.com/stock/{code}-{ticker.market.upper()}"}]
 
 
@@ -7935,7 +7937,7 @@ function card(it,g){
     if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");t.className="tag new";t.textContent+=" 新"}}
   if(it.auction){const a=$("span","tag auc","集合竞价");a.title=it.auction+"：此时价格基本就是收盘价";tg.append(a)}
   else if(it.preopen){const ph=it.preopen_phase||"",a=$("span","tag auc","竞价·"+(ph||"进行中"));
-    a.title=it.preopen+"："+({"可撤单":"还能撤单，参考价常是试探：只展示，概率仍按币安代理算","不可撤单":"不能撤单了，参考价比之前可信，加单仍会改变它，概率按它算","随机撮合":"随机撮合中，概率按参考价算","已撮合":"开盘价已定，概率按它算，连续交易 09:30 开始"}[ph]||"")+"；竞价高开或低开不等于当天收涨或收跌";tg.append(a)}
+    a.title=it.preopen+"："+({"可撤单":"还能撤单，参考价常是试探：只展示，概率仍按币安代理算"+(it.preopen.startsWith("韩交所")?"；韩股盘前显示的价格也可能是 Nextrade 盘前成交，以 09:00（首尔）撮合的开盘价为准":""),"不可撤单":"不能撤单了，参考价比之前可信，加单仍会改变它，概率按它算","随机撮合":"随机撮合中，概率按参考价算","已撮合":"开盘价已定，概率按它算，连续交易 09:30 开始"}[ph]||"")+"；竞价高开或低开不等于当天收涨或收跌";tg.append(a)}
   else if(it.trading){const a=$("span","tag "+(it.trading==="开盘中"?"open":"lunch"),it.trading);
     a.title={"开盘中":"交易所连续交易中：直接用现货相对昨收","午休":"午间休市","未开盘":"今日尚未开盘：按代理估算",
       "已收盘":"今日已收盘","休市":"今天不是交易日"}[it.trading]||"";tg.append(a)}

@@ -100,7 +100,8 @@ async def run():
         {"name": "腾讯", "url": "https://gu.qq.com/hk00625"},
         {"name": "etnet", "url": "https://www.etnet.com.hk/www/tc/stocks/realtime/quote.php?code=625"},
         {"name": "港交所", "url": "https://www.hkex.com.hk/Market-Data/Securities-Prices/Equities/Equities-Quote?sym=625&sc_lang=zh-HK"}]
-    assert m.quote_pages(m.StockTicker("sh", "688836"))[0] == {"name": "腾讯", "url": "https://gu.qq.com/sh688836"}
+    assert [g["name"] for g in m.quote_pages(m.StockTicker("sh", "688836"))] == ["东方财富", "同花顺", "腾讯", "富途"]  # the first two show 匹配量 / 未匹配量
+    assert m.quote_pages(m.StockTicker("sz", "000001"))[1] == {"name": "同花顺", "url": "https://stockpage.10jqka.com.cn/000001/"}
     assert m.quote_pages(m.StockTicker("kr", "000660")) == [{"name": "Naver", "url": "https://finance.naver.com/item/main.naver?code=000660"}]
     pcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "HK0625USDT,UNITREEUSDT,SKHYNIXUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
     assert pcfg.preopen_alert and pcfg.preopen_lead == 5
@@ -134,7 +135,8 @@ async def run():
     now["ms"] = bj(10, 8, 9, 10, 15)
     await pbot.preopen_reminders(now["ms"]); await pbot.drain_deliveries()
     assert len(sent) == 2 and plain(sent[1]).startswith("🔔 沪深开盘集合竞价 5 分钟后开始（09:15–09:25") and "宇树 UNITREE" in sent[1] and "SHEIN" not in sent[1], sent[1]
-    assert "看竞价行情：腾讯 https://gu.qq.com/sh688836｜东方财富 https://quote.eastmoney.com/sh688836.html｜富途 https://www.futunn.com/stock/688836-SH" in sent[1], sent[1]
+    assert ("看竞价行情：东方财富 https://quote.eastmoney.com/sh688836.html｜同花顺 https://stockpage.10jqka.com.cn/688836/｜腾讯 https://gu.qq.com/sh688836"
+            "｜富途 https://www.futunn.com/stock/688836-SH") in sent[1], sent[1]
     now["ms"] = bj(10, 8, 7, 25, 40)
     await pbot.preopen_reminders(now["ms"]); await pbot.drain_deliveries()
     assert len(sent) == 3 and plain(sent[2]).startswith("🔔 韩交所开盘同时呼价 5 分钟后开始（首尔 08:30–09:00") and "概率暂缺：等待行情" in sent[2], sent[2]
@@ -161,7 +163,7 @@ async def run():
     assert items["SHEIN 希音"]["preopen"].startswith("港交所开市前竞价") and items["SHEIN 希音"]["preopen_phase"] == "可撤单" and "trading" not in items["SHEIN 希音"], items["SHEIN 希音"]
     assert "preopen_price" not in items["SHEIN 希音"]  # no quote read: nothing to show
     assert items["SHEIN 希音"]["pages"][0] == {"name": "富途", "url": "https://www.futunn.com/stock/00625-HK"} and len(items["SHEIN 希音"]["pages"]) == 5
-    assert items["宇树 UNITREE"]["trading"] == "未开盘" and "preopen" not in items["宇树 UNITREE"] and items["宇树 UNITREE"]["pages"][0]["name"] == "腾讯"
+    assert items["宇树 UNITREE"]["trading"] == "未开盘" and "preopen" not in items["宇树 UNITREE"] and items["宇树 UNITREE"]["pages"][0]["name"] == "东方财富"
     now["ms"] = bj(10, 8, 9, 20)
     items = {i["name"]: i for i in pbot.odds_payload()["items"]}
     assert items["宇树 UNITREE"]["preopen"].startswith("沪深开盘集合竞价") and items["宇树 UNITREE"]["preopen_phase"] == "不可撤单" and items["SHEIN 希音"]["preopen_phase"] == "随机撮合"
