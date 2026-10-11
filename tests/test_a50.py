@@ -203,7 +203,8 @@ async def run():
     await bot.refresh_odds_inputs(bj(9, 25, 15, 2))
     assert bot.store.get("a50_print:2026-09-25:新浪CFD") is None
 
-    # 8) while A50 is shut there is nothing new to map: the odds pause until it reopens
+    # 8) while A50 is shut its last print is the view there is: the odds rest on it, flagged, with no suggestion; a print
+    #    from before the anchor or not from the last session pauses them until it reopens
     m.a50_next_open = a50_next_open
     assert [m.a50_next_open(t) for t in (bj(9, 26, 5, 14), bj(9, 28, 9, 0), bj(9, 28, 16, 40), bj(9, 29, 3, 0))] == [None] * 4
     assert [m.a50_next_open(t) for t in (bj(9, 26, 5, 15), bj(9, 27, 23, 0), bj(9, 28, 8, 59), bj(9, 29, 6, 0))] == \
@@ -211,7 +212,13 @@ async def run():
     bot = make_bot(); bot.anchors["A50"] = (bj(9, 24, 15, 0), D("14180")); bot.a50_anchor_source = "东方财富"
     bot.cn.a50 = m.IndexQuote("A50期货", D("14196.5"), None, None, None, None, bj(9, 26, 5, 14), "东方财富")
     for when in (NOW, bj(9, 28, 0, 22), bj(9, 28, 8, 30)):  # Saturday evening, Sunday night, Monday before 09:00
-        assert bot.sse_odds(when) == "A50 休市，09-28 09:00 开盘后恢复概率", bot.sse_odds(when)
+        o = bot.sse_odds(when)
+        assert isinstance(o, m.CloseOdds) and o.warn == "A50 休市，按 09-26 05:14 的最后一口估算（休市期间的消息未反映，不给建议）；09-28 09:00 开盘后更新", o
+    bot.cn.a50 = m.IndexQuote("A50期货", D("14196.5"), None, None, None, None, bj(9, 24, 14, 59), "东方财富")  # before the 15:00 anchor
+    assert bot.sse_odds(NOW) == "A50 休市，09-28 09:00 开盘后恢复概率", bot.sse_odds(NOW)
+    bot.cn.a50 = m.IndexQuote("A50期货", D("14196.5"), None, None, None, None, bj(9, 25, 16, 20), "东方财富")  # Friday's night session missing
+    assert bot.sse_odds(NOW) == "A50 休市，09-28 09:00 开盘后恢复概率", bot.sse_odds(NOW)
+    bot.cn.a50 = m.IndexQuote("A50期货", D("14196.5"), None, None, None, None, bj(9, 26, 5, 14), "东方财富")
     bot.cn.a50 = m.IndexQuote("A50期货", D("14196.5"), None, None, None, None, bj(9, 28, 9, 1), "东方财富")
     assert isinstance(bot.sse_odds(bj(9, 28, 9, 2)), m.CloseOdds)  # Monday's day session: odds again
     print("A50_OK")

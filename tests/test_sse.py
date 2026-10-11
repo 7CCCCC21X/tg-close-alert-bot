@@ -239,8 +239,11 @@ async def run():
     await x.refresh_daily(now)
     assert x.close == m.DailyClose(dt.date(2026, 9, 24), D("3888.37"), D("3870.10"), "腾讯日K", now) and x.confirmed(now)
     bot.anchors["A50"] = (c24, D("14200"))
-    # A50 has been shut since Saturday 05:15: no new move to map, so no odds until it reopens at 09:00
-    assert bot.sse_odds(now) == "A50 休市，09-28 09:00 开盘后恢复概率"
+    # A50 has been shut since Saturday 05:15: its last print is the latest view there is, so the odds rest on it, say
+    # so, and recommend nothing (the card holds back on a warning) until it reopens at 09:00
+    o = bot.sse_odds(now)
+    assert isinstance(o, m.CloseOdds) and o.warn == "A50 休市，按 09-26 05:06 的最后一口估算（休市期间的消息未反映，不给建议）；09-28 09:00 开盘后更新", o
+    assert o.proxy_note.startswith("A50 14,280 / 15:00 14,200 → +0.563%") and o.target == dt.date(2026, 9, 28) and o.mode == "盘后", o
     now = bj(2026, 9, 28, 9, 5)
     x.a50 = m.IndexQuote("A50期货", D("14280"), D("14250"), None, None, None, bj(2026, 9, 28, 9, 4), "东方财富")
     o = bot.sse_odds(now)
@@ -371,7 +374,8 @@ async def run():
     await bot.refresh_odds_inputs(bj(2026, 9, 26, 16, 0))
     assert bot.anchors["A50"] == (c24, D("14319"))
     assert store.get("anchor:A50") == [c24, "14319", "15:00 五分钟K近似", "东方财富"]
-    assert bot.sse_odds(bj(2026, 9, 26, 16, 0)) == "A50 休市，09-28 09:00 开盘后恢复概率"
+    o = bot.sse_odds(bj(2026, 9, 26, 16, 0))  # Saturday: the Friday-night print against the recovered anchor, flagged
+    assert isinstance(o, m.CloseOdds) and o.warn.startswith("A50 休市，按 09-26 05:06 的最后一口估算") and "15:00 五分钟K近似 14,319" in o.proxy_note, o
     friday_night, x.a50 = x.a50, m.IndexQuote("A50期货", D("14297"), D("14300"), None, None, None, bj(2026, 9, 28, 9, 4), "东方财富")
     o = bot.sse_odds(bj(2026, 9, 28, 9, 5)); x.a50 = friday_night  # Monday's open: odds again, from the same anchor
     assert isinstance(o, m.CloseOdds) and o.ref == D("3888.37") and o.target == dt.date(2026, 9, 28), o

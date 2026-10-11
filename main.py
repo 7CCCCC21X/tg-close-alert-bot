@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.35.4"
+VERSION = "1.35.5"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -10123,13 +10123,19 @@ class Bot:
         a50, anchor = self.cn.a50, self.anchors.get("A50")
         ref_note = f"{close_date.strftime('%m-%d')} 收盘"
         reopen = a50_next_open(now_ms)
-        if reopen:
-            # No A50 trading, so nothing new to map: pause rather than keep showing the last session's odds.
-            return f"A50 {a50_closed_note(now_ms)}，{stamp(reopen, seconds=False)} 开盘后恢复概率"
         if a50 is None:
-            return "暂无 A50 报价，暂不输出概率"
+            return (f"A50 {a50_closed_note(now_ms)}，{stamp(reopen, seconds=False)} 开盘后恢复概率" if reopen
+                    else "暂无 A50 报价，暂不输出概率")
         warn = ""
-        if self.cn.a50_stale(now_ms):
+        if reopen:
+            # No A50 trading (a weekend, a Singapore holiday): its last print is still the latest market view there is,
+            # so the odds rest on it, say so, and recommend nothing on it (what happened since is not in it). A print
+            # from before the cash close, or not from the last session, is no view: pause until it reopens.
+            if a50.quoted_ms < close_ms or self.cn.a50_stale(now_ms):
+                return f"A50 {a50_closed_note(now_ms)}，{stamp(reopen, seconds=False)} 开盘后恢复概率"
+            warn = (f"A50 {a50_closed_note(now_ms)}，按 {stamp(a50.quoted_ms, seconds=False)} 的最后一口估算"
+                    f"（休市期间的消息未反映，不给建议）；{stamp(reopen, seconds=False)} 开盘后更新")
+        elif self.cn.a50_stale(now_ms):
             # A short gap (a feed outage, the 16:30-16:45 break running long) prices from the last print, flagged;
             # after an hour without a print the odds would be guesswork: pause them.
             if a50_session(now_ms) == "休市" or now_ms - a50.quoted_ms > self.A50_SOFT_STALE_MS:
