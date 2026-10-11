@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.35.5"
+VERSION = "1.36.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -7329,7 +7329,7 @@ button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,s
 @keyframes pulse{0%,100%{box-shadow:0 0 0 3px var(--down-bg)}50%{box-shadow:0 0 0 6px transparent}}
 @keyframes shimmer{from{background-position:100% 0}to{background-position:0 0}}
 @keyframes chgr{from{background:var(--up-bg)}to{background:transparent}}@keyframes chgg{from{background:var(--down-bg)}to{background:transparent}}
-@media (prefers-reduced-motion:reduce){.card.flash{animation:none;outline:3px solid var(--best);outline-offset:3px}h1:before,.skel,.odds.chg-r,.odds.chg-g{animation:none!important}.bar i,#totop{transition:none!important}}
+@media (prefers-reduced-motion:reduce){.card.flash{animation:none;outline:3px solid var(--best);outline-offset:3px}h1:before,.skel,.odds.chg-r,.odds.chg-g,.toast{animation:none!important}.bar i,#totop{transition:none!important}}
 .wrap{max-width:1560px;margin:0 auto;padding:12px 16px 28px}
 header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 16px;padding:4px 0 8px}
 .ttl{display:flex;flex-direction:column;gap:2px;min-width:0}
@@ -7478,8 +7478,19 @@ button.tog{font-family:inherit;padding:4px 11px}.tog.on{border-color:var(--best)
 @media(max-width:560px){.wrap{padding:10px 16px 24px}header{padding:2px 0 4px}h1{font-size:19px}.grid{gap:10px}.card{padding:10px 12px 8px;gap:6px}.card.hot{padding:9px 11px 7px}body.olddata .card.hot{padding:10px 12px 8px}
 h2{margin:12px 2px 6px}.legend{margin-bottom:4px}.edge{min-height:40px}.pb{padding-top:6px}.odds{margin-top:0}.tag,.cd{padding:1px 7px}.quote a.open{padding:3px 10px}.skel{height:150px}}
 #fsent{height:1px;margin-top:-1px}
+/* 涨跌幅声音提醒: the bell in the header, the toasts at the bottom left, the settings row in 自定义 */
+#snd.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}#snd.wait{border-style:dashed}
+#toasts{position:fixed;left:12px;right:68px;bottom:calc(12px + env(safe-area-inset-bottom,0px));z-index:7;display:flex;flex-direction:column;align-items:flex-start;gap:6px;pointer-events:none}
+.toast{pointer-events:auto;max-width:100%;display:inline-flex;flex-wrap:wrap;align-items:baseline;gap:4px 7px;border:1px solid var(--best-soft);background:var(--card);color:var(--text);border-radius:12px;padding:7px 12px;font:inherit;font-size:12.5px;line-height:1.4;box-shadow:var(--shadow2);cursor:pointer;text-align:left;animation:toastin .25s ease-out}
+.toast:hover{border-color:var(--best)}.toast b{font-weight:600;white-space:nowrap}.toast .tm{color:var(--muted);font-variant-numeric:tabular-nums}.toast .ev{font-weight:600;font-variant-numeric:tabular-nums}
+@keyframes toastin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+#sndrow select{font:inherit;font-size:12.5px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);padding:3px 6px}
+.sndfix{display:inline-flex;align-items:center;gap:3px;font-size:12px;color:var(--muted);white-space:nowrap;margin-right:4px}
+.sndfix input{width:58px;font:inherit;font-size:12px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--text);padding:2px 5px}.sndfix input:not(:placeholder-shown){border-color:var(--best);color:var(--best);font-weight:600}
+#sndrow input[type=range]{width:88px;accent-color:var(--best);vertical-align:middle;margin:0 2px}#sndrow .mut{line-height:1.5}
+#sndlog{width:100%;display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font-size:12px}#sndlog .cb{font-variant-numeric:tabular-nums}
 </style></head><body><div class="wrap">
-<header><div class="ttl"><h1>收盘涨跌概率</h1><div class="meta" id="meta">加载中…</div></div><div class="hr"><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button><button type="button" class="tog" id="edit" title="调整卡片和栏目顺序、隐藏卡片或栏目、改高亮门槛">✎ 自定义</button></div></header>
+<header><div class="ttl"><h1>收盘涨跌概率</h1><div class="meta" id="meta">加载中…</div></div><div class="hr"><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label><button type="button" class="tog" id="snd" title="涨跌幅声音提醒">🔕 声音</button><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button><button type="button" class="tog" id="edit" title="调整卡片和栏目顺序、隐藏卡片或栏目、改高亮门槛">✎ 自定义</button></div></header>
 <div class="legend" id="legend"></div>
 <div id="fsent" aria-hidden="true"></div>
 <div class="fbar" id="fbar"><div class="fchips" id="fchips"></div>
@@ -7494,6 +7505,7 @@ h2{margin:12px 2px 6px}.legend{margin-bottom:4px}.edge{min-height:40px}.pb{paddi
 <div class="pr" id="onerow"></div>
 <div class="pr" id="oppsrc"></div>
 <div class="pr" id="oppway"></div>
+<div class="pr" id="sndrow"></div>
 <div class="pr"><span class="mut">“价格阶梯”和“模拟交易”栏默认不显示，勾上才出现；每笔交易的证据和导出在</span><a class="cb" id="journal" href="#">模拟交易复盘 ↗</a></div>
 <div class="pr"><label>高亮门槛 <input type="number" id="hotin" min="1" max="50" step="1"> ¢</label><span class="mut">净优势达到这个值的卡片标红框、进机会条（和模型的“建议门槛”不是一回事：没超过建议门槛的方向不会被建议）。栏目标题和每张卡的工具条（自定义时）、每一档的说明（点开档位）旁各有一个“红框 ¢”框：填了按它，空着跟随上一级（档位 → 卡片 → 栏目 → 这里）</span></div>
 <div class="pr"><span class="mut" id="hidn"></span><span class="sp"></span><button type="button" class="cb" id="showall">全部显示</button><button type="button" class="cb" id="reset" title="还原卡片和栏目顺序、隐藏与高亮门槛（收藏保留）">恢复默认布局</button><button type="button" class="cb pri" id="done">完成</button></div>
@@ -7507,6 +7519,7 @@ h2{margin:12px 2px 6px}.legend{margin-bottom:4px}.edge{min-height:40px}.pb{paddi
 <h2 id="h-ladder">市值阶梯</h2><div class="grid wide" id="g-ladder"></div>
 <h2 id="h-sim">模拟交易</h2><div class="grid wide" id="g-sim"></div>
 <footer id="foot">模型参考，非投资建议。</footer>
+<div id="toasts" aria-live="polite"></div>
 <button type="button" id="totop" title="回到顶部" aria-label="回到顶部">↑</button>
 </div>
 <script>
@@ -7876,6 +7889,12 @@ function priceLadderBook(c,it,L,live){
     const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);
     hots.push({key,name:it.name,group:it.group||"levels",url:it.predict&&it.predict.url||"",maker:hotMk?{text:text(hotMk),edge:hotMk.edge,points:hotMk.points}:null,taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
   return c}
+function jumpTo(key){  // bring a card into view (its section unfolded first) and flash its frame once
+  const find=()=>[...document.querySelectorAll(".card")].find(x=>x.dataset.key===key);let c=find();if(!c)return;
+  const g=c.parentElement.id.slice(2);if(folded.includes(g)){folded=folded.filter(x=>x!==g);keep("folded",folded);if(last)render(last);c=find();if(!c)return}
+  const el=document.getElementById("opps");
+  c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+(oppPin&&!el.hidden?el.offsetHeight:0)+8)+"px";c.scrollIntoView({behavior:matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth",block:"start"});
+  c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")}
 function drawOpps(){  // every red-framed suggestion on the page in one strip on top: makers (挂单) on one row, takers (吃单) on the next, largest first; tap one to jump to its card.
   // 自定义 leaves sections out, drops either side, or lists makers whatever their points; by default a maker is listed only where a
   // quote placed now earns points (a maker's edge is only real once it fills: the points are what makes the wait pay)
@@ -7888,10 +7907,7 @@ function drawOpps(){  // every red-framed suggestion on the page in one strip on
     b.addEventListener("click",()=>{oppFold=!oppFold;keep("oppFold",oppFold);drawOpps()});return b};
   if(oppFold){const sum=$("div","osum");sum.append($("span","ok","🔥 机会 "+n),$("span","og","挂单 "+makers.length),$("span","og","吃单 "+takers.length),foldBtn());el.replaceChildren(sum);return}
   el.replaceChildren();let head=$("span","ok","🔥 机会 "+n);
-  const jump=h=>{const find=()=>[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);let c=find();if(!c)return;
-    const g=c.parentElement.id.slice(2);if(folded.includes(g)){folded=folded.filter(x=>x!==g);keep("folded",folded);if(last)render(last);c=find()}
-    c.style.scrollMarginTop=(document.getElementById("fbar").offsetHeight+(oppPin&&!el.hidden?el.offsetHeight:0)+8)+"px";c.scrollIntoView({behavior:matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth",block:"start"});
-    c.classList.remove("flash");void c.offsetWidth;c.classList.add("flash")};
+  const jump=h=>jumpTo(h.key);
   const group=(label,list,title)=>{if(!list.length)return;const row=$("div","orow");if(head){row.append(head);head=null}
     const t=$("span","og",label+" "+list.length);t.title=title;row.append(t);
     list.forEach(h=>{  // every one, wrapping onto more lines; a tap opens the market on Predict (a new tab) and brings its card into view here
@@ -7992,6 +8008,7 @@ function card(it,g){
   row("目标",it.close_label);row("参考",it.ref+unit+"（"+it.ref_note+"）");row("有效",it.effective+unit);row("代理",it.proxy_note);
   row("σ","日 "+(it.sigma_daily*100).toFixed(2)+"% × √"+it.remaining.toFixed(3)+" = "+(it.sigma*100).toFixed(2)+"%");
   row("σ 来源",it.sigma_note);row("涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%");row("z",it.z.toFixed(3));
+  if(snd&&sndEligible(it)){const sp=sndStepFor(it),st=mv[favKey(it)];row("声音提醒","每 "+sp.toFixed(2)+"% 一档（"+sndBasis(it)+"）"+(st?"，现在第 "+st.lvl+" 档":""))}
   det.append(dl);c.append(det);if(it.warn){const w=$("div","warn small","⚠️ "+it.warn);c.append(w)}
   tail(c,it);return c}
 function tail(c,it){const ag=ages(it);if(ag)c.append(ag);if(it.predict)c.append(book(it.predict,favKey(it),it.pages))}
@@ -8092,6 +8109,7 @@ function drawPanel(){
    ["opp-pin","固定在顶部",oppPin,v=>{oppPin=v;keep("oppPin",v)},"滚动时机会条一直贴在筛选栏下面（右侧“收起”可折成一行）；勾掉则随页面滚走"]
   ].forEach(([id,label,on,set,title])=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.id=id;i.checked=on;l.title=title;
     i.addEventListener("change",()=>{set(i.checked);if(last)render(last)});l.append(i,label);ow.append(l)});
+  drawSound();
   document.getElementById("hotin").value=hotCents;
   document.getElementById("hidn").textContent=hidden.length?"已隐藏 "+hidden.length+" 张卡片（变淡显示，点“显示”恢复）":"没有隐藏的卡片";
   document.getElementById("showall").disabled=!hidden.length}
@@ -8125,7 +8143,7 @@ function load(){
     if(last)for(const it of d.items){const k=favKey(it),o=last.items.find(x=>favKey(x)===k);  // a fair price that moved since the last refresh
       if(o&&o.fair_up!=null&&it.fair_up!=null&&Math.abs(o.fair_up-it.fair_up)>=5e-4)changedAt[k]={at:Date.now(),up:it.fair_up>o.fair_up}}
     const sig=JSON.stringify(d.items),same=!!last&&sig===lastSig;lastSig=sig;  // books move every 15 s, crypto quotes every 30 s: a repeat
-    last=d;if(!same||drag)render(d);                                            // rebuilds nothing (a drag still notes it); the stream patches the daily cards between answers
+    last=d;checkMoves(d.items);if(!same||drag)render(d);                                            // rebuilds nothing (a drag still notes it); the stream patches the daily cards between answers
     drawMeta(d);
     if(!same)drawLegend();
     document.getElementById("foot").textContent=d.note;tick();
@@ -8137,6 +8155,96 @@ function load(){
 function drawMeta(d){const ago=$("span","","");ago.id="ago";
   document.getElementById("meta").replaceChildren(...(d.today?[$("span","","今天 "+d.today)]:[]),$("span","","数据 "+d.generated_at),ago,
     ...(live?[$("span","","实时推送")]:[]),$("span","","基准 "+d.mode),$("span","","v"+d.version))}
+// --- 涨跌幅声音提醒: a beep and a toast when a card's day change walks another step, or turns from up to down; this browser only --
+// A step is a share of the card's own daily σ (½σ by default: an index with a 0.9% σ rings every 0.45%, a 6% stock every 3%; each
+// step moves the model's fair price by roughly 15–25¢), or a fixed % per section. A rung rings once: coming back it only counts
+// as left a fifth of a step below it, so a price dancing on a rung does not ring on every tick.
+let snd=stored("snd",false,isBool),sndSens=stored("sndSens","mid",v=>["hi","mid","lo"].includes(v)),sndFlip=stored("sndFlip",true,isBool),sndNotify=stored("sndNotify",false,isBool);
+let sndVol=stored("sndVol",60,v=>typeof v==="number"&&v>=0&&v<=100);
+let sndStep=stored("sndStep",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Object.values(v).every(x=>typeof x==="number"&&x>=.05&&x<=50));  // a fixed step per section (%), else σ
+const SND_K={hi:.25,mid:.5,lo:1},SND_SENS=[["hi","高：每 ¼ 日σ 一档"],["mid","中：每 ½ 日σ 一档"],["lo","低：每 1 日σ 一档"]],SND_FIXED={index:.5,contract:2,crypto:1},SND_GROUPS=["index","contract","crypto"];
+function sndStepFor(it){const g=it.group||"contract";if(sndStep[g])return sndStep[g];  // this card's step, in %
+  const s=typeof it.sigma_daily==="number"&&it.sigma_daily>0?it.sigma_daily*100*SND_K[sndSens]:SND_FIXED[g]||0;return s?Math.max(.05,Math.round(s*100)/100):0}
+function sndBasis(it){const g=it.group||"contract";if(sndStep[g])return "固定";
+  return typeof it.sigma_daily==="number"&&it.sigma_daily>0?SND_SENS.find(x=>x[0]===sndSens)[1].slice(2,-3)+"，日σ "+(it.sigma_daily*100).toFixed(2)+"%":"没有 σ，按默认"}
+const mv={};  // card key -> {ref, step, lvl, sg}: the reference price and step the state was built for, the last rung rung for (in steps, signed), the side last rung for
+function sndEligible(it){return typeof it.move==="number"&&Number.isFinite(it.move)&&!it.missing&&it.kind!=="sim"&&it.kind!=="ladder"&&!hidden.includes(favKey(it))&&!hideSec.includes(it.group||"contract")}
+function moveEvents(it){  // what this card's move earns now, keeping its state: [] or events {text, dir (+1 up / -1 down), flip}
+  const step=sndStepFor(it);if(!step)return[];const k=favKey(it),x=it.move,m=step/5,sgn=x>0?1:x<0?-1:0,side=Math.abs(x)>=m?sgn:0,st=mv[k];
+  if(!st||st.ref!==it.ref||Math.abs(st.step-step)>step*.25){mv[k]={ref:it.ref,step,lvl:Math.trunc(x/step)||0,sg:side};return[]}  // first seen, a new reference price or a changed step: a silent start
+  const out=[],pc=v=>(v>0?"+":"")+v.toFixed(2)+"%",rung=n=>pc(n*step),L=st.lvl;
+  const a=Math.trunc(x/step)||0,b=sgn*Math.trunc((Math.abs(x)+m)/step)||0;  // a: the rung reached going away from zero; b: the rung still held coming back (the leeway)
+  let lvl=L;
+  if(a!==0&&L!==0&&Math.sign(a)!==Math.sign(L))lvl=a;  // through zero and past a rung on the other side in one go
+  else if(Math.abs(a)>Math.abs(L))lvl=a;
+  else if(Math.abs(b)<Math.abs(L))lvl=b;
+  if(lvl!==L){const away=Math.abs(lvl)>Math.abs(L)||lvl!==0&&Math.sign(lvl)!==Math.sign(L);
+    out.push(away?{text:(lvl>0?"涨破 ":"跌破 ")+rung(lvl)+"（现 "+pc(x)+"）",dir:lvl>0?1:-1}
+                 :{text:(L>0?"回落到 ":"回升到 ")+pc(x)+"（"+(L>0?"低于 ":"高于 ")+rung(L>0?lvl+1:lvl-1)+" 档）",dir:L>0?-1:1});st.lvl=lvl}
+  if(sndFlip&&side!==0&&st.sg!==0&&side!==st.sg)out.push({text:(side>0?"转涨 ":"转跌 ")+pc(x),dir:side,flip:true});
+  if(side!==0)st.sg=side;
+  return out}
+let sndLog=[];  // the last alerts, newest first (自定义 lists them)
+function checkMoves(items){  // after every refresh and stream patch: toast every event, ring once per batch (a flip's tune first), notify if asked
+  if(!snd||!Array.isArray(items))return;const got=[];
+  for(const it of items){if(!sndEligible(it))continue;for(const ev of moveEvents(it))got.push({...ev,key:favKey(it),name:it.name})}
+  if(!got.length)return;const at=Date.now();
+  got.forEach(ev=>{sndLog.unshift({...ev,at});toast(ev,at)});sndLog=sndLog.slice(0,8);
+  const lead=got.find(e=>e.flip)||got[0];play((lead.flip?"flip":"")+(lead.dir>0?"up":"down"));
+  if(sndNotify&&"Notification" in window&&Notification.permission==="granted")try{const n=new Notification(lead.name+" "+lead.text,{body:got.slice(1).map(e=>e.name+" "+e.text).join("；"),tag:"move",silent:document.visibilityState==="visible"});
+    n.onclick=()=>{window.focus();jumpTo(lead.key);n.close()}}catch(e){}
+  if(editing&&!(document.activeElement&&document.activeElement.closest("#sndrow")))drawSound()}
+function toast(ev,at){const el=document.getElementById("toasts"),b=$("button","toast");b.type="button";b.title="跳到这张卡";
+  const t=$("span","ev",ev.text);t.style.color=ev.dir>0?upColor():downColor();b.append($("span","tm",hms(at)),$("b","",ev.name),t);
+  b.addEventListener("click",()=>{jumpTo(ev.key);b.remove()});el.append(b);while(el.children.length>4)el.firstChild.remove();setTimeout(()=>b.remove(),15000)}
+// the beeps: WAVs the page makes itself (no files), played through <audio> elements (an iPhone keeps those audible on silent mode, where the Web Audio API is muted)
+const clips={},SND_NOTES={up:[[660,.12],[880,.18]],down:[[880,.12],[660,.18]],flipup:[[523,.1],[659,.1],[784,.22]],flipdown:[[784,.1],[659,.1],[523,.22]],probe:[[0,.05]]};
+let sndReady=null;  // whether this page may play sound yet: null = not tried, false = the browser wants a tap first
+function wav(notes,amp){  // [[Hz, seconds], …] as a 16-bit mono WAV data URI: a sine per note with a 10 ms attack and a 40 ms release
+  const sr=16000,n=Math.ceil(sr*notes.reduce((s,x)=>s+x[1],0)),buf=new ArrayBuffer(44+n*2),v=new DataView(buf),txt=(o,t)=>{for(let i=0;i<t.length;i++)v.setUint8(o+i,t.charCodeAt(i))};
+  txt(0,"RIFF");v.setUint32(4,36+n*2,true);txt(8,"WAVE");txt(12,"fmt ");v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);txt(36,"data");v.setUint32(40,n*2,true);
+  let i=0;for(const[f,d]of notes){const len=Math.round(sr*d);for(let j=0;j<len&&i<n;j++,i++){const t=j/sr,env=Math.max(0,Math.min(1,t/.01,(d-t)/.04));v.setInt16(44+i*2,Math.round(Math.sin(2*Math.PI*f*t)*env*amp*32767),true)}}
+  let s="";const u=new Uint8Array(buf);for(let j=0;j<u.length;j+=8192)s+=String.fromCharCode.apply(null,u.subarray(j,j+8192));return "data:audio/wav;base64,"+btoa(s)}
+function makeClips(force){if(clips.up&&!force)return;const amp=.9*Math.pow(sndVol/100,1.3);  // loudness is baked into the clips: an iPhone ignores an element's volume
+  for(const k in SND_NOTES){const a=clips[k]||(clips[k]=new Audio());a.dataset.kind=k;a.preload="auto";a.src=wav(SND_NOTES[k],k==="probe"?0:amp)}}
+function setReady(ok){if(sndReady===ok)return;sndReady=ok;drawSnd()}
+function play(kind,force){if(!snd&&!force)return;makeClips();const a=clips[kind]||clips.up;
+  try{a.muted=false;a.currentTime=0;const p=a.play();if(p)p.then(()=>setReady(true)).catch(()=>setReady(false))}catch(e){setReady(false)}}
+function unlockAll(){  // in a tap: play every clip muted (an older iPhone unlocks each element on its own) and the silent probe for real, which tells whether sound may play now
+  makeClips();for(const k in clips){const a=clips[k];if(!a.paused)continue;const mute=k!=="probe";a.muted=mute;
+    try{const p=a.play();if(p)p.then(()=>{a.pause();a.currentTime=0;a.muted=false;if(!mute)setReady(true)}).catch(()=>{a.muted=false;if(!mute)setReady(false)})}catch(e){a.muted=false}}}
+function armSound(){play("up",true);unlockAll()}  // the sample first (audible), then the rest muted
+function resetMoves(){for(const k in mv)delete mv[k];if(snd&&last)checkMoves(last.items)}  // every card starts over, silently, from where it stands now
+function setSnd(v){snd=v;keep("snd",snd);if(snd){resetMoves();armSound()}drawSnd();if(editing)drawSound();if(last)render(last)}
+function drawSnd(){const b=document.getElementById("snd");b.classList.toggle("on",snd);b.classList.toggle("wait",snd&&sndReady===false);
+  b.textContent=snd?(sndReady===false?"🔔 点此启用":"🔔 声音"):"🔕 声音";
+  b.title=!snd?"涨跌幅声音提醒已关：点一下开启（会响一声试听；档距等在 ✎ 自定义里）":sndReady===false?"浏览器要先在页面上点一下才允许发声：点这里（或页面任意处）启用"
+    :"涨跌幅声音提醒已开：每张卡的涨跌幅每走过一档、或由涨转跌 / 由跌转涨时响一声并弹出提示；点一下关闭，档距等在 ✎ 自定义里"}
+function drawSound(){  // 自定义: the sound alert's settings
+  const r=document.getElementById("sndrow");r.replaceChildren();
+  const tog=(id,label,on,set,title)=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.id=id;i.checked=on;l.title=title;i.addEventListener("change",()=>set(i.checked));l.append(i,label);return l};
+  r.append($("b","","🔔 涨跌幅声音提醒"),tog("snd-on","开启",snd,setSnd,"每张卡的涨跌幅每走过一档、或由涨转跌 / 由跌转涨时响一声并在左下角弹出提示；只在这个浏览器里、页面开着时有效"));
+  const sel=$("select");sel.id="snd-sens";SND_SENS.forEach(([k,t])=>{const o=$("option","",t);o.value=k;sel.append(o)});sel.value=sndSens;
+  sel.addEventListener("change",()=>{sndSens=sel.value;keep("sndSens",sndSens);resetMoves();drawSound();if(last)render(last)});
+  const sl=$("label","mut");sl.append("档距 ",sel);sl.title="一档 = 这张卡自己的日波动率 σ 的几分之几（每张卡的明细里写着它的 σ 和档距）：上证 σ 约 0.9% 时 ½σ ≈ 0.45% 一档，宇树 σ 约 6% 时 ≈ 3% 一档，各卡响得一样勤；每档大约对应公平价变动 15–25¢";r.append(sl);
+  const fx=$("span","mut","或固定：");SND_GROUPS.forEach(g=>{const l=$("label","sndfix"),i=$("input");i.type="number";i.min=".05";i.max="50";i.step=".05";i.placeholder="σ";i.id="snd-step-"+g;if(sndStep[g]!=null)i.value=sndStep[g];
+    i.title=SEC_NAMES[g]+"这一栏固定每变动多少 % 响一次；空 = 按各卡的波动率";
+    i.addEventListener("change",()=>{const t=i.value.trim(),n=Number(t),v=t!==""&&Number.isFinite(n)?Math.min(50,Math.max(.05,Math.round(n*100)/100)):null;
+      if(v==null)delete sndStep[g];else sndStep[g]=v;keep("sndStep",sndStep);i.value=v==null?"":v;resetMoves();if(last)render(last)});
+    l.append(SEC_NAMES[g]+" ",i," %");fx.append(l)});r.append(fx);
+  r.append(tog("snd-flip","翻转也响",sndFlip,v=>{sndFlip=v;keep("sndFlip",v)},"由涨转跌、由跌转涨时响（三连音），不管有没有走过一档；0 附近留 ⅕ 档的缓冲，不会在 0 上下反复响"));
+  const vol=$("label","mut"),vr=$("input");vr.type="range";vr.min="0";vr.max="100";vr.step="5";vr.value=sndVol;vr.id="snd-vol";vr.title="响度（拖完会响一声）";vol.append("音量 ",vr);
+  vr.addEventListener("change",()=>{sndVol=Number(vr.value);keep("sndVol",sndVol);makeClips(true);play("up",true)});r.append(vol);
+  if("Notification" in window)r.append(tog("snd-notify","同时弹系统通知",sndNotify,v=>{sndNotify=v;keep("sndNotify",v);if(v&&Notification.permission==="default"){const q=Notification.requestPermission(()=>{});if(q&&q.then)q.then(()=>{if(editing)drawSound()}).catch(()=>{})}},
+    "电脑上切到别的标签页时也能看到（手机浏览器多半不支持）；要先允许本站通知"+(Notification.permission==="denied"?"（当前已被浏览器拒绝）":"")));
+  r.append(ctlBtn("试听","响一声（涨的音；开着时也顺便解除浏览器的发声限制）",armSound));
+  r.append($("span","mut","浏览器要先在页面上点过一下才允许发声；手机锁屏或切到别的应用后页面不再刷新，也就不会响。隐藏的卡片和栏目不提醒；模拟交易和阶梯卡没有单一的涨跌幅，不提醒。"));
+  const lg=$("div");lg.id="sndlog";lg.append($("span","mut","最近："+(sndLog.length?"":"还没有提醒")));
+  sndLog.slice(0,5).forEach(e=>{const b=$("button","cb",hms(e.at)+" "+e.name+" "+e.text);b.type="button";b.title="跳到这张卡";b.addEventListener("click",()=>jumpTo(e.key));lg.append(b)});r.append(lg)}
+function sndInit(){drawSnd();if(!snd)return;makeClips();  // sound was on last time: find out whether this page may play yet; if not, the first tap anywhere unlocks it
+  try{const p=clips.probe.play();if(p)p.then(()=>setReady(true)).catch(()=>setReady(false))}catch(e){setReady(false)}}
+["pointerdown","keydown"].forEach(ev=>addEventListener(ev,()=>{if(snd&&sndReady===false)unlockAll()},{passive:true,capture:true}));
+document.getElementById("snd").addEventListener("click",()=>setSnd(!snd));
 // The event stream (/events): the index and contract cards' numbers arrive within a second of a change and are patched into the
 // last full answer; data.json still brings the books, the crypto cards and the texts every 10 seconds, and is the fallback.
 let es=null,live=false;
@@ -8149,7 +8257,7 @@ function patchLive(d){
     for(const k of LIVE_KEYS){if(!(k in li)||JSON.stringify(li[k])===JSON.stringify(it[k]))continue;
       if(k==="fair_up"&&it.fair_up!=null&&li.fair_up!=null&&Math.abs(li.fair_up-it.fair_up)>=5e-4)changedAt[favKey(it)]={at:Date.now(),up:li.fair_up>it.fair_up};
       it[k]=li[k];changed=true}}
-  if(!changed)return;if(d.generated_at)last.generated_at=d.generated_at;fetchedAt=okAt=Date.now();failMsg="";
+  if(!changed)return;checkMoves(last.items);if(d.generated_at)last.generated_at=d.generated_at;fetchedAt=okAt=Date.now();failMsg="";
   if(document.visibilityState!=="hidden")render(last);drawMeta(last);tick()}
 function connectLive(){
   if(!("EventSource" in window)||dead||es)return;
@@ -8181,7 +8289,7 @@ setTopH();addEventListener("resize",setTopH);if("ResizeObserver" in window)new R
 const totop=document.getElementById("totop");addEventListener("scroll",()=>totop.classList.toggle("show",scrollY>600),{passive:true});
 totop.addEventListener("click",()=>scrollTo({top:0,behavior:matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth"}));
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once
-load();connectLive();setInterval(()=>{if(document.visibilityState!=="hidden")load()},10000);setInterval(tick,1000);  // a hidden tab waits: visibilitychange fetches at once on return
+sndInit();load();connectLive();setInterval(()=>{if(document.visibilityState!=="hidden")load()},10000);setInterval(tick,1000);  // a hidden tab waits: visibilitychange fetches at once on return
 </script></body></html>"""
 
 
@@ -8540,7 +8648,7 @@ class WebServer:
         headers = (f"HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n{encoding}"
                    "Vary: Accept-Encoding\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
                    "X-Robots-Tag: noindex\r\nContent-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; "
-                   "script-src 'unsafe-inline'; img-src 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n")
+                   "script-src 'unsafe-inline'; media-src data:; img-src 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n")
         with contextlib.suppress(Exception):
             writer.write(headers.encode("latin-1") + (b"" if method.upper() == "HEAD" else body))
             await writer.drain()

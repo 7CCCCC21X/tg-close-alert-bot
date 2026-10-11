@@ -202,6 +202,67 @@ async def layout_check(browser, page):
                                                                             "ETH 先触 1k/3k", "BTC 10月涨跌", "ETH 10月涨跌", "HYPE 反超 SOL"]
 
 
+async def sound_check(page):
+    """涨跌幅声音提醒: off until the bell is tapped (a browser lets a page play sound only after a tap), then a card rings
+    once per step of its own daily σ (½σ by default) and once when it turns from up to down, with a fifth of a step of
+    leeway so a price dancing on a rung rings once; every alert is a toast that jumps to its card; kept in this browser."""
+    plays = lambda: page.evaluate("window.__plays")
+    assert await page.inner_text("#snd") == "🔕 声音" and await page.evaluate("localStorage.getItem('snd')") is None and await plays() == []
+    assert "声音提醒" not in await page.text_content("#g-index dl")
+    await page.click("#snd")  # the tap: the sample rings, the other clips are unlocked muted, the silent probe shows sound may play
+    assert await page.inner_text("#snd") == "🔔 声音" and await page.evaluate("localStorage.getItem('snd')") == "true"
+    got = await plays(); assert got[0] == "up" and "probe" in got and "flipdown:m" in got, got
+    assert await page.locator(".toast").count() == 0  # every card started silently from where it stands
+    assert "% 一档（每 ½ 日σ，日σ " in await page.text_content("#g-index dl"), await page.text_content("#g-index dl")  # the card says its own step
+    await page.evaluate("window.__plays = []")
+    # the rungs, on a synthetic card with a 1% daily σ: a 0.50% step with 0.10% of leeway
+    seq = [0.3, 0.49, 0.5, 0.41, 0.39, 1.7, -0.05, -0.1, -1.0, -0.91, -0.89, 0.12]
+    out = await page.evaluate("seq => seq.map(m => moveEvents({name:'X', symbol:'X', group:'index', ref:'1', move:m, sigma_daily:0.01}).map(e => e.text + (e.flip ? '!' : '')))", seq)
+    assert out == [[], [], ["涨破 +0.50%（现 +0.50%）"], [], ["回落到 +0.39%（低于 +0.50% 档）"], ["涨破 +1.50%（现 +1.70%）"], ["回落到 -0.05%（低于 +0.50% 档）"],
+                   ["转跌 -0.10%!"], ["跌破 -1.00%（现 -1.00%）"], [], ["回升到 -0.89%（高于 -1.00% 档）"], ["回升到 +0.12%（高于 -0.50% 档）", "转涨 +0.12%!"]], out
+    assert await page.evaluate("moveEvents({name:'X', symbol:'X', group:'index', ref:'2', move:0.9, sigma_daily:0.01})") == []  # a new reference price: a silent restart
+    # the whole way: a refresh with a moved card toasts every event and rings once per batch, a flip's tune first
+    card = lambda mv: {"name": "试音", "symbol": "TEST", "group": "index", "ref": "1", "move": mv, "sigma_daily": 0.01}
+    await page.evaluate("c => checkMoves([c])", card(0.2))
+    assert await page.locator(".toast").count() == 0 and await plays() == []
+    await page.evaluate("c => checkMoves([c])", card(0.6))
+    t = await page.inner_text(".toast"); assert t.endswith("\n试音\n涨破 +0.50%（现 +0.60%）") and await plays() == ["up"], (t, await plays())
+    await page.evaluate("c => checkMoves([c])", card(-0.6))
+    texts = await page.locator(".toast").all_inner_texts()
+    assert [x.split("\n", 1)[1] for x in texts] == ["试音\n涨破 +0.50%（现 +0.60%）", "试音\n跌破 -0.50%（现 -0.60%）", "试音\n转跌 -0.60%"] and await plays() == ["up", "flipdown"], texts
+    await page.evaluate("hidden = ['TEST']"); await page.evaluate("c => checkMoves([c])", card(-1.2))  # a hidden card is left alone
+    assert await page.locator(".toast").count() == 3 and await plays() == ["up", "flipdown"]
+    await page.evaluate("hidden = []")
+    # 自定义: the settings; a fixed step for a section replaces σ there
+    await page.click("#edit")
+    assert await page.is_checked("#snd-on") and await page.input_value("#snd-sens") == "mid" and await page.is_checked("#snd-flip")
+    assert "最近：" in await page.inner_text("#sndlog") and "试音 转跌 -0.60%" in await page.inner_text("#sndlog")
+    await page.select_option("#snd-sens", "lo")
+    assert await page.evaluate("localStorage.getItem('sndSens')") == '"lo"' and await page.evaluate("sndStepFor({group:'index', sigma_daily:0.01})") == 1
+    await page.fill("#snd-step-index", "0.25"); await page.press("#snd-step-index", "Tab")
+    assert await page.evaluate("localStorage.getItem('sndStep')") == '{"index":0.25}' and await page.evaluate("sndStepFor({group:'index', sigma_daily:0.01})") == 0.25
+    assert await page.evaluate("sndStepFor({group:'contract', sigma_daily:0.06})") == 6 and "每 0.25% 一档（固定）" in await page.text_content("#g-index dl")
+    await page.fill("#snd-step-index", ""); await page.press("#snd-step-index", "Tab")
+    assert await page.evaluate("localStorage.getItem('sndStep')") == "{}"
+    await page.select_option("#snd-sens", "mid")
+    # a toast jumps to its card (the frame flashes); a real card's alert carries its name
+    await page.evaluate("document.querySelectorAll('.toast').forEach(t => t.remove())")
+    await page.evaluate("(() => { const it = last.items[0]; checkMoves([{...it, move: it.move + 20 * sndStepFor(it)}]) })()")
+    texts = await page.locator(".toast").all_inner_texts()  # from -0.99% to +10.2%: past a rung on the other side, and the turn itself
+    assert len(texts) == 2 and "上证指数\n涨破 +" in texts[0] and "上证指数\n转涨 +" in texts[1], texts
+    await page.click(".toast >> nth=0")
+    assert await page.locator("#g-index .card.flash").count() == 1 and await page.locator(".toast").count() == 1
+    await page.evaluate("document.querySelectorAll('.toast').forEach(t => t.remove())")
+    # off again (kept): nothing rings or toasts; on at the next visit, the silent probe finds out whether sound may play
+    await page.click("#done"); await page.click("#snd")
+    assert await page.inner_text("#snd") == "🔕 声音" and await page.evaluate("localStorage.getItem('snd')") == "false"
+    await page.evaluate("window.__plays = []"); await page.evaluate("c => checkMoves([c])", card(3))
+    assert await page.locator(".toast").count() == 0 and await plays() == [] and "声音提醒" not in await page.text_content("#g-index dl")
+    await page.evaluate("localStorage.setItem('snd', 'true')"); await page.reload(); await page.wait_for_selector(".card .odds")
+    assert await page.inner_text("#snd") == "🔔 声音" and await plays() == ["probe"], await plays()
+    await page.evaluate("localStorage.setItem('snd', 'false')"); await page.reload(); await page.wait_for_selector(".card .odds")
+    assert await page.inner_text("#snd") == "🔕 声音" and await plays() == []
+
 async def browser_check(async_playwright, chrome, port, token):
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
@@ -224,6 +285,10 @@ async def browser_check(async_playwright, chrome, port, token):
         await older.close()
         page = await browser.new_page(viewport={"width": 390, "height": 900})
         await page.add_init_script("if(!localStorage.getItem('levelsDefault')){localStorage.setItem('hideSec','[\"sim\"]');localStorage.setItem('levelsDefault','1')}")  # 价格阶梯 on, as below; one-shot so a reload keeps what the test changes
+        errs = []; page.on("pageerror", lambda e: errs.append(str(e)))  # a script error anywhere on the page fails the check at the end
+        # no sound comes out of a headless browser: every play() is recorded (its clip, ":m" when muted) and succeeds, as a tapped page's would
+        await page.add_init_script("window.__plays=[];HTMLMediaElement.prototype.play=function(){window.__plays.push(this.dataset.kind+(this.muted?':m':''));return Promise.resolve()};"
+                                   "HTMLMediaElement.prototype.pause=function(){}")
         await page.goto(url)
         await page.wait_for_selector(".card .odds")
         text = await page.inner_text(".wrap")
@@ -295,7 +360,9 @@ async def browser_check(async_playwright, chrome, port, token):
         assert not await page.is_visible("#g-crypto") and await page.inner_text("#h-index") == "指数" and await page.is_visible("#g-index .card")
         await page.click("#h-crypto .fold")
         assert await page.is_visible("#g-crypto .card") and await page.locator("#h-crypto .fs").count() == 0 and await page.evaluate("localStorage.getItem('folded')") == "[]"
+        await sound_check(page)
         await layout_check(browser, page)
+        assert errs == [], errs
         if os.environ.get("WEB_SCREENSHOT"):
             await page.screenshot(path=os.environ["WEB_SCREENSHOT"], full_page=True)
         await browser.close()
@@ -358,6 +425,7 @@ async def run():
     st, head, body = await request(port, b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n"); assert st == 200 and body == b"ok"
     st, head, body = await request(port, f"GET /p/{token} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
     assert st == 200 and b"<title>" in body and "text/html" in head and "Cache-Control: no-store" in head and "Referrer-Policy: no-referrer" in head
+    assert "Content-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; media-src data:; img-src 'none'; frame-ancestors 'none'" in head, head  # the beeps are data: WAVs
     st, head, body = await request(port, f"GET /p/{token}/data.json?x=1 HTTP/1.1\r\nHost: x\r\n\r\n".encode())
     assert st == 200 and json.loads(body)["items"][0]["name"] == "上证指数" and "application/json" in head
     assert "Content-Encoding" not in head and "Vary: Accept-Encoding" in head  # no Accept-Encoding: plain
