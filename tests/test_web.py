@@ -83,11 +83,12 @@ async def layout_check(browser, page):
     g = await phone.locator("#g-fav .card:nth-child(1) .grip").bounding_box()
     t = await phone.locator("#g-fav .card:nth-child(3)").bounding_box()
     x, y = g["x"] + g["width"] / 2, g["y"] + g["height"] / 2
+    y0 = await phone.evaluate("scrollY")  # wherever the taps left the page: the drag itself must not scroll it
     await touch("touchStart", x, y)
     for i in range(1, 13):
         await touch("touchMove", x, y + (t["y"] + t["height"] * 0.8 - y) * i / 12)
     await touch("touchEnd")
-    assert await phone.evaluate("scrollY") == 0 and await phone.evaluate("localStorage.getItem('favs')") == '["SOLUSDT","BTCUSDT","BNBUSDT"]'
+    assert await phone.evaluate("scrollY") == y0 and await phone.evaluate("localStorage.getItem('favs')") == '["SOLUSDT","BTCUSDT","BNBUSDT"]'
     b = await phone.locator("#g-index .card .odds").bounding_box()
     await touch("touchStart", b["x"] + 20, b["y"] + 5)
     for i in range(1, 9):
@@ -279,12 +280,25 @@ async def watch_check(bot, page):
     await page.fill("#snd-fav", "5"); await page.dispatch_event("#snd-fav", "change")
     assert await page.evaluate("[favMove, localStorage.getItem('favMove')]") == [5, "5"]
     await page.click("#done"); await page.click("#g-index .card .star")  # 上证指数: the one card with a model here
+    # the ⭐ 收藏 title carries the sound switch and the same box; each starred card a 🔔 box of its own (empty = the title's)
+    assert await page.input_value("#h-fav .mv input") == "5" and await page.inner_text("#h-fav .hbell") == "🔔" and await page.get_attribute("#g-fav .card .mv input", "placeholder") == "5"
+    assert await page.input_value("#g-fav .card .mv input") == "" and await page.locator("#g-index .card .mv").count() == 0  # only starred cards
+    await page.click("#h-fav .hbell"); assert await page.evaluate("oppSound") is False and await page.inner_text("#h-fav .hbell") == "🔕"
+    await page.click("#h-fav .hbell"); assert await page.evaluate("oppSound") is True
     await page.evaluate("document.hasFocus = () => false; oppNotify = true; Notification.permission = 'granted'; window.__shown = []; window.__beeps = 0")  # (the reload above reset the stub)
     assert await page.evaluate("favBase['上证指数'] === last.items[0].fair_up") and await page.evaluate("favBase['宇树 UNITREE']") is None
     await page.evaluate("last.items[0].fair_up += 0.03; render(last)"); assert await page.evaluate("[window.__beeps, window.__shown.length]") == [0, 0]  # 3¢: not yet
     await page.evaluate("last.items[0].fair_up += 0.03; render(last)"); assert await page.evaluate("window.__beeps") == 2  # 6¢ since the start
     shown = await page.evaluate("window.__shown"); assert len(shown) == 1 and shown[0][0] == "📈 收藏变动 1" and "上证指数 公平价 35.0¢ → 41.0¢（+6.0¢）" == shown[0][1], shown
     await page.evaluate("last.items[0].fair_up -= 0.04; render(last)"); assert await page.evaluate("window.__beeps") == 2  # 4¢ from the alerted 41¢: not yet
+    await page.fill("#g-fav .card .mv input", "2"); await page.dispatch_event("#g-fav .card .mv input", "change")  # this card's own bar
+    assert await page.evaluate("favMoveMap") == {"上证指数": 2} and await page.evaluate("localStorage.getItem('favmove')") == '{"上证指数":2}'
+    await page.evaluate("last.items[0].fair_up -= 0.025; render(last)"); assert await page.evaluate("window.__beeps") == 4  # 6.5¢ under the alerted 41¢: well over 2¢
+    await page.fill("#h-fav .mv input", "0"); await page.dispatch_event("#h-fav .mv input", "change")  # the title's bar off: the card's own still counts
+    assert await page.evaluate("[favMove, localStorage.getItem('favMove')]") == [0, "0"]  # (the panel's box is redrawn when 自定义 opens)
+    await page.evaluate("last.items[0].fair_up += 0.03; render(last)"); assert await page.evaluate("window.__beeps") == 6
+    await page.fill("#g-fav .card .mv input", ""); await page.dispatch_event("#g-fav .card .mv input", "change"); assert await page.evaluate("favMoveMap") == {}
+    await page.evaluate("last.items[0].fair_up += 0.09; render(last)"); assert await page.evaluate("window.__beeps") == 6  # nothing set any more: quiet
     await page.click("#g-fav .card .star"); await page.click("#edit"); await page.fill("#snd-fav", "0"); await page.dispatch_event("#snd-fav", "change")
     await page.evaluate("oppNotify = false; keep('oppNotify', false)")
     await page.uncheck("#snd-on"); await page.click("#done")

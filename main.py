@@ -7428,7 +7428,9 @@ a.opp{text-decoration:none}a.opp.link:after{content:"↗";color:var(--best);font
 h2 .secsort{margin-left:auto;font-weight:400;font-size:12px;color:var(--muted);letter-spacing:0}h2 .secsort select{font-size:12px;padding:2px 5px}
 .hotset{display:inline-flex;align-items:center;gap:3px;font-size:12px;font-weight:400;color:var(--muted);letter-spacing:0;white-space:nowrap}
 .hotset input{width:52px;font:inherit;font-size:12px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--text);padding:2px 5px}
-.hotset input:not(:placeholder-shown){border-color:var(--hot);color:var(--hot);font-weight:600}h2 .hotset{margin-left:6px}.hotrow{margin-top:4px;display:flex;align-items:center;gap:6px}
+.hotset input:not(:placeholder-shown){border-color:var(--hot);color:var(--hot);font-weight:600}h2 .hotset{margin-left:6px}
+.hotset.mv input{width:44px}.hotset.mv input:not(:placeholder-shown){border-color:var(--best);color:var(--best)}h2 .hotset.mv{font-size:11.5px}.card .head .mv{flex:none}
+h2 .hbell{margin-left:8px;border:0;background:none;font:inherit;font-size:14px;line-height:1;cursor:pointer;padding:2px 4px;border-radius:6px;color:var(--muted)}h2 .hbell:hover{background:var(--chip)}h2 .hbell.on{color:var(--best)}.hotrow{margin-top:4px;display:flex;align-items:center;gap:6px}
 .card.flash{animation:flash 1.4s ease-out}@keyframes flash{from{outline:3px solid var(--best);outline-offset:3px}to{outline:3px solid transparent;outline-offset:3px}}
 #g-levels{grid-template-columns:repeat(auto-fill,minmax(min(100%,440px),1fr))}
 .card.price-lad{gap:8px}.price-top{display:flex;flex-wrap:wrap;align-items:baseline;gap:5px 9px;font-variant-numeric:tabular-nums}.price-top b{font-size:26px;font-weight:750;letter-spacing:-.02em}.price-top .plabel{font-size:12px;color:var(--muted)}
@@ -7613,11 +7615,35 @@ function alertOpps(list){if(oppSound){beep();if(navigator.vibrate)try{navigator.
 // starred cards (⭐ 收藏): the same sound and notification when a card's fair price has moved favMove¢ or more since the last
 // such alert (the price when the page opened, at first); 0 = off. The ladders have no single fair price and are left out.
 let favMove=stored("favMove",0,v=>typeof v==="number"&&v>=0&&v<=50);const favBase={};
-function favMoves(){if(!last||!favMove||!oppPrimed)return;const moved=[];
-  for(const it of last.items){const k=favKey(it);if(!favs.includes(k)||typeof it.fair_up!=="number"){delete favBase[k];continue}
-    const base=favBase[k];if(base===undefined){favBase[k]=it.fair_up;continue}
-    if(Math.abs(it.fair_up-base)>=favMove/100-1e-9){moved.push({name:it.name,from:base,to:it.fair_up});favBase[k]=it.fair_up}}
+// each starred card can have its own bar (the 🔔 box next to its star; empty = the one in the ⭐ 收藏 title, i.e. favMove)
+let favMoveMap=stored("favmove",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Object.values(v).every(x=>typeof x==="number"&&x>=0&&x<=50));
+const favMoveFor=k=>favMoveMap[k]??favMove;
+function favMoves(){if(!last||!oppPrimed)return;const moved=[],live=new Set();
+  const look=(bk,name,fair,th)=>{live.add(bk);const base=favBase[bk];if(base===undefined){favBase[bk]=fair;return}
+    if(Math.abs(fair-base)>=th/100-1e-9){moved.push({name,from:base,to:fair});favBase[bk]=fair}};
+  for(const it of last.items){const k=favKey(it),th=favs.includes(k)?favMoveFor(k):0;if(!th)continue;
+    if(it.kind==="ladder"){for(const r of (it.ladder&&it.ladder.rows||[]))if(!r.touched&&typeof r.fair==="number")look(k+"#"+r.label,it.name+" "+r.label,r.fair,th)}
+    else if(typeof it.fair_up==="number")look(k,it.name,it.fair_up,th)}
+  for(const bk in favBase)if(!live.has(bk))delete favBase[bk];  // unstarred, bar off, or no model price now: starts afresh next time
   if(moved.length)alertMoves(moved)}
+function moveInput(key){  // the 🔔 box on a starred card: its own bar in ¢, empty = the ⭐ 收藏 title's
+  const l=$("label","hotset mv"),i=$("input");i.type="number";i.min="0";i.max="50";i.step="0.5";i.placeholder=String(favMove);if(favMoveMap[key]!=null)i.value=favMoveMap[key];
+  const tip="这张卡的公平价变动提醒：比上次提醒时变动达到这么多¢就响（空 = 跟随 ⭐ 收藏 标题旁的值，0 = 这张不响）";i.title=tip;i.setAttribute("aria-label",tip);l.title=tip;
+  for(const ev of["click","pointerdown","mousedown","touchstart"])l.addEventListener(ev,e=>e.stopPropagation());
+  const commit=()=>{const t=i.value.trim(),n=Number(t),v=t!==""&&Number.isFinite(n)?Math.min(50,Math.max(0,n)):null;
+    if(v!==(favMoveMap[key]??null)){if(v==null)delete favMoveMap[key];else favMoveMap[key]=v;keep("favmove",favMoveMap)}};
+  i.addEventListener("change",()=>{commit();i.blur()});i.addEventListener("blur",()=>{commit();if(pending&&!drag){const d=pending;pending=null;render(d)}});
+  l.append("🔔 ",i," ¢");return l}
+function favHead(){  // in the ⭐ 收藏 title: the sound switch and the bar every starred card follows unless it has its own
+  const b=$("button","hbell"+(oppSound?" on":""),oppSound?"🔔":"🔕");b.type="button";b.setAttribute("aria-pressed",oppSound?"true":"false");
+  b.title=oppSound?"声音提醒已开（“"+SOUNDS[soundKind].name+"”，音量 "+soundVol+"%）；点击关闭。音色、音量、时长在 ✎ 自定义 里":"点击开启声音提醒（新机会和收藏变动都用它）";
+  b.addEventListener("click",e=>{e.stopPropagation();setSound(!oppSound);if(last)render(last)});
+  const l=$("label","hotset mv"),i=$("input");i.type="number";i.min="0";i.max="50";i.step="0.5";i.value=favMove;
+  const tip="收藏的卡片公平价比上次提醒时变动达到这么多¢就响一声（并弹通知）；0 = 不响；每张卡旁边的 🔔 框可以单独设";i.title=tip;i.setAttribute("aria-label",tip);l.title=tip;
+  for(const ev of["click","pointerdown","mousedown","touchstart"])l.addEventListener(ev,e=>e.stopPropagation());
+  const commit=()=>{const t=i.value.trim(),n=Number(t),v=t!==""&&Number.isFinite(n)?Math.min(50,Math.max(0,n)):0;if(v!==favMove){favMove=v;keep("favMove",favMove);if(editing)drawPanel()}i.value=favMove};
+  i.addEventListener("change",()=>{commit();i.blur()});i.addEventListener("blur",()=>{commit();if(pending&&!drag){const d=pending;pending=null;render(d)}});
+  l.append("变动 ≥ ",i," ¢ 响");return[b,l]}
 function alertMoves(list){if(oppSound){beep();if(navigator.vibrate)try{navigator.vibrate([200,100,200])}catch(e){}}
   if(oppNotify&&canNotify()&&Notification.permission==="granted"&&(document.hidden||!document.hasFocus()))try{
     const body=list.slice(0,4).map(m=>m.name+" 公平价 "+cent(m.from)+" → "+cent(m.to)+"（"+sg(m.to-m.from)+"）").join(" · ")+(list.length>4?" · …":"");
@@ -8013,7 +8039,7 @@ function card(it,g){
       hotInput("card:"+fk,hotMap["sec:"+(it.group||"contract")]??hotCents,"这张卡的红框门槛（空 = 跟随栏目 / 全局）"),$("span","sp"),
       ctlBtn(off?"显示":"隐藏",off?"恢复显示这张卡":"隐藏这张卡（在自定义里可恢复）",()=>toggleHidden(fk)));
     c.append(bar);if(off)c.classList.add("off")}
-  const tg=$("div","tags");head.append(...(g==="fav"&&!editing?[grip]:[]),st,nm,tg);  // tags wrap under the full name when the card is narrow
+  const tg=$("div","tags");head.append(...(g==="fav"&&!editing?[grip]:[]),st,nm,...(on&&!editing?[moveInput(fk)]:[]),tg);  // tags wrap under the full name when the card is narrow
   if(it.day){const t=$("span","tag"+(it.day_ahead>0?" next":""),(!it.day_tag?it.day_label:it.day_tag==="今天"&&(it.trading||it.auction)?it.day_label.split(" ")[0]:it.day_label.split(" ")[0]+" "+it.day_tag));t.title="交易日 "+it.day_label;tg.append(t);
     const k=it.name+"|"+(it.symbol||"");if(seen[k]&&seen[k]<it.day)rolled[k]=Date.now();seen[k]=it.day;
     if(rolled[k]&&Date.now()-rolled[k]<600000){c.classList.add("rolled");t.className="tag new";t.textContent+=" 新"}}
@@ -8134,6 +8160,7 @@ function render(d){
     if(sg){sg.type="button";sg.title="按住拖动，调整栏目顺序";sg.setAttribute("aria-label","拖动栏目");sg.addEventListener("pointerdown",e=>startSecDrag(e,g))}
     h.replaceChildren(...(sg?[sg]:[]),head,...(sum?[sum]:[]),
       ...(editing&&g!=="fav"?[ctlBtn("↑","栏目上移",()=>moveSec(g,-1),i<=0),ctlBtn("↓","栏目下移",()=>moveSec(g,1),i<0||i>=vis.length-1)]:[]));
+    if(g==="fav"&&!editing)h.append(...favHead());
     if(!editing&&SEC_SORTS[g]&&items.length>1){  // the ladder sections: a sort of their own (the filter bar's sort flattens the page instead)
       const l=$("label","fsort secsort"),s=$("select");l.append("排序 ",s);SEC_SORTS[g].forEach(([v,t])=>{const o=$("option","",t);o.value=v;s.append(o)});s.value=secSort[g]||"";
       s.title="这一栏卡片的排列顺序（只影响本浏览器；默认顺序 = 自定义里拖出来的顺序）";l.addEventListener("click",e=>e.stopPropagation());
@@ -8205,8 +8232,8 @@ function drawPanel(){
   // starred cards: a move of this many cents in the fair price sounds too
   const mv=$("label","tog"),mi=$("input");mi.type="number";mi.id="snd-fav";mi.min="0";mi.max="50";mi.step="0.5";mi.value=favMove;
   mv.title="⭐ 收藏的卡片：公平价比上一次这样提醒时（刚打开页面时按当时的价）变动达到这么多¢，也响一声并按上面的设置弹通知；0 = 不响。阶梯卡没有单一公平价，不算";
-  mi.addEventListener("change",()=>{const v=Number(mi.value);favMove=mi.value.trim()!==""&&Number.isFinite(v)?Math.min(50,Math.max(0,v)):0;mi.value=favMove;keep("favMove",favMove);for(const k in favBase)delete favBase[k]});
-  mv.append("⭐ 收藏公平价变动 ≥ ",mi," ¢ 也响");so.append(mv);
+  mi.addEventListener("change",()=>{const v=Number(mi.value);favMove=mi.value.trim()!==""&&Number.isFinite(v)?Math.min(50,Math.max(0,v)):0;mi.value=favMove;keep("favMove",favMove)});
+  mv.append("⭐ 收藏公平价变动 ≥ ",mi," ¢ 也响");so.append(mv,$("span","mut","（⭐ 收藏 标题旁有同一个框和 🔔 开关；每张收藏卡的 🔔 框可以单独设）"));
   so.append($("span","mut","同一个机会响过后，在列或离开不到 5 分钟都不再响；机会条右侧的 🔔 随时开关。标签页在后台时标题会闪“🔥 新机会”，手机上会震动一下。注意：锁屏或切走后手机浏览器可能被暂停，长时间离开请靠 Telegram 推送；iPhone 静音开关打开时网页不出声"));
   const wl=document.getElementById("watch");wl.replaceChildren($("span","mut","★ 自选市场（存在机器人上，网页声音提醒和 Telegram 共用）："));
   const tgl=$("label","tog"),tgi=$("input");tgi.type="checkbox";tgi.id="watch-tg";tgi.checked=watch.tg_only;tgi.disabled=!watch.tg||watchSaving>0;
@@ -8239,8 +8266,8 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;oppPin=true;oppFold=false;folded=[];oneRow=[];secSort={};hotMap={};oppSound=false;oppSoundAll=true;soundKind="ding";soundVol=70;soundLen="mid";oppNotify=false;favMove=0;
-  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","oppPin","oppFold","folded","oneRow","secsort","hotmap","oppSound","oppSoundAll","soundKind","soundVol","soundLen","oppNotify","favMove"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
+  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;oppPin=true;oppFold=false;folded=[];oneRow=[];secSort={};hotMap={};oppSound=false;oppSoundAll=true;soundKind="ding";soundVol=70;soundLen="mid";oppNotify=false;favMove=0;favMoveMap={};
+  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","oppPin","oppFold","folded","oneRow","secsort","hotmap","oppSound","oppSoundAll","soundKind","soundVol","soundLen","oppNotify","favMove","favmove"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 let loading=null,lastSig="",dead=false;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
 const LOAD_TIMEOUT_MS=8000;
