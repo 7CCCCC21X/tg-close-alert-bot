@@ -202,7 +202,48 @@ async def layout_check(browser, page):
                                                                             "ETH 先触 1k/3k", "BTC 10月涨跌", "ETH 10月涨跌", "HYPE 反超 SOL"]
 
 
-async def browser_check(async_playwright, chrome, port, token):
+async def watch_check(bot, page):
+    """The chime (🔔): a short beep when an opportunity enters the strip that was not there, for every one or only the
+    watched markets, kept in this browser; the watched markets (自选) and the Telegram limit are the bot's, changed from
+    自定义 through POST /watch and shared with /watch."""
+    await page.add_init_script("window.__beeps=0;class FakeCtx{constructor(){this.state='suspended';this.currentTime=0;this.destination={}}"
+                               "resume(){this.state='running'}createGain(){return{gain:{setValueAtTime(){},exponentialRampToValueAtTime(){}},connect(x){return x}}}"
+                               "createOscillator(){window.__beeps++;return{frequency:{},connect(g){return g},start(){},stop(){}}}}window.AudioContext=FakeCtx")
+    await page.reload(); await page.wait_for_selector(".card .odds")
+    await page.click("#edit")
+    assert (await page.inner_text("#sound")).startswith("🔔 声音提醒：\n开启\n全部机会都响") and not await page.is_checked("#snd-on") and await page.is_checked("#snd-all")
+    names = await page.eval_on_selector_all("#watch input[data-watch]", "els => els.map(e => e.dataset.watch)")
+    assert names[:4] == ["SSE", "UNITREEUSDT", "BNB", "SOL"] and "SIM" not in names and not await page.is_checked("#watch-tg"), names
+    await page.check("#watch input[data-watch=UNITREEUSDT]"); await page.wait_for_function("watchMsg === '已保存'")
+    assert bot.watch_state() == ({"UNITREEUSDT": "宇树 UNITREE"}, False) and await page.inner_text("#watchmsg") == "已保存"
+    await page.check("#watch-tg"); await page.wait_for_function("watch.tg_only === true")
+    assert bot.watch_state() == ({"UNITREEUSDT": "宇树 UNITREE"}, True)
+    # a refused change is undone on the page and said so
+    await page.evaluate("saveWatch({keys: ['NOPE']})"); await page.wait_for_function("watchMsg.startsWith('保存失败')")
+    assert await page.evaluate("watch.keys") == ["UNITREEUSDT"] and "不认识的市场" in await page.inner_text("#watchmsg")
+    # the chime: turning it on sounds once (and unlocks audio); the strip's new entries sound, the same ones again do not
+    await page.check("#snd-on"); assert await page.evaluate("window.__beeps") == 2 and await page.evaluate("localStorage.getItem('oppSound')") == "true"  # two notes
+    await page.click("#done")
+    opp = lambda key, ekey, name: f"{{key:'{key}',ekey:'{ekey}',name:'{name}',group:'crypto',url:'',maker:null,taker:{{text:'吃涨 40.0',edge:.12}}}}"
+    await page.evaluate(f"hots.push({opp('UNITREEUSDT', 'UNITREEUSDT', '宇树 UNITREE')}, {opp('SOLUSDT', 'SOL', 'SOL 先触 60/140')}); drawOpps()")
+    assert await page.evaluate("window.__beeps") == 4 and await page.inner_text("#opps .obell") == "🔔"
+    assert await page.eval_on_selector_all("#opps .opp", "els => els.map(e => e.classList.contains('w'))") == [True, False]  # ★ on the watched one
+    await page.evaluate("drawOpps()"); assert await page.evaluate("window.__beeps") == 4  # the same entries: quiet
+    await page.click("#opps .obell"); assert await page.inner_text("#opps .obell") == "🔕" and await page.evaluate("oppSound") is False
+    await page.evaluate("delete oppSeenAt['t:SOLUSDT']; drawOpps()"); assert await page.evaluate("window.__beeps") == 4  # off: quiet
+    await page.click("#opps .obell"); assert await page.evaluate("window.__beeps") == 6  # on again (its own beep)
+    await page.evaluate("oppSoundAll = false; delete oppSeenAt['t:SOLUSDT']; delete oppSeenAt['t:UNITREEUSDT']; drawOpps()")
+    assert await page.evaluate("window.__beeps") == 8  # only the watched market sounds, SOL alone would not
+    await page.evaluate("delete oppSeenAt['t:SOLUSDT']; drawOpps()"); assert await page.evaluate("window.__beeps") == 8
+    await page.reload(); await page.wait_for_selector(".card .odds")
+    assert await page.evaluate("[watch.keys, watch.tg_only, oppSound]") == [["UNITREEUSDT"], True, True]  # the bot's list, this browser's chime
+    await page.click("#edit"); await page.click("#watch button.cb:nth-of-type(2)"); await page.wait_for_function("watch.keys.length === 0")  # 清空自选
+    assert "自选为空" in await page.inner_text("#watchmsg") or await page.inner_text("#watchmsg") == "已保存"
+    await page.uncheck("#watch-tg"); await page.wait_for_function("watch.tg_only === false"); await page.uncheck("#snd-on"); await page.click("#done")
+    assert bot.watch_state() == ({}, False) and await page.evaluate("localStorage.getItem('oppSound')") == "false"
+
+
+async def browser_check(async_playwright, chrome, port, token, bot):
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         url = f"http://127.0.0.1:{port}/p/{token}"
@@ -295,6 +336,7 @@ async def browser_check(async_playwright, chrome, port, token):
         assert not await page.is_visible("#g-crypto") and await page.inner_text("#h-index") == "指数" and await page.is_visible("#g-index .card")
         await page.click("#h-crypto .fold")
         assert await page.is_visible("#g-crypto .card") and await page.locator("#h-crypto .fs").count() == 0 and await page.evaluate("localStorage.getItem('folded')") == "[]"
+        await watch_check(bot, page)
         await layout_check(browser, page)
         if os.environ.get("WEB_SCREENSHOT"):
             await page.screenshot(path=os.environ["WEB_SCREENSHOT"], full_page=True)
@@ -395,6 +437,27 @@ async def run():
     for raw in [b"GET /p/wrongtokenwrongtoken HTTP/1.1\r\n\r\n", f"GET /p/{token}/other HTTP/1.1\r\n\r\n".encode(), b"GET /etc/passwd HTTP/1.1\r\n\r\n"]:
         st, _, _ = await request(port, raw); assert st == 404, raw
     st, _, _ = await request(port, f"POST /p/{token} HTTP/1.1\r\n\r\n".encode()); assert st == 405
+    # the one write: POST /watch (JSON) sets the watched markets (自选) and whether the Telegram alerts keep to them;
+    # data.json carries them, and each card's market key (the one /edge and /watch know it by)
+    d = json.loads((await request(port, f"GET /p/{token}/data.json HTTP/1.1\r\n\r\n".encode()))[2])
+    assert d["watch"] == {"keys": [], "names": {}, "tg_only": False, "tg": True} and [i["ekey"] for i in d["items"][:4]] == ["SSE", "UNITREEUSDT", "BNB", "SOL"], d["watch"]
+    assert d["items"][-1]["ekey"] == "SIM" and {i["ekey"] for i in d["items"][:-1]} <= {k for k, _ in bot.edge_markets()}
+    post = lambda body, ctype="Content-Type: application/json\r\n": request(port, f"POST /p/{token}/watch HTTP/1.1\r\nHost: x\r\n{ctype}Content-Length: {len(body)}\r\n\r\n".encode() + body)
+    st, head, body = await post(b'{"keys": ["UNITREEUSDT", "SOL"], "tg_only": true}')
+    assert st == 200 and "application/json" in head and json.loads(body) == {"keys": ["UNITREEUSDT", "SOL"], "names": {"UNITREEUSDT": "宇树 UNITREE", "SOL": "SOL"}, "tg_only": True, "tg": True}, body
+    assert bot.watch_state() == ({"UNITREEUSDT": "宇树 UNITREE", "SOL": "SOL"}, True) and store.get("settings")["watch_keys"] == {"UNITREEUSDT": "宇树 UNITREE", "SOL": "SOL"}
+    d = json.loads((await request(port, f"GET /p/{token}/data.json HTTP/1.1\r\n\r\n".encode()))[2]); assert d["watch"]["keys"] == ["UNITREEUSDT", "SOL"] and d["watch"]["tg_only"]  # the cached answer was dropped
+    st, _, body = await post(b'{"tg_only": false}'); assert st == 200 and json.loads(body)["keys"] == ["UNITREEUSDT", "SOL"] and not bot.watch_state()[1]  # a field left out stays as it is
+    for bad, why in [(b'{"keys": ["NOPE"]}', "不认识的市场：NOPE"), (b'{"keys": "x"}', "keys 要是"), (b'{"tg_only": 1}', "tg_only"), (b'[1]', "JSON 对象"), (b'{bad', ""), (b'\xff', "")]:
+        st, _, body = await post(bad); assert st == 400 and why in json.loads(body)["error"], (bad, body)
+    st, _, body = await post(b'{"keys": []}', ""); assert st == 400 and "JSON" in json.loads(body)["error"]  # a form post (no JSON content type) is refused
+    assert bot.watch_state() == ({"UNITREEUSDT": "宇树 UNITREE", "SOL": "SOL"}, False)  # nothing refused changed anything
+    st, _, _ = await request(port, f"POST /p/{token}/watch HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 99999\r\n\r\n".encode()); assert st == 400  # too big
+    st, _, _ = await request(port, f"POST /p/{token}/watch HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: x\r\n\r\n".encode()); assert st == 400
+    st, _, _ = await request(port, f"POST /p/{token}/data.json HTTP/1.1\r\nContent-Length: 0\r\n\r\n".encode()); assert st == 405
+    st, _, _ = await request(port, b"POST /p/" + b"x" * len(token) + b"/watch HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"); assert st == 405
+    assert bot.watch_update([], False) == {"keys": [], "names": {}, "tg_only": False, "tg": True}
+    d = json.loads((await request(port, f"GET /p/{token}/data.json HTTP/1.1\r\n\r\n".encode()))[2]); assert d["watch"]["keys"] == []
     st, _, _ = await request(port, b"GARBAGE\r\n\r\n"); assert st == 400
     # within the cache interval the last good answer is served; a payload crash after it returns 500 without killing the server
     orig = bot.odds_payload; bot.odds_payload = lambda: 1 / 0
@@ -417,7 +480,7 @@ async def run():
         print("browser check skipped (no Playwright/Chromium)")
     else:
         web.CACHE_SECONDS = {}  # the browser check changes the payload and reloads at once
-        await browser_check(async_playwright, chrome, port, token)
+        await browser_check(async_playwright, chrome, port, token, bot)
     await web.stop()
     print("WEB_OK")
 asyncio.run(run())
