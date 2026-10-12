@@ -289,6 +289,60 @@ async def run():
     r = await ask("/edge 清空"); assert "已取消全部单独门槛" in r and abot.settings()["edge_bars"] == {} and abs(abot.edge_bar(mk_hsi) - 0.10) < 1e-12
     assert abs(abot.edge_default() - 0.10) < 1e-12
 
+    # --- /watch: the watched markets (自选); "只推自选" keeps the Telegram alerts to them ------------------------------------
+    niulai = abot.edge_target(["牛来"])[0].removeprefix("key:")
+    r = await ask("/watch"); assert r.startswith("⭐ 自选市场：还没有") and "全部市场都推送" in r and "/watch 只推自选" in r, r
+    assert abot.watch_state() == ({}, False) and abot.watch_filter() is None and abot.watch_payload() == {"keys": [], "names": {}, "tg_only": False, "tg": True}
+    r = await ask("/watch 牛来"); assert r.startswith("✅ 已把 $牛来 市值 加入自选") and abot.watch_state() == ({niulai: "$牛来 市值"}, False), r
+    r = await ask("/watch 牛来"); assert r.startswith("ℹ️ $牛来 市值 已在自选里"), r
+    r = await ask("/watch 恒指"); assert "已把 恒生指数 加入自选" in r and list(abot.watch_state()[0]) == [niulai, "HSI"], r
+    for bad in ("/watch 指数", "/watch 牛来 300M", "/watch off", "/watch 不存在的市场", "/watch 默认"):
+        assert "❌" in await ask(bad), bad
+    assert abot.watch_filter() is None  # the list alone changes nothing on Telegram (it is the page's chime that reads it)
+    r = await ask("/watch 只推自选"); assert "只推送自选市场" in r and abot.watch_filter() == {niulai, "HSI"} and abot.watch_state()[1], r
+    assert "只推送自选 $牛来 市值、恒生指数" in abot.status("1:0") and "/watch 自选" in abot.status("1:0")
+    r = await ask("/watch 牛来 off"); assert r.startswith("✅ 已把 $牛来 市值 移出自选") and abot.watch_filter() == {"HSI"}, r
+    r = await ask("/watch 牛来 off"); assert r.startswith("ℹ️ $牛来 市值 不在自选里"), r
+    r = await ask("/watch 清空"); assert "已清空自选市场" in r and "现在什么都不推送" in r and abot.watch_filter() == set(), r
+    assert "只推送自选，但自选为空" in abot.status("1:0")
+    r = await ask("/watch 全部推送"); assert "全部市场都推送" in r and abot.watch_filter() is None and not abot.watch_state()[1], r
+    for bad in ([1], "x", ["NOPE"], ["HSI"] * 201):
+        try: abot.watch_update(bad); assert False, bad
+        except ValueError: pass
+    try: abot.watch_update(None, 1); assert False
+    except ValueError: pass
+    assert abot.watch_state() == ({}, False)  # a refused update changes nothing
+    assert abot.watch_update(["HSI", "UNITREEUSDT", "HSI"], None)["keys"] == ["HSI", "UNITREEUSDT"]  # once each, in order
+    # the alerts: with 只推自选 on, a market off the list is not announced; put on the list while the announcement is
+    # young, it is sent; 建议失效 / 方向反转 keep to the list too
+    wtg = FakeTelegram(); wbot = m.Bot(cfg, m.Store(":memory:"), FM(NOW), wtg)
+    wbot.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
+    wbot.watch_update(["UNITREEUSDT"], True)
+    await step(wbot, NOW, hsi(0.28, [("0.45", "300")], [("0.48", "300")], NOW))
+    await step(wbot, NOW + MIN, hsi(0.28, [("0.45", "300")], [("0.48", "300")], NOW + MIN))
+    assert wtg.sent == [] and (wbot.store.get("edgealerts") or {})[SLUG]["alert"]["key"] == "HSI" and (wbot.store.get("edgealerts") or {})[SLUG]["told"] == "down"
+    wbot.watch_update(["UNITREEUSDT", "HSI"], None)
+    await step(wbot, NOW + 2 * MIN, hsi(0.28, [("0.45", "300")], [("0.48", "300")], NOW + 2 * MIN))
+    assert len(wtg.sent) == 1 and wtg.sent[0][1].startswith("🟢 新机会｜恒生指数（10-05）\n挂跌 @ 52.0¢"), wtg.sent
+    wbot.watch_update(["UNITREEUSDT"], None)  # taken off the list again: its 方向反转 stays quiet
+    for i in (3, 4):
+        await step(wbot, NOW + i * MIN, hsi(0.55, [("0.45", "300")], [("0.48", "300")], NOW + i * MIN))  # 挂跌 @ 52¢ −7¢, 挂涨 @ 45¢ +10¢: the other side now
+    assert len(wtg.sent) == 1 and (wbot.store.get("edgealerts") or {})[SLUG]["alert"]["kind"] == "flip", wbot.store.get("edgealerts")
+    wbot.watch_update(None, False)  # every market again: the young follow-up goes out
+    await step(wbot, NOW + 5 * MIN, hsi(0.55, [("0.45", "300")], [("0.48", "300")], NOW + 5 * MIN))
+    assert len(wtg.sent) == 2 and wtg.sent[1][1].startswith("🔄 方向反转｜恒生指数（10-05）"), wtg.sent
+    # digest mode keeps to the list too
+    dwcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "EDGE_ALERT_DIGEST_MINUTES": "30"})
+    dwtg = FakeTelegram(); dwbot = m.Bot(dwcfg, m.Store(":memory:"), FM(NOW), dwtg)
+    dwbot.store.put("subscriptions", {"1:0": {"chat": 1, "thread": 0, "active": True}})
+    dwbot.watch_update([], True)
+    await step(dwbot, NOW, hsi(0.28, [("0.45", "300")], [("0.48", "300")], NOW))
+    await step(dwbot, NOW + MIN, hsi(0.28, [("0.45", "300")], [("0.48", "300")], NOW + MIN))
+    assert dwtg.sent == []
+    dwbot.watch_update(["HSI"], None)
+    await step(dwbot, NOW + 2 * MIN, hsi(0.28, [("0.45", "300")], [("0.48", "300")], NOW + 2 * MIN))
+    assert len(dwtg.sent) == 1 and dwtg.sent[0][1].startswith("📬 机会摘要") and "恒生指数" in dwtg.sent[0][1], dwtg.sent
+
 
 asyncio.run(run())
 print("EDGEALERT_OK")

@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.35.3"
+VERSION = "1.36.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -7417,7 +7417,8 @@ a.simrow>*{min-width:0}a.simrow>:nth-child(2){overflow:hidden;text-overflow:elli
 .small{font-size:12px;margin-top:3px}.mut{color:var(--faint)}.warn{color:var(--warn)}footer{color:var(--faint);font-size:11.5px;margin-top:22px;padding-top:12px;border-top:1px solid var(--line);line-height:1.6;max-width:760px}
 #opps{display:flex;flex-direction:column;align-items:stretch;gap:5px;margin:8px 0 4px;padding:8px 11px;font-size:12px;border-radius:12px;border:1px solid var(--hot-soft);background:linear-gradient(90deg,var(--hot-bg),var(--card) 85%)}
 #opps.pin{position:sticky;top:var(--top-h,46px);z-index:4;max-height:36vh;overflow-y:auto;overscroll-behavior:contain;box-shadow:var(--shadow)}
-#opps .ofold{margin-left:auto;border:0;background:none;color:var(--muted);font:inherit;font-size:11.5px;cursor:pointer;padding:2px 4px;white-space:nowrap;border-radius:6px}#opps .ofold:hover{color:var(--text);background:var(--chip)}
+#opps .otools{margin-left:auto;display:inline-flex;align-items:center;gap:2px}#opps .ofold,#opps .obell{border:0;background:none;color:var(--muted);font:inherit;font-size:11.5px;cursor:pointer;padding:2px 4px;white-space:nowrap;border-radius:6px}#opps .ofold:hover,#opps .obell:hover{color:var(--text);background:var(--chip)}#opps .obell{font-size:13px;line-height:1}#opps .obell.on{color:var(--best)}
+.opp.w b::before{content:"★";margin-right:3px;color:var(--best)}.panel .wmsg:empty{display:none}
 #opps .osum{display:flex;flex-wrap:wrap;align-items:center;gap:5px 10px}
 #opps .orow{display:flex;flex-wrap:wrap;align-items:center;gap:5px 6px}#opps .ok{color:var(--hot);font-weight:700;white-space:nowrap}#opps .og{color:var(--muted);font-weight:600;white-space:nowrap;margin-left:2px}
 .opp{display:inline-flex;align-items:baseline;gap:4px;max-width:100%;border:1px solid var(--hot-soft);background:var(--card);color:var(--text);border-radius:999px;padding:3px 10px;font:inherit;font-size:12px;line-height:1.4;cursor:pointer;font-variant-numeric:tabular-nums;box-shadow:var(--shadow);transition:border-color .15s,box-shadow .15s}
@@ -7469,6 +7470,7 @@ h2 .fs{font-weight:400;color:var(--faint)}h2 .fs b{color:var(--hot);font-weight:
 .panel{background:var(--card);border:1px solid var(--best-soft);border-radius:var(--r);padding:12px 14px;margin:6px 0 10px;display:flex;flex-direction:column;gap:8px;font-size:13px;box-shadow:var(--shadow2)}
 .panel .pr{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}.panel .cgrp{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;width:100%}
 .panel input[type=number]{width:58px;font:inherit;padding:2px 6px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)}
+.panel select{font:inherit;font-size:12.5px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);padding:2px 6px;max-width:170px}.panel input[type=range]{width:90px;accent-color:var(--best);margin:0}.panel label.cb{display:inline-block}
 button.tog{font-family:inherit;padding:4px 11px}.tog.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}
 #totop{position:fixed;right:16px;bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:6;width:40px;height:40px;border-radius:50%;border:1px solid var(--line);background:var(--card);box-shadow:var(--shadow2);color:var(--text);font-size:16px;line-height:1;cursor:pointer;opacity:0;pointer-events:none;transform:translateY(8px);transition:opacity .2s,transform .2s}
 #totop.show{opacity:1;pointer-events:auto;transform:none}#totop:hover{color:var(--best);border-color:var(--best)}
@@ -7486,15 +7488,17 @@ h2{margin:12px 2px 6px}.legend{margin-bottom:4px}.edge{min-height:40px}.pb{paddi
 <div id="stale" hidden><span id="stalemsg"></span><button type="button" class="cb" id="retry">立即重试</button></div>
 <div id="opps" hidden></div>
 <div class="panel" id="custom" hidden>
-<div class="pr"><b>自定义布局</b><span class="mut">拖动 ⠿ 或点 ◀ ▶ 调整卡片顺序（收藏栏平时也能拖）；拖动栏目标题前的 ⠿ 或点旁边的 ↑ ↓ 调整栏目顺序；“隐藏”收起不看的卡片。只保存在这个浏览器。</span></div>
+<div class="pr"><b>自定义布局</b><span class="mut">拖动 ⠿ 或点 ◀ ▶ 调整卡片顺序（收藏栏平时也能拖）；拖动栏目标题前的 ⠿ 或点旁边的 ↑ ↓ 调整栏目顺序；“隐藏”收起不看的卡片。除 ★ 自选市场外都只保存在这个浏览器。</span></div>
 <div class="pr" id="secs"></div>
 <div class="pr" id="cards"></div>
 <div class="pr" id="onerow"></div>
 <div class="pr" id="oppsrc"></div>
 <div class="pr" id="oppway"></div>
+<div class="pr" id="sound"></div>
+<div class="pr" id="watch"></div>
 <div class="pr"><span class="mut">“价格阶梯”和“模拟交易”栏默认不显示，勾上才出现；每笔交易的证据和导出在</span><a class="cb" id="journal" href="#">模拟交易复盘 ↗</a></div>
 <div class="pr"><label>高亮门槛 <input type="number" id="hotin" min="1" max="50" step="1"> ¢</label><span class="mut">净优势达到这个值的卡片标红框、进机会条（和模型的“建议门槛”不是一回事：没超过建议门槛的方向不会被建议）。栏目标题和每张卡的工具条（自定义时）、每一档的说明（点开档位）旁各有一个“红框 ¢”框：填了按它，空着跟随上一级（档位 → 卡片 → 栏目 → 这里）</span></div>
-<div class="pr"><span class="mut" id="hidn"></span><span class="sp"></span><button type="button" class="cb" id="showall">全部显示</button><button type="button" class="cb" id="reset" title="还原卡片和栏目顺序、隐藏与高亮门槛（收藏保留）">恢复默认布局</button><button type="button" class="cb pri" id="done">完成</button></div>
+<div class="pr"><span class="mut" id="hidn"></span><span class="sp"></span><button type="button" class="cb" id="showall">全部显示</button><button type="button" class="cb" id="reset" title="还原卡片和栏目顺序、隐藏、高亮门槛与声音提醒（收藏和自选市场保留）">恢复默认布局</button><button type="button" class="cb pri" id="done">完成</button></div>
 </div>
 <h2 id="h-flat" hidden></h2><div class="grid" id="g-flat" hidden></div>
 <h2 id="h-fav" hidden>⭐ 收藏</h2><div class="grid" id="g-fav"></div>
@@ -7556,6 +7560,64 @@ let oppOff=stored("oppOff",[],strs),oppMakers=stored("oppMakers",true,isBool),op
 try{if(localStorage.getItem("oppTaker")==="true"){oppMakers=false;keep("oppMakers",false)}localStorage.removeItem("oppTaker")}catch(e){}  // the old "只列吃单" switch carries over, once
 let folded=stored("folded",[],strs);  // sections folded away: the title stays, with how many cards it holds and how many are red-framed
 let oppPin=stored("oppPin",true,isBool),oppFold=stored("oppFold",false,isBool);  // the strip stays under the filter bar while scrolling; folded to one line
+// the chime: a short two-note beep when an opportunity enters the strip that was not there (this browser only); for every
+// opportunity, or only the watched markets. An entry heard once stays quiet while it is listed and for 5 minutes after it goes.
+let oppSound=stored("oppSound",false,isBool),oppSoundAll=stored("oppSoundAll",true,isBool);
+const oppSeenAt={};let oppPrimed=false,audio=null;const SOUND_AGAIN_MS=300000;
+// the tone: built-in patterns synthesised with WebAudio (no audio files: the page loads nothing), or the viewer's own clip
+// (kept in this browser as a data: URL, decoded once); the volume and how long it goes on are the viewer's too
+const SOUNDS={ding:{name:"叮咚",type:"sine",gain:.8,notes:[[880,0,.14],[1320,.14,.18]]},
+  triple:{name:"三连音",type:"triangle",gain:.6,notes:[[660,0,.1],[880,.12,.1],[1100,.24,.2]]},
+  beep:{name:"滴滴",type:"square",gain:.25,notes:[[1500,0,.07],[1500,.12,.07]]},
+  alarm:{name:"警报",type:"square",gain:.22,notes:[[1000,0,.16],[700,.18,.16],[1000,.36,.16],[700,.54,.16]]},
+  bell:{name:"钟声",type:"sine",gain:.7,notes:[[1760,0,.7],[2640,0,.35],[880,0,.9]]},
+  file:{name:"自定义文件"}};
+const SOUND_LEN={short:{label:"短（1 遍）",secs:0,plays:1},mid:{label:"中（约 2 秒）",secs:2,plays:2},long:{label:"长（约 5 秒）",secs:5,plays:3}};
+const SOUND_FILE_MAX=600*1024;  // a clip this size still fits localStorage (5 MB) with room to spare
+let soundKind=stored("soundKind","ding",v=>typeof v==="string"&&Object.prototype.hasOwnProperty.call(SOUNDS,v)),soundVol=stored("soundVol",70,v=>typeof v==="number"&&v>=0&&v<=100),
+  soundLen=stored("soundLen","mid",v=>typeof v==="string"&&Object.prototype.hasOwnProperty.call(SOUND_LEN,v)),soundFile=null,fileBuf=null,fileName="";
+try{soundFile=localStorage.getItem("soundFile")||null;fileName=localStorage.getItem("soundFileName")||""}catch(e){}
+if(soundKind==="file"&&!soundFile)soundKind="ding";
+function ctx(){const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return null;if(!audio)audio=new AC();if(audio.state==="suspended")audio.resume();return audio}
+function tone(ac,at,f,dur,type,peak){const o=ac.createOscillator(),g=ac.createGain();o.type=type;o.frequency.value=f;
+  g.gain.setValueAtTime(.0001,at);g.gain.exponentialRampToValueAtTime(Math.max(.0002,peak),at+.015);g.gain.exponentialRampToValueAtTime(.0001,at+dur);
+  o.connect(g).connect(ac.destination);o.start(at);o.stop(at+dur+.02)}
+function beep(){try{const ac=ctx();if(!ac||!soundVol)return;const len=SOUND_LEN[soundLen],vol=soundVol/100;
+  if(soundKind==="file"){playFile(ac,len.plays,vol);return}
+  const snd=SOUNDS[soundKind],span=Math.max(...snd.notes.map(n=>n[1]+n[2])),t0=ac.currentTime+.01;let t=0,passes=0;
+  do{for(const[f,at,dur]of snd.notes)tone(ac,t0+t+at,f,dur,snd.type,snd.gain*vol);t+=span+.3;passes++}while(t<len.secs&&passes<20)}catch(e){}}
+async function playFile(ac,plays,vol){if(!soundFile)return;
+  if(!fileBuf){const b=atob(soundFile.slice(soundFile.indexOf(",")+1)),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);
+    fileBuf=await new Promise((ok,no)=>{const r=ac.decodeAudioData(a.buffer,ok,no);if(r&&r.then)r.then(ok,no)})}
+  let t=ac.currentTime+.01;for(let i=0;i<plays;i++){const src=ac.createBufferSource(),g=ac.createGain();src.buffer=fileBuf;g.gain.value=vol;src.connect(g).connect(ac.destination);src.start(t);t+=fileBuf.duration+.3}}
+function setSoundFile(file,done){  // the viewer's own clip: read once, kept as a data: URL in this browser
+  if(!file){soundFile=null;fileBuf=null;fileName="";try{localStorage.removeItem("soundFile");localStorage.removeItem("soundFileName")}catch(e){}if(soundKind==="file"){soundKind="ding";keep("soundKind",soundKind)}done("");return}
+  if(file.size>SOUND_FILE_MAX){done("文件太大："+Math.round(file.size/1024)+" KB，限 "+Math.round(SOUND_FILE_MAX/1024)+" KB（剪短一点，或转成 mp3 / ogg）");return}
+  const rd=new FileReader();rd.onerror=()=>done("读不了这个文件");
+  rd.onload=()=>{try{localStorage.setItem("soundFile",rd.result);localStorage.setItem("soundFileName",file.name)}catch(e){done("浏览器存不下这个文件");return}
+    soundFile=rd.result;fileBuf=null;fileName=file.name;soundKind="file";keep("soundKind",soundKind);done("")};
+  rd.readAsDataURL(file)}
+function setSound(on){oppSound=on;keep("oppSound",on);if(on)beep()}  // the click that turns it on also unlocks audio (browsers want a gesture first)
+// reaching a viewer who is not looking: a system notification when the tab is in the background (asked once, this browser),
+// the tab's title flashing until it is looked at, and a short vibration on a phone that has it
+let oppNotify=stored("oppNotify",false,isBool);
+const canNotify=()=>typeof Notification!=="undefined"&&!!Notification.requestPermission;
+function askNotify(done){if(!canNotify()){done("denied");return}try{const r=Notification.requestPermission(v=>done(v));if(r&&r.then)r.then(done,()=>done("denied"))}catch(e){done("denied")}}
+function notifyOpps(list){if(!oppNotify||!canNotify()||Notification.permission!=="granted"||(!document.hidden&&document.hasFocus()))return;
+  try{const body=list.slice(0,4).map(h=>h.name+" "+h.pick.text+" "+sg(h.pick.edge)).join(" · ")+(list.length>4?" · …":"");
+    const n=new Notification("🔥 新机会 "+list.length,{body,tag:"opps",renotify:true,silent:oppSound});n.onclick=()=>{try{window.focus()}catch(e){}n.close()}}catch(e){}}
+const baseTitle=document.title;let flashTimer=0;
+function flashTitle(n){if(!document.hidden)return;clearInterval(flashTimer);let on=false;flashTimer=setInterval(()=>{on=!on;document.title=on?"🔥 新机会 "+n:baseTitle},900)}
+document.addEventListener("visibilitychange",()=>{if(!document.hidden&&flashTimer){clearInterval(flashTimer);flashTimer=0;document.title=baseTitle}});
+function alertOpps(list){if(oppSound){beep();if(navigator.vibrate)try{navigator.vibrate([200,100,200])}catch(e){}}notifyOpps(list);if(oppSound||oppNotify)flashTitle(list.length)}
+// the watched markets (自选) live on the bot, so the page and the Telegram alerts share them: data.json brings them, POST /watch changes them
+let watch={keys:[],names:{},tg_only:false,tg:true},watchSaving=0,watchMsg="";
+const watched=h=>watch.keys.includes(h.ekey||h.key);
+async function saveWatch(ch){const prev=watch;watch={...watch,...ch};watchSaving++;watchMsg="保存中…";if(editing)drawPanel();
+  try{const r=await fetch(location.pathname.replace(/\\/$/,"")+"/watch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({keys:watch.keys,tg_only:watch.tg_only})});
+    const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||("HTTP "+r.status));watch=d;watchMsg="已保存"}
+  catch(e){watch=prev;watchMsg="保存失败："+(e&&e.message||e)}
+  finally{watchSaving--;if(editing)drawPanel();if(last)render(last)}}
 function toggleFold(g){folded=folded.includes(g)?folded.filter(x=>x!==g):[...folded,g];keep("folded",folded);if(last)render(last)}
 let secOrder=stored("secs",SECTIONS,strs);secOrder=[...new Set(secOrder.filter(g=>SECTIONS.includes(g)))];
 SECTIONS.forEach((g,i)=>{if(!secOrder.includes(g)){const prev=SECTIONS.slice(0,i).reverse().find(x=>secOrder.includes(x));  // a new section joins after its default neighbour
@@ -7872,7 +7934,7 @@ function priceLadderBook(c,it,L,live){
   c.append(w);const ag=ages(it);if(ag)c.append(ag);
   if(hot){c.classList.add("hot");c.title="净优势 ≥"+hotCentsFor(it,hot.row)+"¢："+hot.row+" "+hot.label+" @ "+cent(hot.price)+" "+sg(hot.edge);
     const text=e=>e.row+" "+e.label+" "+(e.price*100).toFixed(1);
-    hots.push({key,name:it.name,group:it.group||"levels",url:it.predict&&it.predict.url||"",maker:hotMk?{text:text(hotMk),edge:hotMk.edge,points:hotMk.points}:null,taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
+    hots.push({key,ekey:it.ekey||key,name:it.name,group:it.group||"levels",url:it.predict&&it.predict.url||"",maker:hotMk?{text:text(hotMk),edge:hotMk.edge,points:hotMk.points}:null,taker:hotTk?{text:text(hotTk),edge:hotTk.edge}:null})}
   return c}
 function drawOpps(){  // every red-framed suggestion on the page in one strip on top: makers (挂单) on one row, takers (吃单) on the next, largest first; tap one to jump to its card.
   // 自定义 leaves sections out, drops either side, or lists makers whatever their points; by default a maker is listed only where a
@@ -7881,10 +7943,19 @@ function drawOpps(){  // every red-framed suggestion on the page in one strip on
   const pool=hots.filter(h=>!oppOff.includes(h.group)&&!seen.has(h.key)&&seen.add(h.key));
   const makers=oppMakers?pool.filter(h=>h.maker&&(!oppPoints||h.maker.points)).map(h=>({...h,pick:h.maker})).sort(byEdge):[];
   const takers=oppTakers?pool.filter(h=>h.taker).map(h=>({...h,pick:h.taker})).sort(byEdge):[];
+  const now=Date.now(),fresh=[];  // the chime: entries not listed a moment ago (nor within the last 5 minutes)
+  for(const h of [...makers.map(h=>["m",h]),...takers.map(h=>["t",h])]){const id=h[0]+":"+h[1].key;
+    if(oppPrimed&&!(id in oppSeenAt)&&(oppSoundAll||watched(h[1])))fresh.push(h[1]);oppSeenAt[id]=now}
+  for(const id in oppSeenAt)if(now-oppSeenAt[id]>SOUND_AGAIN_MS)delete oppSeenAt[id];
+  if(oppPrimed&&fresh.length)alertOpps(fresh);if(last)oppPrimed=true;  // the first strip drawn from data is what is already there: silent
   const n=makers.length+takers.length;el.hidden=editing||!n;el.classList.toggle("pin",oppPin);if(el.hidden){el.replaceChildren();return}
+  const bellBtn=()=>{const b=$("button","obell"+(oppSound?" on":""),oppSound?"🔔":"🔕");b.type="button";b.setAttribute("aria-label","声音提醒");b.setAttribute("aria-pressed",oppSound?"true":"false");
+    b.title=oppSound?"声音提醒已开：新机会进入机会条时响“"+SOUNDS[soundKind].name+"”（"+(oppSoundAll?"全部机会":"只限 ★ 自选市场")+"；音量 "+soundVol+"%）；点击关闭":"点击开启声音提醒：新机会进入机会条时响一声（范围在 ✎ 自定义 里选）";
+    b.addEventListener("click",()=>{setSound(!oppSound);drawOpps()});return b};
   const foldBtn=()=>{const b=$("button","ofold",oppFold?"展开 ▾":"收起 ▴");b.type="button";b.title=oppFold?"展开机会条":"把机会条折成一行（只剩数量）";
     b.addEventListener("click",()=>{oppFold=!oppFold;keep("oppFold",oppFold);drawOpps()});return b};
-  if(oppFold){const sum=$("div","osum");sum.append($("span","ok","🔥 机会 "+n),$("span","og","挂单 "+makers.length),$("span","og","吃单 "+takers.length),foldBtn());el.replaceChildren(sum);return}
+  const tools=()=>{const t=$("span","otools");t.append(bellBtn(),foldBtn());return t};
+  if(oppFold){const sum=$("div","osum");sum.append($("span","ok","🔥 机会 "+n),$("span","og","挂单 "+makers.length),$("span","og","吃单 "+takers.length),tools());el.replaceChildren(sum);return}
   el.replaceChildren();let head=$("span","ok","🔥 机会 "+n);
   const jump=h=>{const find=()=>[...document.querySelectorAll(".card")].find(x=>x.dataset.key===h.key);let c=find();if(!c)return;
     const g=c.parentElement.id.slice(2);if(folded.includes(g)){folded=folded.filter(x=>x!==g);keep("folded",folded);if(last)render(last);c=find()}
@@ -7894,12 +7965,12 @@ function drawOpps(){  // every red-framed suggestion on the page in one strip on
     const t=$("span","og",label+" "+list.length);t.title=title;row.append(t);
     list.forEach(h=>{  // every one, wrapping onto more lines; a tap opens the market on Predict (a new tab) and brings its card into view here
       const b=h.url?$("a","opp link"):$("button","opp");if(h.url){b.href=h.url;b.target="_blank";b.rel="noopener noreferrer"}else b.type="button";
-      b.title=h.url?"在新标签页打开这个 Predict 市场，并定位到它的卡片":"跳到这张卡";b.append($("b","",h.name),$("span","",h.pick.text),$("i","",sg(h.pick.edge)));
+      b.title=(h.url?"在新标签页打开这个 Predict 市场，并定位到它的卡片":"跳到这张卡")+(watched(h)?"；★ 自选市场":"");if(watched(h))b.classList.add("w");b.append($("b","",h.name),$("span","",h.pick.text),$("i","",sg(h.pick.edge)));
       b.addEventListener("click",()=>jump(h));row.append(b)});
     el.append(row)};
   group("挂单",makers,"挂单机会：排队等成交，不保证成交"+(oppPoints?"；只列现在挂单能拿积分的市场":""));
   group("吃单",takers,"吃单机会：立即成交，已扣手续费与滑点");
-  if(el.firstChild)el.firstChild.append(foldBtn())}
+  if(el.firstChild)el.firstChild.append(tools())}
 function rowNote(r,L,it){  // one line about a ladder level itself, above its four directions: on a phone nothing hovers
   const d=$("div","lnote"),parts=[];
   if(r.dist!=null)parts.push((L.kind==="price"?"现价还要"+(r.dist>=0?"涨 ":"跌 "):L.metric+"还要涨 ")+(Math.abs(r.dist)*100).toFixed(1)+"% 才碰到");
@@ -7946,7 +8017,7 @@ function card(it,g){
   const v=view(it),best=v.best,hb=hotFor(it);  // for the trade size picked in the bar; hb = the red-frame bar of this card
   if(best&&best.edge>=hb){c.classList.add("hot");c.title="净优势 ≥"+hotCentsFor(it)+"¢："+best.label+" @ "+cent(best.price)+" +"+cent(best.edge);
     const by=(a,b)=>b.edge-a.edge,mk=v.ok.filter(e=>e.maker).sort(by)[0],tk=v.ok.filter(e=>!e.maker).sort(by)[0],text=e=>e.label+" "+(e.price*100).toFixed(1);
-    hots.push({key:fk,name:it.name,group:it.group||"contract",url:it.predict&&it.predict.url||"",maker:mk&&mk.edge>=hb?{text:text(mk),edge:mk.edge,points:!!(it.predict&&it.predict.points_ok===true)}:null,
+    hots.push({key:fk,ekey:it.ekey||fk,name:it.name,group:it.group||"contract",url:it.predict&&it.predict.url||"",maker:mk&&mk.edge>=hb?{text:text(mk),edge:mk.edge,points:!!(it.predict&&it.predict.points_ok===true)}:null,
                taker:tk&&tk.edge>=hb?{text:text(tk),edge:tk.edge}:null})}
   if(it.missing){c.append($("p","","概率暂缺："+it.missing));tail(c,it);return c}
   const o=$("div","odds"),a=$("b",style==="us"?"d":"u"),b=$("b",style==="us"?"u":"d");
@@ -8090,6 +8161,48 @@ function drawPanel(){
    ["opp-pin","固定在顶部",oppPin,v=>{oppPin=v;keep("oppPin",v)},"滚动时机会条一直贴在筛选栏下面（右侧“收起”可折成一行）；勾掉则随页面滚走"]
   ].forEach(([id,label,on,set,title])=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.id=id;i.checked=on;l.title=title;
     i.addEventListener("change",()=>{set(i.checked);if(last)render(last)});l.append(i,label);ow.append(l)});
+  // the chime (this browser) and the watched markets (the bot's: the page and the Telegram alerts share them)
+  const so=document.getElementById("sound");so.replaceChildren($("span","mut","🔔 声音提醒："));
+  [["snd-on","开启",oppSound,setSound,"新机会进入机会条时响一声（只在这个浏览器；开启时会试响一声，浏览器要先有一次点击才允许出声）"],
+   ["snd-all","全部机会都响",oppSoundAll,v=>{oppSoundAll=v;keep("oppSoundAll",v)},"勾上：机会条里出现任何新机会都响；勾掉：只有下面 ★ 自选的市场才响"]
+  ].forEach(([id,label,on,set,title])=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.id=id;i.checked=on;l.title=title;
+    i.addEventListener("change",()=>{set(i.checked);drawOpps();drawPanel()});l.append(i,label);so.append(l)});
+  // which tone, how loud, how long, and a 试听 button; the viewer's own clip as one more choice
+  const kind=$("label","tog"),ks=$("select");ks.id="snd-kind";ks.title="提示音：内置的几种用浏览器合成，不下载任何文件；也可以用自己的音频文件";
+  for(const[k,v]of Object.entries(SOUNDS)){if(k==="file"&&!soundFile)continue;const o=$("option","",v.name+(k==="file"&&fileName?"（"+fileName+"）":""));o.value=k;ks.append(o)}
+  ks.value=soundKind;ks.addEventListener("change",()=>{soundKind=ks.value;keep("soundKind",soundKind);beep();drawOpps()});kind.append("提示音 ",ks);
+  const vol=$("label","tog"),vs=$("input");vs.type="range";vs.id="snd-vol";vs.min="0";vs.max="100";vs.step="5";vs.value=soundVol;vs.title="音量（0 = 静音；手机还受媒体音量和静音开关影响）";
+  const vn=$("span","",soundVol+"%");vs.addEventListener("input",()=>{vn.textContent=vs.value+"%"});vs.addEventListener("change",()=>{soundVol=Number(vs.value);keep("soundVol",soundVol);beep()});vol.append("音量 ",vs,vn);
+  const len=$("label","tog"),ls=$("select");ls.id="snd-len";ls.title="响多久：短 = 响一遍；中、长 = 反复响到这么久（自己的文件按遍数：1 / 2 / 3 遍）";
+  for(const[k,v]of Object.entries(SOUND_LEN)){const o=$("option","",v.label);o.value=k;ls.append(o)}
+  ls.value=soundLen;ls.addEventListener("change",()=>{soundLen=ls.value;keep("soundLen",soundLen);beep()});len.append("时长 ",ls);
+  const test=$("button","cb","试听");test.type="button";test.id="snd-test";test.title="按现在的提示音、音量和时长响一次";test.addEventListener("click",beep);
+  const fl=$("label","cb"),fi=$("input");fi.type="file";fi.id="snd-file";fi.accept="audio/*";fi.hidden=true;fl.append(soundFile?"换自己的音频":"用自己的音频…",fi);fl.title="选一个短音频文件（mp3 / ogg / wav 等，≤ "+Math.round(SOUND_FILE_MAX/1024)+" KB），只存在这个浏览器";
+  const fmsg=$("span","mut wmsg");fmsg.id="snd-fmsg";
+  fi.addEventListener("change",()=>{const f=fi.files&&fi.files[0];if(!f)return;setSoundFile(f,err=>{fmsg.textContent=err;if(!err){beep();drawPanel()}})});
+  so.append(kind,vol,len,test,fl);
+  if(soundFile){const rm=$("button","cb","删掉自己的音频");rm.type="button";rm.id="snd-fdel";rm.addEventListener("click",()=>setSoundFile(null,()=>drawPanel()));so.append(rm)}
+  so.append(fmsg);
+  // the system notification
+  const nl=$("label","tog"),ni=$("input");ni.type="checkbox";ni.id="snd-notify";ni.checked=oppNotify&&canNotify()&&Notification.permission==="granted";ni.disabled=!canNotify();
+  nl.title=canNotify()?"标签页在后台或窗口没有焦点时弹一条系统通知（第一次要允许；桌面 Chrome / Edge / Firefox 和安卓 Chrome 支持；iPhone 只有加到主屏幕的网页才支持）":"这个浏览器不支持网页通知（iPhone 的 Safari 要先把网页加到主屏幕）";
+  ni.addEventListener("change",()=>{if(!ni.checked){oppNotify=false;keep("oppNotify",false);drawPanel();return}
+    askNotify(v=>{oppNotify=v==="granted";keep("oppNotify",oppNotify);if(!oppNotify)fmsg.textContent="浏览器没有允许通知：请在地址栏的网站设置里允许";drawPanel()})});
+  nl.append(ni,"🖥 后台时弹系统通知");so.append(nl);
+  so.append($("span","mut","同一个机会响过后，在列或离开不到 5 分钟都不再响；机会条右侧的 🔔 随时开关。标签页在后台时标题会闪“🔥 新机会”，手机上会震动一下。注意：锁屏或切走后手机浏览器可能被暂停，长时间离开请靠 Telegram 推送；iPhone 静音开关打开时网页不出声"));
+  const wl=document.getElementById("watch");wl.replaceChildren($("span","mut","★ 自选市场（存在机器人上，网页声音提醒和 Telegram 共用）："));
+  const tgl=$("label","tog"),tgi=$("input");tgi.type="checkbox";tgi.id="watch-tg";tgi.checked=watch.tg_only;tgi.disabled=!watch.tg||watchSaving>0;
+  tgl.title=watch.tg?"勾上：Telegram 的优势提醒（新机会 / 建议失效 / 方向反转）只发自选市场；勾掉：全部市场都发（/watch 只推自选 一样）":"机器人没有开启 Telegram 优势提醒（EDGE_ALERT 或 PREDICT 为 off）";
+  tgi.addEventListener("change",()=>saveWatch({tg_only:tgi.checked}));tgl.append(tgi,"📨 Telegram 只推送自选");
+  const fill=$("button","cb","加入 ⭐ 收藏的卡片"),clr=$("button","cb","清空自选");fill.type=clr.type="button";fill.title="把收藏的卡片都加入自选";
+  fill.addEventListener("click",()=>{const add=(last?last.items:[]).filter(it=>it.kind!=="sim"&&it.ekey&&favs.includes(favKey(it))).map(it=>it.ekey);saveWatch({keys:[...new Set([...watch.keys,...add])]})});
+  clr.addEventListener("click",()=>saveWatch({keys:[]}));clr.disabled=!watch.keys.length;
+  const msg=$("span","mut wmsg",watchMsg||(watch.tg_only&&!watch.keys.length?"⚠️ 已选“只推送自选”但自选为空：Telegram 现在什么都不推送":""));msg.id="watchmsg";
+  wl.append(tgl,fill,clr,msg);
+  if(last)for(const g of secOrder){const items=last.items.filter(it=>(it.group||"contract")===g&&it.kind!=="sim"&&it.ekey);if(!items.length)continue;
+    const grp=$("span","cgrp");grp.append($("span","mut",SEC_NAMES[g]+"："));
+    items.forEach(it=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=watch.keys.includes(it.ekey);i.dataset.watch=it.ekey;i.disabled=watchSaving>0;
+      i.addEventListener("change",()=>saveWatch({keys:i.checked?[...watch.keys,it.ekey]:watch.keys.filter(k=>k!==it.ekey)}));l.append(i,it.name);grp.append(l)});wl.append(grp)}
   document.getElementById("hotin").value=hotCents;
   document.getElementById("hidn").textContent=hidden.length?"已隐藏 "+hidden.length+" 张卡片（变淡显示，点“显示”恢复）":"没有隐藏的卡片";
   document.getElementById("showall").disabled=!hidden.length}
@@ -8108,8 +8221,8 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;oppPin=true;oppFold=false;folded=[];oneRow=[];secSort={};hotMap={};
-  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","oppPin","oppFold","folded","oneRow","secsort","hotmap"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
+  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;oppPin=true;oppFold=false;folded=[];oneRow=[];secSort={};hotMap={};oppSound=false;oppSoundAll=true;soundKind="ding";soundVol=70;soundLen="mid";oppNotify=false;
+  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","oppPin","oppFold","folded","oneRow","secsort","hotmap","oppSound","oppSoundAll","soundKind","soundVol","soundLen","oppNotify"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 let loading=null,lastSig="",dead=false;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
 const LOAD_TIMEOUT_MS=8000;
@@ -8120,6 +8233,7 @@ function load(){
     const r=await fetch(location.pathname.replace(/\\/$/,"")+"/data.json",{cache:"no-store",signal:ctl.signal});
     if(!r.ok)throw new Error("HTTP "+r.status);
     const d=await r.json();if(d.server_ms)skew=d.server_ms-Date.now();fetchedAt=okAt=Date.now();failMsg="";style=d.color_style||"cn";
+    if(d.watch&&typeof d.watch==="object"&&Array.isArray(d.watch.keys)&&!watchSaving)watch=d.watch;
     if(last)for(const it of d.items){const k=favKey(it),o=last.items.find(x=>favKey(x)===k);  // a fair price that moved since the last refresh
       if(o&&o.fair_up!=null&&it.fair_up!=null&&Math.abs(o.fair_up-it.fair_up)>=5e-4)changedAt[k]={at:Date.now(),up:it.fair_up>o.fair_up}}
     const sig=JSON.stringify(d.items),same=!!last&&sig===lastSig;lastSig=sig;  // books move every 15 s, crypto quotes every 30 s: a repeat
@@ -8406,6 +8520,15 @@ load();setInterval(load,60000);
 </script></body></html>"""
 
 
+def header_value(header_block: str, name: str) -> str:
+    """The first header called ``name`` (case-insensitive) in the raw header lines after the request line, "" if none."""
+    for line in header_block.split("\r\n"):
+        key, sep, value = line.partition(":")
+        if sep and key.strip().lower() == name.lower():
+            return value.strip()
+    return ""
+
+
 def accepts_gzip(header_block: str) -> bool:
     """Whether the request's Accept-Encoding lists gzip (any positive q), from the raw header lines after the request line."""
     for line in header_block.split("\r\n"):
@@ -8445,11 +8568,13 @@ class WebServer:
 
     Routes: /health, /p/<token> (HTML), /p/<token>/data.json (JSON), /p/<token>/events (server-sent events: the daily
     cards' live numbers whenever they change, checked every second), /p/<token>/journal (the paper trades' review
-    page) with journal.json / journal.csv (exports). Everything else is 404, the token is compared in constant time,
-    and responses are no-store with a restrictive CSP. Text bodies are gzip-compressed for a client that accepts it
+    page) with journal.json / journal.csv (exports), and the one write: POST /p/<token>/watch (JSON) sets the watched
+    markets (自选) and whether the Telegram alerts keep to them. Everything else is 404, the token is compared in
+    constant time, and responses are no-store with a restrictive CSP. Text bodies are gzip-compressed for a client that accepts it
     (the page is ~80 KB, data.json is fetched every 10 seconds by every open tab).
     """
     MAX_HEADER_BYTES = 8192
+    MAX_BODY_BYTES = 16384  # a POST /watch body (a few hundred market keys at most)
     GZIP_MIN_BYTES = 512  # below this a gzip header costs about as much as it saves
     CACHE_SECONDS = {"data.json": 1.0, "journal.json": 5.0, "live.json": 1.0}  # several tabs (or a scanner) share one build per interval
     STREAM_SECONDS = 1.0        # an event stream looks for a change this often
@@ -8491,14 +8616,17 @@ class WebServer:
             with contextlib.suppress(Exception):
                 await self.server.wait_closed()
 
-    def route(self, method: str, path: str) -> tuple[int, str, bytes]:
+    def route(self, method: str, path: str, body: bytes = b"", headers: str = "") -> tuple[int, str, bytes]:
+        parts = path.strip("/").split("/")
+        # (compare_digest needs ASCII on both sides: a scanner's odd bytes are simply not the token)
+        mine = len(parts) in {2, 3} and parts[0] == "p" and parts[1].isascii() and hmac.compare_digest(parts[1], self.token)
+        if method == "POST" and mine and len(parts) == 3 and parts[2] == "watch":
+            return self.post_watch(body, headers)
         if method not in {"GET", "HEAD"}:
             return 405, "text/plain; charset=utf-8", b"method not allowed"
         if path in {"/", "/health"}:
             return 200, "text/plain; charset=utf-8", b"ok"
-        parts = path.strip("/").split("/")
-        # (compare_digest needs ASCII on both sides: a scanner's odd bytes are simply not the token)
-        if len(parts) in {2, 3} and parts[0] == "p" and parts[1].isascii() and hmac.compare_digest(parts[1], self.token):
+        if mine:
             if len(parts) == 2:
                 return 200, "text/html; charset=utf-8", self.pages["page"]
             if parts[2] == "data.json":
@@ -8513,6 +8641,23 @@ class WebServer:
                 return 200, "text/csv; charset=utf-8", self.bot.journal_csv().encode("utf-8")
         return 404, "text/plain; charset=utf-8", b"not found"
 
+    def post_watch(self, body: bytes, headers: str) -> tuple[int, str, bytes]:
+        """POST /p/<token>/watch with {"keys": [market keys], "tg_only": bool} (either may be left out): the page's 自选
+        and its Telegram limit, the one thing the page may change. JSON only, so a cross-site form cannot post it; the
+        answer is the new state, as data.json carries it."""
+        answer = lambda status, obj: (status, "application/json; charset=utf-8", json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+        if "application/json" not in header_value(headers, "content-type").lower():
+            return answer(400, {"error": "要 JSON（Content-Type: application/json）"})
+        try:
+            data = json.loads(body.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("要一个 JSON 对象")
+            result = self.bot.watch_update(data.get("keys"), data.get("tg_only"))
+        except (ValueError, UnicodeDecodeError) as error:
+            return answer(400, {"error": str(error) or "参数不对"})
+        self.cache.pop("data.json", None)  # the next data.json shows the change
+        return answer(200, result)
+
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
@@ -8525,7 +8670,13 @@ class WebServer:
             if method.upper() == "GET" and self.is_stream(path):
                 await self.stream(writer)
                 return
-            status, ctype, body = self.route(method.upper(), path)
+            body_in = b""
+            if method.upper() == "POST":
+                length = int(header_value(rest, "content-length") or "0")  # none = no body; an odd value is a ValueError (400)
+                if not 0 <= length <= self.MAX_BODY_BYTES:
+                    raise ValueError("body too large")
+                body_in = await asyncio.wait_for(reader.readexactly(length), timeout=10)
+            status, ctype, body = self.route(method.upper(), path, body_in, rest)
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ValueError):
             status, ctype, body, method, gzip_ok = 400, "text/plain; charset=utf-8", b"bad request", "GET", False
         except Exception as error:  # Never let a page request touch the bot's loops.
@@ -8924,6 +9075,8 @@ COMMANDS: tuple[Command, ...] = (
     Command("book", "对比 Predict 订单簿和模型公平价，看挂涨还是挂跌优势大"),
     Command("edge", "优势提醒门槛：按栏目 / 市场 / 档位单独设置几¢才提醒", "牛来 4",
             "不带参数查看；/edge 6 改默认；/edge 市值阶梯 6、/edge 牛来 4、/edge 牛来 300M 3；末尾 off 取消；/edge 清空"),
+    Command("watch", "自选市场：网页声音提醒的范围；勾“只推自选”后 Telegram 优势提醒也只发这些市场", "牛来",
+            "不带参数查看；/watch 牛来 加入、/watch 牛来 off 移出、/watch 清空；/watch 只推自选 / /watch 全部推送；网页 ✎ 自定义 里也能勾选"),
     Command("web", "获取概率网页链接（自动刷新）"),
     Command("calib", "用已保存的预测快照和实际收盘给概率模型打分（Brier/校准/逐日向前拟合）"),
     Command("sim", "模拟交易：净优势 ≥10¢ 时买 100 份，看长期是赚还是亏（只记账，不下单）"),
@@ -9194,7 +9347,7 @@ class Bot:
             "/unsubscribe": self.cmd_unsubscribe, "/threshold": self.cmd_threshold,
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
             "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/calib": self.cmd_calib,
-            "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge,
+            "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge, "/watch": self.cmd_watch,
         }
 
     def settings(self) -> dict:
@@ -10571,11 +10724,14 @@ class Bot:
         if self.config.sim and self.config.predict:
             items.append(self.safe_card("模拟交易", "SIM", "sim", lambda: {"name": "模拟交易", "symbol": "SIM", "group": "sim",
                                                                           "kind": "sim", "sim": self.sim_report()}))
+        for item in items:
+            item.setdefault("ekey", self.item_ekey(item))  # the key /edge and /watch know the card by
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
         return {"generated_at": stamp(now_ms) + "（北京时间）", "version": VERSION, "server_ms": now_ms,
                 "today": f"{today:%m-%d} {WEEKDAYS[today.weekday()]}",
                 "mode": BASELINE_SHORT.get(self.settings()["mode"], self.settings()["mode"]),
                 "color_style": self.config.color_style, "items": items, "notional": self.config.predict_trade_usd,
+                "watch": self.watch_payload(),
                 "note": ("模型参考，非投资建议。有效价 = 参考收盘 × 代理现价 ÷ 代理在参考收盘时刻的价格；"
                          "P(涨) = 1 − Φ(ln((参考+半跳)/有效)/σ剩余)，平盘两边各计一半。目标日跳过周末和已配置的交易所假期。"
                          if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")}
@@ -11973,7 +12129,7 @@ class Bot:
             kind, side = change.split(":")
             st["note"] = self.edge_note(mk, sides[st["told"]], now_ms) if st["told"] else None
             st["alert"] = {"seq": st["seq"], "at": now_ms, "kind": kind, "side": side, "market": mk.market, "item": mk.item,
-                           "driver": market_driver(mk.kind, mk.key, mk.settle, mk.item)[1],
+                           "key": mk.key, "driver": market_driver(mk.kind, mk.key, mk.settle, mk.item)[1],
                            "url": predict_url(mk.book.slug or mk.market.partition("#")[0], self.config.predict_ref),
                            "text": self.edge_alert_text(kind, side, mk, edges, sides, best, note, maker_only, bar)}
             if kind == "appear" and best is not None:
@@ -12054,10 +12210,13 @@ class Bot:
         """Each market's latest announcement to every active subscription that has not got it yet."""
         subs = [(sub_id, sub) for sub_id, sub in self.subscriptions().items() if sub.get("active")]
         digest = self.config.edge_alert_digest
+        watched = self.watch_filter()
         for market, st in state.items():
             alert = st.get("alert")
             if not alert or now_ms - int(alert["at"]) > self.EDGE_ALERT_FRESH_MS:
                 continue
+            if watched is not None and alert.get("key") and alert["key"] not in watched:
+                continue  # /watch 只推自选: not one of the watched markets (it is sent if it is added while the announcement is young)
             if digest and alert.get("kind") == "appear":
                 continue  # gathered into the digest below: 建议失效 / 方向反转 still go one by one, they protect an order
             for sub_id, sub in subs:
@@ -12117,12 +12276,15 @@ class Bot:
                 now = self.market.now_ms()
                 latest = self.store.get("edgealerts", {}) or {}
                 live = {mk.market: mk for mk in self.sim_markets(now)}
+                watched = self.watch_filter()
                 included.clear()
                 rows = []
                 for market, st in latest.items():
                     alert = (st.get("alert") or {}) if isinstance(st, dict) else {}
                     if alert.get("kind") != "appear" or st.get("told") != alert.get("side"):
                         continue
+                    if watched is not None and alert.get("key") and alert["key"] not in watched:
+                        continue  # /watch 只推自选
                     if int(self.store.get(f"edgesent:{market}:{sub_id}") or 0) >= int(alert.get("seq") or 0):
                         continue
                     mk = live.get(market.removesuffix("|maker"))
@@ -12541,7 +12703,10 @@ class Bot:
         extra = [k for k in bars if k != "default"]
         if extra:
             line += "｜单独门槛：" + "、".join(f"{names.get(k, k)} {bars[k]:g}¢" for k in extra[:6]) + ("…" if len(extra) > 6 else "")
-        return line + "｜/edge 调整"
+        watch, tg_only = self.watch_state()
+        if tg_only:
+            line += ("｜⭐ 只推送自选 " + "、".join(list(watch.values())[:6]) + ("…" if len(watch) > 6 else "")) if watch else "｜⚠️ 只推送自选，但自选为空：现在什么都不推送"
+        return line + "｜/edge 调整" + ("、/watch 自选" if tg_only or watch else "")
 
     def cmd_edge(self, req: Request) -> str:
         """/edge: show or set the announcement bar per section, market or level."""
@@ -12573,6 +12738,107 @@ class Bot:
         self.update_settings(edge_bars=bars, edge_names=names)
         what = "默认门槛" if key == "default" else f"{name} 的提醒门槛"
         return f"✅ {what}改为 ≥{cents:g}¢（下一轮生效；已提醒过的建议不重发）。\n" + self.edge_text()
+
+    # --- /watch: the watched markets (自选) — the page's sound alert keeps to them, and the Telegram alerts when asked ------
+
+    WATCH_MAX = 200
+    WATCH_ONLY_WORDS = {"只推自选", "只推送自选", "只发自选", "only", "tg_only", "tgonly"}
+    WATCH_ALL_WORDS = {"全部推送", "全部", "全部市场", "all"}
+
+    def watch_state(self) -> tuple[dict[str, str], bool]:
+        """({market key: card name} picked with /watch or on the page, Telegram alerts limited to them?), from the settings."""
+        settings = self.settings()
+        keys = settings.get("watch_keys")
+        keys = {str(k): str(v) for k, v in keys.items()} if isinstance(keys, dict) else {}
+        return keys, bool(settings.get("watch_tg_only"))
+
+    def watch_filter(self) -> set[str] | None:
+        """The market keys the Telegram edge alerts keep to (/watch 只推自选), None when every market is announced."""
+        keys, tg_only = self.watch_state()
+        return set(keys) if tg_only else None
+
+    def watch_payload(self) -> dict:
+        """The watched markets as data.json carries them (and as POST /watch answers)."""
+        keys, tg_only = self.watch_state()
+        return {"keys": list(keys), "names": keys, "tg_only": tg_only,
+                "tg": bool(self.config.edge_alert and self.config.predict)}
+
+    def watch_update(self, keys: Any = None, tg_only: Any = None) -> dict:
+        """Replace the watched markets (a list of market keys) and / or the Telegram limit; None leaves one as it is.
+        Unknown keys, a wrong type or too many are refused (ValueError) and nothing changes."""
+        current, only = self.watch_state()
+        if keys is not None:
+            if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
+                raise ValueError("keys 要是市场代码的列表")
+            if len(keys) > self.WATCH_MAX:
+                raise ValueError(f"自选最多 {self.WATCH_MAX} 个市场")
+            known = dict(self.edge_markets())
+            unknown = [k for k in keys if k not in known]
+            if unknown:
+                raise ValueError("不认识的市场：" + "、".join(unknown[:5]) + ("…" if len(unknown) > 5 else ""))
+            current = {k: known[k] for k in dict.fromkeys(keys)}
+        if tg_only is not None:
+            if not isinstance(tg_only, bool):
+                raise ValueError("tg_only 要是 true / false")
+            only = tg_only
+        self.update_settings(watch_keys=current, watch_tg_only=only)
+        return self.watch_payload()
+
+    def item_ekey(self, item: dict) -> str:
+        """The market key (/edge, /watch) of a web card: an index card's Predict key, a first-touch card's own key (its
+        symbol is the Binance pair), otherwise its symbol."""
+        name, symbol = str(item.get("name") or ""), str(item.get("symbol") or "")
+        if item.get("group") == "index":
+            return PREDICT_KEYS.get(name, name)
+        if "先触" in name:
+            for key, touch in self.touches.items():
+                if touch.spec.symbol == symbol:
+                    return key
+        return symbol
+
+    def watch_text(self) -> str:
+        keys, tg_only = self.watch_state()
+        lines = ["⭐ 自选市场" + (f"（{len(keys)} 个）：" + "、".join(keys.values()) if keys else "：还没有")]
+        if tg_only:
+            lines.append("📨 Telegram 优势提醒：只推送自选市场" + ("（自选为空：现在什么都不推送！）" if not keys else ""))
+        else:
+            lines.append("📨 Telegram 优势提醒：全部市场都推送（自选只用于网页的声音提醒）")
+        lines.append("网页 ✎ 自定义 里可以勾选自选市场、开关声音提醒和“只推送自选”。"
+                     "用法：/watch 牛来 加入；/watch 牛来 off 移出；/watch 清空；/watch 只推自选 或 /watch 全部推送。")
+        return "\n".join(lines)
+
+    def cmd_watch(self, req: Request) -> str:
+        """/watch: show or change the watched markets and whether the Telegram alerts keep to them."""
+        args = list(req.args)
+        if not args:
+            return self.watch_text()
+        keys, _ = self.watch_state()
+        word = " ".join(args).lower()
+        if word in {"清空", "clear", "全部取消"}:
+            self.watch_update([], None)
+            return "✅ 已清空自选市场。\n" + self.watch_text()
+        if word in self.WATCH_ONLY_WORDS:
+            self.watch_update(None, True)
+            return "✅ Telegram 优势提醒改为只推送自选市场（下一轮生效）。\n" + self.watch_text()
+        if word in self.WATCH_ALL_WORDS:
+            self.watch_update(None, False)
+            return "✅ Telegram 优势提醒改为全部市场都推送。\n" + self.watch_text()
+        off = args[-1].lower() in {"off", "关", "关闭", "取消", "删除", "移出"}
+        if off and len(args) == 1:
+            raise ValueError("用法：/watch 牛来 off（移出一个市场）；/watch 清空（全部移出）")
+        key, name = self.edge_target(args[:-1] if off else args)
+        if not key.startswith("key:"):
+            raise ValueError("自选按市场勾选：/watch 牛来、/watch 恒指、/watch SOL；栏目和档位不能加入")
+        key = key[4:]
+        if off:
+            if key not in keys:
+                return f"ℹ️ {name} 不在自选里。\n" + self.watch_text()
+            self.watch_update([k for k in keys if k != key], None)
+            return f"✅ 已把 {name} 移出自选。\n" + self.watch_text()
+        if key in keys:
+            return f"ℹ️ {name} 已在自选里。\n" + self.watch_text()
+        self.watch_update([*keys, key], None)
+        return f"✅ 已把 {name} 加入自选。\n" + self.watch_text()
 
     def edge_need(self, swing: float = 0.0) -> float:
         """The net edge a suggestion must clear: the configured minimum, or the model's own error when that is larger."""
