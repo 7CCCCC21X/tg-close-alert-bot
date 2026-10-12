@@ -202,31 +202,66 @@ async def layout_check(browser, page):
                                                                             "ETH 先触 1k/3k", "BTC 10月涨跌", "ETH 10月涨跌", "HYPE 反超 SOL"]
 
 
+async def until(page, expr, tries=200):
+    """Poll ``expr`` (a JS expression) until it is true: wait_for_function would eval a string, which the page's CSP forbids."""
+    for _ in range(tries):
+        if await page.evaluate(expr):
+            return
+        await page.wait_for_timeout(50)
+    raise AssertionError(f"timed out waiting for {expr}")
+
+
 async def watch_check(bot, page):
     """The chime (🔔): a short beep when an opportunity enters the strip that was not there, for every one or only the
     watched markets, kept in this browser; the watched markets (自选) and the Telegram limit are the bot's, changed from
     自定义 through POST /watch and shared with /watch."""
-    await page.add_init_script("window.__beeps=0;class FakeCtx{constructor(){this.state='suspended';this.currentTime=0;this.destination={}}"
+    await page.add_init_script("window.__beeps=0;window.__plays=0;window.__notes=[];class FakeCtx{constructor(){this.state='suspended';this.currentTime=0;this.destination={}}"
                                "resume(){this.state='running'}createGain(){return{gain:{setValueAtTime(){},exponentialRampToValueAtTime(){}},connect(x){return x}}}"
-                               "createOscillator(){window.__beeps++;return{frequency:{},connect(g){return g},start(){},stop(){}}}}window.AudioContext=FakeCtx")
+                               "createOscillator(){window.__beeps++;return{frequency:{},connect(g){return g},start(){},stop(){}}}"
+                               "decodeAudioData(buf,ok){ok({duration:.3})}createBufferSource(){window.__plays++;return{connect(g){return g},start(){}}}}window.AudioContext=FakeCtx;"
+                               "localStorage.setItem('soundLen','\"short\"');"  # one pass per beep: the note counts below
+                               "window.__asked=0;window.__shown=[];class FakeNote{constructor(t,o){window.__shown.push([t,o.body])}close(){}}FakeNote.permission='default';"
+                               "FakeNote.requestPermission=()=>{window.__asked++;FakeNote.permission='granted';return Promise.resolve('granted')};window.Notification=FakeNote")
     await page.reload(); await page.wait_for_selector(".card .odds")
     await page.click("#edit")
-    assert (await page.inner_text("#sound")).startswith("🔔 声音提醒：\n开启\n全部机会都响") and not await page.is_checked("#snd-on") and await page.is_checked("#snd-all")
+    assert (await page.inner_text("#sound")).startswith("🔔 声音提醒：\n开启\n全部机会都响\n提示音") and not await page.is_checked("#snd-on") and await page.is_checked("#snd-all")
+    # the tone, volume and length: built-in patterns (so many notes each), the viewer's own clip, 试听
+    assert await page.eval_on_selector_all("#snd-kind option", "o => o.map(x => x.value)") == ["ding", "triple", "beep", "alarm", "bell"]  # no clip yet: no 自定义文件
+    assert await page.input_value("#snd-vol") == "70" and await page.input_value("#snd-len") == "short" and await page.input_value("#snd-kind") == "ding"
+    await page.click("#snd-test"); assert await page.evaluate("window.__beeps") == 2
+    await page.select_option("#snd-kind", "triple"); assert await page.evaluate("window.__beeps") == 5 and await page.evaluate("localStorage.getItem('soundKind')") == '"triple"'  # it plays once picked
+    await page.select_option("#snd-len", "long"); assert await page.evaluate("window.__beeps") == 5 + 3 * 7  # 三连音 spans 0.44 s + 0.3 s gap: 7 passes fill 5 s
+    await page.select_option("#snd-len", "short"); n = await page.evaluate("window.__beeps")
+    await page.evaluate("soundVol = 0; beep()"); assert await page.evaluate("window.__beeps") == n  # muted: nothing
+    await page.evaluate("soundVol = 70")
+    await page.set_input_files("#snd-file", {"name": "ding.wav", "mimeType": "audio/wav", "buffer": b"RIFF" + bytes(40)}); await until(page, "soundKind === 'file'")
+    assert await page.evaluate("window.__plays") == 1 and await page.evaluate("fileName") == "ding.wav" and (await page.evaluate("localStorage.getItem('soundFile')")).startswith("data:audio/wav;base64,")
+    assert await page.input_value("#snd-kind") == "file" and "ding.wav" in await page.inner_text("#snd-kind option[value=file]")
+    await page.select_option("#snd-len", "long"); assert await page.evaluate("window.__plays") == 4  # a clip: 3 plays for 长
+    await page.set_input_files("#snd-file", {"name": "big.mp3", "mimeType": "audio/mpeg", "buffer": bytes(700 * 1024)})
+    await until(page, "document.getElementById('snd-fmsg').textContent.startsWith('文件太大')"); assert await page.evaluate("fileName") == "ding.wav"  # refused, the old one stays
+    await page.click("#snd-fdel"); assert await page.evaluate("[soundKind, localStorage.getItem('soundFile')]") == ["ding", None] and await page.locator("#snd-kind option").count() == 5
+    await page.select_option("#snd-len", "short"); await page.evaluate("window.__beeps = 0")
+    # the system notification: asked once, then shown while the tab is not looked at
+    await page.check("#snd-notify"); await until(page, "oppNotify === true"); assert await page.evaluate("window.__asked") == 1
     names = await page.eval_on_selector_all("#watch input[data-watch]", "els => els.map(e => e.dataset.watch)")
     assert names[:4] == ["SSE", "UNITREEUSDT", "BNB", "SOL"] and "SIM" not in names and not await page.is_checked("#watch-tg"), names
-    await page.check("#watch input[data-watch=UNITREEUSDT]"); await page.wait_for_function("watchMsg === '已保存'")
+    await page.check("#watch input[data-watch=UNITREEUSDT]"); await until(page, "watchMsg === '已保存'")
     assert bot.watch_state() == ({"UNITREEUSDT": "宇树 UNITREE"}, False) and await page.inner_text("#watchmsg") == "已保存"
-    await page.check("#watch-tg"); await page.wait_for_function("watch.tg_only === true")
+    await page.check("#watch-tg"); await until(page, "watch.tg_only === true")
     assert bot.watch_state() == ({"UNITREEUSDT": "宇树 UNITREE"}, True)
     # a refused change is undone on the page and said so
-    await page.evaluate("saveWatch({keys: ['NOPE']})"); await page.wait_for_function("watchMsg.startsWith('保存失败')")
+    await page.evaluate("saveWatch({keys: ['NOPE']})"); await until(page, "watchMsg.startsWith('保存失败')")
     assert await page.evaluate("watch.keys") == ["UNITREEUSDT"] and "不认识的市场" in await page.inner_text("#watchmsg")
     # the chime: turning it on sounds once (and unlocks audio); the strip's new entries sound, the same ones again do not
     await page.check("#snd-on"); assert await page.evaluate("window.__beeps") == 2 and await page.evaluate("localStorage.getItem('oppSound')") == "true"  # two notes
     await page.click("#done")
     opp = lambda key, ekey, name: f"{{key:'{key}',ekey:'{ekey}',name:'{name}',group:'crypto',url:'',maker:null,taker:{{text:'吃涨 40.0',edge:.12}}}}"
+    await page.evaluate("document.hasFocus = () => false")  # the window is not looked at: the notification shows
     await page.evaluate(f"hots.push({opp('UNITREEUSDT', 'UNITREEUSDT', '宇树 UNITREE')}, {opp('SOLUSDT', 'SOL', 'SOL 先触 60/140')}); drawOpps()")
     assert await page.evaluate("window.__beeps") == 4 and await page.inner_text("#opps .obell") == "🔔"
+    assert await page.evaluate("window.__shown") == [["🔥 新机会 2", "宇树 UNITREE 吃涨 40.0 +12.0¢ · SOL 先触 60/140 吃涨 40.0 +12.0¢"]]
+    await page.evaluate("oppNotify = false; keep('oppNotify', false)")
     assert await page.eval_on_selector_all("#opps .opp", "els => els.map(e => e.classList.contains('w'))") == [True, False]  # ★ on the watched one
     await page.evaluate("drawOpps()"); assert await page.evaluate("window.__beeps") == 4  # the same entries: quiet
     await page.click("#opps .obell"); assert await page.inner_text("#opps .obell") == "🔕" and await page.evaluate("oppSound") is False
@@ -237,10 +272,11 @@ async def watch_check(bot, page):
     await page.evaluate("delete oppSeenAt['t:SOLUSDT']; drawOpps()"); assert await page.evaluate("window.__beeps") == 8
     await page.reload(); await page.wait_for_selector(".card .odds")
     assert await page.evaluate("[watch.keys, watch.tg_only, oppSound]") == [["UNITREEUSDT"], True, True]  # the bot's list, this browser's chime
-    await page.click("#edit"); await page.click("#watch button.cb:nth-of-type(2)"); await page.wait_for_function("watch.keys.length === 0")  # 清空自选
+    await page.click("#edit"); await page.click("#watch button.cb:nth-of-type(2)"); await until(page, "watch.keys.length === 0")  # 清空自选
     assert "自选为空" in await page.inner_text("#watchmsg") or await page.inner_text("#watchmsg") == "已保存"
-    await page.uncheck("#watch-tg"); await page.wait_for_function("watch.tg_only === false"); await page.uncheck("#snd-on"); await page.click("#done")
+    await page.uncheck("#watch-tg"); await until(page, "watch.tg_only === false"); await page.uncheck("#snd-on"); await page.click("#done")
     assert bot.watch_state() == ({}, False) and await page.evaluate("localStorage.getItem('oppSound')") == "false"
+    await page.evaluate("localStorage.removeItem('soundLen')")
 
 
 async def browser_check(async_playwright, chrome, port, token, bot):

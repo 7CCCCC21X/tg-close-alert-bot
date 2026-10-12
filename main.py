@@ -7470,6 +7470,7 @@ h2 .fs{font-weight:400;color:var(--faint)}h2 .fs b{color:var(--hot);font-weight:
 .panel{background:var(--card);border:1px solid var(--best-soft);border-radius:var(--r);padding:12px 14px;margin:6px 0 10px;display:flex;flex-direction:column;gap:8px;font-size:13px;box-shadow:var(--shadow2)}
 .panel .pr{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}.panel .cgrp{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;width:100%}
 .panel input[type=number]{width:58px;font:inherit;padding:2px 6px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)}
+.panel select{font:inherit;font-size:12.5px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);padding:2px 6px;max-width:170px}.panel input[type=range]{width:90px;accent-color:var(--best);margin:0}.panel label.cb{display:inline-block}
 button.tog{font-family:inherit;padding:4px 11px}.tog.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}
 #totop{position:fixed;right:16px;bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:6;width:40px;height:40px;border-radius:50%;border:1px solid var(--line);background:var(--card);box-shadow:var(--shadow2);color:var(--text);font-size:16px;line-height:1;cursor:pointer;opacity:0;pointer-events:none;transform:translateY(8px);transition:opacity .2s,transform .2s}
 #totop.show{opacity:1;pointer-events:auto;transform:none}#totop:hover{color:var(--best);border-color:var(--best)}
@@ -7563,11 +7564,52 @@ let oppPin=stored("oppPin",true,isBool),oppFold=stored("oppFold",false,isBool); 
 // opportunity, or only the watched markets. An entry heard once stays quiet while it is listed and for 5 minutes after it goes.
 let oppSound=stored("oppSound",false,isBool),oppSoundAll=stored("oppSoundAll",true,isBool);
 const oppSeenAt={};let oppPrimed=false,audio=null;const SOUND_AGAIN_MS=300000;
-function beep(){try{const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;if(!audio)audio=new AC();if(audio.state==="suspended")audio.resume();
-  const t=audio.currentTime;[[880,0],[1320,.14]].forEach(([f,d])=>{const o=audio.createOscillator(),g=audio.createGain();o.type="sine";o.frequency.value=f;
-    g.gain.setValueAtTime(.0001,t+d);g.gain.exponentialRampToValueAtTime(.25,t+d+.02);g.gain.exponentialRampToValueAtTime(.0001,t+d+.14);
-    o.connect(g).connect(audio.destination);o.start(t+d);o.stop(t+d+.16)})}catch(e){}}
+// the tone: built-in patterns synthesised with WebAudio (no audio files: the page loads nothing), or the viewer's own clip
+// (kept in this browser as a data: URL, decoded once); the volume and how long it goes on are the viewer's too
+const SOUNDS={ding:{name:"叮咚",type:"sine",gain:.8,notes:[[880,0,.14],[1320,.14,.18]]},
+  triple:{name:"三连音",type:"triangle",gain:.6,notes:[[660,0,.1],[880,.12,.1],[1100,.24,.2]]},
+  beep:{name:"滴滴",type:"square",gain:.25,notes:[[1500,0,.07],[1500,.12,.07]]},
+  alarm:{name:"警报",type:"square",gain:.22,notes:[[1000,0,.16],[700,.18,.16],[1000,.36,.16],[700,.54,.16]]},
+  bell:{name:"钟声",type:"sine",gain:.7,notes:[[1760,0,.7],[2640,0,.35],[880,0,.9]]},
+  file:{name:"自定义文件"}};
+const SOUND_LEN={short:{label:"短（1 遍）",secs:0,plays:1},mid:{label:"中（约 2 秒）",secs:2,plays:2},long:{label:"长（约 5 秒）",secs:5,plays:3}};
+const SOUND_FILE_MAX=600*1024;  // a clip this size still fits localStorage (5 MB) with room to spare
+let soundKind=stored("soundKind","ding",v=>typeof v==="string"&&Object.prototype.hasOwnProperty.call(SOUNDS,v)),soundVol=stored("soundVol",70,v=>typeof v==="number"&&v>=0&&v<=100),
+  soundLen=stored("soundLen","mid",v=>typeof v==="string"&&Object.prototype.hasOwnProperty.call(SOUND_LEN,v)),soundFile=null,fileBuf=null,fileName="";
+try{soundFile=localStorage.getItem("soundFile")||null;fileName=localStorage.getItem("soundFileName")||""}catch(e){}
+if(soundKind==="file"&&!soundFile)soundKind="ding";
+function ctx(){const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return null;if(!audio)audio=new AC();if(audio.state==="suspended")audio.resume();return audio}
+function tone(ac,at,f,dur,type,peak){const o=ac.createOscillator(),g=ac.createGain();o.type=type;o.frequency.value=f;
+  g.gain.setValueAtTime(.0001,at);g.gain.exponentialRampToValueAtTime(Math.max(.0002,peak),at+.015);g.gain.exponentialRampToValueAtTime(.0001,at+dur);
+  o.connect(g).connect(ac.destination);o.start(at);o.stop(at+dur+.02)}
+function beep(){try{const ac=ctx();if(!ac||!soundVol)return;const len=SOUND_LEN[soundLen],vol=soundVol/100;
+  if(soundKind==="file"){playFile(ac,len.plays,vol);return}
+  const snd=SOUNDS[soundKind],span=Math.max(...snd.notes.map(n=>n[1]+n[2])),t0=ac.currentTime+.01;let t=0,passes=0;
+  do{for(const[f,at,dur]of snd.notes)tone(ac,t0+t+at,f,dur,snd.type,snd.gain*vol);t+=span+.3;passes++}while(t<len.secs&&passes<20)}catch(e){}}
+async function playFile(ac,plays,vol){if(!soundFile)return;
+  if(!fileBuf){const b=atob(soundFile.slice(soundFile.indexOf(",")+1)),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);
+    fileBuf=await new Promise((ok,no)=>{const r=ac.decodeAudioData(a.buffer,ok,no);if(r&&r.then)r.then(ok,no)})}
+  let t=ac.currentTime+.01;for(let i=0;i<plays;i++){const src=ac.createBufferSource(),g=ac.createGain();src.buffer=fileBuf;g.gain.value=vol;src.connect(g).connect(ac.destination);src.start(t);t+=fileBuf.duration+.3}}
+function setSoundFile(file,done){  // the viewer's own clip: read once, kept as a data: URL in this browser
+  if(!file){soundFile=null;fileBuf=null;fileName="";try{localStorage.removeItem("soundFile");localStorage.removeItem("soundFileName")}catch(e){}if(soundKind==="file"){soundKind="ding";keep("soundKind",soundKind)}done("");return}
+  if(file.size>SOUND_FILE_MAX){done("文件太大："+Math.round(file.size/1024)+" KB，限 "+Math.round(SOUND_FILE_MAX/1024)+" KB（剪短一点，或转成 mp3 / ogg）");return}
+  const rd=new FileReader();rd.onerror=()=>done("读不了这个文件");
+  rd.onload=()=>{try{localStorage.setItem("soundFile",rd.result);localStorage.setItem("soundFileName",file.name)}catch(e){done("浏览器存不下这个文件");return}
+    soundFile=rd.result;fileBuf=null;fileName=file.name;soundKind="file";keep("soundKind",soundKind);done("")};
+  rd.readAsDataURL(file)}
 function setSound(on){oppSound=on;keep("oppSound",on);if(on)beep()}  // the click that turns it on also unlocks audio (browsers want a gesture first)
+// reaching a viewer who is not looking: a system notification when the tab is in the background (asked once, this browser),
+// the tab's title flashing until it is looked at, and a short vibration on a phone that has it
+let oppNotify=stored("oppNotify",false,isBool);
+const canNotify=()=>typeof Notification!=="undefined"&&!!Notification.requestPermission;
+function askNotify(done){if(!canNotify()){done("denied");return}try{const r=Notification.requestPermission(v=>done(v));if(r&&r.then)r.then(done,()=>done("denied"))}catch(e){done("denied")}}
+function notifyOpps(list){if(!oppNotify||!canNotify()||Notification.permission!=="granted"||(!document.hidden&&document.hasFocus()))return;
+  try{const body=list.slice(0,4).map(h=>h.name+" "+h.pick.text+" "+sg(h.pick.edge)).join(" · ")+(list.length>4?" · …":"");
+    const n=new Notification("🔥 新机会 "+list.length,{body,tag:"opps",renotify:true,silent:oppSound});n.onclick=()=>{try{window.focus()}catch(e){}n.close()}}catch(e){}}
+const baseTitle=document.title;let flashTimer=0;
+function flashTitle(n){if(!document.hidden)return;clearInterval(flashTimer);let on=false;flashTimer=setInterval(()=>{on=!on;document.title=on?"🔥 新机会 "+n:baseTitle},900)}
+document.addEventListener("visibilitychange",()=>{if(!document.hidden&&flashTimer){clearInterval(flashTimer);flashTimer=0;document.title=baseTitle}});
+function alertOpps(list){if(oppSound){beep();if(navigator.vibrate)try{navigator.vibrate([200,100,200])}catch(e){}}notifyOpps(list);if(oppSound||oppNotify)flashTitle(list.length)}
 // the watched markets (自选) live on the bot, so the page and the Telegram alerts share them: data.json brings them, POST /watch changes them
 let watch={keys:[],names:{},tg_only:false,tg:true},watchSaving=0,watchMsg="";
 const watched=h=>watch.keys.includes(h.ekey||h.key);
@@ -7905,10 +7947,10 @@ function drawOpps(){  // every red-framed suggestion on the page in one strip on
   for(const h of [...makers.map(h=>["m",h]),...takers.map(h=>["t",h])]){const id=h[0]+":"+h[1].key;
     if(oppPrimed&&!(id in oppSeenAt)&&(oppSoundAll||watched(h[1])))fresh.push(h[1]);oppSeenAt[id]=now}
   for(const id in oppSeenAt)if(now-oppSeenAt[id]>SOUND_AGAIN_MS)delete oppSeenAt[id];
-  if(oppPrimed&&oppSound&&fresh.length)beep();if(last)oppPrimed=true;  // the first strip drawn from data is what is already there: silent
+  if(oppPrimed&&fresh.length)alertOpps(fresh);if(last)oppPrimed=true;  // the first strip drawn from data is what is already there: silent
   const n=makers.length+takers.length;el.hidden=editing||!n;el.classList.toggle("pin",oppPin);if(el.hidden){el.replaceChildren();return}
   const bellBtn=()=>{const b=$("button","obell"+(oppSound?" on":""),oppSound?"🔔":"🔕");b.type="button";b.setAttribute("aria-label","声音提醒");b.setAttribute("aria-pressed",oppSound?"true":"false");
-    b.title=oppSound?"声音提醒已开：新机会进入机会条时响一声（"+(oppSoundAll?"全部机会":"只限 ★ 自选市场")+"）；点击关闭":"点击开启声音提醒：新机会进入机会条时响一声（范围在 ✎ 自定义 里选）";
+    b.title=oppSound?"声音提醒已开：新机会进入机会条时响“"+SOUNDS[soundKind].name+"”（"+(oppSoundAll?"全部机会":"只限 ★ 自选市场")+"；音量 "+soundVol+"%）；点击关闭":"点击开启声音提醒：新机会进入机会条时响一声（范围在 ✎ 自定义 里选）";
     b.addEventListener("click",()=>{setSound(!oppSound);drawOpps()});return b};
   const foldBtn=()=>{const b=$("button","ofold",oppFold?"展开 ▾":"收起 ▴");b.type="button";b.title=oppFold?"展开机会条":"把机会条折成一行（只剩数量）";
     b.addEventListener("click",()=>{oppFold=!oppFold;keep("oppFold",oppFold);drawOpps()});return b};
@@ -8125,7 +8167,29 @@ function drawPanel(){
    ["snd-all","全部机会都响",oppSoundAll,v=>{oppSoundAll=v;keep("oppSoundAll",v)},"勾上：机会条里出现任何新机会都响；勾掉：只有下面 ★ 自选的市场才响"]
   ].forEach(([id,label,on,set,title])=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.id=id;i.checked=on;l.title=title;
     i.addEventListener("change",()=>{set(i.checked);drawOpps();drawPanel()});l.append(i,label);so.append(l)});
-  so.append($("span","mut","同一个机会响过后，在列或离开不到 5 分钟都不再响；机会条右侧的 🔔 随时开关"));
+  // which tone, how loud, how long, and a 试听 button; the viewer's own clip as one more choice
+  const kind=$("label","tog"),ks=$("select");ks.id="snd-kind";ks.title="提示音：内置的几种用浏览器合成，不下载任何文件；也可以用自己的音频文件";
+  for(const[k,v]of Object.entries(SOUNDS)){if(k==="file"&&!soundFile)continue;const o=$("option","",v.name+(k==="file"&&fileName?"（"+fileName+"）":""));o.value=k;ks.append(o)}
+  ks.value=soundKind;ks.addEventListener("change",()=>{soundKind=ks.value;keep("soundKind",soundKind);beep();drawOpps()});kind.append("提示音 ",ks);
+  const vol=$("label","tog"),vs=$("input");vs.type="range";vs.id="snd-vol";vs.min="0";vs.max="100";vs.step="5";vs.value=soundVol;vs.title="音量（0 = 静音；手机还受媒体音量和静音开关影响）";
+  const vn=$("span","",soundVol+"%");vs.addEventListener("input",()=>{vn.textContent=vs.value+"%"});vs.addEventListener("change",()=>{soundVol=Number(vs.value);keep("soundVol",soundVol);beep()});vol.append("音量 ",vs,vn);
+  const len=$("label","tog"),ls=$("select");ls.id="snd-len";ls.title="响多久：短 = 响一遍；中、长 = 反复响到这么久（自己的文件按遍数：1 / 2 / 3 遍）";
+  for(const[k,v]of Object.entries(SOUND_LEN)){const o=$("option","",v.label);o.value=k;ls.append(o)}
+  ls.value=soundLen;ls.addEventListener("change",()=>{soundLen=ls.value;keep("soundLen",soundLen);beep()});len.append("时长 ",ls);
+  const test=$("button","cb","试听");test.type="button";test.id="snd-test";test.title="按现在的提示音、音量和时长响一次";test.addEventListener("click",beep);
+  const fl=$("label","cb"),fi=$("input");fi.type="file";fi.id="snd-file";fi.accept="audio/*";fi.hidden=true;fl.append(soundFile?"换自己的音频":"用自己的音频…",fi);fl.title="选一个短音频文件（mp3 / ogg / wav 等，≤ "+Math.round(SOUND_FILE_MAX/1024)+" KB），只存在这个浏览器";
+  const fmsg=$("span","mut wmsg");fmsg.id="snd-fmsg";
+  fi.addEventListener("change",()=>{const f=fi.files&&fi.files[0];if(!f)return;setSoundFile(f,err=>{fmsg.textContent=err;if(!err){beep();drawPanel()}})});
+  so.append(kind,vol,len,test,fl);
+  if(soundFile){const rm=$("button","cb","删掉自己的音频");rm.type="button";rm.id="snd-fdel";rm.addEventListener("click",()=>setSoundFile(null,()=>drawPanel()));so.append(rm)}
+  so.append(fmsg);
+  // the system notification
+  const nl=$("label","tog"),ni=$("input");ni.type="checkbox";ni.id="snd-notify";ni.checked=oppNotify&&canNotify()&&Notification.permission==="granted";ni.disabled=!canNotify();
+  nl.title=canNotify()?"标签页在后台或窗口没有焦点时弹一条系统通知（第一次要允许；桌面 Chrome / Edge / Firefox 和安卓 Chrome 支持；iPhone 只有加到主屏幕的网页才支持）":"这个浏览器不支持网页通知（iPhone 的 Safari 要先把网页加到主屏幕）";
+  ni.addEventListener("change",()=>{if(!ni.checked){oppNotify=false;keep("oppNotify",false);drawPanel();return}
+    askNotify(v=>{oppNotify=v==="granted";keep("oppNotify",oppNotify);if(!oppNotify)fmsg.textContent="浏览器没有允许通知：请在地址栏的网站设置里允许";drawPanel()})});
+  nl.append(ni,"🖥 后台时弹系统通知");so.append(nl);
+  so.append($("span","mut","同一个机会响过后，在列或离开不到 5 分钟都不再响；机会条右侧的 🔔 随时开关。标签页在后台时标题会闪“🔥 新机会”，手机上会震动一下。注意：锁屏或切走后手机浏览器可能被暂停，长时间离开请靠 Telegram 推送；iPhone 静音开关打开时网页不出声"));
   const wl=document.getElementById("watch");wl.replaceChildren($("span","mut","★ 自选市场（存在机器人上，网页声音提醒和 Telegram 共用）："));
   const tgl=$("label","tog"),tgi=$("input");tgi.type="checkbox";tgi.id="watch-tg";tgi.checked=watch.tg_only;tgi.disabled=!watch.tg||watchSaving>0;
   tgl.title=watch.tg?"勾上：Telegram 的优势提醒（新机会 / 建议失效 / 方向反转）只发自选市场；勾掉：全部市场都发（/watch 只推自选 一样）":"机器人没有开启 Telegram 优势提醒（EDGE_ALERT 或 PREDICT 为 off）";
@@ -8157,8 +8221,8 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;oppPin=true;oppFold=false;folded=[];oneRow=[];secSort={};hotMap={};oppSound=false;oppSoundAll=true;
-  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","oppPin","oppFold","folded","oneRow","secsort","hotmap","oppSound","oppSoundAll"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
+  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;oppPin=true;oppFold=false;folded=[];oneRow=[];secSort={};hotMap={};oppSound=false;oppSoundAll=true;soundKind="ding";soundVol=70;soundLen="mid";oppNotify=false;
+  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","oppPin","oppFold","folded","oneRow","secsort","hotmap","oppSound","oppSoundAll","soundKind","soundVol","soundLen","oppNotify"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 let loading=null,lastSig="",dead=false;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
 const LOAD_TIMEOUT_MS=8000;
