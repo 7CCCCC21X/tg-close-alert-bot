@@ -274,8 +274,21 @@ async def watch_check(bot, page):
     assert await page.evaluate("[watch.keys, watch.tg_only, oppSound]") == [["UNITREEUSDT"], True, True]  # the bot's list, this browser's chime
     await page.click("#edit"); await page.click("#watch button.cb:nth-of-type(2)"); await until(page, "watch.keys.length === 0")  # 清空自选
     assert "自选为空" in await page.inner_text("#watchmsg") or await page.inner_text("#watchmsg") == "已保存"
-    await page.uncheck("#watch-tg"); await until(page, "watch.tg_only === false"); await page.uncheck("#snd-on"); await page.click("#done")
-    assert bot.watch_state() == ({}, False) and await page.evaluate("localStorage.getItem('oppSound')") == "false"
+    await page.uncheck("#watch-tg"); await until(page, "watch.tg_only === false")
+    # a starred card's fair price moving by the set amount sounds too (and notifies), measured from the last such alert
+    await page.fill("#snd-fav", "5"); await page.dispatch_event("#snd-fav", "change")
+    assert await page.evaluate("[favMove, localStorage.getItem('favMove')]") == [5, "5"]
+    await page.click("#done"); await page.click("#g-index .card .star")  # 上证指数: the one card with a model here
+    await page.evaluate("document.hasFocus = () => false; oppNotify = true; Notification.permission = 'granted'; window.__shown = []; window.__beeps = 0")  # (the reload above reset the stub)
+    assert await page.evaluate("favBase['上证指数'] === last.items[0].fair_up") and await page.evaluate("favBase['宇树 UNITREE']") is None
+    await page.evaluate("last.items[0].fair_up += 0.03; render(last)"); assert await page.evaluate("[window.__beeps, window.__shown.length]") == [0, 0]  # 3¢: not yet
+    await page.evaluate("last.items[0].fair_up += 0.03; render(last)"); assert await page.evaluate("window.__beeps") == 2  # 6¢ since the start
+    shown = await page.evaluate("window.__shown"); assert len(shown) == 1 and shown[0][0] == "📈 收藏变动 1" and "上证指数 公平价 35.0¢ → 41.0¢（+6.0¢）" == shown[0][1], shown
+    await page.evaluate("last.items[0].fair_up -= 0.04; render(last)"); assert await page.evaluate("window.__beeps") == 2  # 4¢ from the alerted 41¢: not yet
+    await page.click("#g-fav .card .star"); await page.click("#edit"); await page.fill("#snd-fav", "0"); await page.dispatch_event("#snd-fav", "change")
+    await page.evaluate("oppNotify = false; keep('oppNotify', false)")
+    await page.uncheck("#snd-on"); await page.click("#done")
+    assert bot.watch_state() == ({}, False) and await page.evaluate("localStorage.getItem('oppSound')") == "false" and await page.evaluate("favs") == []
     await page.evaluate("localStorage.removeItem('soundLen')")
 
 

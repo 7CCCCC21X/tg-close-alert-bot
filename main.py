@@ -7607,9 +7607,22 @@ function notifyOpps(list){if(!oppNotify||!canNotify()||Notification.permission!=
   try{const body=list.slice(0,4).map(h=>h.name+" "+h.pick.text+" "+sg(h.pick.edge)).join(" · ")+(list.length>4?" · …":"");
     const n=new Notification("🔥 新机会 "+list.length,{body,tag:"opps",renotify:true,silent:oppSound});n.onclick=()=>{try{window.focus()}catch(e){}n.close()}}catch(e){}}
 const baseTitle=document.title;let flashTimer=0;
-function flashTitle(n){if(!document.hidden)return;clearInterval(flashTimer);let on=false;flashTimer=setInterval(()=>{on=!on;document.title=on?"🔥 新机会 "+n:baseTitle},900)}
+function flashTitle(text){if(!document.hidden)return;clearInterval(flashTimer);let on=false;flashTimer=setInterval(()=>{on=!on;document.title=on?text:baseTitle},900)}
 document.addEventListener("visibilitychange",()=>{if(!document.hidden&&flashTimer){clearInterval(flashTimer);flashTimer=0;document.title=baseTitle}});
-function alertOpps(list){if(oppSound){beep();if(navigator.vibrate)try{navigator.vibrate([200,100,200])}catch(e){}}notifyOpps(list);if(oppSound||oppNotify)flashTitle(list.length)}
+function alertOpps(list){if(oppSound){beep();if(navigator.vibrate)try{navigator.vibrate([200,100,200])}catch(e){}}notifyOpps(list);if(oppSound||oppNotify)flashTitle("🔥 新机会 "+list.length)}
+// starred cards (⭐ 收藏): the same sound and notification when a card's fair price has moved favMove¢ or more since the last
+// such alert (the price when the page opened, at first); 0 = off. The ladders have no single fair price and are left out.
+let favMove=stored("favMove",0,v=>typeof v==="number"&&v>=0&&v<=50);const favBase={};
+function favMoves(){if(!last||!favMove||!oppPrimed)return;const moved=[];
+  for(const it of last.items){const k=favKey(it);if(!favs.includes(k)||typeof it.fair_up!=="number"){delete favBase[k];continue}
+    const base=favBase[k];if(base===undefined){favBase[k]=it.fair_up;continue}
+    if(Math.abs(it.fair_up-base)>=favMove/100-1e-9){moved.push({name:it.name,from:base,to:it.fair_up});favBase[k]=it.fair_up}}
+  if(moved.length)alertMoves(moved)}
+function alertMoves(list){if(oppSound){beep();if(navigator.vibrate)try{navigator.vibrate([200,100,200])}catch(e){}}
+  if(oppNotify&&canNotify()&&Notification.permission==="granted"&&(document.hidden||!document.hasFocus()))try{
+    const body=list.slice(0,4).map(m=>m.name+" 公平价 "+cent(m.from)+" → "+cent(m.to)+"（"+sg(m.to-m.from)+"）").join(" · ")+(list.length>4?" · …":"");
+    const n=new Notification("📈 收藏变动 "+list.length,{body,tag:"favmove",renotify:true,silent:oppSound});n.onclick=()=>{try{window.focus()}catch(e){}n.close()}}catch(e){}
+  if(oppSound||oppNotify)flashTitle("📈 收藏变动 "+list.length)}
 // the watched markets (自选) live on the bot, so the page and the Telegram alerts share them: data.json brings them, POST /watch changes them
 let watch={keys:[],names:{},tg_only:false,tg:true},watchSaving=0,watchMsg="";
 const watched=h=>watch.keys.includes(h.ekey||h.key);
@@ -8128,7 +8141,7 @@ function render(d){
     if(editing&&g!=="fav"&&g!=="sim")h.append(hotInput("sec:"+g,hotCents,"这一栏的红框门槛（空 = 全局）"))}  // 自定义: the section's own bar
   const now=[...document.querySelectorAll(".wrap>.grid")].map(e=>e.id.slice(2)).filter(g=>g!=="fav");
   if(now.join()!==secOrder.join())for(const g of secOrder)foot.before(document.getElementById("h-"+g),document.getElementById("g-"+g));
-  restoreScroll(marks);drawOpps();tick()}
+  restoreScroll(marks);drawOpps();favMoves();tick()}
 function drawLegend(){
   const lg=document.getElementById("legend");const sw=$("span","sw");[["涨",upColor()],["平","var(--flat)"],["跌",downColor()]].forEach(([t,col])=>{const i=$("i");i.style.background=col;sw.append(i,t)});
   const own=Object.keys(hotMap).length,hot=$("span","sw hot");hot.append($("i"),"红框 = 净优势 ≥"+hotCents+"¢（高亮门槛"+(own?"，另有 "+own+" 处单独设置":"")+"）");
@@ -8189,6 +8202,11 @@ function drawPanel(){
   ni.addEventListener("change",()=>{if(!ni.checked){oppNotify=false;keep("oppNotify",false);drawPanel();return}
     askNotify(v=>{oppNotify=v==="granted";keep("oppNotify",oppNotify);if(!oppNotify)fmsg.textContent="浏览器没有允许通知：请在地址栏的网站设置里允许";drawPanel()})});
   nl.append(ni,"🖥 后台时弹系统通知");so.append(nl);
+  // starred cards: a move of this many cents in the fair price sounds too
+  const mv=$("label","tog"),mi=$("input");mi.type="number";mi.id="snd-fav";mi.min="0";mi.max="50";mi.step="0.5";mi.value=favMove;
+  mv.title="⭐ 收藏的卡片：公平价比上一次这样提醒时（刚打开页面时按当时的价）变动达到这么多¢，也响一声并按上面的设置弹通知；0 = 不响。阶梯卡没有单一公平价，不算";
+  mi.addEventListener("change",()=>{const v=Number(mi.value);favMove=mi.value.trim()!==""&&Number.isFinite(v)?Math.min(50,Math.max(0,v)):0;mi.value=favMove;keep("favMove",favMove);for(const k in favBase)delete favBase[k]});
+  mv.append("⭐ 收藏公平价变动 ≥ ",mi," ¢ 也响");so.append(mv);
   so.append($("span","mut","同一个机会响过后，在列或离开不到 5 分钟都不再响；机会条右侧的 🔔 随时开关。标签页在后台时标题会闪“🔥 新机会”，手机上会震动一下。注意：锁屏或切走后手机浏览器可能被暂停，长时间离开请靠 Telegram 推送；iPhone 静音开关打开时网页不出声"));
   const wl=document.getElementById("watch");wl.replaceChildren($("span","mut","★ 自选市场（存在机器人上，网页声音提醒和 Telegram 共用）："));
   const tgl=$("label","tog"),tgi=$("input");tgi.type="checkbox";tgi.id="watch-tg";tgi.checked=watch.tg_only;tgi.disabled=!watch.tg||watchSaving>0;
@@ -8221,8 +8239,8 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;oppPin=true;oppFold=false;folded=[];oneRow=[];secSort={};hotMap={};oppSound=false;oppSoundAll=true;soundKind="ding";soundVol=70;soundLen="mid";oppNotify=false;
-  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","oppPin","oppFold","folded","oneRow","secsort","hotmap","oppSound","oppSoundAll","soundKind","soundVol","soundLen","oppNotify"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
+  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;oppPin=true;oppFold=false;folded=[];oneRow=[];secSort={};hotMap={};oppSound=false;oppSoundAll=true;soundKind="ding";soundVol=70;soundLen="mid";oppNotify=false;favMove=0;
+  ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","oppPin","oppFold","folded","oneRow","secsort","hotmap","oppSound","oppSoundAll","soundKind","soundVol","soundLen","oppNotify","favMove"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 let loading=null,lastSig="",dead=false;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
 const LOAD_TIMEOUT_MS=8000;
