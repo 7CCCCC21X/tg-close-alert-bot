@@ -34,7 +34,7 @@
 
 | 项目 | 默认行为 |
 | --- | --- |
-| 检查间隔 | 2 秒（`POLL_SECONDS`，最小 1）；币安合约的最新价和标记价各一次批量请求；采样不等 Telegram：消息在后台排队发送，采样照常进行 |
+| 检查间隔 | 1 秒（`POLL_SECONDS`，最小 1）；成交价和标记价来自币安 WebSocket 实时流（`BINANCE_STREAM`，见“实时推送”），流断开时退回每轮两次批量请求；采样不等 Telegram：消息在后台排队发送，采样照常进行 |
 | 发送前复核 | 消息排队（例如 Telegram 429 冷却）期间行情变旧、超过 `MAX_PRICE_AGE_SECONDS`，或最新一次采样已不再触发，这条提醒直接作废、不补发旧价；下一轮用新行情重新判断。只有 Telegram 确认收到才记为已发送 |
 | 首次采样已超过阈值 | 提醒，无需等下次穿越 |
 | 持续超过阈值 | 每 300 秒再次提醒 |
@@ -43,7 +43,7 @@
 | 重新触发 | 回到阈值的 80% 内后重新武装；默认为 ±0.8% 内 |
 | 涨跌反转 | 反方向超过 1% 时提醒，仍遵守 30 秒最短间隔 |
 | 基准换日 | 日 K 模式：自动重新计算，新日 K 不可用时不沿用旧基准；交易所收盘时刻模式：保持到下一次已确认的交易日收盘替换，长假不过期 |
-| 参考数据 | 交易所收盘、汇率、恒指、KOSPI、上证/A50、Hyperliquid、概率输入各自在后台独立刷新（交易时段内：个股实时价每 1 秒，沪港股票合并成一次请求，`QUOTE_REFRESH_SECONDS` 可调；上证/A50、KOSPI 每 5 秒；恒指 20 秒（现货 3 秒）；加密现货价每 5 秒；休市时 60 秒；网页的指数和合约卡片连同盘口由服务器实时推送）；提醒循环只读最近一次有效结果，外部接口变慢或挂起不会拖慢提醒 |
+| 参考数据 | 交易所收盘、汇率、恒指、KOSPI、上证/A50、Hyperliquid、概率输入各自在后台独立刷新（交易时段内：个股实时价每 1 秒，沪港股票合并成一次请求，`QUOTE_REFRESH_SECONDS` 可调；上证/A50、KOSPI 每 5 秒；恒指 20 秒（现货 3 秒）；加密现货价来自币安 WebSocket 流、每秒读一次，流断开时每 5 秒请求；休市时 60 秒；网页的指数和合约卡片连同盘口由服务器实时推送）；提醒循环只读最近一次有效结果，外部接口变慢或挂起不会拖慢提醒 |
 | 最新成交价过期 | 超过 120 秒未更新，暂停该项涨跌提醒并报告异常 |
 | 网络故障/合约缺失 | 不生成假价格、不换成别的合约、不把数据缺失当作未触发 |
 | 错误提醒去重 | 同一订阅同一数据项的异常**持续 30 秒以上**才首次提示（一次超时抖动不提示），之后最多每 30 分钟提示一次；“数据恢复”只在提示过异常之后发 |
@@ -86,7 +86,7 @@ tg-close-alert-bot/
 └── tests/
     ├── run_all.py
     ├── offline.py
-    └── test_*.py（47 组离线测试）
+    └── test_*.py（48 组离线测试）
 ```
 
 `Dockerfile` 会在构建时运行 `tests/` 里的全部离线测试（不联网、不需要 Token），任何一组失败都会让构建失败，不会上线有问题的版本。不需要在电脑上安装 Python，也不需要额外搭建数据库服务。
@@ -114,7 +114,7 @@ TELEGRAM_BOT_TOKEN=替换成BotFather给你的Token
 ADMIN_USER_ID=0
 SYMBOLS=UNITREEUSDT,HK0625USDT,CXMTUSDT,SKHYNIXUSDT
 ALERT_THRESHOLD_PCT=1
-POLL_SECONDS=2
+POLL_SECONDS=1
 ALERT_COOLDOWN_SECONDS=300
 ALERT_STEP_PCT=1
 MIN_ALERT_GAP_SECONDS=30
@@ -209,6 +209,15 @@ EXCHANGE_TICKERS=UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:6888
 | `/test` | 仅测试消息能否发到当前私聊/话题 |
 | `/id` | 显示自己的用户 ID、当前聊天 ID、话题 ID |
 | `/help` | 查看帮助 |
+
+## 实时推送（WebSocket）
+
+默认开启两路 WebSocket 流，轮询照常运行作兜底，流断了就自动退回轮询并按 2、4、8…60 秒重连：
+
+- **币安**（`BINANCE_STREAM`）：合约的每笔成交（`aggTrade`，时间戳仍是最后一笔成交，成交稀疏的合约和原来一样会换标记价）和每秒一次的标记价 / 指数价；加密卡片用到的现货交易对（BNB、SOL、BTC、ETH、HYPE 等）的每笔成交。流在线且每个合约都见过成交时，提醒循环一轮不发任何请求，每秒判断一次；加密卡片每秒从流里取价。
+- **Predict**（`PREDICT_STREAM`，`wss://ws.predict.fun/ws`，主题 `predictOrderbook/<市场 id>`）：指数、合约标的和 ★ 自选市场（含自选阶梯的每一档）的订单簿一变就推过来，网页的事件流在 1 秒内送到页面；最多跟 80 个市场。订阅被拒（例如需要 API Key）时 `/status` 会写明，盘口照旧按 5 / 15 秒轮询。
+- `/status` 的“📶 实时推送”一行：每路流“✓ N 秒前”（最近一条消息）、“已连接，等待数据”或“✗ 原因”。
+- 代码只用标准库（自带一个很小的 RFC 6455 客户端），不走 HTTP 代理；Railway 直连没有问题。
 
 ## 按证券交易所收盘时刻取基准（/mode exchange）
 
@@ -359,7 +368,7 @@ HL_TICKERS=UNITREEUSDT=xyz:UNITREE,HK0625USDT=xyz:SHEIN,CXMTUSDT=xyz:CXMT,SKHYNI
 
 ### Predict 订单簿对比（/book）
 
-机器人读取 Predict.fun 上对应的订单簿（指数和合约标的的每日涨跌市场每 5 秒，`PREDICT_FAST_SECONDS`；其余市场和阶梯的上百个档位每 15 秒，`PREDICT_POLL_SECONDS`）（只读，不下单），和模型公平价比较，告诉你挂哪边优势大。`/book` 列出全部标的并附市场链接，`/prob` 和概率网页的每张卡片也附带盘口。网页上盘口那行开头的“Predict ↗”按钮在新标签页打开对应的 Predict 市场（链接带邀请码 `?ref=B00EA`）；四个优势格子点了不跳转，而是展开明细（见下）。
+机器人读取 Predict.fun 上对应的订单簿（指数、合约标的和 ★ 自选市场另有 WebSocket 实时推送，见“实时推送”；轮询作兜底：这些市场每 5 秒，`PREDICT_FAST_SECONDS`；其余市场和阶梯的上百个档位每 15 秒，`PREDICT_POLL_SECONDS`）（只读，不下单），和模型公平价比较，告诉你挂哪边优势大。`/book` 列出全部标的并附市场链接，`/prob` 和概率网页的每张卡片也附带盘口。网页上盘口那行开头的“Predict ↗”按钮在新标签页打开对应的 Predict 市场（链接带邀请码 `?ref=B00EA`）；四个优势格子点了不跳转，而是展开明细（见下）。
 
 市场链接按目标收盘日自动拼出，日期变了不用改任何配置：
 
@@ -645,7 +654,9 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 | `ADMIN_USER_ID` | `0` | 管理员数字用户 ID，0 为仅允许获取 ID 的初始化状态 |
 | `SYMBOLS` | 截图中的四个合约 | 英文逗号分隔，精确使用币安代码 |
 | `ALERT_THRESHOLD_PCT` | `1` | 百分数，1 代表 1% |
-| `POLL_SECONDS` | `2` | 行情轮询目标间隔，最小 1 秒 |
+| `POLL_SECONDS` | `1` | 提醒循环间隔，最小 1 秒（实时流开着时一轮不发请求） |
+| `BINANCE_STREAM` | `on` | 币安 WebSocket 实时流（合约成交价 + 标记价每秒，加密现货成交价）；`off` 只轮询 |
+| `PREDICT_STREAM` | `on` | Predict WebSocket 实时盘口（指数、合约标的和 ★ 自选的市场，含自选阶梯的各档，最多 80 个）；`off` 只轮询 |
 | `QUOTE_REFRESH_SECONDS` | `1` | 个股实时行情在其交易时段内的刷新间隔（1～300 秒），沪港股票一次请求取齐。指数不可调：上证/A50、KOSPI 交易中 10 秒、恒指 20 秒、休市 60 秒 |
 | `ALERT_COOLDOWN_SECONDS` | `300` | 持续超标的周期提醒间隔，0 关闭 |
 | `ALERT_STEP_PCT` | `1` | 超过阈值后每扩大多少个百分点进入新提醒档位，0 关闭 |

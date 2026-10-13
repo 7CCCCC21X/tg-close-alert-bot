@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
 import contextlib
 import contextvars
 import copy
@@ -472,6 +474,8 @@ class Config:
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
     predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
     predict_api_key: str = ""  # Optional x-api-key for api.predict.fun (REST orderbook).
+    binance_stream: bool = True   # Binance trades and mark prices over WebSocket (BINANCE_STREAM); polling stays as the fallback
+    predict_stream: bool = True   # Predict books over WebSocket for the daily and watched markets (PREDICT_STREAM)
     predict_poll: int = 15   # seconds between orderbook refreshes (the ladders' hundred books)
     predict_fast: int = 5    # ... and the daily index / contract books (PREDICT_FAST_SECONDS)
     predict_ref: str = "B00EA"  # referral code appended to Predict market links (?ref=); empty = none
@@ -538,7 +542,9 @@ class Config:
             symbols=symbols, db_path=e.get("STATE_DB", "./data/bot.sqlite3"),
             threshold=threshold,
             cooldown=bounded_int(e, "ALERT_COOLDOWN_SECONDS", 300, 0, 86400),
-            poll=bounded_int(e, "POLL_SECONDS", 2, 1, 3600),
+            poll=bounded_int(e, "POLL_SECONDS", 1, 1, 3600),
+            binance_stream=e.get("BINANCE_STREAM", "on").strip().lower() not in {"off", "0", "false", "no"},
+            predict_stream=e.get("PREDICT_STREAM", "on").strip().lower() not in {"off", "0", "false", "no"},
             quote_refresh=bounded_int(e, "QUOTE_REFRESH_SECONDS", 1, 1, 300),
             step=number(e.get("ALERT_STEP_PCT", "1"), "ALERT_STEP_PCT", zero_ok=True),
             min_gap=bounded_int(e, "MIN_ALERT_GAP_SECONDS", 30, 0, 3600),
@@ -779,6 +785,281 @@ async def _blocking(fn: Any, *args: Any) -> Any:
 
 async def http_json(url: str, payload: dict | None = None, timeout: int = 15) -> Any:
     return await _blocking(_http_json, url, payload, timeout)
+
+
+# --- WebSocket streams: Binance prices and Predict books pushed within the second instead of polled ----------------------------
+def ws_mask(data: bytes, mask: bytes) -> bytes:
+    """XOR ``data`` with the 4-byte ``mask`` (RFC 6455 client frames), in one integer operation."""
+    if not data:
+        return b""
+    pad = (mask * (len(data) // 4 + 1))[:len(data)]
+    return (int.from_bytes(data, "big") ^ int.from_bytes(pad, "big")).to_bytes(len(data), "big")
+
+
+class WebSocketClient:
+    """A small RFC 6455 client on asyncio streams (TLS), enough for the exchange feeds: text frames out (masked, as a
+    client must), text / ping / close frames in (a ping is answered at once), fragmented messages joined. No
+    extensions and no proxy: the feeds are reached directly, as on Railway."""
+    MAX_MESSAGE = 4 * 1024 * 1024
+    GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.reader, self.writer = reader, writer
+        self.closed = False
+        self.last_frame = time.monotonic()  # when the last frame of any kind came (pongs included)
+
+    @classmethod
+    async def connect(cls, url: str, headers: dict[str, str] | None = None, timeout: float = 15.0) -> "WebSocketClient":
+        parts = urllib.parse.urlsplit(url)
+        tls = parts.scheme == "wss"
+        host, port = parts.hostname or "", parts.port or (443 if tls else 80)
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(
+            host, port, ssl=ssl.create_default_context() if tls else None, server_hostname=host if tls else None), timeout)
+        key = base64.b64encode(secrets.token_bytes(16)).decode()
+        lines = [f"GET {path} HTTP/1.1", f"Host: {host}" + ("" if port in (80, 443) else f":{port}"), "Upgrade: websocket",
+                 "Connection: Upgrade", f"Sec-WebSocket-Key: {key}", "Sec-WebSocket-Version: 13", "User-Agent: tg-close-alert-bot",
+                 *(f"{k}: {v}" for k, v in (headers or {}).items())]
+        try:
+            writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+            await writer.drain()
+            head = (await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout)).decode("latin-1", "replace")
+        except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError) as error:
+            writer.close()
+            raise RemoteError(f"WebSocket 握手失败：{clean_error(error) or type(error).__name__}") from None
+        status, _, rest = head.partition("\r\n")
+        expect = base64.b64encode(hashlib.sha1((key + cls.GUID).encode()).digest()).decode()
+        if " 101 " not in status or header_value(rest, "sec-websocket-accept") != expect:
+            writer.close()
+            raise RemoteError(f"WebSocket 握手失败：{brief_error(status, 60)}")
+        return cls(reader, writer)
+
+    async def _send(self, opcode: int, payload: bytes) -> None:
+        if self.closed:
+            raise RemoteError("WebSocket 已关闭")
+        n, mask = len(payload), secrets.token_bytes(4)
+        head = bytes([0x80 | opcode]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + n.to_bytes(2, "big") if n < 65536
+                                         else bytes([0x80 | 127]) + n.to_bytes(8, "big"))
+        self.writer.write(head + mask + ws_mask(payload, mask))
+        await self.writer.drain()
+
+    async def send_text(self, text: str) -> None:
+        await self._send(0x1, text.encode("utf-8"))
+
+    async def ping(self, data: bytes = b"") -> None:
+        await self._send(0x9, data)
+
+    async def _frame(self) -> tuple[bool, int, bytes]:
+        head = await self.reader.readexactly(2)
+        fin, opcode, masked, n = bool(head[0] & 0x80), head[0] & 0x0F, bool(head[1] & 0x80), head[1] & 0x7F
+        if n == 126:
+            n = int.from_bytes(await self.reader.readexactly(2), "big")
+        elif n == 127:
+            n = int.from_bytes(await self.reader.readexactly(8), "big")
+        if n > self.MAX_MESSAGE:
+            raise RemoteError(f"WebSocket 帧过大（{n} 字节）")
+        mask = await self.reader.readexactly(4) if masked else b""
+        payload = await self.reader.readexactly(n) if n else b""
+        self.last_frame = time.monotonic()
+        return fin, opcode, (ws_mask(payload, mask) if masked else payload)
+
+    async def recv(self, timeout: float | None = None) -> str | None:
+        """The next text message (fragments joined), None once the peer closed. A ping is answered here; a pong and a
+        binary message are skipped. ``timeout`` (seconds, per frame) raises asyncio.TimeoutError."""
+        buf, kind = bytearray(), 0
+        while True:
+            try:
+                fin, opcode, payload = await asyncio.wait_for(self._frame(), timeout)
+            except asyncio.IncompleteReadError:
+                self.closed = True
+                return None
+            if opcode == 0x8:
+                self.closed = True
+                with contextlib.suppress(Exception):
+                    self.writer.write(bytes([0x88, 0x80]) + secrets.token_bytes(4))
+                    self.writer.close()
+                return None
+            if opcode == 0x9:
+                await self._send(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x1, 0x2):
+                kind, buf = opcode, bytearray(payload)
+            elif opcode == 0x0 and kind:
+                buf += payload
+            else:
+                raise RemoteError(f"WebSocket 帧类型异常（{opcode}）")
+            if len(buf) > self.MAX_MESSAGE:
+                raise RemoteError("WebSocket 消息过大")
+            if fin:
+                done, kind = kind, 0
+                if done == 0x1:  # a binary message is dropped once complete
+                    return bytes(buf).decode("utf-8", "replace")
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            with contextlib.suppress(Exception):
+                await self._send(0x8, b"")
+        with contextlib.suppress(Exception):
+            self.writer.close()
+            await self.writer.wait_closed()
+
+
+class StreamFeed:
+    """A WebSocket feed kept connected in the background: reconnects after a growing pause, pings a quiet connection,
+    and records when the last message came and why it last failed (for /status). A subclass says where to connect,
+    what to send once connected and what a message means. Everything it feeds keeps working from the polled data
+    while the stream is down."""
+    NAME = "stream"
+    IDLE_SECONDS = 30        # no frame for this long: a ping goes out
+    DEAD_SECONDS = 120       # no frame at all for this long: reconnect
+    FRESH_SECONDS = 10       # a message this recent means the stream is live (its prices may be used instead of a request)
+    PAUSE_SECONDS = 2.0      # before the first reconnect; doubles each failure up to MAX_PAUSE
+    MAX_PAUSE = 60
+
+    def __init__(self) -> None:
+        self.ws: WebSocketClient | None = None
+        self.last_at = 0.0      # monotonic: the last message
+        self.messages = 0
+        self.error = ""         # the last failure, "" once connected again
+        self.failed_at = 0.0
+        self.connected_at = 0.0
+
+    def url(self) -> str:
+        raise NotImplementedError
+
+    def headers(self) -> dict[str, str]:
+        return {}
+
+    def wanted(self) -> bool:
+        return True
+
+    async def on_open(self, ws: WebSocketClient) -> None:
+        pass
+
+    async def on_tick(self, ws: WebSocketClient) -> None:
+        """Between messages (and on every idle timeout): a chance to subscribe to new things."""
+
+    def on_message(self, text: str) -> None:
+        raise NotImplementedError
+
+    def live(self) -> bool:
+        return self.ws is not None and not self.ws.closed and time.monotonic() - self.last_at < self.FRESH_SECONDS
+
+    def status(self) -> str:
+        if self.live():
+            return f"✓ {int(time.monotonic() - self.last_at)} 秒前"
+        if self.ws is not None and not self.ws.closed:
+            return "已连接，等待数据"
+        return f"✗ {brief_error(self.error, 50)}" if self.error else "未连接"
+
+    async def run(self, stopping: asyncio.Event) -> None:
+        pause = self.PAUSE_SECONDS
+        while not stopping.is_set():
+            if not self.wanted():
+                await asyncio.sleep(2)
+                continue
+            url = self.url()
+            try:
+                self.ws = await WebSocketClient.connect(url, self.headers())
+                self.connected_at = time.monotonic()
+                await self.on_open(self.ws)
+                while not stopping.is_set():
+                    if self.url() != url:
+                        break  # the subscription set changed: reconnect with the new one
+                    try:
+                        text = await self.ws.recv(timeout=self.IDLE_SECONDS)
+                    except asyncio.TimeoutError:
+                        if time.monotonic() - self.ws.last_frame > self.DEAD_SECONDS:
+                            raise RemoteError(f"{self.DEAD_SECONDS} 秒没有收到任何数据")
+                        await self.ws.ping()
+                        await self.on_tick(self.ws)
+                        continue
+                    if text is None:
+                        raise RemoteError("连接被对方关闭")
+                    self.last_at = time.monotonic()
+                    self.messages += 1
+                    self.error = ""
+                    pause = self.PAUSE_SECONDS
+                    try:
+                        self.on_message(text)
+                    except (ValueError, TypeError, KeyError, AttributeError, decimal.InvalidOperation) as error:
+                        LOG.debug("%s: message ignored: %s", self.NAME, clean_error(error))
+                    await self.on_tick(self.ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.error, self.failed_at = clean_error(error) or type(error).__name__, time.monotonic()
+                LOG.info("%s 断开：%s（%.0f 秒后重连）", self.NAME, self.error, pause)
+            finally:
+                if self.ws is not None:
+                    await self.ws.close()
+                    self.ws = None
+            if stopping.is_set():
+                break
+            await asyncio.sleep(pause)
+            pause = min(self.MAX_PAUSE, pause * 2)
+
+
+class BinanceStream(StreamFeed):
+    """Binance trades (and, for the contracts, the mark price every second) as they happen, for a set of symbols that
+    may grow while running (a new one reconnects with the longer stream list)."""
+    NAME = "币安实时流"
+
+    def __init__(self, base: str, symbols: Any = (), mark: bool = False):
+        super().__init__()
+        self.base, self.mark = base.rstrip("/"), mark
+        self.symbols: set[str] = {s.upper() for s in symbols}
+        self.last: dict[str, tuple[str, int]] = {}            # symbol -> (last trade price, trade time ms)
+        self.marks: dict[str, tuple[str, str, int]] = {}      # symbol -> (mark price, index price, time ms)
+
+    def want(self, symbol: str) -> None:
+        self.symbols.add(symbol.upper())
+
+    def wanted(self) -> bool:
+        return bool(self.symbols)
+
+    def url(self) -> str:
+        streams = [f"{s.lower()}@aggTrade" for s in sorted(self.symbols)]
+        if self.mark:
+            streams += [f"{s.lower()}@markPrice@1s" for s in sorted(self.symbols)]
+        return f"{self.base}/stream?streams={'/'.join(streams)}"
+
+    def on_message(self, text: str) -> None:
+        msg = json.loads(text)
+        data = msg.get("data", msg) if isinstance(msg, dict) else {}
+        kind, symbol = data.get("e"), str(data.get("s") or "").upper()
+        if kind == "aggTrade" and symbol:
+            self.last[symbol] = (str(data["p"]), int(data.get("T") or data.get("E") or 0))
+        elif kind == "markPriceUpdate" and symbol:
+            self.marks[symbol] = (str(data["p"]), str(data.get("i") or ""), int(data.get("E") or 0))
+
+    def price(self, symbol: str) -> tuple[str, int] | None:
+        """(last trade price, its time) while the stream is live and has seen the symbol trade, else None."""
+        return self.last.get(symbol.upper()) if self.live() else None
+
+    def row(self, symbol: str) -> dict | None:
+        """The symbol as /fapi/v2/ticker/price + premiumIndex would answer, from the stream; None when it cannot."""
+        found = self.price(symbol)
+        if found is None:
+            return None
+        row = {"symbol": symbol.upper(), "price": found[0], "time": found[1]}
+        mark = self.marks.get(symbol.upper())
+        if mark and self.mark:
+            row.update(markPrice=mark[0], markTime=mark[2], indexPrice=mark[1] or None)
+        return row
+
+
+FUTURES_WS = "wss://fstream.binance.com"
+SPOT_WS = "wss://stream.binance.com:9443"
+SPOT_STREAM = BinanceStream(SPOT_WS)  # the crypto markets' spot pairs; the bot starts it (tests leave it idle)
+
+
+def spot_cadence(symbol: str, default: int) -> int:
+    """How often a crypto market re-reads its price: every second from the live stream, else its own polling cadence."""
+    return 1 if SPOT_STREAM.price(symbol) is not None else default
 
 
 async def http_get(url: str, timeout: int = 15, headers: dict[str, str] | None = None) -> bytes:
@@ -1052,6 +1333,7 @@ class Binance:
         self.offset_ms = 0
         self.clock_checked = 0.0
         self.blocked_until = 0.0
+        self.stream = BinanceStream(FUTURES_WS, config.symbols, mark=True)  # run by the bot when BINANCE_STREAM is on
 
     def now_ms(self) -> int:
         return int(time.time() * 1000) + self.offset_ms
@@ -1084,7 +1366,20 @@ class Binance:
         self.clock_checked = time.monotonic()
 
     async def prices(self) -> dict[str, dict]:
-        """Last trade per symbol, plus the mark price (markPrice/markTime) when the index feed answers."""
+        """Last trade per symbol, plus the mark price (markPrice/markTime) when the index feed answers. From the live
+        stream when it is up and has seen every symbol trade (no request at all); the REST answer otherwise, which also
+        seeds the stream's last trades, so a thin contract does not wait for its next trade."""
+        rows = {symbol: self.stream.row(symbol) for symbol in self.config.symbols}
+        if all(rows.values()):
+            return {symbol: row for symbol, row in rows.items() if row}
+        rows = await self.prices_rest()
+        for symbol, row in rows.items():
+            if symbol not in self.stream.last and row.get("price") is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    self.stream.last[symbol] = (str(row["price"]), int(row.get("time") or 0))
+        return rows
+
+    async def prices_rest(self) -> dict[str, dict]:
         data, marks = await asyncio.gather(self.get("/fapi/v2/ticker/price"),
                                            self.get("/fapi/v1/premiumIndex"), return_exceptions=True)
         if isinstance(data, BaseException):
@@ -3835,6 +4130,8 @@ class VolBook:
 # Buying 跌 at p is the same as selling 涨 at 1 − p, so for 跌 the prices are 1 − 卖1 (maker) / 1 − 买1 (taker).
 PREDICT_GRAPHQL = "https://graphql.predict.fun/graphql"
 PREDICT_REST = "https://api.predict.fun/v1"
+PREDICT_WS = "wss://ws.predict.fun/ws"
+PREDICT_STREAM_MAX = 80  # books followed over the stream at most (the daily markets, the watched ones and their ladders)
 PREDICT_SITE = "https://predict.fun/zh-cn/market/"
 PREDICT_ITEMS = (("HSI", "恒生指数", "hk"), ("KOSPI", "KOSPI", "kr"), ("SSE", "上证指数", "sh"))
 PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
@@ -4304,11 +4601,42 @@ class PredictFeed:
         self.fees: dict[str, tuple[int | None, float]] = {}      # market id -> (feeRateBps or None, when read)
         self.refreshed = -1e9       # the last full round (every target)
         self.refreshed_fast = -1e9  # the last fast round (the daily index / contract books, PREDICT_FAST_SECONDS)
+        self.live_keys: frozenset = frozenset()                  # item keys whose books the stream follows (the fast tier)
+        self.stream = PredictStream(self)                        # run by the bot when PREDICT_STREAM is on
         self.gate = asyncio.Semaphore(PREDICT_PARALLEL)          # requests in flight: the other feeds share the thread pool
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
 
     def headers(self) -> dict[str, str]:
         return {"x-api-key": self.config.predict_api_key} if self.config.predict_api_key else {}
+
+    def live_ids(self) -> list[str]:
+        """The market ids the stream should follow: the live keys' books and, for a ladder among them, every level."""
+        ids: list[str] = []
+        for key in sorted(self.live_keys):
+            book = self.books.get(key)
+            if book is not None:
+                ids.append(book.market_id)
+            ids += [row.market_id for row in self.ladders.get(key, [])]
+        return list(dict.fromkeys(ids))[:PREDICT_STREAM_MAX]
+
+    def apply_book(self, market_id: str, data: Any) -> int:
+        """A pushed orderbook for ``market_id``: every book and ladder level with that id takes it (priced as the
+        REST one is). Returns how many took it; a payload without levels changes nothing."""
+        book = data.get("orderbook", data) if isinstance(data, dict) else None
+        if not isinstance(book, dict) or ("bids" not in book and "asks" not in book):
+            return 0
+        bids, asks, now_ms = predict_levels(book.get("bids"), True), predict_levels(book.get("asks"), False), int(time.time() * 1000)
+        took = 0
+        for key, old in list(self.books.items()):
+            if old.market_id == market_id:
+                self.books[key] = dataclasses.replace(old, bids=bids, asks=asks, fetched_ms=now_ms)
+                took += 1
+        for key, rows in self.ladders.items():
+            for i, row in enumerate(rows):
+                if row.market_id == market_id and row.book is not None:
+                    rows[i] = dataclasses.replace(row, book=dataclasses.replace(row.book, bids=bids, asks=asks, fetched_ms=now_ms))
+                    took += 1
+        return took
 
     async def fetch(self, url: str, payload: dict | None = None) -> Any:
         """One Predict request, at most PREDICT_PARALLEL at a time; a 429 (or any retry_after) pauses them all."""
@@ -4607,6 +4935,54 @@ class PredictFeed:
         return refreshed(failed, len(targets) - len(failed))
 
 
+class PredictStream(StreamFeed):
+    """Predict.fun books pushed as they change (wss://ws.predict.fun/ws, topic predictOrderbook/<market id>) for the
+    feed's live keys; a new market is subscribed as soon as the polled round has resolved it."""
+    NAME = "Predict 实时盘口"
+
+    def __init__(self, feed: "PredictFeed"):
+        super().__init__()
+        self.feed = feed
+        self.subscribed: set[str] = set()
+        self.requests = 0
+        self.rejected: dict[str, str] = {}  # market id -> why the subscription was refused
+
+    def url(self) -> str:
+        return PREDICT_WS
+
+    def headers(self) -> dict[str, str]:
+        return self.feed.headers()
+
+    def wanted(self) -> bool:
+        return bool(self.feed.live_ids())
+
+    async def on_open(self, ws: WebSocketClient) -> None:
+        self.subscribed = set()
+        await self.on_tick(ws)
+
+    async def on_tick(self, ws: WebSocketClient) -> None:
+        for market_id in self.feed.live_ids():
+            if market_id in self.subscribed or market_id in self.rejected:
+                continue
+            self.requests += 1
+            await ws.send_text(json.dumps({"method": "subscribe", "requestId": self.requests, "params": [f"predictOrderbook/{market_id}"]}))
+            self.subscribed.add(market_id)
+
+    def on_message(self, text: str) -> None:
+        msg = json.loads(text)
+        if not isinstance(msg, dict):
+            return
+        topic = str(msg.get("topic") or "")
+        if topic.startswith("predictOrderbook/"):
+            self.feed.apply_book(topic.partition("/")[2], msg.get("data"))
+        elif msg.get("type") == "R" and (msg.get("error") or msg.get("success") is False):
+            self.error = f"订阅被拒：{brief_error(str(msg.get('error') or msg.get('message') or msg), 60)}"
+
+    def status(self) -> str:
+        base = super().status()
+        return base + (f"｜{len(self.subscribed)} 个市场" if self.subscribed and self.ws is not None else "")
+
+
 # --- first-touch market (which barrier does BNB hit first?) ------------------------------------------
 def et_ms(year: int, month: int, day: int, hour: int, minute: int, utc_offset: int) -> int:
     """US Eastern wall time -> epoch ms; utc_offset is -4 (EDT, Mar-Nov) or -5 (EST)."""
@@ -4660,6 +5036,11 @@ async def binance_spot(path: str, **params: Any) -> Any:
     """GET /api/v3/<path> from Binance spot (the crypto markets' resolution source): the public hosts in turn, those in
     cooldown last. A rate-limit answer (retry_after) pauses every spot request for that long instead of trying the next
     host at once: the api*.binance.com hosts share one IP-based limit, and a 429 ignored escalates to a 418 ban."""
+    if path == "ticker/price" and params.get("symbol"):
+        SPOT_STREAM.want(str(params["symbol"]))  # from now on the stream follows it; this call still answers from REST if needed
+        found = SPOT_STREAM.price(str(params["symbol"]))
+        if found is not None:
+            return {"symbol": str(params["symbol"]).upper(), "price": found[0]}
     left = SPOT_BACKOFF["until"] - time.monotonic()
     if left > 0:
         raise RemoteError(f"币安现货接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
@@ -4836,7 +5217,7 @@ class TouchMarket:
     async def refresh(self, now_ms: int) -> None:
         mono = time.monotonic()
         try:
-            if mono - self.times["price"] >= self.PRICE_SECONDS:
+            if mono - self.times["price"] >= spot_cadence(self.spec.symbol, self.PRICE_SECONDS):
                 self.times["price"] = mono
                 data = await self.get("ticker/price", symbol=self.spec.symbol)
                 self.price, self.priced_ms = number(data["price"], "BNB"), now_ms
@@ -5143,7 +5524,7 @@ class UpDownMarket:
                         errors.append(clean_error(error) or type(error).__name__)
         if self.close_of("end") is None:  # settled: nothing is left to price
             try:
-                if mono - self.times["price"] >= self.PRICE_SECONDS:
+                if mono - self.times["price"] >= spot_cadence(self.spec.symbol, self.PRICE_SECONDS):
                     self.times["price"] = mono
                     data = await self.get("ticker/price", symbol=self.spec.symbol)
                     self.price, self.priced_ms = number(data["price"], self.spec.symbol), now_ms
@@ -9474,6 +9855,7 @@ class Bot:
             self.predict.ladder_keys.update(self.ranges)
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
+        self.stream_tasks: list[asyncio.Task] = []
         self.sim_ran = -1e9  # monotonic time of the paper trader's last look
         self.sim_checked: dict[str, float] = {}  # market id -> monotonic time Predict was last asked for its result
         self.edge_ran = -1e9  # monotonic time of the edge alerts' last look
@@ -12760,6 +13142,13 @@ class Bot:
         """The books read every PREDICT_FAST_SECONDS: the daily index and contract markets (the cards one watches)."""
         return frozenset([*(key for key, _, _ in PREDICT_ITEMS), *self.config.symbols])
 
+    def predict_live_keys(self) -> frozenset:
+        """The fast tier plus the watched markets (/watch, the page's 自选): read every PREDICT_FAST_SECONDS and, with
+        PREDICT_STREAM on, followed over the stream as they change."""
+        keys = self.predict_fast_keys() | frozenset(self.watch_state()[0])
+        self.predict.live_keys = keys
+        return keys
+
     def predict_targets(self, now_ms: int) -> dict[str, str]:
         """Item key -> Predict slug for the close the model is pricing (the next close when the model has none)."""
         if not self.config.predict:
@@ -13213,7 +13602,7 @@ class Bot:
         active = ("🟢 已订阅" if sub and sub.get("active") else f"⏸ 已自动暂停（{sub['suspended']}）→ /resume 恢复"
                   if sub and sub.get("suspended") else "⏸ 未订阅/已暂停")
         style = self.config.color_style
-        lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(), self.health_line(),
+        lines = [f"📡 {bold(f'监控状态 v{VERSION}')}｜{active}", self.config_summary(), self.health_line(), *filter(None, [self.stream_line()]),
                  f"📊 {legend(style)}｜→ 后为币安现价相对该行价格",
                  calendar_warning(self.config.holidays, dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date())]
         if self.settings()["mode"] == "binance_daily" and self.config.tickers:
@@ -13764,7 +14153,7 @@ class Bot:
         if self.config.probability:
             jobs.append(("概率输入", lambda: self.refresh_odds_inputs(now())))
         if self.config.predict:
-            jobs.append(("Predict 盘口", lambda: self.predict.refresh(self.predict_targets(now()), fast=self.predict_fast_keys())))
+            jobs.append(("Predict 盘口", lambda: self.predict.refresh(self.predict_targets(now()), fast=self.predict_live_keys())))
         if self.config.touch:
             jobs.append(("先触市场", lambda: self.refresh_touch(now())))
             jobs.append(("涨跌市场", lambda: self.refresh_updown(now())))
@@ -13864,6 +14253,25 @@ class Bot:
         state["error"] = outcome.error
         if outcome.error:
             state["error_at"] = now
+
+    def streams(self) -> list[tuple[str, StreamFeed]]:
+        """The WebSocket feeds this configuration runs, with their names for /status."""
+        out: list[tuple[str, StreamFeed]] = []
+        if self.config.binance_stream and isinstance(getattr(self.market, "stream", None), BinanceStream):
+            out += [("币安合约", self.market.stream), ("币安现货", SPOT_STREAM)]
+        if self.config.predict_stream and self.config.predict:
+            out.append(("Predict 盘口", self.predict.stream))
+        return out
+
+    def start_streams(self) -> None:
+        self.stream_tasks = [asyncio.create_task(feed.run(self.stopping), name=f"stream:{name}") for name, feed in self.streams()]
+
+    def stream_line(self) -> str:
+        """📶 one entry per stream: live (how long since its last message), connected but quiet, or down and why."""
+        feeds = self.streams()
+        if not feeds:
+            return ""
+        return "📶 实时推送：" + "｜".join(f"{name} {feed.status()}" for name, feed in feeds)
 
     def start_reference_tasks(self) -> None:
         self.reference_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="reference")
@@ -13978,10 +14386,11 @@ class Bot:
         # a day change several contracts' candle requests would then queue the Telegram sends behind them.
         loop.set_default_executor(ThreadPoolExecutor(max_workers=16, thread_name_prefix="io"))
         self.start_reference_tasks()
+        self.start_streams()
         core = [asyncio.create_task(self.monitor_loop(), name="monitor"),
                 asyncio.create_task(self.commands_loop(), name="commands"),
                 asyncio.create_task(self.watchdog(), name="watchdog")]
-        tasks = [*core, *self.reference_tasks]
+        tasks = [*core, *self.reference_tasks, *self.stream_tasks]
         if self.config.web_port:
             try:
                 self.web = WebServer(self, self.config.web_port, self.web_token)
