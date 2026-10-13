@@ -547,6 +547,7 @@ async def run():
     assert {k: live["items"][1][k] for k in ("name", "symbol", "missing")} == {"name": "宇树 UNITREE", "symbol": "UNITREEUSDT", "missing": "等待行情"} and len(live["items"]) == 2, live["items"]
     assert {k: live["items"][1][k] for k in ("auction", "preopen", "preopen_phase", "preopen_price", "preopen_at")} == {"auction": "", "preopen": "", "preopen_phase": "", "preopen_price": "", "preopen_at": 0}  # the session tags ride along
     assert live["items"][1]["trading"] == "已收盘" and live["items"][0]["trading"] == "已收盘", live["items"]
+    assert "predict" not in live["items"][0]  # no book here (Predict is not polled in this test); with one it rides along, without edges or age
     assert live["items"][0]["fair_up"] == json.loads(body)["items"][0]["fair_up"] and web.streams == 1
     w.close(); await w.wait_closed()
     st, _, _ = await request(port, b"GET /p/" + b"x" * len(token) + b"/events HTTP/1.1\r\nHost: x\r\n\r\n"); assert st == 404

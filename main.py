@@ -472,7 +472,8 @@ class Config:
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
     predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
     predict_api_key: str = ""  # Optional x-api-key for api.predict.fun (REST orderbook).
-    predict_poll: int = 15   # seconds between orderbook refreshes
+    predict_poll: int = 15   # seconds between orderbook refreshes (the ladders' hundred books)
+    predict_fast: int = 5    # ... and the daily index / contract books (PREDICT_FAST_SECONDS)
     predict_ref: str = "B00EA"  # referral code appended to Predict market links (?ref=); empty = none
     predict_fee_bps: int = 200   # taker fee rate when a market states none (Predict: 2% × min(p, 1 − p); makers 0)
     predict_trade_usd: float = 100.0  # trade size a taker edge is priced for (walks the book's depth)
@@ -537,7 +538,7 @@ class Config:
             symbols=symbols, db_path=e.get("STATE_DB", "./data/bot.sqlite3"),
             threshold=threshold,
             cooldown=bounded_int(e, "ALERT_COOLDOWN_SECONDS", 300, 0, 86400),
-            poll=bounded_int(e, "POLL_SECONDS", 5, 3, 3600),
+            poll=bounded_int(e, "POLL_SECONDS", 2, 1, 3600),
             quote_refresh=bounded_int(e, "QUOTE_REFRESH_SECONDS", 1, 1, 300),
             step=number(e.get("ALERT_STEP_PCT", "1"), "ALERT_STEP_PCT", zero_ok=True),
             min_gap=bounded_int(e, "MIN_ALERT_GAP_SECONDS", 30, 0, 3600),
@@ -553,6 +554,7 @@ class Config:
             predict_slugs=parse_predict_slugs(e.get("PREDICT_SLUGS", DEFAULT_PREDICT_SLUGS)),
             predict_api_key=e.get("PREDICT_API_KEY", "").strip(),
             predict_poll=bounded_int(e, "PREDICT_POLL_SECONDS", 15, 5, 3600),
+            predict_fast=bounded_int(e, "PREDICT_FAST_SECONDS", 5, 2, 3600),
             predict_ref=parse_ref_code(e.get("PREDICT_REF_CODE", "B00EA")),
             predict_fee_bps=bounded_int(e, "PREDICT_FEE_BPS", 200, 0, 1000),
             predict_trade_usd=parse_bounded(e, "PREDICT_TRADE_USD", "100", 1, 1_000_000),
@@ -2826,7 +2828,7 @@ class CnIndex:
     Sina, Yahoo 000001.SS): a realtime "last price" says nothing reliable about which session it closed.
     """
     REFRESH_SECONDS = 60      # between sessions
-    SESSION_SECONDS = 10      # while Shanghai trades (its own index) or an A50 session runs (the after-hours proxy)
+    SESSION_SECONDS = 5       # while Shanghai trades (its own index) or an A50 session runs (the after-hours proxy)
     DAILY_SECONDS = 600       # re-read the daily bars this often once the expected close is confirmed
     PENDING_SECONDS = 60      # ...and this often while the close the calendar expects is not confirmed yet
     STALE_MS = 10 * 60_000    # a live quote older than this is not used for new probabilities
@@ -3181,7 +3183,7 @@ def dated_ref(daily: dict[dt.date, D], day: dt.date, live: D | None) -> tuple[D 
 class KospiIndex:
     """KOSPI composite index: Naver's realtime index feed first, Eastmoney (100.KS11) as fallback."""
     REFRESH_SECONDS = 60   # between sessions
-    SESSION_SECONDS = 10   # while the KRX regular session runs (to 15 minutes after the close)
+    SESSION_SECONDS = 5    # while the KRX regular session runs (to 15 minutes after the close)
     SOURCES = (("Naver", "https://polling.finance.naver.com/api/realtime/domestic/index/KOSPI",
                 {"Referer": "https://finance.naver.com/"}),
                ("东方财富", IndexFutures.EM + "100.KS11", {"Referer": "https://quote.eastmoney.com/"}))
@@ -4300,7 +4302,8 @@ class PredictFeed:
         self.ladder_pick: dict[str, Any] = {}                    # item key -> which of the category's markets its ladder keeps
         self.ladders: dict[str, list[LadderRow]] = {}            # item key -> one row per market, by threshold
         self.fees: dict[str, tuple[int | None, float]] = {}      # market id -> (feeRateBps or None, when read)
-        self.refreshed = -1e9
+        self.refreshed = -1e9       # the last full round (every target)
+        self.refreshed_fast = -1e9  # the last fast round (the daily index / contract books, PREDICT_FAST_SECONDS)
         self.gate = asyncio.Semaphore(PREDICT_PARALLEL)          # requests in flight: the other feeds share the thread pool
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
 
@@ -4568,13 +4571,22 @@ class PredictFeed:
         except (RemoteError, TimeoutError, OSError) as error:
             self.errors[key] = clean_error(error) or type(error).__name__
 
-    async def refresh(self, targets: dict[str, str], force: bool = False) -> Refreshed | bool:
-        """targets: item key -> slug. False = not due yet."""
-        if not force and time.monotonic() - self.refreshed < self.config.predict_poll:
+    async def refresh(self, targets: dict[str, str], force: bool = False, fast: frozenset = frozenset()) -> Refreshed | bool:
+        """targets: item key -> slug. The keys in ``fast`` (the daily index / contract books) are read every
+        PREDICT_FAST_SECONDS, everything every PREDICT_POLL_SECONDS. False = not due yet."""
+        mono = time.monotonic()
+        full = force or mono - self.refreshed >= self.config.predict_poll
+        quick = full or (bool(fast) and mono - self.refreshed_fast >= min(self.config.predict_fast, self.config.predict_poll))
+        if not quick:
             return False
-        if (left := self.blocked_until - time.monotonic()) > 0:
+        if (left := self.blocked_until - mono) > 0:
             return Refreshed("failed", f"Predict 接口限流，冷却 {int(left) + 1} 秒后再试（盘口暂按上次结果显示）")
-        self.refreshed = time.monotonic()
+        self.refreshed_fast = mono
+        if not full:  # the fast tier alone: nothing else moves
+            await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in targets.items() if key in fast))
+            failed = [f"{key}：{error}" for key, error in self.errors.items() if key in fast and "还没有这个市场" not in error]
+            return refreshed(failed, len([k for k in targets if k in fast]) - len(failed))
+        self.refreshed = mono
         for key in list(self.books):
             if targets.get(key) != self.books[key].slug:
                 self.books.pop(key)  # the target day moved on: never show yesterday's book for today's market
@@ -4795,7 +4807,7 @@ class TouchMarket:
     The path check reads hourly bars and drills into 1-minute bars only for an hour that reached a barrier,
     so a hit is dated to the minute; a minute that spans both barriers, or the market's opening minute,
     cannot be ordered from OHLC and is reported for a manual check."""
-    PRICE_SECONDS = 30
+    PRICE_SECONDS = 5   # Binance spot: one small request per market
     VOL_SECONDS = 3600
     SCAN_SECONDS = 300
     PRICE_STALE_MS = 5 * 60_000     # a spot price older than this prices nothing
@@ -5078,7 +5090,7 @@ class UpDownOdds:
 class UpDownMarket:
     """A Binance spot pair against the close of its period's first 1-minute candle: live price, 30-day σ, and the two
     candle closes that set and settle the market, each read once its minute is over (strictly that minute) and kept."""
-    PRICE_SECONDS = 30
+    PRICE_SECONDS = 5
     VOL_SECONDS = 3600
     CANDLE_SECONDS = 30            # a candle still missing is asked for again this often
     CANDLE_GRACE_MS = 2_000        # and only this long after its minute ended
@@ -5241,7 +5253,7 @@ class FlipMarket:
     """Two Hyperliquid perps against each other: live mids, the 30-day σ of their price ratio, and the path since the
     window opened. The path check reads hourly bars and opens an hour's 1-minute candles only when a flip was possible
     in it (A's high reached B's low), so it costs next to nothing while the two are far apart."""
-    PRICE_SECONDS = 30
+    PRICE_SECONDS = 5
     VOL_SECONDS = 3600
     SCAN_SECONDS = 300
     PRICE_STALE_MS = 5 * 60_000     # mids older than this price nothing
@@ -6348,7 +6360,7 @@ class RangeMarket:
     """A Binance pair over one month: live price, 30-day σ, and the window's highest High and lowest Low so far. Hourly
     candles carry exactly the extremes of their minutes, and the window runs from one hour boundary to another, so they
     decide every level; the running hour's own candle counts at once (a level reached resolves the market at once)."""
-    PRICE_SECONDS = 30
+    PRICE_SECONDS = 5   # Binance spot (the stock ladder below keeps its own)
     VOL_SECONDS = 3600
     SCAN_SECONDS = 60
     PRICE_STALE_MS = 5 * 60_000     # a price older than this prices nothing
@@ -7846,10 +7858,10 @@ function book(p,key,pages){
   const w=$("div","pb"),q=$("div","quote");q.append(openLink(p.url));w.append(q);
   (pages||[]).slice(0,3).forEach(g=>{const a=$("a","pt pg",g.name+" ↗");a.href=g.url;a.target="_blank";a.rel="noopener noreferrer";a.title="在新标签页打开 "+g.name+" 的行情页：竞价时看当前价（参考平衡价）和更新时间，别只看逐笔成交";q.append(a)});
   const has=p.bids||p.asks;
-  if(has&&!(p.bids||[]).length&&!(p.asks||[]).length){q.append($("span","mut","暂无挂单"));if(p.stale)q.append($("span","warn",p.age+" 秒前"))}
+  if(has&&!(p.bids||[]).length&&!(p.asks||[]).length){q.append($("span","mut","暂无挂单"));if(p.stale)q.append($("span","warn",bookAge(p)+" 秒前"))}
   else if(has){const b=p.bids[0],k=p.asks[0],lv=(t,l)=>{const x=$("span","",t+" ");x.append($("b","",l?cent(l[0]):"无"));if(l)x.append("×"+qk(l[1]));if(l)x.title=qty(l[1])+" 份";return x};
     q.append(lv("买1",b),lv("卖1",k));if(b&&k)q.title="价差 "+cent(k[0]-b[0]);
-    if(p.stale)q.append($("span","warn",p.age+" 秒前"))}
+    if(p.stale)q.append($("span","warn",bookAge(p)+" 秒前"))}
   else if(!p.error)q.append($("span","","等待获取"));
   const pp=pointsPill(p);if(pp)q.append(pp);  // the market's points, after the quotes (a narrow card wraps it, not the quotes)
   if(p.error)w.append($("div","warn small",(has?"刷新失败，显示上次盘口：":"")+p.error));
@@ -8124,6 +8136,7 @@ function card(it,g){
   row("σ 来源",it.sigma_note);row("涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%");row("z",it.z.toFixed(3));
   det.append(dl);c.append(det);if(it.warn){const w=$("div","warn small","⚠️ "+it.warn);c.append(w)}
   tail(c,it);return c}
+const bookAge=p=>p.age!=null?p.age:Math.max(0,Math.round((Date.now()+skew-(p.fetched_ms||0))/1000));  // a block from the event stream carries no age
 function tail(c,it){const al=aucLine(it);if(al)c.append(al);const ag=ages(it);if(ag)c.append(ag);if(it.predict)c.append(book(it.predict,favKey(it),it.pages))}
 // the pre-open auction's indicative price while the odds still rest on something else (the 可撤单 phase, or a card without
 // odds): a line of its own, with its move from the reference close, updated by the event stream every second
@@ -8332,7 +8345,7 @@ function drawMeta(d){const ago=$("span","","");ago.id="ago";
 // last full answer; data.json still brings the books, the crypto cards and the texts every 10 seconds, and is the fallback.
 let es=null,live=false;
 const LIVE_KEYS=["quote_ms","effective","move","ref","up","flat","down","z","fair_up","fair_down","sigma","remaining","warn","proxy_note","source","eff_label","missing",
-  "auction","preopen","preopen_phase","preopen_price","preopen_at","trading"];  // the session tags and the pre-open auction's indicative price too
+  "auction","preopen","preopen_phase","preopen_price","preopen_at","trading","predict"];  // the session tags, the pre-open auction's indicative price and the book too
 function patchLive(d){
   if(!last||!Array.isArray(d.items))return;if(d.server_ms)skew=d.server_ms-Date.now();
   let changed=false;
@@ -8373,7 +8386,7 @@ setTopH();addEventListener("resize",setTopH);if("ResizeObserver" in window)new R
 const totop=document.getElementById("totop");addEventListener("scroll",()=>totop.classList.toggle("show",scrollY>600),{passive:true});
 totop.addEventListener("click",()=>scrollTo({top:0,behavior:matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth"}));
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")load()});  // back from another tab: fetch at once
-load();connectLive();setInterval(()=>{if(document.visibilityState!=="hidden")load()},10000);setInterval(tick,1000);  // a hidden tab waits: visibilitychange fetches at once on return
+load();connectLive();setInterval(()=>{if(document.visibilityState!=="hidden")load()},5000);setInterval(tick,1000);  // a hidden tab waits: visibilitychange fetches at once on return
 </script></body></html>"""
 
 
@@ -10932,6 +10945,9 @@ class Bot:
         for title, odds in (self.odds_items(now_ms) if self.config.probability else []):
             name, _, symbol = title.partition("｜")
             session = {**self.SESSION_EMPTY, **self.session_fields(title, symbol, now_ms)}  # the pre-open price every second, the tags at once
+            book = self.predict_payload(title, odds, now_ms)  # the book too, within a second of a refresh (data.json would be up to 5 s)
+            if book:
+                session["predict"] = {k: v for k, v in book.items() if k not in {"edges", "age"}}  # age ticks every second: the page counts it
             if isinstance(odds, str):
                 items.append({"name": name, "symbol": symbol, "missing": odds, **session})
             else:
@@ -12740,6 +12756,10 @@ class Bot:
     def predict_key(self, title: str) -> str:
         return PREDICT_KEYS.get(title) or title.split("｜")[-1]
 
+    def predict_fast_keys(self) -> frozenset:
+        """The books read every PREDICT_FAST_SECONDS: the daily index and contract markets (the cards one watches)."""
+        return frozenset([*(key for key, _, _ in PREDICT_ITEMS), *self.config.symbols])
+
     def predict_targets(self, now_ms: int) -> dict[str, str]:
         """Item key -> Predict slug for the close the model is pricing (the next close when the model has none)."""
         if not self.config.predict:
@@ -13744,7 +13764,7 @@ class Bot:
         if self.config.probability:
             jobs.append(("概率输入", lambda: self.refresh_odds_inputs(now())))
         if self.config.predict:
-            jobs.append(("Predict 盘口", lambda: self.predict.refresh(self.predict_targets(now()))))
+            jobs.append(("Predict 盘口", lambda: self.predict.refresh(self.predict_targets(now()), fast=self.predict_fast_keys())))
         if self.config.touch:
             jobs.append(("先触市场", lambda: self.refresh_touch(now())))
             jobs.append(("涨跌市场", lambda: self.refresh_updown(now())))

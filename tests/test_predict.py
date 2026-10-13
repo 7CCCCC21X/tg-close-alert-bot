@@ -7,7 +7,7 @@ D = m.D
 
 # config + slugs
 c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"})
-assert c.predict and c.predict_poll == 15 and c.predict_api_key == "" and c.predict_ref == "B00EA"
+assert c.predict and c.predict_poll == 15 and c.predict_fast == 5 and c.predict_api_key == "" and c.predict_ref == "B00EA"
 assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_REF_CODE": ""}).predict_ref == ""
 assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_REF_CODE": " AB12 "}).predict_ref == "AB12"
 try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PREDICT_REF_CODE": "a&b=c"}); assert False
