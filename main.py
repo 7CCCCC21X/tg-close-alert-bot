@@ -7430,6 +7430,7 @@ h2 .secsort{margin-left:auto;font-weight:400;font-size:12px;color:var(--muted);l
 .hotset input{width:52px;font:inherit;font-size:12px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--text);padding:2px 5px}
 .hotset input:not(:placeholder-shown){border-color:var(--hot);color:var(--hot);font-weight:600}h2 .hotset{margin-left:6px}
 .hotset.mv input{width:44px}.hotset.mv input:not(:placeholder-shown){border-color:var(--best);color:var(--best)}h2 .hotset.mv{font-size:11.5px}.card .head .mv{flex:none}
+h2 .hbell.floatbtn{font-size:11.5px;color:var(--best)}h2 .hbell.floatbtn.on,#float.on{color:var(--best);border-color:var(--best)}
 h2 .hbell{margin-left:8px;border:0;background:none;font:inherit;font-size:14px;line-height:1;cursor:pointer;padding:2px 4px;border-radius:6px;color:var(--muted)}h2 .hbell:hover{background:var(--chip)}h2 .hbell.on{color:var(--best)}.hotrow{margin-top:4px;display:flex;align-items:center;gap:6px}
 .card.flash{animation:flash 1.4s ease-out}@keyframes flash{from{outline:3px solid var(--best);outline-offset:3px}to{outline:3px solid transparent;outline-offset:3px}}
 #g-levels{grid-template-columns:repeat(auto-fill,minmax(min(100%,440px),1fr))}
@@ -7481,7 +7482,7 @@ button.tog{font-family:inherit;padding:4px 11px}.tog.on{border-color:var(--best)
 h2{margin:12px 2px 6px}.legend{margin-bottom:4px}.edge{min-height:40px}.pb{padding-top:6px}.odds{margin-top:0}.tag,.cd{padding:1px 7px}.quote a.open{padding:3px 10px}.skel{height:150px}}
 #fsent{height:1px;margin-top:-1px}
 </style></head><body><div class="wrap">
-<header><div class="ttl"><h1>收盘涨跌概率</h1><div class="meta" id="meta">加载中…</div></div><div class="hr"><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button><button type="button" class="tog" id="edit" title="调整卡片和栏目顺序、隐藏卡片或栏目、改高亮门槛">✎ 自定义</button></div></header>
+<header><div class="ttl"><h1>收盘涨跌概率</h1><div class="meta" id="meta">加载中…</div></div><div class="hr"><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label><button type="button" class="tog floatbtn" id="float" title="弹出一个只显示 ⭐ 收藏概率的小窗口：Chrome / Edge 桌面版会一直浮在最上面，切换标签页或别的程序都看得见；其他浏览器打开一个小的独立窗口">⧉ 悬浮</button><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button><button type="button" class="tog" id="edit" title="调整卡片和栏目顺序、隐藏卡片或栏目、改高亮门槛">✎ 自定义</button></div></header>
 <div class="legend" id="legend"></div>
 <div id="fsent" aria-hidden="true"></div>
 <div class="fbar" id="fbar"><div class="fchips" id="fchips"></div>
@@ -7519,6 +7520,7 @@ const open=new Set(),seen={},rolled={};let skew=0,fetchedAt=0,style="cn",last=nu
 // the viewer's theme: the system's unless a light or dark one is picked (kept in this browser; <head> applies it before the first paint)
 const THEMES={auto:["◐","自动"],light:["☀","浅色"],dark:["☾","深色"]};let theme=stored("theme","auto",v=>typeof v==="string"&&Object.prototype.hasOwnProperty.call(THEMES,v));
 function applyTheme(){const r=document.documentElement;if(theme==="auto")delete r.dataset.theme;else r.dataset.theme=theme;
+  if(floatPip&&!floatPip.closed){const fr=floatPip.document.documentElement;if(theme==="auto")delete fr.dataset.theme;else fr.dataset.theme=theme}
   const b=document.getElementById("theme");b.textContent=THEMES[theme][0]+" "+THEMES[theme][1];b.title="主题："+THEMES[theme][1]+"（点击切换：自动 → 浅色 → 深色）";
   document.querySelectorAll("meta[name=theme-color]").forEach(m=>m.content=theme==="dark"?"#0d1014":theme==="light"?"#f2f4f8":m.dataset.c)}
 const changedAt={};  // card key -> when its fair price last moved between two refreshes (the number flashes once)
@@ -7643,7 +7645,27 @@ function favHead(){  // in the ⭐ 收藏 title: the sound switch and the bar ev
   for(const ev of["click","pointerdown","mousedown","touchstart"])l.addEventListener(ev,e=>e.stopPropagation());
   const commit=()=>{const t=i.value.trim(),n=Number(t),v=t!==""&&Number.isFinite(n)?Math.min(50,Math.max(0,n)):0;if(v!==favMove){favMove=v;keep("favMove",favMove);if(editing)drawPanel()}i.value=favMove};
   i.addEventListener("change",()=>{commit();i.blur()});i.addEventListener("blur",()=>{commit();if(pending&&!drag){const d=pending;pending=null;render(d)}});
-  l.append("变动 ≥ ",i," ¢ 响");return[b,l]}
+  l.append("变动 ≥ ",i," ¢ 响");
+  const fb=$("button","hbell floatbtn",floatPip&&!floatPip.closed?"⧉ 悬浮中":"⧉ 悬浮");fb.type="button";fb.title=document.getElementById("float").title;
+  fb.addEventListener("click",e=>{e.stopPropagation();floatOpen()});return[b,l,fb]}
+// ⧉ 悬浮: the starred cards' odds in a small always-on-top window (document picture-in-picture: Chrome / Edge on a desktop),
+// drawn by this page on every render; elsewhere a small popup window with the /mini page (the same list, refreshed on its own)
+let floatPip=null,floatPop=null;
+const pipAble=()=>!!(window.documentPictureInPicture&&documentPictureInPicture.requestWindow);
+function floatOpen(){
+  if(floatPip&&!floatPip.closed){try{floatPip.focus()}catch(e){}return}
+  const url=location.pathname.replace(/\\/$/,"")+"/mini";
+  if(!pipAble()){floatPopup(url);return}
+  documentPictureInPicture.requestWindow({width:340,height:Math.min(640,110+Math.max(1,favs.length)*76)}).then(w=>{
+    floatPip=w;const d=w.document,t=document.documentElement.dataset.theme;if(t)d.documentElement.dataset.theme=t;
+    const st=d.createElement("style");st.textContent=MINI_CSS;d.head.append(st);const ti=d.createElement("title");ti.textContent="收藏 · 概率";d.head.append(ti);
+    const box=d.createElement("div");box.id="mini";const f=d.createElement("div");f.id="mfoot";f.textContent="⭐ 收藏的概率 · 随主页面实时更新";d.body.append(box,f);
+    w.addEventListener("pagehide",()=>{floatPip=null;drawFloatBtn()});floatDraw();drawFloatBtn()}).catch(()=>floatPopup(url))}
+function floatPopup(url){floatPop=window.open(url,"mini","popup=yes,width=340,height=520");if(!floatPop)location.href=url}  // a blocked popup: the page itself
+function floatDraw(){if(!floatPip||floatPip.closed||!last)return;const box=floatPip.document.getElementById("mini");if(box)miniRender(box,last.items,{favs,hots:new Set(hots.map(h=>h.key)),style,skew})}
+function drawFloatBtn(){const on=!!(floatPip&&!floatPip.closed);document.querySelectorAll(".floatbtn").forEach(b=>{b.classList.toggle("on",on);b.textContent=on?"⧉ 悬浮中":"⧉ 悬浮"})}
+document.getElementById("float").addEventListener("click",floatOpen);
+/*@MINI@*/
 function alertMoves(list){if(oppSound){beep();if(navigator.vibrate)try{navigator.vibrate([200,100,200])}catch(e){}}
   if(oppNotify&&canNotify()&&Notification.permission==="granted"&&(document.hidden||!document.hasFocus()))try{
     const body=list.slice(0,4).map(m=>m.name+" 公平价 "+cent(m.from)+" → "+cent(m.to)+"（"+sg(m.to-m.from)+"）").join(" · ")+(list.length>4?" · …":"");
@@ -8112,6 +8134,7 @@ function tick(){
   const ago=document.getElementById("ago");if(ago&&fetchedAt)ago.textContent=Math.max(0,Math.round((Date.now()-fetchedAt)/1000))+" 秒前刷新";
   document.querySelectorAll(".age").forEach(el=>{const a=Math.max(0,now-Number(el.dataset.ms));
     el.textContent=a<60e3?Math.round(a/1000)+" 秒前":a<3600e3?Math.floor(a/60e3)+" 分钟前":Math.floor(a/3600e3)+" 小时前";el.classList.toggle("old",a>Number(el.dataset.old))});
+  if(floatPip&&!floatPip.closed)tickCd(floatPip.document,now);
   drawStale()}
 function drawStale(){  // a failed refresh says the cards are old; past STALE_MS their suggestions stop being highlighted
   const el=document.getElementById("stale"),gone=okAt?Date.now()-okAt:Infinity,old=gone>STALE_MS,bad=!!failMsg||old&&!!okAt;
@@ -8138,7 +8161,7 @@ function render(d){
     const clear=ctlBtn("清除筛选","回到按栏目分组的页面",()=>{filt=[];sortBy="";keep("filt",filt);keep("sort",sortBy);if(last)render(last)});
     fh.replaceChildren($("span","hn",(filt.length?"筛选结果":"全部卡片")+" "+hits.length+" 张"+(sortBy==="edge"?" · 按净优势":sortBy==="time"?" · 按剩余时间":"")),clear);
     fg.replaceChildren(...(hits.length?hits.map(x=>card(x.it,"flat")):[$("p","mut","没有符合条件的卡片")]));
-    restoreScroll(marks);drawOpps();tick();return}
+    restoreScroll(marks);drawOpps();floatDraw();tick();return}
   // starred cards leave their own section for the one on top, in the order the viewer keeps them (drag ⠿ to change);
   // hidden cards and sections are left out, except in 自定义 where they show faded so they can be brought back
   const shown=i=>editing||!hidden.includes(favKey(i));
@@ -8168,7 +8191,7 @@ function render(d){
     if(editing&&g!=="fav"&&g!=="sim")h.append(hotInput("sec:"+g,hotCents,"这一栏的红框门槛（空 = 全局）"))}  // 自定义: the section's own bar
   const now=[...document.querySelectorAll(".wrap>.grid")].map(e=>e.id.slice(2)).filter(g=>g!=="fav");
   if(now.join()!==secOrder.join())for(const g of secOrder)foot.before(document.getElementById("h-"+g),document.getElementById("g-"+g));
-  restoreScroll(marks);drawOpps();favMoves();tick()}
+  restoreScroll(marks);drawOpps();favMoves();floatDraw();tick()}
 function drawLegend(){
   const lg=document.getElementById("legend");const sw=$("span","sw");[["涨",upColor()],["平","var(--flat)"],["跌",downColor()]].forEach(([t,col])=>{const i=$("i");i.style.background=col;sw.append(i,t)});
   const own=Object.keys(hotMap).length,hot=$("span","sw hot");hot.append($("i"),"红框 = 净优势 ≥"+hotCents+"¢（高亮门槛"+(own?"，另有 "+own+" 处单独设置":"")+"）");
@@ -8343,6 +8366,72 @@ load();connectLive();setInterval(()=>{if(document.visibilityState!=="hidden")loa
 
 
 # --- the paper trades' review page (/p/<token>/journal): every trade with its evidence, exports ---------------------
+# --- ⭐ 收藏 in a small window: the renderer and stylesheet are shared by the page's picture-in-picture window and /mini ---------
+MINI_CSS = """:root{color-scheme:light;--bg:#f2f4f8;--card:#fff;--text:#161a20;--muted:#636b77;--line:#e2e6ec;--best:#2a66e0;--up:#dd3a40;--down:#17a05b;--flat:#c6ccd4;--hot:#e4262d;--hot-bg:#fdeaea;--warn:#b86e00}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--line:#262c34;--best:#79a7f7;--up:#ff6166;--down:#3ccc7f;--flat:#3a424c;--hot:#ff5a60;--hot-bg:#3a1b1f;--warn:#e6a93f}}
+:root[data-theme=dark]{color-scheme:dark;--bg:#0d1014;--card:#171b21;--text:#e8ebef;--muted:#9aa3ae;--line:#262c34;--best:#79a7f7;--up:#ff6166;--down:#3ccc7f;--flat:#3a424c;--hot:#ff5a60;--hot-bg:#3a1b1f;--warn:#e6a93f}
+*{box-sizing:border-box}body{margin:0;padding:8px;background:var(--bg);color:var(--text);font:13px/1.45 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+#mini{display:flex;flex-direction:column;gap:6px}.mcard{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:7px 9px}.mcard.hot{border-color:var(--hot);box-shadow:0 0 0 3px var(--hot-bg)}
+.mhead{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.mhead b{font-size:13.5px}.mtag{font-size:11px;color:var(--muted);background:var(--line);border-radius:999px;padding:1px 7px;white-space:nowrap}.mhot{font-size:12px}
+.cd{margin-left:auto;font-size:11px;color:var(--muted);white-space:nowrap}.cd.soon{color:var(--warn);font-weight:600}
+.modds{display:flex;align-items:center;gap:8px;margin-top:4px}.modds b{font-size:17px;white-space:nowrap;letter-spacing:-.01em}.modds b i{font-style:normal;font-size:11px;font-weight:600;color:var(--muted)}
+.mbar{flex:1;display:flex;height:7px;border-radius:999px;overflow:hidden;background:var(--line)}.mbar i{display:block;height:100%;transition:width .6s}
+.mline{font-size:11.5px;margin-top:3px;color:var(--muted)}.mmut{color:var(--muted)}.mrows{display:flex;flex-wrap:wrap;gap:3px 10px;margin-top:3px;font-size:12px}.mrow b{color:var(--text)}
+.mnone{color:var(--muted);text-align:center;padding:20px 0}#mfoot{font-size:11px;color:var(--muted);text-align:center;padding:8px 0 2px}#mfoot a{color:var(--best)}
+"""
+MINI_JS = r"""function tickCd(doc,now){doc.querySelectorAll(".cd").forEach(el=>{const left=Math.floor((Number(el.dataset.close)-now)/1000);
+  if(left<=0){el.className="cd done";el.textContent="已到收盘";return}
+  const d=Math.floor(left/86400),h=Math.floor(left%86400/3600),m=Math.floor(left%3600/60),s=left%60,two=n=>String(n).padStart(2,"0");
+  el.className="cd"+(left<1800?" soon":"");el.textContent="⏳ "+(d?d+"天 ":"")+two(h)+":"+two(m)+":"+two(s)})}
+function miniRender(box,items,o){  // the starred cards, compact, in the viewer's order; o: {favs, hots (card keys), style, skew}
+  const doc=box.ownerDocument,mk=(t,c,x)=>{const e=doc.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
+  const key=it=>it.symbol||it.name,up=o.style==="us"?"var(--down)":"var(--up)",down=o.style==="us"?"var(--up)":"var(--down)",pc=x=>(x*100).toFixed(1)+"¢";
+  const like=(v,ref)=>{const d=(String(ref).split(".")[1]||"").length,n=Number(String(v).replace(/,/g,""));  // the card's own rounding: the reference's decimals
+    if(!isFinite(n))return v;const k=d>=2?d:(Math.abs(n)>=1000?0:2);return n.toLocaleString("en-US",{minimumFractionDigits:k,maximumFractionDigits:k})};
+  const list=o.favs.map(k=>items.find(it=>key(it)===k)).filter(it=>it&&it.kind!=="sim");
+  box.replaceChildren();
+  if(!list.length){box.append(mk("p","mnone","还没有收藏：在主页面点卡片的 ☆"));return}
+  for(const it of list){const hot=o.hots.has(key(it)),b=mk("div","mcard"+(hot?" hot":"")),h=mk("div","mhead");
+    h.append(mk("b","",it.name));
+    if(it.day_label)h.append(mk("span","mtag",it.day_tag&&it.day_tag!=="今天"?it.day_label.split(" ")[0]+" "+it.day_tag:it.day_label.split(" ")[0]));
+    if(hot)h.append(mk("span","mhot","🔥"));
+    if(it.close_ms){const cd=mk("span","cd");cd.dataset.close=it.close_ms;h.append(cd)}b.append(h);
+    if(it.kind==="ladder"){const L=it.ladder||{},rows=(L.rows||[]).filter(r=>!r.touched&&typeof r.fair==="number"),done=(L.rows||[]).filter(r=>r.touched).length;
+      const m=mk("div","mline");m.append(mk("span","mmut",(L.metric||"")+" "),mk("b","",L.kind==="price"?(L.price||"—"):(L.cap||"—")));if(done)m.append(mk("span","mmut"," · 已触及 "+done+" 档"));b.append(m);
+      const r=mk("div","mrows");rows.forEach(x=>{const sp=mk("span","mrow");sp.append(mk("span","mmut",x.label+" "),mk("b","",pc(x.fair)));r.append(sp)});
+      if(!rows.length)r.append(mk("span","mmut",L.waiting||L.error||"暂无待触及的档位"));b.append(r)}
+    else if(typeof it.fair_up==="number"){const lb=it.labels||["涨","跌"],od=mk("div","modds"),a=mk("b"),c=mk("b");a.style.color=up;c.style.color=down;
+      a.append(mk("i","",lb[0]+" "),pc(it.fair_up));c.append(pc(it.fair_down),mk("i",""," "+lb[1]));
+      const bar=mk("span","mbar");[[it.up,up],[it.flat,"var(--flat)"],[it.down,down]].forEach(([w,col])=>{const i=mk("i");i.style.width=((w||0)*100)+"%";i.style.background=col;bar.append(i)});
+      od.append(a,bar,c);b.append(od);
+      if(it.ref!=null&&it.effective!=null)b.append(mk("div","mline","参考 "+it.ref+" → "+(it.eff_label||"有效")+" "+like(it.effective,it.ref)+(typeof it.move==="number"?"（"+(it.move>0?"+":"")+it.move.toFixed(2)+"%）":"")))}
+    else b.append(mk("div","mline","概率暂缺："+(it.missing||"等待数据")));
+    box.append(b)}
+  tickCd(doc,Date.now()+(o.skew||0))}
+"""
+WEB_PAGE = WEB_PAGE.replace("/*@MINI@*/", "const MINI_CSS=" + json.dumps(MINI_CSS, ensure_ascii=False) + ";\n" + MINI_JS, 1)
+MINI_PAGE = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>收藏 · 概率</title>
+<script>try{var t=JSON.parse(localStorage.getItem("theme"));if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}catch(e){}</script>
+<style>@MINI_CSS@</style></head>
+<body><div id="mini"><p class="mnone">加载中…</p></div><div id="mfoot">⭐ 收藏的概率 · <span id="mago">每 5 秒刷新</span> · <a id="mback" href="#">主页面 ↗</a></div>
+<script>
+@MINI_JS@
+// this browser's stars (the main page keeps them in localStorage, which this window shares)
+const favsOf=()=>{try{const v=JSON.parse(localStorage.getItem("favs")||"[]");return Array.isArray(v)?v.filter(k=>typeof k==="string"):[]}catch(e){return[]}};
+const base=location.pathname.replace(/\\/mini\\/?$/,"");document.getElementById("mback").href=base;
+let skew=0,last=null,okAt=0;
+function draw(){if(last)miniRender(document.getElementById("mini"),last.items,{favs:favsOf(),hots:new Set(),style:last.color_style||"cn",skew})}
+async function load(){try{const r=await fetch(base+"/data.json",{cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);const d=await r.json();
+    if(d.server_ms)skew=d.server_ms-Date.now();last=d;okAt=Date.now();draw();document.getElementById("mago").textContent="每 5 秒刷新"}
+  catch(e){document.getElementById("mago").textContent="刷新失败"+(okAt?"，显示的是 "+Math.round((Date.now()-okAt)/1000)+" 秒前的数据":"")}}
+load();setInterval(load,5000);setInterval(()=>tickCd(document,Date.now()+skew),1000);
+addEventListener("storage",e=>{if(e.key==="favs"||e.key==="theme"){try{const t=JSON.parse(localStorage.getItem("theme"));if(t==="light"||t==="dark")document.documentElement.dataset.theme=t;else delete document.documentElement.dataset.theme}catch(x){}draw()}});
+</script></body></html>""".replace("@MINI_CSS@", MINI_CSS).replace("@MINI_JS@", MINI_JS)
+
 JOURNAL_PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8613,7 +8702,7 @@ class WebServer:
 
     Routes: /health, /p/<token> (HTML), /p/<token>/data.json (JSON), /p/<token>/events (server-sent events: the daily
     cards' live numbers whenever they change, checked every second), /p/<token>/journal (the paper trades' review
-    page) with journal.json / journal.csv (exports), and the one write: POST /p/<token>/watch (JSON) sets the watched
+    page) with journal.json / journal.csv (exports), /p/<token>/mini (the starred cards' odds alone, for a small window), and the one write: POST /p/<token>/watch (JSON) sets the watched
     markets (自选) and whether the Telegram alerts keep to them. Everything else is 404, the token is compared in
     constant time, and responses are no-store with a restrictive CSP. Text bodies are gzip-compressed for a client that accepts it
     (the page is ~80 KB, data.json is fetched every 10 seconds by every open tab).
@@ -8631,7 +8720,7 @@ class WebServer:
         self.bot, self.port, self.token = bot, port, token
         self.streams = 0  # event streams open now
         self.server: asyncio.base_events.Server | None = None
-        self.pages = {"page": WEB_PAGE.encode("utf-8"), "journal": JOURNAL_PAGE.encode("utf-8")}
+        self.pages = {"page": WEB_PAGE.encode("utf-8"), "journal": JOURNAL_PAGE.encode("utf-8"), "mini": MINI_PAGE.encode("utf-8")}
         self.cache: dict[str, tuple[float, bytes]] = {}  # name -> (expires, body): the JSON is built once per interval
         self.gzipped: dict[bytes, bytes] = {body: gzip.compress(body, compresslevel=9) for body in self.pages.values()}
 
@@ -8679,6 +8768,8 @@ class WebServer:
                     "data.json", lambda: json.dumps(page_payload(self.bot.odds_payload()), ensure_ascii=False, default=str).encode("utf-8"))
             if parts[2] == "journal":
                 return 200, "text/html; charset=utf-8", self.pages["journal"]
+            if parts[2] == "mini":
+                return 200, "text/html; charset=utf-8", self.pages["mini"]
             if parts[2] == "journal.json":
                 return 200, "application/json; charset=utf-8", self.cached(
                     "journal.json", lambda: json.dumps(self.bot.journal_payload(), ensure_ascii=False, default=str).encode("utf-8"))
