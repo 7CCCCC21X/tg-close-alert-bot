@@ -7353,7 +7353,8 @@ h2{font-size:13px;font-weight:700;color:var(--text);letter-spacing:.02em;margin:
 @media (pointer:coarse){.star{padding:8px;margin:-8px -6px -8px -9px}.grip{padding:8px 8px;margin:-8px 0 -8px -10px}}.star.on{color:var(--star)}.star:hover{color:var(--star);transform:scale(1.15)}
 .name{font-weight:700;font-size:15px;min-width:0;max-width:calc(100% - 20px);flex:1 0 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:-.005em}
 .tag{border-radius:999px;padding:2px 8px;font-size:11.5px;font-weight:600;line-height:1.35;background:var(--chip);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
-.tag.next{background:var(--best-bg);color:var(--best)}.tag.auc{background:var(--warn);color:var(--on-accent)}.tag.open{background:var(--down-bg);color:var(--down)}.tag.new{background:var(--best);color:var(--on-accent)}.tag.hotk{background:var(--hot);color:var(--on-accent)}
+.tag.next{background:var(--best-bg);color:var(--best)}.tag.auc{background:var(--warn);color:var(--on-accent)}
+.aucline{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;margin-top:6px;padding:5px 9px;border-radius:9px;background:var(--warn-bg);font-size:12px;color:var(--text)}.aucline b{color:var(--warn);font-size:13px}.aucline .mut{font-size:11px}.aucline .age{font-size:11px;color:var(--muted)}.tag.open{background:var(--down-bg);color:var(--down)}.tag.new{background:var(--best);color:var(--on-accent)}.tag.hotk{background:var(--hot);color:var(--on-accent)}
 .cd{font-size:11.5px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;background:var(--chip);border-radius:999px;padding:2px 8px;line-height:1.35}
 .cd.done{color:var(--muted);font-weight:500}.cd.soon{color:var(--warn);background:var(--warn-bg)}
 .odds{display:flex;align-items:center;gap:10px;font-variant-numeric:tabular-nums;margin:2px -4px 0;padding:2px 4px;border-radius:8px}
@@ -8115,7 +8116,6 @@ function card(it,g){
   // 昨收 1,768,000 · 今日 1,769,000 (while trading) / 今收 … · 估算 … (after the close: the proxy's view of the next close)
   sm.append($("span","rd",it.ref_rel||it.ref_day||"参考"),$("span","v",it.ref),$("span","rd sep",it.eff_label||"→"),$("span","v",like(it.effective,it.ref)));
   if(it.unit)sm.append($("span","un",it.unit));
-  if(it.preopen_price&&it.eff_label!=="竞价"&&it.eff_label!=="开盘价"){const pv=$("span","v",it.preopen_price);pv.title="开市前竞价的参考价（"+(it.preopen_phase||"")+"阶段）：只展示，概率按币安代理算";sm.append($("span","rd sep","竞价"),pv,$("span","un",it.preopen_phase||""))}
   sm.title=(it.ref_day?it.ref_day+" 收盘 ":"参考 ")+it.ref+unit+"；"+(it.eff_label==="今日"?"今日现价":it.eff_label==="竞价"?"开市前竞价参考价（撮合前会变）":it.eff_label==="开盘价"?"已撮合的开盘价（连续交易前）":"按代理估算的下一收盘")+" "+it.effective+unit+"；点开看计算明细";
   const chip=$("span","chip",(it.move>=0?"+":"")+it.move.toFixed(2)+"%");chip.style.color=it.move>0?upColor():it.move<0?downColor():"var(--muted)";sm.append(chip);det.append(sm);
   const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
@@ -8124,7 +8124,18 @@ function card(it,g){
   row("σ 来源",it.sigma_note);row("涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%");row("z",it.z.toFixed(3));
   det.append(dl);c.append(det);if(it.warn){const w=$("div","warn small","⚠️ "+it.warn);c.append(w)}
   tail(c,it);return c}
-function tail(c,it){const ag=ages(it);if(ag)c.append(ag);if(it.predict)c.append(book(it.predict,favKey(it),it.pages))}
+function tail(c,it){const al=aucLine(it);if(al)c.append(al);const ag=ages(it);if(ag)c.append(ag);if(it.predict)c.append(book(it.predict,favKey(it),it.pages))}
+// the pre-open auction's indicative price while the odds still rest on something else (the 可撤单 phase, or a card without
+// odds): a line of its own, with its move from the reference close, updated by the event stream every second
+const numOf=v=>{const n=Number(String(v==null?"":v).replace(/,/g,""));return Number.isFinite(n)?n:null};
+function aucLine(it){
+  if(!it.preopen_price||it.eff_label==="竞价"||it.eff_label==="开盘价")return null;
+  const d=$("div","aucline"),r=numOf(it.ref),p=numOf(it.preopen_price),ph=it.preopen_phase||"";
+  d.append($("b","","📍 竞价参考价 "+it.preopen_price+(it.unit?" "+it.unit:"")));
+  if(r&&p!=null){const m=(p/r-1)*100,ch=$("span","chip",(m>=0?"+":"")+m.toFixed(2)+"%");ch.style.color=m>0?upColor():m<0?downColor():"var(--muted)";d.append(ch)}
+  if(it.preopen_at){const ag=$("span","age");ag.dataset.ms=it.preopen_at;ag.dataset.old=120000;d.append(ag)}
+  d.append($("span","mut",ph?ph+"阶段"+(ph==="可撤单"?"：还能撤单，常是试探；概率仍按上面的有效价算":"")+"，撮合前仍会变":"撮合前仍会变"));
+  d.title=it.preopen||"开市前竞价";return d}
 function tick(){
   const now=Date.now()+skew;
   document.querySelectorAll(".cd").forEach(el=>{const left=Math.floor((Number(el.dataset.close)-now)/1000);
@@ -8320,7 +8331,8 @@ function drawMeta(d){const ago=$("span","","");ago.id="ago";
 // The event stream (/events): the index and contract cards' numbers arrive within a second of a change and are patched into the
 // last full answer; data.json still brings the books, the crypto cards and the texts every 10 seconds, and is the fallback.
 let es=null,live=false;
-const LIVE_KEYS=["quote_ms","effective","move","ref","up","flat","down","z","fair_up","fair_down","sigma","remaining","warn","proxy_note","source","eff_label","missing"];
+const LIVE_KEYS=["quote_ms","effective","move","ref","up","flat","down","z","fair_up","fair_down","sigma","remaining","warn","proxy_note","source","eff_label","missing",
+  "auction","preopen","preopen_phase","preopen_price","preopen_at","trading"];  // the session tags and the pre-open auction's indicative price too
 function patchLive(d){
   if(!last||!Array.isArray(d.items))return;if(d.server_ms)skew=d.server_ms-Date.now();
   let changed=false;
@@ -8376,6 +8388,7 @@ MINI_CSS = """:root{color-scheme:light;--bg:#f2f4f8;--card:#fff;--text:#161a20;-
 .cd{margin-left:auto;font-size:11px;color:var(--muted);white-space:nowrap}.cd.soon{color:var(--warn);font-weight:600}
 .modds{display:flex;align-items:center;gap:8px;margin-top:4px}.modds b{font-size:17px;white-space:nowrap;letter-spacing:-.01em}.modds b i{font-style:normal;font-size:11px;font-weight:600;color:var(--muted)}
 .mbar{flex:1;display:flex;height:7px;border-radius:999px;overflow:hidden;background:var(--line)}.mbar i{display:block;height:100%;transition:width .6s}
+.mtag.auc{background:var(--warn);color:#fff}.maline{font-size:11.5px;margin-top:3px;color:var(--warn);font-weight:600}
 .mline{font-size:11.5px;margin-top:3px;color:var(--muted)}.mmut{color:var(--muted)}.mrows{display:flex;flex-wrap:wrap;gap:3px 10px;margin-top:3px;font-size:12px}.mrow b{color:var(--text)}
 .mnone{color:var(--muted);text-align:center;padding:20px 0}#mfoot{font-size:11px;color:var(--muted);text-align:center;padding:8px 0 2px}#mfoot a{color:var(--best)}
 """
@@ -8394,6 +8407,7 @@ function miniRender(box,items,o){  // the starred cards, compact, in the viewer'
   for(const it of list){const hot=o.hots.has(key(it)),b=mk("div","mcard"+(hot?" hot":"")),h=mk("div","mhead");
     h.append(mk("b","",it.name));
     if(it.day_label)h.append(mk("span","mtag",it.day_tag&&it.day_tag!=="今天"?it.day_label.split(" ")[0]+" "+it.day_tag:it.day_label.split(" ")[0]));
+    if(it.auction)h.append(mk("span","mtag auc","收盘竞价"));else if(it.preopen)h.append(mk("span","mtag auc","竞价·"+(it.preopen_phase||"进行中")));else if(it.trading)h.append(mk("span","mtag",it.trading));
     if(hot)h.append(mk("span","mhot","🔥"));
     if(it.close_ms){const cd=mk("span","cd");cd.dataset.close=it.close_ms;h.append(cd)}b.append(h);
     if(it.kind==="ladder"){const L=it.ladder||{},rows=(L.rows||[]).filter(r=>!r.touched&&typeof r.fair==="number"),done=(L.rows||[]).filter(r=>r.touched).length;
@@ -8406,6 +8420,9 @@ function miniRender(box,items,o){  // the starred cards, compact, in the viewer'
       od.append(a,bar,c);b.append(od);
       if(it.ref!=null&&it.effective!=null)b.append(mk("div","mline","参考 "+it.ref+" → "+(it.eff_label||"有效")+" "+like(it.effective,it.ref)+(typeof it.move==="number"?"（"+(it.move>0?"+":"")+it.move.toFixed(2)+"%）":"")))}
     else b.append(mk("div","mline","概率暂缺："+(it.missing||"等待数据")));
+    if(it.preopen_price&&it.eff_label!=="竞价"&&it.eff_label!=="开盘价"){  // the pre-open auction's indicative price while the odds rest on something else
+      const num=v=>{const n=Number(String(v==null?"":v).replace(/,/g,""));return Number.isFinite(n)?n:null},r=num(it.ref),p=num(it.preopen_price);
+      b.append(mk("div","maline","📍 竞价参考价 "+it.preopen_price+(r&&p!=null?"（"+((p/r-1)*100>=0?"+":"")+((p/r-1)*100).toFixed(2)+"%）":"")+(it.preopen_phase?" "+it.preopen_phase+"阶段":"")+(it.preopen_phase==="可撤单"?"，概率暂不按它算":"")))}
     box.append(b)}
   tickCd(doc,Date.now()+(o.skew||0))}
 """
@@ -10822,18 +10839,7 @@ class Bot:
             book = self.predict_payload(title, odds, now_ms)
             if book:
                 base["predict"] = book
-            market = self.item_market(title)
-            if market:
-                holidays = self.config.holidays.get(market, frozenset())
-                if auction_running(market, now_ms, holidays):
-                    base["auction"] = (auction_window(market, now_ms) or AUCTIONS[market])[2]
-                elif symbol and (phase := preopen_phase(market, now_ms, holidays)):
-                    base["preopen"], base["preopen_phase"] = (preopen_window(market, now_ms) or PRE_AUCTIONS[market])[2], phase
-                    q, window = self.stocks.live.get(symbol), stock_quote_window(market, now_ms, holidays)
-                    if q is not None and window and q.quoted_ms >= window[0] and not (q.prev_close and q.last == q.prev_close):
-                        base["preopen_price"], base["preopen_at"] = fmt_price(q.last), q.quoted_ms  # the indicative price, whatever the odds rest on
-                elif state := session_state(market, now_ms, holidays):
-                    base["trading"] = state
+            base.update(self.session_fields(title, symbol, now_ms))
             if symbol and symbol in self.config.tickers:
                 base["pages"] = quote_pages(self.config.tickers[symbol])  # where to watch the stock's own quote
             if isinstance(odds, str):
@@ -10895,6 +10901,28 @@ class Bot:
         q = self.stocks.live.get(title.split("｜")[-1])
         return q.source if q is not None else ""
 
+    SESSION_EMPTY = {"auction": "", "preopen": "", "preopen_phase": "", "preopen_price": "", "preopen_at": 0, "trading": ""}
+
+    def session_fields(self, title: str, symbol: str, now_ms: int) -> dict:
+        """A card's session tags: the closing auction, the pre-open auction (its phase and, for a contract card, the
+        indicative price the stock's own feed shows, whatever the odds rest on), or the session state. Only the keys
+        that apply; the event stream sends the others empty so the page can take a tag down."""
+        out: dict[str, Any] = {}
+        market = self.item_market(title)
+        if not market:
+            return out
+        holidays = self.config.holidays.get(market, frozenset())
+        if auction_running(market, now_ms, holidays):
+            out["auction"] = (auction_window(market, now_ms) or AUCTIONS[market])[2]
+        elif symbol and (phase := preopen_phase(market, now_ms, holidays)):
+            out["preopen"], out["preopen_phase"] = (preopen_window(market, now_ms) or PRE_AUCTIONS[market])[2], phase
+            q, window = self.stocks.live.get(symbol), stock_quote_window(market, now_ms, holidays)
+            if q is not None and window and q.quoted_ms >= window[0] and not (q.prev_close and q.last == q.prev_close):
+                out["preopen_price"], out["preopen_at"] = fmt_price(q.last), q.quoted_ms
+        elif state := session_state(market, now_ms, holidays):
+            out["trading"] = state
+        return out
+
     def live_payload(self) -> dict:
         """The index and contract cards' live numbers for the page's event stream (/events): every item data.json has
         for them, keyed the same way (name + symbol), with only the figures that change between quotes. A card whose
@@ -10903,10 +10931,11 @@ class Bot:
         items = []
         for title, odds in (self.odds_items(now_ms) if self.config.probability else []):
             name, _, symbol = title.partition("｜")
+            session = {**self.SESSION_EMPTY, **self.session_fields(title, symbol, now_ms)}  # the pre-open price every second, the tags at once
             if isinstance(odds, str):
-                items.append({"name": name, "symbol": symbol, "missing": odds})
+                items.append({"name": name, "symbol": symbol, "missing": odds, **session})
             else:
-                items.append({"name": name, "symbol": symbol, **self.odds_numbers(title, name, odds)})
+                items.append({"name": name, "symbol": symbol, **self.odds_numbers(title, name, odds), **session})
         return {"server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）", "items": items}
 
     def safe_card(self, name: str, key: str, group: str, build: Any, *args: Any) -> dict:

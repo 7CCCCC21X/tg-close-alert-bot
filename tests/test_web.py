@@ -322,7 +322,7 @@ async def float_check(browser, page, port, token):
         assert await page.eval_on_selector_all(".floatbtn", "b => b.map(x => x.textContent)") == ["⧉ 悬浮中", "⧉ 悬浮中"]
         assert await pip.title() == "收藏 · 概率" and await pip.locator("#mini .mcard").count() == 2
         text = await pip.inner_text("#mini")
-        assert text.startswith("上证指数\n10-08 下周四\n⏳ 7天 16:5") and "涨 35.0¢\n65.0¢ 跌\n参考 3,850.12 → 隐含 3,819.64（-0.79%）\n$牛来 市值" in text, text
+        assert text.startswith("上证指数\n10-08 下周四\n已收盘\n⏳ 7天 16:5") and "涨 35.0¢\n65.0¢ 跌\n参考 3,850.12 → 隐含 3,819.64（-0.79%）\n$牛来 市值" in text, text
         assert await pip.evaluate("getComputedStyle(document.body).backgroundColor") == "rgb(242, 244, 248)"
         await page.evaluate("last.items[0].fair_up = 0.42; last.items[0].fair_down = 0.58; render(last)")  # every render of the page redraws it
         assert "涨 42.0¢\n58.0¢ 跌" in await pip.inner_text("#mini .mcard")
@@ -340,12 +340,33 @@ async def float_check(browser, page, port, token):
     await ctx.add_init_script("if (!localStorage.getItem('favs')) localStorage.setItem('favs', JSON.stringify(['上证指数', 'UNITREEUSDT']))")
     mini = await ctx.new_page(); await mini.goto(f"http://127.0.0.1:{port}/p/{token}/mini"); await mini.wait_for_selector(".mcard")
     text = await mini.inner_text("body")
-    assert text.startswith("上证指数\n10-08 下周四\n⏳ 7天 16:5") and "涨 35.0¢\n65.0¢ 跌" in text and "宇树 UNITREE\n10-08 下周四\n概率暂缺：等待行情" in text and text.endswith("每 5 秒刷新 · 主页面 ↗"), text
+    assert text.startswith("上证指数\n10-08 下周四\n已收盘\n⏳ 7天 16:5") and "涨 35.0¢\n65.0¢ 跌" in text and "宇树 UNITREE\n10-08 下周四\n已收盘\n概率暂缺：等待行情" in text and text.endswith("每 5 秒刷新 · 主页面 ↗"), text
     assert await mini.get_attribute("#mback", "href") == f"/p/{token}" and await mini.locator("#mini .mcard").count() == 2
     await mini.evaluate("localStorage.setItem('favs', '[]'); dispatchEvent(new StorageEvent('storage', {key: 'favs'}))")  # the main page's stars change: redrawn
     assert await mini.inner_text("#mini") == "还没有收藏：在主页面点卡片的 ☆"
     await ctx.close()
     await page.click("#g-fav .card .star"); await page.click("#g-fav .card .star"); assert await page.evaluate("favs") == []
+
+
+async def auction_check(page):
+    """The pre-open auction's indicative price in the 可撤单 phase (the odds still rest on the proxy): an orange line of its
+    own on the card, with its move from the reference close, brought by the event stream and taken down with the phase;
+    the mini window shows the tag and the line too."""
+    await page.reload(); await page.wait_for_selector(".card .odds")
+    live = lambda **f: page.evaluate("patchLive({items: [{name: '上证指数', symbol: '', " + ", ".join(f"{k}: {v!r}" for k, v in f.items()) + "}]})")
+    await live(preopen="沪深开盘集合竞价（09:15–09:25）", preopen_phase="可撤单", preopen_price="3,760.00", preopen_at=1759194000000, auction="", trading="")
+    card = page.locator("#g-index .card")
+    assert await card.locator(".tag.auc").inner_text() == "竞价·可撤单" and await card.locator(".aucline").count() == 1
+    text = await card.locator(".aucline").inner_text()
+    assert text.startswith("📍 竞价参考价 3,760.00\n-2.34%") and "可撤单阶段：还能撤单，常是试探；概率仍按上面的有效价算，撮合前仍会变" in text, text
+    assert await card.locator(".aucline .age").count() == 1 and await card.locator(".odds").count() == 1  # the odds stay as they were
+    box = await page.evaluate("const d = document.createElement('div'); miniRender(d, last.items, {favs: ['上证指数'], hots: new Set(), style: 'cn', skew: 0}); d.innerText")
+    assert "竞价·可撤单" in box and "📍 竞价参考价 3,760.00（-2.34%） 可撤单阶段，概率暂不按它算" in box, box
+    await live(preopen="沪深开盘集合竞价（09:15–09:25）", preopen_phase="不可撤单", preopen_price="3,765.00", preopen_at=1759194060000, eff_label="竞价", effective="3,765.00", auction="", trading="")
+    assert await card.locator(".aucline").count() == 0 and await card.locator(".tag.auc").inner_text() == "竞价·不可撤单"  # the odds rest on it now: the summary shows it
+    await live(preopen="", preopen_phase="", preopen_price="", preopen_at=0, eff_label="隐含", auction="", trading="已收盘")
+    assert await card.locator(".tag.auc").count() == 0 and await card.locator(".aucline").count() == 0 and await card.locator(".tag.lunch").inner_text() == "已收盘"
+    await page.reload(); await page.wait_for_selector(".card .odds")
 
 
 async def browser_check(async_playwright, chrome, port, token, bot):
@@ -443,6 +464,7 @@ async def browser_check(async_playwright, chrome, port, token, bot):
         assert await page.is_visible("#g-crypto .card") and await page.locator("#h-crypto .fs").count() == 0 and await page.evaluate("localStorage.getItem('folded')") == "[]"
         await watch_check(bot, page)
         await float_check(browser, page, port, token)
+        await auction_check(page)
         await layout_check(browser, page)
         if os.environ.get("WEB_SCREENSHOT"):
             await page.screenshot(path=os.environ["WEB_SCREENSHOT"], full_page=True)
@@ -522,7 +544,9 @@ async def run():
     live = json.loads(event[len(b"event: live\ndata: "):])
     assert live["server_ms"] == bot.market.now_ms() and live["items"][0]["name"] == "上证指数", live
     assert {"fair_up", "fair_down", "effective", "quote_ms", "move", "proxy_note", "warn"} <= set(live["items"][0]) and "ref_note" not in live["items"][0]
-    assert live["items"][1] == {"name": "宇树 UNITREE", "symbol": "UNITREEUSDT", "missing": "等待行情"} and len(live["items"]) == 2, live["items"]
+    assert {k: live["items"][1][k] for k in ("name", "symbol", "missing")} == {"name": "宇树 UNITREE", "symbol": "UNITREEUSDT", "missing": "等待行情"} and len(live["items"]) == 2, live["items"]
+    assert {k: live["items"][1][k] for k in ("auction", "preopen", "preopen_phase", "preopen_price", "preopen_at")} == {"auction": "", "preopen": "", "preopen_phase": "", "preopen_price": "", "preopen_at": 0}  # the session tags ride along
+    assert live["items"][1]["trading"] == "已收盘" and live["items"][0]["trading"] == "已收盘", live["items"]
     assert live["items"][0]["fair_up"] == json.loads(body)["items"][0]["fair_up"] and web.streams == 1
     w.close(); await w.wait_closed()
     st, _, _ = await request(port, b"GET /p/" + b"x" * len(token) + b"/events HTTP/1.1\r\nHost: x\r\n\r\n"); assert st == 404
