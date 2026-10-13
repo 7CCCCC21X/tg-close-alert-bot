@@ -75,7 +75,8 @@ async def layout_check(browser, page):
     ctx = await browser.new_context(viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True)
     phone = await ctx.new_page(); await phone.goto(page.url); await phone.wait_for_selector(".card .odds")
     for _ in range(3):
-        await phone.tap("#g-crypto .card .star")
+        await phone.tap("#g-crypto .card .star")  # each tap scrolls its star into view; the drag below starts from the top
+    await phone.evaluate("scrollTo(0, 0)"); await phone.wait_for_timeout(100)
     cdp = await ctx.new_cdp_session(phone)
     async def touch(kind, x=0, y=0):
         await cdp.send("Input.dispatchTouchEvent", {"type": kind, "touchPoints": [] if kind == "touchEnd" else [{"x": x, "y": y}]})
@@ -88,7 +89,7 @@ async def layout_check(browser, page):
     for i in range(1, 13):
         await touch("touchMove", x, y + (t["y"] + t["height"] * 0.8 - y) * i / 12)
     await touch("touchEnd")
-    assert await phone.evaluate("scrollY") == y0 and await phone.evaluate("localStorage.getItem('favs')") == '["SOLUSDT","BTCUSDT","BNBUSDT"]'
+    assert await phone.evaluate("scrollY") == y0 and await phone.evaluate("localStorage.getItem('favs')") == '["SOLUSDT","BTCUSDT","BNBUSDT"]', (y0, await phone.evaluate("scrollY"), await phone.evaluate("localStorage.getItem('favs')"), g, t)
     b = await phone.locator("#g-index .card .odds").bounding_box()
     await touch("touchStart", b["x"] + 20, b["y"] + 5)
     for i in range(1, 9):
@@ -247,9 +248,9 @@ async def watch_check(bot, page):
     await page.check("#snd-notify"); await until(page, "oppNotify === true"); assert await page.evaluate("window.__asked") == 1
     names = await page.eval_on_selector_all("#watch input[data-watch]", "els => els.map(e => e.dataset.watch)")
     assert names[:4] == ["SSE", "UNITREEUSDT", "BNB", "SOL"] and "SIM" not in names and not await page.is_checked("#watch-tg"), names
-    await page.check("#watch input[data-watch=UNITREEUSDT]"); await until(page, "watchMsg === '已保存'")
+    await page.check("#watch input[data-watch=UNITREEUSDT]"); await until(page, "watchSaving === 0 && watchMsg === '已保存'")
     assert bot.watch_state() == ({"UNITREEUSDT": "宇树 UNITREE"}, False) and await page.inner_text("#watchmsg") == "已保存"
-    await page.check("#watch-tg"); await until(page, "watch.tg_only === true")
+    await page.check("#watch-tg"); await until(page, "watchSaving === 0 && watch.tg_only === true")
     assert bot.watch_state() == ({"UNITREEUSDT": "宇树 UNITREE"}, True)
     # a refused change is undone on the page and said so
     await page.evaluate("saveWatch({keys: ['NOPE']})"); await until(page, "watchMsg.startsWith('保存失败')")
@@ -273,9 +274,9 @@ async def watch_check(bot, page):
     await page.evaluate("delete oppSeenAt['t:SOLUSDT']; drawOpps()"); assert await page.evaluate("window.__beeps") == 8
     await page.reload(); await page.wait_for_selector(".card .odds")
     assert await page.evaluate("[watch.keys, watch.tg_only, oppSound]") == [["UNITREEUSDT"], True, True]  # the bot's list, this browser's chime
-    await page.click("#edit"); await page.click("#watch button.cb:nth-of-type(2)"); await until(page, "watch.keys.length === 0")  # 清空自选
-    assert "自选为空" in await page.inner_text("#watchmsg") or await page.inner_text("#watchmsg") == "已保存"
-    await page.uncheck("#watch-tg"); await until(page, "watch.tg_only === false")
+    await page.click("#edit"); await page.click("#watch button.cb:nth-of-type(2)"); await until(page, "watchSaving === 0 && watch.keys.length === 0")  # 清空自选
+    assert "自选为空" in await page.inner_text("#watchmsg") or await page.inner_text("#watchmsg") == "已保存", await page.evaluate("[watchMsg, watch, watchSaving]")
+    await page.uncheck("#watch-tg"); await until(page, "watchSaving === 0 && watch.tg_only === false")
     # a starred card's fair price moving by the set amount sounds too (and notifies), measured from the last such alert
     await page.fill("#snd-fav", "5"); await page.dispatch_event("#snd-fav", "change")
     assert await page.evaluate("[favMove, localStorage.getItem('favMove')]") == [5, "5"]
@@ -304,6 +305,68 @@ async def watch_check(bot, page):
     await page.uncheck("#snd-on"); await page.click("#done")
     assert bot.watch_state() == ({}, False) and await page.evaluate("localStorage.getItem('oppSound')") == "false" and await page.evaluate("favs") == []
     await page.evaluate("localStorage.removeItem('soundLen')")
+
+
+async def float_check(browser, page, port, token):
+    """⧉ 悬浮: the starred cards' odds in a document picture-in-picture window the page draws on every render (a real popup
+    stands in for it here), the /mini page in a popup where there is no such API, and /mini on its own."""
+    await page.reload(); await page.wait_for_selector(".card .odds")
+    await page.click("#g-index .card .star"); await page.click("#g-ladder .card .star")  # 上证指数, $牛来 市值
+    assert await page.eval_on_selector_all(".floatbtn", "b => b.map(x => x.textContent)") == ["⧉ 悬浮", "⧉ 悬浮"]  # the header's and the ⭐ 收藏 title's
+    if not await page.evaluate("typeof window.documentPictureInPicture === 'object'"):  # headless Chromium has had it since 116
+        print("document picture-in-picture check skipped (no API in this Chromium)")
+    else:
+        async with page.context.expect_page() as popup:  # the picture-in-picture window is a page of its own to Playwright
+          await page.click("#float")
+        pip = await popup.value; await until(page, "floatPip !== null")
+        assert await page.eval_on_selector_all(".floatbtn", "b => b.map(x => x.textContent)") == ["⧉ 悬浮中", "⧉ 悬浮中"]
+        assert await pip.title() == "收藏 · 概率" and await pip.locator("#mini .mcard").count() == 2
+        text = await pip.inner_text("#mini")
+        assert text.startswith("上证指数\n10-08 下周四\n已收盘\n⏳ 7天 16:5") and "涨 35.0¢\n65.0¢ 跌\n参考 3,850.12 → 隐含 3,819.64（-0.79%）\n$牛来 市值" in text, text
+        assert await pip.evaluate("getComputedStyle(document.body).backgroundColor") == "rgb(242, 244, 248)"
+        await page.evaluate("last.items[0].fair_up = 0.42; last.items[0].fair_down = 0.58; render(last)")  # every render of the page redraws it
+        assert "涨 42.0¢\n58.0¢ 跌" in await pip.inner_text("#mini .mcard")
+        await page.click("#theme"); await page.click("#theme")  # 浅色, then 深色: the small window follows
+        assert await pip.evaluate("document.documentElement.dataset.theme") == "dark" and await pip.evaluate("getComputedStyle(document.body).backgroundColor") == "rgb(13, 16, 20)"
+        await page.click("#theme"); assert await pip.evaluate("document.documentElement.dataset.theme") is None
+        await page.click("#float"); assert len(page.context.pages) == 2  # already open: brought to the front, not opened again
+        await pip.close(); await until(page, "floatPip === null")
+        assert await page.eval_on_selector_all(".floatbtn", "b => b.map(x => x.textContent)") == ["⧉ 悬浮", "⧉ 悬浮"]
+    # no picture-in-picture API (Firefox, Safari, phones): a small popup window with /mini
+    await page.evaluate("delete window.documentPictureInPicture; window.__opened = null; window.open = (u, n, f) => {window.__opened = [u, n, f]; return {closed: false}}")
+    await page.click("#float"); assert await page.evaluate("window.__opened") == [f"/p/{token}/mini", "mini", "popup=yes,width=340,height=520"]
+    # /mini on its own: this browser's stars, refreshed by itself, a link back
+    ctx = await browser.new_context(viewport={"width": 340, "height": 520})
+    await ctx.add_init_script("if (!localStorage.getItem('favs')) localStorage.setItem('favs', JSON.stringify(['上证指数', 'UNITREEUSDT']))")
+    mini = await ctx.new_page(); await mini.goto(f"http://127.0.0.1:{port}/p/{token}/mini"); await mini.wait_for_selector(".mcard")
+    text = await mini.inner_text("body")
+    assert text.startswith("上证指数\n10-08 下周四\n已收盘\n⏳ 7天 16:5") and "涨 35.0¢\n65.0¢ 跌" in text and "宇树 UNITREE\n10-08 下周四\n已收盘\n概率暂缺：等待行情" in text and text.endswith("每 5 秒刷新 · 主页面 ↗"), text
+    assert await mini.get_attribute("#mback", "href") == f"/p/{token}" and await mini.locator("#mini .mcard").count() == 2
+    await mini.evaluate("localStorage.setItem('favs', '[]'); dispatchEvent(new StorageEvent('storage', {key: 'favs'}))")  # the main page's stars change: redrawn
+    assert await mini.inner_text("#mini") == "还没有收藏：在主页面点卡片的 ☆"
+    await ctx.close()
+    await page.click("#g-fav .card .star"); await page.click("#g-fav .card .star"); assert await page.evaluate("favs") == []
+
+
+async def auction_check(page):
+    """The pre-open auction's indicative price in the 可撤单 phase (the odds still rest on the proxy): an orange line of its
+    own on the card, with its move from the reference close, brought by the event stream and taken down with the phase;
+    the mini window shows the tag and the line too."""
+    await page.reload(); await page.wait_for_selector(".card .odds")
+    live = lambda **f: page.evaluate("patchLive({items: [{name: '上证指数', symbol: '', " + ", ".join(f"{k}: {v!r}" for k, v in f.items()) + "}]})")
+    await live(preopen="沪深开盘集合竞价（09:15–09:25）", preopen_phase="可撤单", preopen_price="3,760.00", preopen_at=1759194000000, auction="", trading="")
+    card = page.locator("#g-index .card")
+    assert await card.locator(".tag.auc").inner_text() == "竞价·可撤单" and await card.locator(".aucline").count() == 1
+    text = await card.locator(".aucline").inner_text()
+    assert text.startswith("📍 竞价参考价 3,760.00\n-2.34%") and "可撤单阶段：还能撤单，常是试探；概率仍按上面的有效价算，撮合前仍会变" in text, text
+    assert await card.locator(".aucline .age").count() == 1 and await card.locator(".odds").count() == 1  # the odds stay as they were
+    box = await page.evaluate("const d = document.createElement('div'); miniRender(d, last.items, {favs: ['上证指数'], hots: new Set(), style: 'cn', skew: 0}); d.innerText")
+    assert "竞价·可撤单" in box and "📍 竞价参考价 3,760.00（-2.34%） 可撤单阶段，概率暂不按它算" in box, box
+    await live(preopen="沪深开盘集合竞价（09:15–09:25）", preopen_phase="不可撤单", preopen_price="3,765.00", preopen_at=1759194060000, eff_label="竞价", effective="3,765.00", auction="", trading="")
+    assert await card.locator(".aucline").count() == 0 and await card.locator(".tag.auc").inner_text() == "竞价·不可撤单"  # the odds rest on it now: the summary shows it
+    await live(preopen="", preopen_phase="", preopen_price="", preopen_at=0, eff_label="隐含", auction="", trading="已收盘")
+    assert await card.locator(".tag.auc").count() == 0 and await card.locator(".aucline").count() == 0 and await card.locator(".tag.lunch").inner_text() == "已收盘"
+    await page.reload(); await page.wait_for_selector(".card .odds")
 
 
 async def browser_check(async_playwright, chrome, port, token, bot):
@@ -400,6 +463,8 @@ async def browser_check(async_playwright, chrome, port, token, bot):
         await page.click("#h-crypto .fold")
         assert await page.is_visible("#g-crypto .card") and await page.locator("#h-crypto .fs").count() == 0 and await page.evaluate("localStorage.getItem('folded')") == "[]"
         await watch_check(bot, page)
+        await float_check(browser, page, port, token)
+        await auction_check(page)
         await layout_check(browser, page)
         if os.environ.get("WEB_SCREENSHOT"):
             await page.screenshot(path=os.environ["WEB_SCREENSHOT"], full_page=True)
@@ -463,6 +528,8 @@ async def run():
     st, head, body = await request(port, b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n"); assert st == 200 and body == b"ok"
     st, head, body = await request(port, f"GET /p/{token} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
     assert st == 200 and b"<title>" in body and "text/html" in head and "Cache-Control: no-store" in head and "Referrer-Policy: no-referrer" in head
+    st, head, body = await request(port, f"GET /p/{token}/mini HTTP/1.1\r\nHost: x\r\n\r\n".encode())  # the starred cards alone, for a small window
+    assert st == 200 and "text/html" in head and "<title>收藏 · 概率</title>".encode() in body and b"function miniRender" in body and "Cache-Control: no-store" in head
     st, head, body = await request(port, f"GET /p/{token}/data.json?x=1 HTTP/1.1\r\nHost: x\r\n\r\n".encode())
     assert st == 200 and json.loads(body)["items"][0]["name"] == "上证指数" and "application/json" in head
     assert "Content-Encoding" not in head and "Vary: Accept-Encoding" in head  # no Accept-Encoding: plain
@@ -477,7 +544,9 @@ async def run():
     live = json.loads(event[len(b"event: live\ndata: "):])
     assert live["server_ms"] == bot.market.now_ms() and live["items"][0]["name"] == "上证指数", live
     assert {"fair_up", "fair_down", "effective", "quote_ms", "move", "proxy_note", "warn"} <= set(live["items"][0]) and "ref_note" not in live["items"][0]
-    assert live["items"][1] == {"name": "宇树 UNITREE", "symbol": "UNITREEUSDT", "missing": "等待行情"} and len(live["items"]) == 2, live["items"]
+    assert {k: live["items"][1][k] for k in ("name", "symbol", "missing")} == {"name": "宇树 UNITREE", "symbol": "UNITREEUSDT", "missing": "等待行情"} and len(live["items"]) == 2, live["items"]
+    assert {k: live["items"][1][k] for k in ("auction", "preopen", "preopen_phase", "preopen_price", "preopen_at")} == {"auction": "", "preopen": "", "preopen_phase": "", "preopen_price": "", "preopen_at": 0}  # the session tags ride along
+    assert live["items"][1]["trading"] == "已收盘" and live["items"][0]["trading"] == "已收盘", live["items"]
     assert live["items"][0]["fair_up"] == json.loads(body)["items"][0]["fair_up"] and web.streams == 1
     w.close(); await w.wait_closed()
     st, _, _ = await request(port, b"GET /p/" + b"x" * len(token) + b"/events HTTP/1.1\r\nHost: x\r\n\r\n"); assert st == 404

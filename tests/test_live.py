@@ -170,6 +170,9 @@ async def run():
     card = hbot.odds_payload()["items"][0]
     assert card["eff_label"] == "估算" and card["source"] == "代理估算" and card["feed"] == "" and card["preopen_phase"] == "可撤单", card
     assert card["preopen_price"] == "35.6" and card["preopen_at"] == bj(9, 28, 9, 5, 10)  # the probe, beside the estimate
+    live = hbot.live_payload()["items"][0]  # the event stream carries it too (every second), and the tags it must take down
+    assert {k: live[k] for k in ("preopen_phase", "preopen_price", "preopen_at", "auction", "trading")} == {"preopen_phase": "可撤单", "preopen_price": "35.6", "preopen_at": bj(9, 28, 9, 5, 10), "auction": "", "trading": ""}
+    assert live["preopen"].startswith("港交所开市前竞价") and live["eff_label"] == "估算"
     # once orders cannot be withdrawn (09:15) the indicative price is the day's price, with the match still to come
     t = bj(9, 28, 9, 16)
     o = hbot.contract_odds("HK0625USDT", D("35.60"), t)
@@ -195,6 +198,7 @@ async def run():
     hbot.odds_items = lambda ms: [("SHEIN 希音｜HK0625USDT", o)]
     card = hbot.odds_payload()["items"][0]
     assert card["eff_label"] == "开盘价" and card["source"] == "已撮合开盘价" and card["preopen_phase"] == "已撮合" and card["feed"] == "腾讯", card
+    assert hbot.live_payload()["items"][0]["preopen_phase"] == "已撮合"
     # it may sit still for the whole auction without going stale; from 09:30 the usual ten-minute clock applies
     o3 = hbot.contract_odds("HK0625USDT", D("35.60"), bj(9, 28, 9, 35))
     assert not o3.preopen and not o3.matched and "现货行情已超 10 分钟未更新" in o3.proxy_note, o3.proxy_note
