@@ -367,7 +367,7 @@ async def auction_check(page):
     await live(preopen="", preopen_phase="", preopen_price="", preopen_at=0, eff_label="隐含", auction="", trading="已收盘")
     assert await card.locator(".tag.auc").count() == 0 and await card.locator(".aucline").count() == 0 and await card.locator(".tag.lunch").inner_text() == "已收盘"
     # the two venues' depth in the details, from the event stream too
-    await card.locator("details summary").first.click()
+    await page.evaluate("open.add('上证指数')")  # the details open on the next render (a click can race a refresh)
     async def shown(depth, expected):  # a data.json refresh may land between the push and the read: push again then
         for _ in range(4):
             await live(depth=depth)
