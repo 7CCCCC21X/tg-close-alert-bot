@@ -127,10 +127,10 @@ async def run():
     # --- Binance: the stream's rows stand in for the two requests while it is live and has seen every symbol trade
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT,CXMTUSDT"})
     assert cfg.poll == 1 and cfg.binance_stream and cfg.predict_stream
-    off = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BINANCE_STREAM": "off", "PREDICT_STREAM": "0"})
-    assert not off.binance_stream and not off.predict_stream
+    off = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BINANCE_STREAM": "off", "PREDICT_STREAM": "0", "HL_STREAM": "no"})
+    assert not off.binance_stream and not off.predict_stream and not off.hl_stream and cfg.hl_stream
     mk = m.Binance(cfg); st = mk.stream
-    assert st.url() == "wss://fstream.binance.com/stream?streams=cxmtusdt@aggTrade/unitreeusdt@aggTrade/cxmtusdt@markPrice@1s/unitreeusdt@markPrice@1s"
+    assert st.url() == "wss://fstream.binance.com/stream?streams=cxmtusdt@aggTrade/unitreeusdt@aggTrade/cxmtusdt@markPrice@1s/unitreeusdt@markPrice@1s/cxmtusdt@depth20@500ms/unitreeusdt@depth20@500ms"
     msg = lambda d: json.dumps({"stream": "x", "data": d})
     st.on_message(msg({"e": "aggTrade", "s": "UNITREEUSDT", "p": "75.5", "T": 1700000000000}))
     assert st.price("UNITREEUSDT") is None  # not live: nothing is taken from it
@@ -160,6 +160,32 @@ async def run():
     assert await m.binance_spot("ticker/price", symbol="bnbusdt") == {"symbol": "BNBUSDT", "price": "800.1"} and m.spot_cadence("BNBUSDT", 5) == 1
     assert m.spot_cadence("SOLUSDT", 5) == 5
     sp.ws = None; sp.symbols.clear(); sp.last.clear()
+
+    # --- the depth stream: the contracts' top 20 levels summed up, live only while the stream is; REST otherwise
+    st.on_message(msg({"e": "depthUpdate", "E": 1700000005000, "s": "UNITREEUSDT", "b": [["75.4", "10"], ["74.0", "100"]], "a": [["75.6", "10"], ["77.0", "5"]]}))
+    book = st.books["UNITREEUSDT"]; assert (book.bid, book.ask, book.within, book.near, book.levels, book.fetched_ms) == (D("75.4"), D("75.6"), D("1510"), D("1510"), 4, 1700000005000)
+    assert mk.depth("UNITREEUSDT", 1700000006000) is book and mk.depth("CXMTUSDT", 1700000006000) is None
+    assert mk.depth("UNITREEUSDT", 1700000005000 + 16_000) is None  # the stream's book is too old without a newer push
+    st.last_at = time.monotonic() - 11; assert mk.depth("UNITREEUSDT", 1700000006000) is None; st.last_at = time.monotonic()
+    await mk.refresh_depth("UNITREEUSDT", 1700000006000); assert "UNITREEUSDT" not in mk.depth_notes  # the stream has it: no request
+    await mk.refresh_depth("CXMTUSDT", 1700000006000); assert mk.depth_notes["CXMTUSDT"]  # REST, blocked here
+    # --- Hyperliquid books over the stream: subscriptions per market, a pushed book summed up for its symbol
+    hl = m.Hyperliquid({"HK0625USDT": ("xyz", "SHEIN"), "BTCUSDT": ("", "BTC")}); hs = hl.stream; sent = []
+    class SendWS:
+        closed = False
+        async def send_text(self, text): sent.append(json.loads(text))
+    assert hs.url() == "wss://api.hyperliquid.xyz/ws" and hs.wanted()
+    await hs.on_open(SendWS())
+    assert sent == [{"method": "subscribe", "subscription": {"type": "l2Book", "coin": "xyz:SHEIN"}}, {"method": "subscribe", "subscription": {"type": "l2Book", "coin": "BTC"}}]
+    await hs.on_tick(SendWS()); assert len(sent) == 2
+    hs.on_message(json.dumps({"channel": "l2Book", "data": {"coin": "xyz:SHEIN", "time": 1700000007000, "levels": [[{"px": "6.15", "sz": "5000", "n": 3}], [{"px": "6.16", "sz": "4000", "n": 2}]]}}))
+    assert hl.books["HK0625USDT"].text() == "$55.4K（点差 0.16%）" and hl.books["HK0625USDT"].fetched_ms == 1700000007000
+    hs.on_message(json.dumps({"channel": "subscriptionResponse", "data": {}})); hs.on_message(json.dumps({"channel": "l2Book", "data": {"coin": "ETH", "levels": [[], []]}}))
+    assert set(hl.books) == {"HK0625USDT"}
+    hs.ws = LiveWS(); hs.last_at = time.monotonic()
+    assert hl.proxy_price("HK0625USDT", 1700000008000) == (D("6.155"), 1700000007000, "盘口中间价")
+    assert hl.proxy_price("HK0625USDT", 1700000007000 + 16_000) is None  # the book is old and there is no quote
+    assert not m.Hyperliquid({}).stream.wanted()
 
     # --- Predict: the live keys' market ids (a ladder's levels too), a pushed book taken by every book and level with
     # that id, the subscriptions sent once per id, a refusal shown
@@ -199,14 +225,14 @@ async def run():
         async def call(self, *a, **k): return True
         async def send(self, *a, **k): pass
     bot = m.Bot(cfg, m.Store(":memory:"), mk, FT())
-    assert [n for n, _ in bot.streams()] == ["币安合约", "币安现货", "Predict 盘口"]
-    assert bot.stream_line() == "📶 实时推送：币安合约 ✓ 0 秒前｜币安现货 未连接｜Predict 盘口 未连接"
+    assert [n for n, _ in bot.streams()] == ["币安合约", "币安现货", "Predict 盘口", "HL 盘口"]
+    assert bot.stream_line() == "📶 实时推送：币安合约 ✓ 0 秒前｜币安现货 未连接｜Predict 盘口 未连接｜HL 盘口 未连接"
     assert "📶 实时推送：币安合约 ✓" in bot.status("1:0")
     bot.watch_update(["HSI"], None)
     assert bot.predict_live_keys() == frozenset({"HSI", "KOSPI", "SSE", "UNITREEUSDT", "CXMTUSDT"}) and bot.predict.live_keys == bot.predict_live_keys()
     quiet = m.Bot(off, m.Store(":memory:"), m.Binance(off), FT())
     assert quiet.streams() == [] and quiet.stream_line() == "" and "📶" not in quiet.status("1:0")
-    only = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BINANCE_STREAM": "off"})
+    only = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "BINANCE_STREAM": "off", "HL_STREAM": "off"})
     assert [n for n, _ in m.Bot(only, m.Store(":memory:"), m.Binance(only), FT()).streams()] == ["Predict 盘口"]
     print("STREAM_OK")
 

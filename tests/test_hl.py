@@ -27,14 +27,21 @@ for bad in [{}, [], [{"x": 1}, []], "nope"]:
 async def run():
     calls = []
     async def fake_json(url, payload=None, timeout=15):
-        calls.append(payload); assert url == m.Hyperliquid.URL and payload["type"] == "metaAndAssetCtxs"
+        calls.append(payload); assert url == m.Hyperliquid.URL and payload["type"] in ("metaAndAssetCtxs", "l2Book")
+        if payload["type"] == "l2Book":  # the book of every quoted market, read with the quotes
+            if payload["coin"] == "xyz:SKHX": return {"coin": "xyz:SKHX", "time": 1, "levels": [[{"px": "1353", "sz": "10", "n": 2}, {"px": "1300", "sz": "99", "n": 1}], [{"px": "1354", "sz": "5", "n": 1}]]}
+            raise m.RemoteError("HTTP 500: 接口请求失败")
         if payload.get("dex") == "xyz": return data
         if "dex" not in payload: return [{"universe": [{"name": "BTC"}]}, [{"markPx": "60000", "prevDayPx": "59000"}]]
         raise m.RemoteError("HTTP 422: 接口请求失败")
     m.http_json = fake_json
     hl = m.Hyperliquid({"SKHYNIXUSDT": ("xyz", "SKHX"), "UNITREEUSDT": ("xyz", "UNITREE"), "BTCUSDT": ("", "BTC"), "ETHUSDT": ("other", "ETH")})
     await hl.refresh()
-    assert sorted(c.get("dex", "") for c in calls) == ["", "other", "xyz"]  # one request per dex
+    assert sorted(c.get("dex", "") for c in calls if c["type"] == "metaAndAssetCtxs") == ["", "other", "xyz"]  # one request per dex
+    assert sorted(c["coin"] for c in calls if c["type"] == "l2Book") == ["BTC", "xyz:SKHX"]  # a book per quoted market (none for the unlisted / failed dex)
+    book = hl.books["SKHYNIXUSDT"]; assert (book.bid, book.ask, book.within, book.near, book.levels) == (D("1353"), D("1354"), D("20300"), D("20300"), 3) and book.text() == "$20.3K（点差 0.07%）"
+    assert "BTCUSDT" not in hl.books and hl.book_notes["BTCUSDT"].startswith("HTTP 500") and "SKHYNIXUSDT" not in hl.book_notes
+    assert hl.proxy_price("SKHYNIXUSDT", 2)[0] == D("1353.5") and hl.proxy_price("SKHYNIXUSDT", 2)[2] == "中间价"  # the stream is not live: the quote's mid
     assert hl.quotes["SKHYNIXUSDT"].mark == D("1353.45") and hl.quotes["BTCUSDT"].coin == "BTC"
     assert "未找到市场 xyz:UNITREE" in hl.notes["UNITREEUSDT"] and "HL_TICKERS" in hl.notes["UNITREEUSDT"], hl.notes
     assert hl.notes["ETHUSDT"].startswith("获取失败（HTTP 422")

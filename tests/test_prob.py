@@ -127,6 +127,35 @@ async def run():
     co = bot.contract_odds("SKHYNIXUSDT", D("1340"), bot.market.now_ms())
     assert isinstance(co, m.CloseOdds) and co.unit == "KRW" and abs(float(co.effective) - 1857000 * 1340 / 1350) < 1e-6 and co.target == dt.date(2026, 9, 28), co
     assert "币安 1,340 / 收盘时刻 1,350 → -0.741%" in co.proxy_note
+    # the after-hours proxy: Hyperliquid when its book is the deeper one (auto, 1.5× to switch) or when PROXY_SOURCE says so;
+    # its own print at the close instant is the anchor, and a quote too old sends the card back to Binance
+    import time as _time
+    assert bot.proxy_venue("SKHYNIXUSDT", now) == "binance" and "深度±1% HL — / 币安 —" == bot.depth_note("SKHYNIXUSDT", now)
+    bot.hl_anchors["SKHYNIXUSDT"] = (close_ms, D("1352"))
+    bot.hl.quotes["SKHYNIXUSDT"] = m.HlQuote("xyz:SKHX", D("1341"), None, D("1342"), None, None, now - 5_000)
+    bot.hl.books["SKHYNIXUSDT"] = m.book_depth("HL", [["1341", "40"]], [["1343", "40"]], now - 1_000)      # $107K within 1 %
+    bot.market.depths["SKHYNIXUSDT"] = m.book_depth("币安", [["1340", "3"]], [["1341", "3"]], now - 1_000)  # $8K
+    assert bot.proxy_venue("SKHYNIXUSDT", now) == "hl" and bot.depth_note("SKHYNIXUSDT", now) == "深度±1% HL $107K / 币安 $8.04K"
+    hl_co = bot.contract_odds("SKHYNIXUSDT", D("1340"), now)
+    assert isinstance(hl_co, m.CloseOdds) and abs(float(hl_co.effective) - 1857000 * 1342 / 1352) < 1e-6, hl_co
+    assert hl_co.proxy_note == "HL 中间价 1,342 / 收盘时刻 1,352 → -0.740%（深度±1% HL $107K / 币安 $8.04K）", hl_co.proxy_note
+    assert bot.depth_line("SKHYNIXUSDT", now) == "📚 深度±1%：币安 $8.04K（点差 0.08%）｜HL $107K（点差 0.15%）｜盘后概率代理 Hyperliquid（自动）"
+    dp = bot.depth_payload("SKHYNIXUSDT", now); assert dp["proxy"] == "hl" and dp["mode"] == "auto" and dp["hl"]["within"] == 107360.0 and dp["binance"]["spread_bps"] == 7.5 and dp["binance"]["age"] == 1
+    bot.market.depths["SKHYNIXUSDT"] = m.book_depth("币安", [["1340", "100"]], [["1341", "100"]], now - 1_000)  # $268K: 2.5× HL, back to Binance
+    assert bot.proxy_venue("SKHYNIXUSDT", now) == "binance" and "币安 1,340 / 收盘时刻 1,350" in bot.contract_odds("SKHYNIXUSDT", D("1340"), now).proxy_note
+    bot.market.depths["SKHYNIXUSDT"] = m.book_depth("币安", [["1340", "35"]], [["1341", "35"]], now - 1_000)  # $94K: HL is deeper but not 1.5×: stays
+    assert bot.proxy_venue("SKHYNIXUSDT", now) == "binance"
+    bot.market.depths["SKHYNIXUSDT"] = m.book_depth("币安", [["1340", "100"]], [["1341", "100"]], now - 400_000)  # stale: no decision, the last choice holds
+    assert bot.proxy_venue("SKHYNIXUSDT", now) == "binance"
+    bot.config = dataclasses.replace(bot.config, proxy_source="hl")
+    assert bot.proxy_venue("SKHYNIXUSDT", now) == "hl" and bot.contract_odds("SKHYNIXUSDT", D("1340"), now).proxy_note.startswith("HL 中间价 1,342")
+    bot.hl.quotes["SKHYNIXUSDT"] = dataclasses.replace(bot.hl.quotes["SKHYNIXUSDT"], fetched_ms=now - 200_000)  # too old: Binance again, as a fallback
+    assert bot.contract_odds("SKHYNIXUSDT", D("1340"), now).proxy_note.startswith("币安 1,340")
+    bot.hl_anchors.pop("SKHYNIXUSDT"); bot.hl.quotes["SKHYNIXUSDT"] = dataclasses.replace(bot.hl.quotes["SKHYNIXUSDT"], fetched_ms=now)
+    assert bot.contract_odds("SKHYNIXUSDT", D("1340"), now).proxy_note.startswith("币安 1,340")  # no HL print at the close yet
+    bot.config = dataclasses.replace(bot.config, proxy_source="binance"); bot.hl_anchors["SKHYNIXUSDT"] = (close_ms, D("1352"))
+    assert bot.proxy_venue("SKHYNIXUSDT", now) == "binance"
+    bot.config = dataclasses.replace(bot.config, proxy_source="auto"); bot.proxy_choice.clear(); bot.market.depths.pop("SKHYNIXUSDT")
     # /status rows
     tg.sent.clear(); await bot.process_message({"text": "/status", "chat": {"id": 1}, "from": {"id": 42}, "date": time.time()})
     st = tg.sent[-1]

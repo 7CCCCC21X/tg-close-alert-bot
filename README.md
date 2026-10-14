@@ -216,6 +216,7 @@ EXCHANGE_TICKERS=UNITREEUSDT=sh:688836,HK0625USDT=hk:00625:same,CXMTUSDT=sh:6888
 
 - **币安**（`BINANCE_STREAM`）：合约的每笔成交（`aggTrade`，时间戳仍是最后一笔成交，成交稀疏的合约和原来一样会换标记价）和每秒一次的标记价 / 指数价；加密卡片用到的现货交易对（BNB、SOL、BTC、ETH、HYPE 等）的每笔成交。流在线且每个合约都见过成交时，提醒循环一轮不发任何请求，每秒判断一次；加密卡片每秒从流里取价。
 - **Predict**（`PREDICT_STREAM`，`wss://ws.predict.fun/ws`，主题 `predictOrderbook/<市场 id>`）：指数、合约标的和 ★ 自选市场（含自选阶梯的每一档）的订单簿一变就推过来，网页的事件流在 1 秒内送到页面；最多跟 80 个市场。订阅被拒（例如需要 API Key）时 `/status` 会写明，盘口照旧按 5 / 15 秒轮询。
+- **Hyperliquid**（`HL_STREAM`，`wss://api.hyperliquid.xyz/ws`，订阅 `l2Book`）：`HL_TICKERS` 里每个市场的订单簿一变就推过来，用于深度比较和盘后代理价；没有流时随 30 秒的行情刷新一起读 `l2Book`。
 - `/status` 的“📶 实时推送”一行：每路流“✓ N 秒前”（最近一条消息）、“已连接，等待数据”或“✗ 原因”。
 - 代码只用标准库（自带一个很小的 RFC 6455 客户端），不走 HTTP 代理；Railway 直连没有问题。
 
@@ -340,6 +341,8 @@ HL 的指数市场由 `HL_INDEX` 控制（默认 `KR200=xyz:KR200`，`off` 关�
 ```text
 HL_TICKERS=UNITREEUSDT=xyz:UNITREE,HK0625USDT=xyz:SHEIN,CXMTUSDT=xyz:CXMT,SKHYNIXUSDT=xyz:SKHX
 ```
+
+**盘口深度与盘后代理**：每个合约另读两边的订单簿（币安 `depth20@500ms` 流 / `/fapi/v1/depth`，Hyperliquid `l2Book` 流 / 接口），算出 ±1% 和 ±0.5% 之内的挂单金额（美元 / USDT）和点差，`/status` 的“📚 深度±1%”行和网页卡片明细的“深度”行都显示。币安 `HK0625USDT` 这类合约深度常常很差，所以收市后把合约涨跌映射到收盘价时，`PROXY_SOURCE=auto`（默认）会选挂单更多的一边：Hyperliquid 的 ±1% 深度达到币安的 1.5 倍就改用 HL 盘口中间价（锚点换成 HL 在收盘时刻的 1 分钟 K 线收盘，由 `candleSnapshot` 取，长假后退到 5 分钟 K），反过来也要 1.5 倍才切回，两边都没读到时保持上次的选择；代理说明写成“HL 盘口中间价 xx / 收盘时刻 xx → ±x%（深度±1% HL $85K / 币安 $12K）”。HL 行情过期或没有收盘时刻价时自动退回币安。`PROXY_SOURCE=binance` / `hl` 固定一边。涨跌提醒本身始终按币安合约价，不受影响。
 
 其中 SK 海力士（`xyz:SKHX`）和长鑫（`xyz:CXMT`）是 trade.xyz 上已确认的市场；宇树和希音的代码未经确认，若该 dex 上没有这个名字，`/status` 会显示“未找到市场 xyz:UNITREE（该 dex 共 N 个市场，相近：…）”，按提示把正确的名字填进 `HL_TICKERS` 即可。设为 `off` 关闭。
 
@@ -657,6 +660,8 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 | `POLL_SECONDS` | `1` | 提醒循环间隔，最小 1 秒（实时流开着时一轮不发请求） |
 | `BINANCE_STREAM` | `on` | 币安 WebSocket 实时流（合约成交价 + 标记价每秒，加密现货成交价）；`off` 只轮询 |
 | `PREDICT_STREAM` | `on` | Predict WebSocket 实时盘口（指数、合约标的和 ★ 自选的市场，含自选阶梯的各档，最多 80 个）；`off` 只轮询 |
+| `HL_STREAM` | `on` | Hyperliquid WebSocket 订单簿流（`HL_TICKERS` 的市场）；`off` 随 30 秒刷新读 `l2Book` |
+| `PROXY_SOURCE` | `auto` | 收市后合约概率的代理：`auto` 选 ±1% 深度更大的一边（1.5 倍才切换）、`binance`、`hl` |
 | `QUOTE_REFRESH_SECONDS` | `1` | 个股实时行情在其交易时段内的刷新间隔（1～300 秒），沪港股票一次请求取齐。指数不可调：上证/A50、KOSPI 交易中 10 秒、恒指 20 秒、休市 60 秒 |
 | `ALERT_COOLDOWN_SECONDS` | `300` | 持续超标的周期提醒间隔，0 关闭 |
 | `ALERT_STEP_PCT` | `1` | 超过阈值后每扩大多少个百分点进入新提醒档位，0 关闭 |

@@ -393,6 +393,14 @@ def parse_deadlines(spec: str) -> dict[str, int]:
     return out
 
 
+def parse_choice(value: str, choices: tuple[str, ...], name: str) -> str:
+    """One of ``choices`` (case-insensitive), or a ValueError naming the variable."""
+    text = (value or "").strip().lower()
+    if text not in choices:
+        raise ValueError(f"{name} 只能是 {' / '.join(choices)}，现在是 {value!r}")
+    return text
+
+
 def parse_hl_tickers(spec: str, symbols: tuple[str, ...]) -> dict[str, tuple[str, str]]:
     """HL_TICKERS="SYMBOL=dex:COIN,..." (dex omitted = the main Hyperliquid perp dex); "off" disables."""
     tickers: dict[str, tuple[str, str]] = {}
@@ -471,6 +479,8 @@ class Config:
     ladder_deadlines: dict[str, int] = field(default_factory=dict)  # STOCK_HIT_MARKETS key -> deadline (23:59 ET, ms) pinned by hand
     kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
+    hl_stream: bool = True        # Hyperliquid books over WebSocket (HL_STREAM)
+    proxy_source: str = "auto"    # the after-hours proxy of a contract's odds: auto (the deeper book), binance, hl (PROXY_SOURCE)
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
     predict_slugs: dict[str, str] = field(default_factory=dict)  # HSI/KOSPI/SSE/symbol -> Predict slug stem
     predict_api_key: str = ""  # Optional x-api-key for api.predict.fun (REST orderbook).
@@ -556,6 +566,8 @@ class Config:
             hl_tickers=parse_hl_tickers(e.get("HL_TICKERS", DEFAULT_HL_TICKERS), symbols),
             kospi_index=e.get("KOSPI_INDEX", "on").strip().lower() not in {"off", "0", "false", "no"},
             hl_index=parse_hl_tickers(e.get("HL_INDEX", DEFAULT_HL_INDEX), ("KR200",)),
+            hl_stream=e.get("HL_STREAM", "on").strip().lower() not in {"off", "0", "false", "no"},
+            proxy_source=parse_choice(e.get("PROXY_SOURCE", "auto"), ("auto", "binance", "hl"), "PROXY_SOURCE"),
             predict=e.get("PREDICT", "on").strip().lower() not in {"off", "0", "false", "no"},
             predict_slugs=parse_predict_slugs(e.get("PREDICT_SLUGS", DEFAULT_PREDICT_SLUGS)),
             predict_api_key=e.get("PREDICT_API_KEY", "").strip(),
@@ -1008,12 +1020,13 @@ class BinanceStream(StreamFeed):
     may grow while running (a new one reconnects with the longer stream list)."""
     NAME = "币安实时流"
 
-    def __init__(self, base: str, symbols: Any = (), mark: bool = False):
+    def __init__(self, base: str, symbols: Any = (), mark: bool = False, depth: bool = False):
         super().__init__()
-        self.base, self.mark = base.rstrip("/"), mark
+        self.base, self.mark, self.depth = base.rstrip("/"), mark, depth
         self.symbols: set[str] = {s.upper() for s in symbols}
         self.last: dict[str, tuple[str, int]] = {}            # symbol -> (last trade price, trade time ms)
         self.marks: dict[str, tuple[str, str, int]] = {}      # symbol -> (mark price, index price, time ms)
+        self.books: dict[str, BookDepth] = {}                 # symbol -> the top 20 levels summed up (depth20@500ms)
 
     def want(self, symbol: str) -> None:
         self.symbols.add(symbol.upper())
@@ -1025,6 +1038,8 @@ class BinanceStream(StreamFeed):
         streams = [f"{s.lower()}@aggTrade" for s in sorted(self.symbols)]
         if self.mark:
             streams += [f"{s.lower()}@markPrice@1s" for s in sorted(self.symbols)]
+        if self.depth:
+            streams += [f"{s.lower()}@depth20@500ms" for s in sorted(self.symbols)]
         return f"{self.base}/stream?streams={'/'.join(streams)}"
 
     def on_message(self, text: str) -> None:
@@ -1035,6 +1050,9 @@ class BinanceStream(StreamFeed):
             self.last[symbol] = (str(data["p"]), int(data.get("T") or data.get("E") or 0))
         elif kind == "markPriceUpdate" and symbol:
             self.marks[symbol] = (str(data["p"]), str(data.get("i") or ""), int(data.get("E") or 0))
+        elif kind == "depthUpdate" and symbol:
+            bids, asks = binance_levels(data)
+            self.books[symbol] = book_depth("币安", bids, asks, int(data.get("E") or time.time() * 1000))
 
     def price(self, symbol: str) -> tuple[str, int] | None:
         """(last trade price, its time) while the stream is live and has seen the symbol trade, else None."""
@@ -1333,7 +1351,35 @@ class Binance:
         self.offset_ms = 0
         self.clock_checked = 0.0
         self.blocked_until = 0.0
-        self.stream = BinanceStream(FUTURES_WS, config.symbols, mark=True)  # run by the bot when BINANCE_STREAM is on
+        self.stream = BinanceStream(FUTURES_WS, config.symbols, mark=True, depth=True)  # run by the bot when BINANCE_STREAM is on
+        self.depths: dict[str, BookDepth] = {}   # symbol -> the last REST depth (the stream's is in self.stream.books)
+        self.depth_notes: dict[str, str] = {}
+        self.depth_at: dict[str, float] = {}     # symbol -> monotonic of the last REST depth read
+
+    DEPTH_SECONDS = 30
+    DEPTH_FRESH_MS = 15_000
+
+    def depth(self, symbol: str, now_ms: int) -> BookDepth | None:
+        """The contract's book summed up: the stream's when it is live and current, else the last REST read."""
+        book = self.stream.books.get(symbol)
+        if book is not None and self.stream.live() and now_ms - book.fetched_ms <= self.DEPTH_FRESH_MS:
+            return book
+        return self.depths.get(symbol)
+
+    async def refresh_depth(self, symbol: str, now_ms: int) -> None:
+        """REST /fapi/v1/depth every DEPTH_SECONDS, only while the stream does not bring the book itself."""
+        book = self.stream.books.get(symbol)
+        if book is not None and self.stream.live() and now_ms - book.fetched_ms <= self.DEPTH_FRESH_MS:
+            return
+        if time.monotonic() - self.depth_at.get(symbol, -1e9) < self.DEPTH_SECONDS:
+            return
+        self.depth_at[symbol] = time.monotonic()
+        try:
+            bids, asks = binance_levels(await self.get("/fapi/v1/depth", symbol=symbol, limit=50))
+            self.depths[symbol] = book_depth("币安", bids, asks, int(time.time() * 1000))
+            self.depth_notes.pop(symbol, None)
+        except Exception as error:
+            self.depth_notes[symbol] = clean_error(error) or type(error).__name__
 
     def now_ms(self) -> int:
         return int(time.time() * 1000) + self.offset_ms
@@ -2634,6 +2680,84 @@ class IndexFutures:
 
 
 @dataclass(frozen=True)
+class BookDepth:
+    """A venue's order book summed up: the best quotes, and the notional resting within 0.5 % and 1 % of the mid (both
+    sides together, in the quote currency: USD on Hyperliquid, USDT on Binance), so two venues' liquidity compares at
+    a glance. ``levels`` is how many price levels were read."""
+    venue: str
+    bid: D | None
+    ask: D | None
+    near: D       # within ±0.5 %
+    within: D     # within ±1 %
+    levels: int
+    fetched_ms: int
+
+    @property
+    def mid(self) -> D | None:
+        if self.bid is not None and self.ask is not None:
+            return (self.bid + self.ask) / 2
+        return self.bid if self.ask is None else self.ask
+
+    @property
+    def spread_bps(self) -> D | None:
+        mid = self.mid
+        if self.bid is None or self.ask is None or not mid:
+            return None
+        return ((self.ask - self.bid) / mid * 10_000).quantize(D("0.1"))
+
+    def text(self) -> str:
+        """'$85.2K（点差 0.08%）' / '$12.3K（单边）' / '无挂单'."""
+        if self.bid is None and self.ask is None:
+            return "无挂单"
+        spread = self.spread_bps
+        return usd_short(self.within) + (f"（点差 {fmt((spread / 100).quantize(D('0.01')))}%）" if spread is not None else "（单边）")
+
+
+def book_depth(venue: str, bids: Any, asks: Any, fetched_ms: int) -> BookDepth:
+    """``bids`` / ``asks``: [(price, size), ...] in any order (strings or Decimals); the notional within 0.5 % and 1 %
+    of the mid (price × size), levels with a bad price or size skipped."""
+    def side(rows: Any, best: bool) -> list[tuple[D, D]]:
+        out = []
+        for row in rows or []:
+            try:
+                p, q = D(str(row[0])), D(str(row[1]))
+            except (TypeError, ValueError, IndexError, KeyError, decimal.InvalidOperation):
+                continue
+            if p.is_finite() and q.is_finite() and p > 0 and q > 0:
+                out.append((p, q))
+        return sorted(out, key=lambda level: level[0], reverse=best)
+    bid_rows, ask_rows = side(bids, True), side(asks, False)
+    bid, ask = (bid_rows[0][0] if bid_rows else None), (ask_rows[0][0] if ask_rows else None)
+    mid = (bid + ask) / 2 if bid is not None and ask is not None else (bid if ask is None else ask)
+    near = within = D(0)
+    if mid:
+        for p, q in [*bid_rows, *ask_rows]:
+            gap = abs(p - mid) / mid
+            if gap <= D("0.01"):
+                within += p * q
+                if gap <= D("0.005"):
+                    near += p * q
+    return BookDepth(venue, bid, ask, near, within, len(bid_rows) + len(ask_rows), fetched_ms)
+
+
+def hl_levels(data: Any) -> tuple[list, list]:
+    """Hyperliquid l2Book -> ([(px, sz)...] bids, [...] asks); levels[0] are the bids, levels[1] the asks."""
+    levels = data.get("levels") if isinstance(data, dict) else None
+    if not isinstance(levels, list) or len(levels) != 2:
+        raise ValueError("Hyperliquid 盘口格式异常")
+    side = lambda rows: [(row["px"], row["sz"]) for row in rows if isinstance(row, dict) and "px" in row and "sz" in row]
+    return side(levels[0] if isinstance(levels[0], list) else []), side(levels[1] if isinstance(levels[1], list) else [])
+
+
+def binance_levels(data: Any) -> tuple[list, list]:
+    """Binance depth (REST or the depth stream: bids/asks or b/a) -> ([(px, qty)...], [...])."""
+    if not isinstance(data, dict):
+        raise ValueError("币安盘口格式异常")
+    rows = lambda key, alt: [(r[0], r[1]) for r in (data.get(key) if key in data else data.get(alt)) or [] if isinstance(r, (list, tuple)) and len(r) >= 2]
+    return rows("bids", "b"), rows("asks", "a")
+
+
+@dataclass(frozen=True)
 class HlQuote:
     """One Hyperliquid perp's context (USD-quoted)."""
     coin: str          # Full market name, e.g. "xyz:SKHX"
@@ -2664,12 +2788,46 @@ class Hyperliquid:
     URL = "https://api.hyperliquid.xyz/info"
     REFRESH_SECONDS = 30
 
+    WS_URL = "wss://api.hyperliquid.xyz/ws"
+    BOOK_FRESH_MS = 15_000  # a book from the stream this recent is current (the stream pushes on every change)
+
     def __init__(self, tickers: dict[str, tuple[str, str]]):
         self.tickers = dict(tickers)
         self.quotes: dict[str, HlQuote] = {}
         self.notes: dict[str, str] = {}   # symbol -> why there is no quote (not listed / fetch failed)
+        self.books: dict[str, BookDepth] = {}   # symbol -> its order book summed up (the stream's, else l2Book every refresh)
+        self.book_notes: dict[str, str] = {}
+        self.stream = HLStream(self)             # run by the bot when HL_STREAM is on
         self.at_cache: dict[tuple[str, int, str], D] = {}
         self.refreshed = -1e9
+
+    def label(self, symbol: str) -> str:
+        """The market name as the API wants it: 'xyz:SHEIN' / 'BTC'."""
+        dex, coin = self.tickers[symbol]
+        return f"{dex}:{coin}" if dex else coin
+
+    def symbol_of(self, coin: str) -> str | None:
+        """The configured symbol a market name belongs to (case-insensitive), None when it is not one of ours."""
+        want = coin.lower()
+        return next((symbol for symbol in self.tickers if self.label(symbol).lower() == want), None)
+
+    def take_book(self, symbol: str, data: Any, fetched_ms: int) -> BookDepth:
+        """An l2Book answer (REST or pushed) for ``symbol``, summed up and kept."""
+        bids, asks = hl_levels(data)
+        self.books[symbol] = book_depth("HL", bids, asks, fetched_ms)
+        self.book_notes.pop(symbol, None)
+        return self.books[symbol]
+
+    def proxy_price(self, symbol: str, now_ms: int) -> tuple[D, int, str] | None:
+        """(price, when, what) to map a contract's after-hours move with: the live book's mid when the stream is current,
+        else the quote's mid, else its mark; None without any."""
+        book = self.books.get(symbol)
+        if book is not None and book.mid and self.stream.live() and now_ms - book.fetched_ms <= self.BOOK_FRESH_MS:
+            return book.mid, book.fetched_ms, "盘口中间价"
+        quote = self.quotes.get(symbol)
+        if quote is None:
+            return None
+        return (quote.mid, quote.fetched_ms, "中间价") if quote.mid else (quote.mark, quote.fetched_ms, "标记价")
 
     async def price_at(self, coin: str, at_ms: int, interval: str = "1m") -> D:
         """Close of the candle that ends exactly at ``at_ms`` (it opens one interval earlier): the market's price at
@@ -2752,6 +2910,15 @@ class Hyperliquid:
                 self.notes[symbol] = f"未找到市场 {label}（该 dex 共 {len(result)} 个市场{hint}），可用 HL_TICKERS 指定"
                 self.quotes.pop(symbol, None)
         failed = [f"{dex or '主市场'}：{result}" for dex, result in by_dex.items() if isinstance(result, str)]
+        now_ms = int(time.time() * 1000)
+        for symbol in self.tickers:  # the books: l2Book, unless the stream brought a current one
+            book = self.books.get(symbol)
+            if symbol not in self.quotes or (book is not None and self.stream.live() and now_ms - book.fetched_ms <= self.BOOK_FRESH_MS):
+                continue
+            try:
+                self.take_book(symbol, await http_json(self.URL, {"type": "l2Book", "coin": self.label(symbol)}), int(time.time() * 1000))
+            except Exception as error:
+                self.book_notes[symbol] = clean_error(error) or type(error).__name__
         return refreshed(failed, len(by_dex) - len(failed))
 
     def line(self, symbol: str, price_usd: D | None, style: str, unit_note: str = "") -> str:
@@ -2770,6 +2937,43 @@ class Hyperliquid:
                      else pct_text(percent(price_usd, quote.mark), style) + unit_note)
         line = f"HL {bold(fmt(quote.mark))}" + (f"（{'·'.join(meta)}）" if meta else "") + f" → {deviation}"
         return line + f"｜⚠️ {brief_error(note)}" if note else line
+
+
+class HLStream(StreamFeed):
+    """Hyperliquid order books as they change (wss://api.hyperliquid.xyz/ws, subscription l2Book per market) for the
+    configured markets; the feed sums each one up as it arrives."""
+    NAME = "Hyperliquid 盘口"
+
+    def __init__(self, feed: Hyperliquid):
+        super().__init__()
+        self.feed = feed
+        self.subscribed: set[str] = set()
+
+    def url(self) -> str:
+        return self.feed.WS_URL
+
+    def wanted(self) -> bool:
+        return bool(self.feed.tickers)
+
+    async def on_open(self, ws: WebSocketClient) -> None:
+        self.subscribed = set()
+        await self.on_tick(ws)
+
+    async def on_tick(self, ws: WebSocketClient) -> None:
+        for symbol in self.feed.tickers:
+            coin = self.feed.label(symbol)
+            if coin not in self.subscribed:
+                await ws.send_text(json.dumps({"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}}))
+                self.subscribed.add(coin)
+
+    def on_message(self, text: str) -> None:
+        msg = json.loads(text)
+        if not isinstance(msg, dict) or msg.get("channel") != "l2Book" or not isinstance(msg.get("data"), dict):
+            return
+        data = msg["data"]
+        symbol = self.feed.symbol_of(str(data.get("coin") or ""))
+        if symbol:
+            self.feed.take_book(symbol, data, int(data.get("time") or time.time() * 1000))
 
 
 @dataclass(frozen=True)
@@ -8513,11 +8717,16 @@ function card(it,g){
   const chip=$("span","chip",(it.move>=0?"+":"")+it.move.toFixed(2)+"%");chip.style.color=it.move>0?upColor():it.move<0?downColor():"var(--muted)";sm.append(chip);det.append(sm);
   const dl=$("dl");const row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("目标",it.close_label);row("参考",it.ref+unit+"（"+it.ref_note+"）");row("有效",it.effective+unit);row("代理",it.proxy_note);
+  if(it.depth)row("深度",depthText(it.depth));
   row("σ","日 "+(it.sigma_daily*100).toFixed(2)+"% × √"+it.remaining.toFixed(3)+" = "+(it.sigma*100).toFixed(2)+"%");
   row("σ 来源",it.sigma_note);row("涨/平/跌",(it.up*100).toFixed(2)+"% / "+(it.flat*100).toFixed(2)+"% / "+(it.down*100).toFixed(2)+"%");row("z",it.z.toFixed(3));
   det.append(dl);c.append(det);if(it.warn){const w=$("div","warn small","⚠️ "+it.warn);c.append(w)}
   tail(c,it);return c}
 const bookAge=p=>p.age!=null?p.age:Math.max(0,Math.round((Date.now()+skew-(p.fetched_ms||0))/1000));  // a block from the event stream carries no age
+const usdShort=v=>{v=Number(v)||0;const a=Math.abs(v);const f=(x,u)=>"$"+(x<100?x.toPrecision(3):Math.round(x))+u;return a>=1e9?f(v/1e9,"B"):a>=1e6?f(v/1e6,"M"):a>=1e3?f(v/1e3,"K"):"$"+v.toFixed(2)};
+function depthText(d){  // '±1% 币安 $12.3K（点差 0.40%）· HL $85.2K（点差 0.08%）· 盘后概率代理 HL（自动）'
+  const one=(name,b)=>name+" "+(!b?"未读到":b.error?"读取失败":(b.bid==null&&b.ask==null)?"无挂单":usdShort(b.within)+(b.spread_bps!=null?"（点差 "+(b.spread_bps/100).toFixed(2)+"%）":"（单边）"));
+  return "±1% "+one("币安",d.binance)+" · "+one("HL",d.hl)+" · 盘后概率代理 "+(d.proxy==="hl"?"Hyperliquid":"币安")+(d.mode==="auto"?"（自动，深 1.5 倍才切换）":"")}
 function tail(c,it){const al=aucLine(it);if(al)c.append(al);const ag=ages(it);if(ag)c.append(ag);if(it.predict)c.append(book(it.predict,favKey(it),it.pages))}
 // the pre-open auction's indicative price while the odds still rest on something else (the 可撤单 phase, or a card without
 // odds): a line of its own, with its move from the reference close, updated by the event stream every second
@@ -8726,7 +8935,7 @@ function drawMeta(d){const ago=$("span","","");ago.id="ago";
 // last full answer; data.json still brings the books, the crypto cards and the texts every 10 seconds, and is the fallback.
 let es=null,live=false;
 const LIVE_KEYS=["quote_ms","effective","move","ref","up","flat","down","z","fair_up","fair_down","sigma","remaining","warn","proxy_note","source","eff_label","missing",
-  "auction","preopen","preopen_phase","preopen_price","preopen_at","trading","predict"];  // the session tags, the pre-open auction's indicative price and the book too
+  "auction","preopen","preopen_phase","preopen_price","preopen_at","trading","predict","depth"];  // the session tags, the pre-open auction's indicative price, the book and the two venues' depth
 function patchLive(d){
   if(!last||!Array.isArray(d.items))return;if(d.server_ms)skew=d.server_ms-Date.now();
   let changed=false;
@@ -9824,6 +10033,8 @@ class Bot:
         self.fx = FxRates(config.fx_manual)
         self.hsi = IndexFutures(config.hsi_futures, config.holidays.get("hk", frozenset()))
         self.hl = Hyperliquid({**config.hl_tickers, **config.hl_index})
+        self.hl_anchors: dict[str, tuple[int, D]] = {}  # symbol -> (close ms, Hyperliquid price at that instant)
+        self.proxy_choice: dict[str, str] = {}          # symbol -> "binance" | "hl": the after-hours proxy in use (auto mode)
         self.kospi = KospiIndex(config.kospi_index, config.holidays.get("kr", frozenset()))
         self.cn = CnIndex(config.sse_index, config.holidays.get("sh", frozenset()))
         self.web_token = config.web_token or self.store.get("web_token") or ""
@@ -10435,6 +10646,15 @@ class Bot:
                 with contextlib.suppress(Exception):
                     price, _ = await self.market.price_at(symbol, close_ms)
                     self.anchors[symbol] = (close_ms, price)
+            if close_ms and symbol in self.hl.tickers and self.hl_anchors.get(symbol, (0,))[0] != close_ms and self.retry_ok(f"hl:{symbol}"):
+                for interval in ("1m", "5m"):  # the 5-minute candle ending at the same instant after a long holiday
+                    try:
+                        self.hl_anchors[symbol] = (close_ms, await self.hl.price_at(self.hl.label(symbol), close_ms, interval))
+                        break
+                    except Exception:
+                        continue
+            if symbol in self.hl.tickers and hasattr(self.market, "refresh_depth"):
+                await self.market.refresh_depth(symbol, now_ms)
             if self.vols.due(symbol):
                 # The stock's own exchange sessions (close to close, opens kept so the opening gap and the in-session
                 # part split as for the indices) – not Binance's 24-hour candles, which mix in nights and weekends.
@@ -10967,16 +11187,88 @@ class Bot:
                 note = f"{info.name}现货 {fmt_price(live.last)}（{live.source}·盘中直接用现货）"
             return close_odds(NAMES.get(symbol, symbol), base, live.last, sigma, remaining, target,
                               price_tick(ticker.market, base), base_note, note, sigma_note, unit)
+        remaining, target = session_remaining(ticker.market, now_ms, close_date, holidays)
+        if self.proxy_venue(symbol, now_ms) == "hl":
+            # the deeper book (or PROXY_SOURCE=hl): Hyperliquid's price against its own print at the close instant
+            found, hl_anchor = self.hl.proxy_price(symbol, now_ms), self.hl_anchors.get(symbol)
+            if found is not None and hl_anchor is not None and hl_anchor[0] == base_ms and now_ms - found[1] <= self.config.max_age * 1000:
+                hl_price, _, what = found
+                hl_move = percent(hl_price, hl_anchor[1])
+                return close_odds(NAMES.get(symbol, symbol), base_value, base_value * hl_price / hl_anchor[1], sigma, remaining, target,
+                                  price_tick(ticker.market, base_value), base_label,
+                                  f"HL {what} {fmt_price(hl_price)} / 收盘时刻 {fmt_price(hl_anchor[1])} → {hl_move:+.3f}%（{self.depth_note(symbol, now_ms)}）"
+                                  + (f"｜{live_why}，暂用 Hyperliquid" if live_why else ""), sigma_note, unit)
+            # Hyperliquid cannot price it right now (no anchor at this close, or a stale quote): Binance as usual
         if anchor is None or anchor[0] != base_ms:
             return "等待币安在收盘时刻的价格"
         if quote_ms and now_ms - quote_ms > self.config.max_age * 1000:
             return f"币安行情已 {(now_ms - quote_ms) // 1000} 秒未更新，暂不输出新概率"
-        remaining, target = session_remaining(ticker.market, now_ms, close_date, holidays)
         move = percent(price, anchor[1])
         return close_odds(NAMES.get(symbol, symbol), base_value, base_value * price / anchor[1], sigma, remaining, target,
                           price_tick(ticker.market, base_value), base_label,
                           f"币安 {fmt_price(price)} / 收盘时刻 {fmt_price(anchor[1])} → {move:+.3f}%"
                           + (f"｜{live_why}，暂用币安" if live_why else ""), sigma_note, unit)
+
+    # --- which venue maps the after-hours move: the deeper book --------------------------------------------------------
+    DEPTH_STALE_MS = 180_000     # a book older than this does not decide
+    DEPTH_SWITCH = D("1.5")      # the other venue takes over once its ±1 % notional is this many times the current one's
+
+    def depths_of(self, symbol: str, now_ms: int) -> tuple[BookDepth | None, BookDepth | None]:
+        """(Binance's book, Hyperliquid's book) for the contract, each None when unknown or stale."""
+        fresh = lambda d: d if d is not None and now_ms - d.fetched_ms <= self.DEPTH_STALE_MS else None
+        binance = self.market.depth(symbol, now_ms) if hasattr(self.market, "depth") else None
+        return fresh(binance), fresh(self.hl.books.get(symbol))
+
+    def proxy_venue(self, symbol: str, now_ms: int) -> str:
+        """"binance" or "hl": PROXY_SOURCE when set; in auto mode the venue whose book holds more within ±1 % of the
+        mid, switching only when the other holds DEPTH_SWITCH times as much (no flapping), Binance until both books
+        are known."""
+        if symbol not in self.hl.tickers:
+            return "binance"
+        if self.config.proxy_source != "auto":
+            return self.config.proxy_source
+        binance, hl = self.depths_of(symbol, now_ms)
+        current = self.proxy_choice.get(symbol, "binance")
+        if binance is None or hl is None:
+            return current
+        if current == "binance" and hl.within > 0 and hl.within >= binance.within * self.DEPTH_SWITCH:
+            current = "hl"
+        elif current == "hl" and (hl.within == 0 or binance.within >= hl.within * self.DEPTH_SWITCH):
+            current = "binance"
+        self.proxy_choice[symbol] = current
+        return current
+
+    def depth_note(self, symbol: str, now_ms: int) -> str:
+        """'深度±1% HL $85.2K / 币安 $12.3K' (unknown sides as —)."""
+        binance, hl = self.depths_of(symbol, now_ms)
+        return f"深度±1% HL {usd_short(hl.within) if hl else '—'} / 币安 {usd_short(binance.within) if binance else '—'}"
+
+    def depth_payload(self, symbol: str, now_ms: int) -> dict | None:
+        """The card's depth block: both books (±0.5 % / ±1 % notional, spread, age) and which venue the odds follow."""
+        if symbol not in self.hl.tickers:
+            return None
+        out: dict[str, Any] = {"proxy": self.proxy_venue(symbol, now_ms), "mode": self.config.proxy_source}
+        for name, book, note in (("binance", self.market.depth(symbol, now_ms) if hasattr(self.market, "depth") else None,
+                                  getattr(self.market, "depth_notes", {}).get(symbol, "")),
+                                 ("hl", self.hl.books.get(symbol), self.hl.book_notes.get(symbol, ""))):
+            if book is None:
+                out[name] = {"error": note} if note else None
+                continue
+            spread = book.spread_bps
+            out[name] = {"within": float(book.within), "near": float(book.near), "spread_bps": float(spread) if spread is not None else None,
+                         "bid": float(book.bid) if book.bid is not None else None, "ask": float(book.ask) if book.ask is not None else None,
+                         "age": max(0, (now_ms - book.fetched_ms) // 1000), "levels": book.levels}
+        return out
+
+    def depth_line(self, symbol: str, now_ms: int) -> str:
+        """'📚 深度±1%：币安 $12.3K（点差 0.40%）｜HL $85.2K（点差 0.08%）｜概率代理 HL' for the status card."""
+        if symbol not in self.hl.tickers:
+            return ""
+        binance, hl = self.depths_of(symbol, now_ms)
+        venue = self.proxy_venue(symbol, now_ms)
+        parts = ["币安 " + (binance.text() if binance else brief_error(getattr(self.market, "depth_notes", {}).get(symbol, "") or "未读到", 30)),
+                 "HL " + (hl.text() if hl else brief_error(self.hl.book_notes.get(symbol, "") or "未读到", 30))]
+        return "📚 深度±1%：" + "｜".join(parts) + f"｜盘后概率代理 {'Hyperliquid' if venue == 'hl' else '币安'}" + ("（自动）" if self.config.proxy_source == "auto" else "")
 
     HSI_PRINT_MS = 5 * 60_000  # the first futures print this soon after the 16:10 cash close is its anchor
 
@@ -11235,6 +11527,8 @@ class Bot:
             if book:
                 base["predict"] = book
             base.update(self.session_fields(title, symbol, now_ms))
+            if symbol and (depth := self.depth_payload(symbol, now_ms)):
+                base["depth"] = depth
             if symbol and symbol in self.config.tickers:
                 base["pages"] = quote_pages(self.config.tickers[symbol])  # where to watch the stock's own quote
             if isinstance(odds, str):
@@ -11327,6 +11621,9 @@ class Bot:
         for title, odds in (self.odds_items(now_ms) if self.config.probability else []):
             name, _, symbol = title.partition("｜")
             session = {**self.SESSION_EMPTY, **self.session_fields(title, symbol, now_ms)}  # the pre-open price every second, the tags at once
+            if symbol and (depth := self.depth_payload(symbol, now_ms)):
+                session["depth"] = {**depth, "binance": {**depth["binance"], "age": 0} if depth.get("binance") and "within" in depth["binance"] else depth.get("binance"),
+                                    "hl": {**depth["hl"], "age": 0} if depth.get("hl") and "within" in depth["hl"] else depth.get("hl")}  # ages tick on the page
             book = self.predict_payload(title, odds, now_ms)  # the book too, within a second of a refresh (data.json would be up to 5 s)
             if book:
                 session["predict"] = {k: v for k, v in book.items() if k not in {"edges", "age"}}  # age ticks every second: the page counts it
@@ -13570,6 +13867,7 @@ class Bot:
             lines.append(self.kospi_line200(now_ms))
         if price is not None and symbol in self.hl.quotes:
             lines.append(self.hl_line(symbol, price))
+            lines.append(self.depth_line(symbol, now_ms))
         if price is not None:  # Model odds for the next close, so each alert carries its own read.
             lines.append(self.odds_row(self.contract_odds(symbol, price, now_ms)))
         return [line for line in lines if line]
@@ -14261,6 +14559,8 @@ class Bot:
             out += [("币安合约", self.market.stream), ("币安现货", SPOT_STREAM)]
         if self.config.predict_stream and self.config.predict:
             out.append(("Predict 盘口", self.predict.stream))
+        if self.config.hl_stream and self.hl.tickers:
+            out.append(("HL 盘口", self.hl.stream))
         return out
 
     def start_streams(self) -> None:

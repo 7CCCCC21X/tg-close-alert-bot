@@ -353,7 +353,7 @@ async def auction_check(page):
     own on the card, with its move from the reference close, brought by the event stream and taken down with the phase;
     the mini window shows the tag and the line too."""
     await page.reload(); await page.wait_for_selector(".card .odds")
-    live = lambda **f: page.evaluate("patchLive({items: [{name: '上证指数', symbol: '', " + ", ".join(f"{k}: {v!r}" for k, v in f.items()) + "}]})")
+    live = lambda **f: page.evaluate("patchLive({items: [{name: '上证指数', symbol: '', " + ", ".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in f.items()) + "}]})")
     await live(preopen="沪深开盘集合竞价（09:15–09:25）", preopen_phase="可撤单", preopen_price="3,760.00", preopen_at=1759194000000, auction="", trading="")
     card = page.locator("#g-index .card")
     assert await card.locator(".tag.auc").inner_text() == "竞价·可撤单" and await card.locator(".aucline").count() == 1
@@ -366,6 +366,12 @@ async def auction_check(page):
     assert await card.locator(".aucline").count() == 0 and await card.locator(".tag.auc").inner_text() == "竞价·不可撤单"  # the odds rest on it now: the summary shows it
     await live(preopen="", preopen_phase="", preopen_price="", preopen_at=0, eff_label="隐含", auction="", trading="已收盘")
     assert await card.locator(".tag.auc").count() == 0 and await card.locator(".aucline").count() == 0 and await card.locator(".tag.lunch").inner_text() == "已收盘"
+    # the two venues' depth in the details, from the event stream too
+    await live(depth={"proxy": "hl", "mode": "auto", "binance": {"within": 8040, "near": 8040, "spread_bps": 7.6, "bid": 1340, "ask": 1341, "age": 1, "levels": 2}, "hl": {"within": 107360, "near": 107360, "spread_bps": 14.9, "bid": 1341, "ask": 1343, "age": 0, "levels": 2}})
+    await card.locator("details summary").first.click()
+    assert "深度\n±1% 币安 $8.04K（点差 0.08%） · HL $107K（点差 0.15%） · 盘后概率代理 Hyperliquid（自动，深 1.5 倍才切换）" in await card.inner_text(), await card.inner_text()
+    await live(depth={"proxy": "binance", "mode": "binance", "binance": None, "hl": {"error": "HTTP 500"}})
+    assert "深度\n±1% 币安 未读到 · HL 读取失败 · 盘后概率代理 币安" in await card.inner_text()
     await page.reload(); await page.wait_for_selector(".card .odds")
 
 
@@ -547,6 +553,7 @@ async def run():
     assert {k: live["items"][1][k] for k in ("name", "symbol", "missing")} == {"name": "宇树 UNITREE", "symbol": "UNITREEUSDT", "missing": "等待行情"} and len(live["items"]) == 2, live["items"]
     assert {k: live["items"][1][k] for k in ("auction", "preopen", "preopen_phase", "preopen_price", "preopen_at")} == {"auction": "", "preopen": "", "preopen_phase": "", "preopen_price": "", "preopen_at": 0}  # the session tags ride along
     assert live["items"][1]["trading"] == "已收盘" and live["items"][0]["trading"] == "已收盘", live["items"]
+    assert live["items"][1]["depth"] == {"proxy": "binance", "mode": "auto", "binance": None, "hl": None} and "depth" not in live["items"][0]  # no book read here
     assert "predict" not in live["items"][0]  # no book here (Predict is not polled in this test); with one it rides along, without edges or age
     assert live["items"][0]["fair_up"] == json.loads(body)["items"][0]["fair_up"] and web.streams == 1
     w.close(); await w.wait_closed()
