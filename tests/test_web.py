@@ -367,11 +367,17 @@ async def auction_check(page):
     await live(preopen="", preopen_phase="", preopen_price="", preopen_at=0, eff_label="隐含", auction="", trading="已收盘")
     assert await card.locator(".tag.auc").count() == 0 and await card.locator(".aucline").count() == 0 and await card.locator(".tag.lunch").inner_text() == "已收盘"
     # the two venues' depth in the details, from the event stream too
-    await live(depth={"proxy": "hl", "mode": "auto", "binance": {"within": 8040, "near": 8040, "spread_bps": 7.6, "bid": 1340, "ask": 1341, "age": 1, "levels": 2}, "hl": {"within": 107360, "near": 107360, "spread_bps": 14.9, "bid": 1341, "ask": 1343, "age": 0, "levels": 2}})
     await card.locator("details summary").first.click()
-    assert "深度\n±1% 币安 $8.04K（点差 0.08%） · HL $107K（点差 0.15%） · 盘后概率代理 Hyperliquid（自动，深 1.5 倍才切换）" in await card.inner_text(), await card.inner_text()
-    await live(depth={"proxy": "binance", "mode": "binance", "binance": None, "hl": {"error": "HTTP 500"}})
-    assert "深度\n±1% 币安 未读到 · HL 读取失败 · 盘后概率代理 币安" in await card.inner_text()
+    async def shown(depth, expected):  # a data.json refresh may land between the push and the read: push again then
+        for _ in range(4):
+            await live(depth=depth)
+            text = await card.inner_text()
+            if expected in text:
+                return
+        assert False, text
+    await shown({"proxy": "hl", "mode": "auto", "binance": {"within": 8040, "near": 8040, "spread_bps": 7.6, "bid": 1340, "ask": 1341, "age": 1, "levels": 2}, "hl": {"within": 107360, "near": 107360, "spread_bps": 14.9, "bid": 1341, "ask": 1343, "age": 0, "levels": 2}},
+                "深度\n±1% 币安 $8.04K（点差 0.08%） · HL $107K（点差 0.15%） · 盘后概率代理 Hyperliquid（自动，深 1.5 倍才切换）")
+    await shown({"proxy": "binance", "mode": "binance", "binance": None, "hl": {"error": "HTTP 500"}}, "深度\n±1% 币安 未读到 · HL 读取失败 · 盘后概率代理 币安")
     await page.reload(); await page.wait_for_selector(".card .odds")
 
 
