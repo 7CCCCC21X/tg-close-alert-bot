@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.36.0"
+VERSION = "1.37.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -391,6 +391,21 @@ def parse_deadlines(spec: str) -> dict[str, int]:
     return out
 
 
+def parse_pyth_feeds(spec: str) -> dict[str, str]:
+    """PYTH_FEEDS="CLL=0x<64 hex>;Metal.XAU/USD=<64 hex>": a feed as MACRO_MARKETS names it (or a market's key) -> the Hermes
+    price-feed id to use for it, pinned by hand when Hermes' listing cannot be searched for it."""
+    out: dict[str, str] = {}
+    for part in re.split(r"[;,]", spec or ""):
+        if not part.strip():
+            continue
+        name, _, value = part.partition("=")
+        value = value.strip().removeprefix("0x").lower()
+        if not name.strip() or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("PYTH_FEEDS 格式：Metal.XAU/USD=<64 位十六进制 feed id>，多个用分号分隔")
+        out[name.strip()] = value
+    return out
+
+
 def parse_hl_tickers(spec: str, symbols: tuple[str, ...]) -> dict[str, tuple[str, str]]:
     """HL_TICKERS="SYMBOL=dex:COIN,..." (dex omitted = the main Hyperliquid perp dex); "off" disables."""
     tickers: dict[str, tuple[str, str]] = {}
@@ -467,6 +482,8 @@ class Config:
     web_base: str = ""       # Public base URL, e.g. https://xxx.up.railway.app
     hl_tickers: dict[str, tuple[str, str]] = field(default_factory=dict)  # symbol -> (dex, coin) on Hyperliquid
     ladder_deadlines: dict[str, int] = field(default_factory=dict)  # STOCK_HIT_MARKETS key -> deadline (23:59 ET, ms) pinned by hand
+    macro: bool = True       # the 宏观 section: WTI / gold / silver / SPY October ladders (Pyth), GC's December settlements, the valuation ladders
+    pyth_feeds: dict[str, str] = field(default_factory=dict)  # PYTH_FEEDS: a MACRO_MARKETS feed ("Metal.XAU/USD", "CLL") or key -> Hermes feed id
     kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
@@ -564,6 +581,8 @@ class Config:
             sim_group_usd=parse_bounded(e, "SIM_GROUP_USD", "300", 0, 10_000_000),
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
             ladder_deadlines=parse_deadlines(e.get("LADDER_DEADLINES", "")),
+            macro=e.get("MACRO", "on").strip().lower() not in {"off", "0", "false", "no"},
+            pyth_feeds=parse_pyth_feeds(e.get("PYTH_FEEDS", "")),
             auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
             preopen_alert=e.get("PREOPEN_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
             preopen_lead=bounded_int(e, "PREOPEN_ALERT_LEAD_MINUTES", 5, 0, 60),
@@ -4486,7 +4505,9 @@ class PredictFeed:
 
     async def ladder_row(self, key: str, slug: str, market: dict) -> "LadderRow | None":
         parse = self.ladder_parse.get(key, cap_target)
-        target = parse(market.get("title", "")) or parse(market.get("question", ""))
+        target = parse(market.get("title", ""))
+        if target is None:  # (a bracket's lowest range starts at 0: a level, not "none")
+            target = parse(market.get("question", ""))
         if target is None:
             return None
         meta = self.market_meta.get(market["id"])
@@ -5539,7 +5560,7 @@ def usd_short(value: D | float | None) -> str:
     if value is None:
         return "—"
     v = float(value)
-    for size, unit in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+    for size, unit in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
         if abs(v) >= size:
             text = f"{v / size:.3g}" if v / size < 100 else f"{v / size:.0f}"
             return f"${text}{unit}"
@@ -6050,6 +6071,12 @@ class RangeSpec:
     start_ms: int     # open of the first candle: 00:00 ET on the 1st
     end_ms: int       # open of the last candle: 23:59 ET on the last day
     default_dir: str = "up"  # the direction of the rules the category was added with ("up": High ≥, "down": Low ≤)
+    group: str = "levels"    # the web page's section the card sits in: "levels" (价格阶梯) or "macro" (宏观)
+    feed: str = ""           # pyth: the feed's Pyth symbol ("Metal.XAU/USD") or the short name Pyth lists it under ("CLL");
+    #                          cme: the Yahoo symbol of the continuous front-month contract ("GC=F")
+    calendar: str = ""       # the sessions that count: "metal" (CME metals, 18:00 → 17:00 ET), "ice" (ICE WTI, 20:00 → 18:00 ET),
+    #                          "us" (the regular stock session) or "settle" (CME settlement days)
+    one_way: str = ""        # "up" when the category's rules fix every level's direction (a settlement "at or above" ladder)
 
     def label(self, ms: int) -> str:
         et = dt.datetime.fromtimestamp(ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(ms))))
@@ -6076,6 +6103,60 @@ STOCK_HIT_MARKETS = (
     # High of at least $100" (NASDAQ:STRC). The window is read from Predict: the market's createdAt and the date its title
     # names (start_ms / end_ms = 0 here); LADDER_DEADLINES=STRC-100=2026-12-31 pins the deadline by hand.
     RangeSpec("STRC-100", "strc-hits-100-by-20260618001620693", "STRC", "nasdaq", "STRC 触及 $100", 0, 0),
+)
+# --- the 宏观 section: commodities, an index ETF and private valuations on Predict ------------------------------------------
+MACRO_MARKETS = (
+    # "during a trading session of October 2026": the sessions dated 10-01 … 10-30 (10-31 is a Saturday), on Pyth's 1-minute
+    # candles of the ICE WTI active month (Pyth lists it as "CLL"). A session runs from 20:00 ET of the prior calendar day
+    # (Monday's from 18:00 ET Sunday) to 18:00 ET, so the window opens 09-30 20:00 ET and closes 10-30 18:00 ET (end_ms is
+    # the open of its last minute, as for every ladder)
+    RangeSpec("WTI-HIT-10", "what-price-will-wti-hit-in-october-2026", "WTI", "pyth", "WTI 原油 10月价格",
+              et_ms(2026, 9, 30, 20, 0, -4), et_ms(2026, 10, 30, 17, 59, -4), group="macro", feed="CLL", calendar="ice"),
+    # Pyth XAU/USD and XAG/USD: a session runs from 18:00 ET of the prior calendar day to 17:00 ET (Sunday 18:00 to Friday
+    # 17:00 with an hour's break a day), so the window is 09-30 18:00 ET → 10-30 17:00 ET
+    RangeSpec("XAU-HIT-10", "what-price-will-xauusd-hit-in-october-2026", "XAUUSD", "pyth", "黄金 XAUUSD 10月价格",
+              et_ms(2026, 9, 30, 18, 0, -4), et_ms(2026, 10, 30, 16, 59, -4), group="macro", feed="Metal.XAU/USD", calendar="metal"),
+    RangeSpec("XAG-HIT-10", "what-price-will-xagusd-hit-in-october-2026", "XAGUSD", "pyth", "白银 XAGUSD 10月价格",
+              et_ms(2026, 9, 30, 18, 0, -4), et_ms(2026, 10, 30, 16, 59, -4), group="macro", feed="Metal.XAG/USD", calendar="metal"),
+    # Pyth SPY/USD in the regular session only (09:30–16:00 ET; pre-market and after-hours prints do not count): 10-01 … 10-30
+    RangeSpec("SPY-HIT-10", "what-price-will-spy-hit-in-october-2026", "SPY", "pyth", "标普500 SPY 10月价格",
+              et_ms(2026, 10, 1, 9, 30, -4), et_ms(2026, 10, 30, 15, 59, -4), group="macro", feed="Equity.US.SPY/USD", calendar="us"),
+    # CME gold futures: the Active Month's official settlement on any trading day from the market's creation (2026-03-02
+    # 13:22 UTC) through the last trading day of December 2026, at or above the level (every level is an ↑ one). Yahoo's
+    # GC=F (the front month) gives the settlements so far and σ, the active contract itself (GCZ26.CMX; GCG27.CMX from its
+    # First Position Date, 11-30) the live price
+    RangeSpec("GC-DEC", "what-will-gold-gc-hit-by-end-of-december", "GC", "cme", "黄金期货 GC 12月底前结算价",
+              et_ms(2026, 3, 2, 8, 22, -5), et_ms(2026, 12, 31, 23, 59, -5), group="macro", feed="GC=F", calendar="settle", one_way="up"),
+)
+
+
+@dataclass(frozen=True)
+class QuoteSpec:
+    """A ladder the bot prices nothing on: its levels follow something no feed the bot can read reports (a private company's
+    secondary-market valuation, an IPO still to come), so its card shows every level's Yes book as Predict quotes it and the
+    probability that book implies, and nothing on it is suggested, alerted or paper-traded."""
+    key: str
+    slug: str
+    name: str
+    kind: str          # "valuation": a Yes/No market per level ("$500B": reached by the deadline or not); "bracket": one per range of a final value
+    end_ms: int        # when the question is decided at the latest
+    close_label: str   # the deadline and the resolution source, for the card
+    question: str      # the question in one line
+    note: str          # why no model prices it
+    group: str = "macro"
+
+
+QUOTE_MARKETS = (
+    QuoteSpec("ANTHROPIC-VAL", "will-anthropics-valuation-hit-by-december-31", "Anthropic 估值（12-31 前）", "valuation",
+              et_ms(2026, 12, 31, 23, 59, -5),
+              "12-31 截止：Nasdaq Private Market 的 NPM Price（每个交易日一个，次日 13:00 ET 公布）任一日达到档位即 Yes；IPO 后另看发行价和公开市值",
+              "Anthropic 的私募市场估值（Nasdaq Private Market 的 NPM Price）在 2026-12-31 前有没有达到各档",
+              "NPM Price 没有可读的公开接口，机器人不出模型价：只显示 Predict 各档的盘口和它隐含的概率，不给建议、不提醒、不模拟交易"),
+    QuoteSpec("OPENAI-IPO", "what-will-openais-ipo-valuation-be", "OpenAI IPO 估值", "bracket",
+              et_ms(2027, 12, 31, 23, 59, -5),
+              "按最终招股书的发行价 × 完全稀释股数结算（上市后的交易价不算；正好落在边界归上一档）；2027-12-31 前没有 IPO 按最低一档",
+              "OpenAI IPO 时的隐含估值（最终招股书的发行价 × 完全稀释股数）落在哪一档",
+              "没有可观测的行情源，机器人不出模型价：只显示 Predict 各档的盘口和它隐含的概率，不给建议、不提醒、不模拟交易"),
 )
 YAHOO_CHART = ("https://query1.finance.yahoo.com/v8/finance/chart/", "https://query2.finance.yahoo.com/v8/finance/chart/")
 # NYSE / Nasdaq closures and 13:00 ET early closes, 2026–2027 (weekends are never sessions)
@@ -6137,6 +6218,218 @@ def us_trading_years(now_ms: int, end_ms: int, intraday: float = 1.0) -> float:
             total += left * (intraday if session[0] <= now_ms < session[1] else 1.0)
         day += dt.timedelta(days=1)
     return total / US_TRADING_DAYS
+
+
+# --- the 宏观 ladders' clocks: the sessions a touch can happen in, the trading time left, CME gold's active contract ------------
+TRADING_DAYS = 252
+MACRO_CLOSED = {  # full closures (weekends aside) of the CME metals and ICE WTI sessions, 2026–27; October 2026 has none
+    "metal": frozenset({dt.date(2026, 1, 1), dt.date(2026, 4, 3), dt.date(2026, 12, 25), dt.date(2027, 1, 1), dt.date(2027, 3, 26), dt.date(2027, 12, 24)}),
+    "ice": frozenset({dt.date(2026, 1, 1), dt.date(2026, 4, 3), dt.date(2026, 12, 25), dt.date(2027, 1, 1), dt.date(2027, 3, 26), dt.date(2027, 12, 24)}),
+}
+MACRO_SESSION_MS = {"metal": 23 * 3_600_000, "ice": 22 * 3_600_000, "us": US_SESSION_MS}  # a full session (one trading day of σ)
+
+
+def macro_session(calendar: str, day: dt.date) -> tuple[int, int] | None:
+    """(open, close) in ms of the session dated ``day`` on a calendar: "metal" (CME metals: 18:00 ET of the prior calendar
+    day to 17:00 ET), "ice" (ICE WTI: 20:00 ET of the prior day, 18:00 ET Sunday for Monday, to 18:00 ET), "us" (the
+    regular stock session, 09:30–16:00 ET, 13:00 on an early close); None when the day has none (a weekend, a closure)."""
+    if calendar == "us":
+        return us_session(day)
+    if calendar not in MACRO_SESSION_MS or day.weekday() >= 5 or day in MACRO_CLOSED.get(calendar, frozenset()):
+        return None
+    prev = day - dt.timedelta(days=1)
+    if calendar == "metal":
+        return et_wall_ms(prev, 18, 0), et_wall_ms(day, 17, 0)
+    return et_wall_ms(prev, 18 if day.weekday() == 0 else 20, 0), et_wall_ms(day, 18, 0)
+
+
+def macro_session_at(calendar: str, ms: int) -> tuple[int, int] | None:
+    """The session running at an instant, if any (the session dated D may begin on the evening of D − 1)."""
+    day = et_date(ms)
+    for d in (day, day + dt.timedelta(days=1)):
+        session = macro_session(calendar, d)
+        if session and session[0] <= ms < session[1]:
+            return session
+    return None
+
+
+def macro_session_state(calendar: str, now_ms: int) -> tuple[str, int]:
+    """("交易中" | "休市", when the next session opens; 0 while one is running or none is listed within two weeks)."""
+    if macro_session_at(calendar, now_ms):
+        return "交易中", 0
+    day = et_date(now_ms)
+    for i in range(14):
+        session = macro_session(calendar, day + dt.timedelta(days=i))
+        if session and session[0] > now_ms:
+            return "休市", session[0]
+    return "休市", 0
+
+
+def macro_trading_years(calendar: str, now_ms: int, end_ms: int) -> float:
+    """Trading time left before end_ms, in years of TRADING_DAYS full sessions (us_trading_years for the stock calendar): the
+    rest of the running session and every later one through the end. Nothing can be hit between sessions."""
+    if end_ms <= now_ms:
+        return 0.0
+    if calendar == "us":
+        return us_trading_years(now_ms, end_ms)
+    total, day, last = 0.0, et_date(now_ms), et_date(end_ms) + dt.timedelta(days=1)
+    while day <= last:
+        session = macro_session(calendar, day)
+        if session:
+            total += max(0, min(session[1], end_ms) - max(session[0], now_ms)) / MACRO_SESSION_MS[calendar]
+        day += dt.timedelta(days=1)
+    return total / TRADING_DAYS
+
+
+def settlement_days(first: dt.date, last: dt.date) -> list[dt.date]:
+    """CME metals settlement days between two dates (inclusive): weekdays that are not US market holidays (metals trade a
+    holiday such as Thanksgiving with an early close and no settlement, or are shut)."""
+    out, day = [], first
+    while day <= last:
+        if day.weekday() < 5 and day not in US_MARKET_HOLIDAYS:
+            out.append(day)
+        day += dt.timedelta(days=1)
+    return out
+
+
+def gc_active_contract(day: dt.date) -> str:
+    """CME gold's Active Month on an ET date, as Yahoo spells the contract (GCZ26.CMX): the nearest delivery-cycle month
+    (Feb, Apr, Jun, Aug, Oct, Dec) that is not the spot month, which changes on the First Position Date, the last business
+    day before the delivery month (Dec 2026's is 11-30: from that day Feb 2027 is active)."""
+    codes = {2: "G", 4: "J", 6: "M", 8: "Q", 10: "V", 12: "Z"}
+    year, month = day.year, day.month
+    for _ in range(8):
+        month = next(m for m in (2, 4, 6, 8, 10, 12, 14) if m >= month)
+        if month > 12:
+            year, month = year + 1, 2
+        position = dt.date(year, month, 1) - dt.timedelta(days=1)
+        while position.weekday() >= 5 or position in US_MARKET_HOLIDAYS:
+            position -= dt.timedelta(days=1)
+        if day < position:
+            return f"GC{codes[month]}{year % 100:02d}.CMX"
+        month += 1
+    raise ValueError("no gold contract found")
+
+
+# --- Pyth: the live price from Hermes, the candles from Pyth Benchmarks (the TradingView feed behind pythdata.app) ---------
+PYTH_HERMES = "https://hermes.pyth.network/v2"
+PYTH_HISTORY = "https://benchmarks.pyth.network/v1/shims/tradingview/history"
+
+
+def pyth_feed_match(rows: Any, want: str, pinned: str = "") -> tuple[str, str] | None:
+    """(id, symbol) of the Hermes price feed (GET /v2/price_feeds?query=…) listed as ``want``: the feed with the pinned id
+    when one is given, else the one whose full symbol is ``want`` ("Metal.XAU/USD"), else the one feed whose short name
+    (base, generic or display symbol) is ``want`` ("CLL"); None when absent or ambiguous."""
+    if not isinstance(rows, list):
+        return None
+    short = (want.split(".")[-1].split("/")[0] if "." in want else want).upper()
+    feeds = []
+    for row in rows:
+        attrs = row.get("attributes") if isinstance(row, dict) else None
+        if not isinstance(attrs, dict) or not re.fullmatch(r"(0x)?[0-9a-fA-F]{64}", str(row.get("id") or "")):
+            continue
+        feeds.append((str(row["id"]).removeprefix("0x").lower(), str(attrs.get("symbol") or ""), attrs))
+    if pinned:
+        return next(((fid, symbol) for fid, symbol, _ in feeds if fid == pinned.removeprefix("0x").lower()), None)
+    exact = [(fid, symbol) for fid, symbol, _ in feeds if symbol == want]
+    if exact:
+        return exact[0]
+    found = []
+    for fid, symbol, attrs in feeds:
+        names = {str(attrs.get(k) or "").upper() for k in ("base", "generic_symbol", "display_symbol")}
+        names |= {n.split("/")[0] for n in names}
+        if short in names:
+            found.append((fid, symbol))
+    return found[0] if len(found) == 1 else None
+
+
+def parse_pyth_latest(data: Any) -> dict[str, tuple[float, int]]:
+    """Hermes GET /v2/updates/price/latest → {feed id: (price, publish time ms)}; a feed without a usable price is left out."""
+    out: dict[str, tuple[float, int]] = {}
+    rows = data.get("parsed") if isinstance(data, dict) else None
+    for row in rows if isinstance(rows, list) else []:
+        price = row.get("price") if isinstance(row, dict) else None
+        try:
+            value = D(str(price["price"])) * D(10) ** int(price["expo"])
+            when = int(price["publish_time"]) * 1000
+        except (TypeError, KeyError, ValueError, decimal.InvalidOperation):
+            continue
+        if value.is_finite() and value > 0:
+            out[str(row.get("id") or "").removeprefix("0x").lower()] = (float(value), when)
+    return out
+
+
+def parse_pyth_history(data: Any) -> list[tuple[int, float, float, float, float]]:
+    """Pyth Benchmarks' TradingView history → [(open ms, open, high, low, close)] oldest first; "no_data" → []; an error
+    status or a malformed body is a ValueError."""
+    if not isinstance(data, dict):
+        raise ValueError("Pyth K 线返回格式异常")
+    status = str(data.get("s") or "")
+    if status == "no_data":
+        return []
+    if status != "ok":
+        raise ValueError(f"Pyth K 线：{brief_error(str(data.get('errmsg') or status or '无状态'), 60)}")
+    cols = [data.get(k) for k in ("t", "o", "h", "l", "c")]
+    if not all(isinstance(c, list) for c in cols) or len({len(c) for c in cols}) != 1:
+        raise ValueError("Pyth K 线的列长度不一致")
+    bars = []
+    for t, o, h, l, c in zip(*cols):
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (t, o, h, l, c)) and h > 0 and l > 0:
+            bars.append((int(t) * 1000, float(o), float(h), float(l), float(c)))
+    return sorted(bars)
+
+
+# --- the valuation ladders' levels: "$500B", "$1.5T", "750 billion"; a bracket's bounds ------------------------------------
+VALUATION_UNITS = {"m": D(10) ** 6, "b": D(10) ** 9, "t": D(10) ** 12, "million": D(10) ** 6, "billion": D(10) ** 9, "trillion": D(10) ** 12}
+
+
+def valuation_amounts(text: str) -> list[D]:
+    """Every valuation a title names, in USD, in order: '$500B', '$1.5T', '750 billion', '$1,000B'. A bare number is not one
+    ("December 31" names a date)."""
+    out = []
+    for found in re.finditer(r"\$?\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(trillion|billion|million|[tbm])\b", str(text or ""), re.I):
+        value = D(found.group(1).replace(",", "")) * VALUATION_UNITS[found.group(2).lower()]
+        if value > 0:
+            out.append(value)
+    return out
+
+
+def valuation_level(title: str) -> D | None:
+    """The level of a "valuation hits $X by <date>" market: the first valuation its title names; None when there is none."""
+    amounts = valuation_amounts(title)
+    return amounts[0] if amounts else None
+
+
+def bracket_bounds(title: str) -> tuple[D, D | None] | None:
+    """(low, high) of a bracket market's title: 'Less than $500B' → (0, 500B); '$500B - $750B' → (500B, 750B); '$2T or more' /
+    'More than $2T' → (2T, None = open-ended); None when it names no valuation."""
+    amounts = valuation_amounts(title)
+    if not amounts:
+        return None
+    if len(amounts) >= 2:
+        return min(amounts[:2]), max(amounts[:2])
+    if re.search(r"less than|under|below|at most|or less|<|不到|以下|低于|少于", str(title).lower()):
+        return D(0), amounts[0]
+    return amounts[0], None
+
+
+def bracket_level(title: str) -> D | None:
+    """A bracket's lower bound (0 for the lowest), the ladder's sort key; None when the title names no valuation."""
+    bounds = bracket_bounds(title)
+    return bounds[0] if bounds else None
+
+
+def bracket_label(title: str) -> str:
+    """'< $500B', '$500B–$750B', '≥ $2T'; the title itself when it names no valuation."""
+    bounds = bracket_bounds(title)
+    if bounds is None:
+        return str(title)
+    low, high = bounds
+    if high is None:
+        return f"≥ {usd_short(low)}"
+    if low == 0:
+        return f"< {usd_short(high)}"
+    return f"{usd_short(low)}–{usd_short(high)}"
 
 
 def deadline_from_text(texts: list[str], after_ms: int) -> int:
@@ -6238,7 +6531,10 @@ def level_direction(rules: str, *titles: str) -> tuple[str, str]:
     text = re.sub(r"\s+", " ", re.sub(r"[\"'“”‘’*]", "", str(rules))).lower()
     down = re.search(r"\blow(?: price)? (?:is )?(?:equal to or (?:lower|less|below)|at or below|<=|≤)|\bfinal low\b", text)
     up = re.search(r"\bhigh(?: price)? (?:is )?(?:equal to or (?:greater|higher|above)|at or above|>=|≥)|\bfinal high\b", text)
-    by_rules = ("down" if down else "up") if bool(down) != bool(up) else ""
+    # rules written for the whole category that name both ways ("final High or Low price equal to or beyond (above for ↑ …,
+    # below for ↓ …)") say nothing about one market: its title's arrow does
+    both = re.search(r"\bhigh\b[^.]{0,40}?\bor\b[^.]{0,20}?\blow\b|\babove for\b.{0,60}?\bbelow for\b", text)
+    by_rules = "" if both else (("down" if down else "up") if bool(down) != bool(up) else "")
     arrow = next((d for t in titles for d, mark in (("down", r"[↓▼]"), ("up", r"[↑▲]")) if re.search(mark, str(t))), "")
     if by_rules and arrow and arrow != by_rules:
         return arrow, "冲突"
@@ -6413,6 +6709,14 @@ class RangeMarket:
         """The candles the window's extremes are read from, short (the evidence's source column)."""
         return "币安小时 K"
 
+    def settle_name(self) -> str:
+        """The resolution source's own data, for the note when our record and the book disagree."""
+        return "币安 1 分钟 K"
+
+    def price_in_window(self) -> bool:
+        """The live price was quoted inside the window, so it counts among the window's extremes."""
+        return self.start_ms <= self.priced_ms < self.window_end
+
     def sigma_note(self) -> str:
         return "30 日小时收盘"
 
@@ -6508,7 +6812,7 @@ class RangeMarket:
         hist, run = self.history, self.running
         highs = [(hist.get("high"), int(hist.get("high_at") or 0)), (run.get("high"), int(run.get("open") or 0))]
         lows = [(hist.get("low"), int(hist.get("low_at") or 0)), (run.get("low"), int(run.get("open") or 0))]
-        if self.price is not None and self.start_ms <= self.priced_ms < self.window_end:
+        if self.price is not None and self.price_in_window():
             hour = self.priced_ms - self.priced_ms % 3_600_000
             highs.append((float(self.price), hour))
             lows.append((float(self.price), hour))
@@ -6775,6 +7079,9 @@ class StockRangeMarket(RangeMarket):
     def extremes_name(self) -> str:
         return "Yahoo 日 K（常规时段）"
 
+    def settle_name(self) -> str:
+        return "TradingView 1 分钟 K"
+
     def et_label(self, ms: int) -> str:
         return self.spec.label(ms)
 
@@ -6812,10 +7119,442 @@ class StockRangeMarket(RangeMarket):
         return ""
 
 
+class PythRangeMarket(RangeMarket):
+    """A Pyth-settled ladder (WTI, gold, silver, SPY in October): Pyth's own 1-minute candles decide it, and the bot reads the
+    same feed. Hermes gives the live price (every 30 s; every 2 minutes while the market is shut, when it cannot change), Pyth
+    Benchmarks the candles: daily ones for σ (close to close over VOL_DAYS sessions, annualised over TRADING_DAYS) and hourly
+    ones (half-hourly for SPY, whose session starts at 09:30) for the window's highest High and lowest Low, counting only the
+    candles inside a trading session of the market's calendar (a High printed in the metals' 17:00–18:00 break or in SPY's
+    pre-market does not count, as it does not on Predict). Time passes in sessions: the time left is the trading time left."""
+    PRICE_SECONDS = 30
+    CLOSED_PRICE_SECONDS = 120
+    SCAN_SECONDS = 120
+    VOL_SECONDS = 1800
+    LOOKUP_SECONDS = 300            # a failed feed lookup is retried this often
+    PUBLISH_STALE_MS = 10 * 60_000  # in session, a price Pyth published longer ago than this prices nothing
+    SIGMA_STALE_MS = 3 * DAY_MS     # a long weekend changes nothing: the daily candles are re-read every 30 minutes anyway
+    VOL_DAYS = 60
+    CHUNK_MS = 7 * DAY_MS           # candles are read a week at a time (at most 336 of them)
+    RESOLUTION = {"us": 30, "metal": 60, "ice": 60}  # candle minutes, aligned with each calendar's session boundaries
+    SESSION_WORDS = {"metal": "周日 18:00 至周五 17:00 ET，每日 17:00–18:00 休息", "ice": "前一日 20:00（周日 18:00）至 18:00 ET",
+                     "us": "常规时段 09:30–16:00 ET"}
+
+    def __init__(self, store: "Store", spec: RangeSpec, pinned_id: str = ""):
+        super().__init__(store, spec)
+        saved = store.get(f"pyth:feed:{spec.feed}", {})
+        saved = saved if isinstance(saved, dict) else {}
+        self.pinned_id = pinned_id.removeprefix("0x").lower()
+        self.feed_id = self.pinned_id or str(saved.get("id") or "")
+        self.feed_symbol = str(saved.get("symbol") or "") if (not self.pinned_id or saved.get("id") == self.pinned_id) else ""
+        if not self.feed_symbol and "." in spec.feed:
+            self.feed_symbol = spec.feed  # a full Pyth symbol: the candles can be asked for by it at once
+        self.fetched_ms = 0
+        self.failures = {"feed": "", "price": "", "vol": "", "scan": ""}
+        self.times = {"feed": -1e9, "price": -1e9, "vol": -1e9, "scan": -1e9}
+
+    @property
+    def calendar(self) -> str:
+        return self.spec.calendar
+
+    @property
+    def resolution(self) -> int:
+        return self.RESOLUTION.get(self.calendar, 60)
+
+    def known(self) -> bool:
+        """The feed's Hermes id and Pyth symbol are both known (looked up once and kept in SQLite)."""
+        return bool(self.feed_id and self.feed_symbol)
+
+    def in_session(self, ms: int) -> bool:
+        return macro_session_at(self.calendar, ms) is not None
+
+    @staticmethod
+    async def fetch_json(url: str) -> Any:
+        try:
+            return json.loads(await fetch_source(url))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise RemoteError("Pyth 未返回有效 JSON") from None
+
+    def lookup_url(self) -> str:
+        query = self.spec.feed.split(".")[-1].split("/")[0] if "." in self.spec.feed else self.spec.feed
+        return f"{PYTH_HERMES}/price_feeds?" + urllib.parse.urlencode({"query": query})
+
+    async def lookup(self) -> None:
+        """The feed's id and symbol from Hermes' listing, kept in SQLite so a restart prices at once."""
+        found = pyth_feed_match(await self.fetch_json(self.lookup_url()), self.spec.feed, self.pinned_id)
+        if not found:
+            raise RemoteError(f"Hermes 没有列出 {self.spec.feed}" + ("（PYTH_FEEDS 钉的 id 不在列表里）" if self.pinned_id else ""))
+        self.feed_id, self.feed_symbol = found
+        self.store.put(f"pyth:feed:{self.spec.feed}", {"id": self.feed_id, "symbol": self.feed_symbol})
+
+    def latest_url(self) -> str:
+        return f"{PYTH_HERMES}/updates/price/latest?ids[]={self.feed_id}&parsed=true"
+
+    def candles_url(self, resolution: str, start_ms: int, end_ms: int) -> str:
+        return PYTH_HISTORY + "?" + urllib.parse.urlencode({"symbol": self.feed_symbol, "resolution": resolution,
+                                                            "from": start_ms // 1000, "to": end_ms // 1000})
+
+    async def candles(self, resolution: str, start_ms: int, end_ms: int) -> list:
+        return parse_pyth_history(await self.fetch_json(self.candles_url(resolution, start_ms, end_ms)))
+
+    def price_seconds(self, now_ms: int) -> int:
+        return self.PRICE_SECONDS if self.in_session(now_ms) else self.CLOSED_PRICE_SECONDS
+
+    async def refresh(self, now_ms: int) -> None:
+        mono, why = time.monotonic(), lambda error: clean_error(error) or type(error).__name__
+        if not self.known() and mono - self.times["feed"] >= self.LOOKUP_SECONDS:
+            self.times["feed"] = mono
+            try:
+                await self.lookup()
+                self.failures["feed"] = ""
+            except Exception as error:
+                self.failures["feed"] = f"行情源：{why(error)}"
+        if self.known():
+            if mono - self.times["price"] >= self.price_seconds(now_ms):
+                self.times["price"] = mono
+                try:
+                    got = parse_pyth_latest(await self.fetch_json(self.latest_url())).get(self.feed_id)
+                    if got is None:
+                        raise RemoteError("Hermes 没有返回这个 feed 的价格")
+                    self.price, self.priced_ms, self.fetched_ms = D(f"{got[0]:.10g}"), got[1], now_ms
+                    self.failures["price"] = ""
+                except Exception as error:
+                    self.failures["price"] = f"价格：{why(error)}"
+            if mono - self.times["vol"] >= self.VOL_SECONDS:
+                self.times["vol"] = mono
+                try:
+                    self.sigma = self.daily_sigma(await self.candles("D", now_ms - 400 * DAY_MS, now_ms), now_ms)
+                    self.sigma_ms = now_ms
+                    self.failures["vol"] = ""
+                except Exception as error:
+                    self.times["vol"] = mono - self.VOL_SECONDS + (60 if self.sigma is None else 300)  # again in 1 / 5 minutes
+                    self.failures["vol"] = f"波动率：{why(error)}"
+            if mono - self.times["scan"] >= self.SCAN_SECONDS:
+                self.times["scan"] = mono
+                try:
+                    await self.scan(now_ms)
+                    self.failures["scan"] = ""
+                except Exception as error:
+                    self.failures["scan"] = f"区间核验：{why(error)}"
+        self.error = "；".join(text for text in self.failures.values() if text)
+
+    def daily_sigma(self, bars: list, now_ms: int) -> float:
+        """Annualised σ from the last VOL_DAYS close-to-close log returns of finished daily candles (the running day's left out)."""
+        closes = [D(str(b[4])) for b in bars if b[0] + DAY_MS <= now_ms and b[4] > 0][-(self.VOL_DAYS + 1):]
+        sigma, count = realised_vol(closes)
+        if count < 10:
+            raise RemoteError(f"日 K 只有 {count} 个收益，不够估 σ")
+        return sigma * math.sqrt(TRADING_DAYS)
+
+    async def scan(self, now_ms: int) -> None:
+        """Extend the window's extremes (persisted) with the candles finished since the last scan, in sessions only; the
+        running candle is kept apart and counts at once. A span the feed has no candles for (the market shut) is read
+        through once it lies in the past; a span cut short is asked for again, so a gap and a truncated answer both end
+        with "through" at the right place."""
+        start, end, res = self.start_ms, self.window_end, self.resolution * 60_000
+        if now_ms <= start:
+            return
+        hist = dict(self.history) or {"start": start, "through": start, "high": None, "high_at": 0, "low": None, "low_at": 0}
+        running: dict = {}
+        for _ in range(12):
+            cursor = int(hist["through"])
+            stop = min(cursor + self.CHUNK_MS, end, now_ms)
+            if cursor >= stop:
+                break
+            bars = [b for b in await self.candles(str(self.resolution), cursor, stop) if cursor <= b[0] < stop]
+            for opened, open_, high, low, _ in bars:
+                if not self.in_session(opened):
+                    continue  # the metals' 17:00–18:00 break, SPY's pre-market and after-hours: not on Predict's clock
+                if hist.get("open") is None:
+                    hist["open"] = open_  # the window's first price: which side of it a level sits on
+                if opened + res > now_ms:  # still running: counts now, persisted once it is over
+                    running = {"open": opened, "high": high, "low": low}
+                    continue
+                if hist["high"] is None or high > hist["high"]:
+                    hist["high"], hist["high_at"] = high, opened
+                if hist["low"] is None or low < hist["low"]:
+                    hist["low"], hist["low_at"] = low, opened
+            if running:
+                hist["through"] = max(int(hist["through"]), running["open"])
+                break
+            if bars:
+                hist["through"] = max(int(hist["through"]), bars[-1][0] + res)
+                continue  # the rest of this span (if any) is asked for again: a gap, or an answer cut short
+            settled = min(stop, (now_ms - res) // res * res)  # candles may still appear this close to now
+            if settled <= cursor:
+                break
+            hist["through"] = settled
+        self.running, self.scanned_ms = running, now_ms
+        self.store.put(f"range:{self.spec.slug}", hist)
+
+    def price_in_window(self) -> bool:
+        """The live price counts among the window's extremes only when Pyth published it inside a session of the window."""
+        return self.start_ms <= self.priced_ms < self.window_end and self.in_session(self.priced_ms)
+
+    def price_stale(self, now_ms: int) -> bool:
+        """Nothing read for 5 minutes, or, while the market trades, a price Pyth published over 10 minutes ago; between
+        sessions the last published price stands (nothing can change)."""
+        if now_ms - self.fetched_ms > self.PRICE_STALE_MS:
+            return True
+        return self.in_session(now_ms) and now_ms - self.priced_ms > self.PUBLISH_STALE_MS
+
+    def remaining_years(self, now_ms: int) -> float:
+        return macro_trading_years(self.calendar, max(now_ms, self.start_ms), self.window_end)
+
+    def source_name(self) -> str:
+        return f"Pyth（{self.feed_symbol or self.spec.feed}）"
+
+    def venue_name(self) -> str:
+        return "Pyth"
+
+    def extremes_source(self) -> str:
+        return f"Pyth {self.resolution} 分钟 K（{self.feed_symbol or self.spec.feed}，只算交易时段内的；与 1 分钟 K 的最高/最低一致）"
+
+    def extremes_name(self) -> str:
+        return f"Pyth {self.resolution} 分钟 K"
+
+    def settle_name(self) -> str:
+        return "Pyth 1 分钟 K"
+
+    def sigma_note(self) -> str:
+        return f"{self.VOL_DAYS} 个交易日收盘（Pyth 日 K），按 {TRADING_DAYS} 个交易日年化"
+
+    def month_word(self) -> str:
+        return f"{et_date(self.end_ms).month} 月"
+
+    def close_label(self) -> str:
+        return f"{self.spec.label(self.window_end)}{self.month_word()}最后一个交易时段收盘为止"
+
+    def window_label(self) -> str:
+        return f"{self.spec.label(self.start_ms)}起（{self.month_word()}第一个交易时段的开盘）"
+
+    def card_extras(self, now_ms: int) -> dict:
+        state, opens = macro_session_state(self.calendar, now_ms)
+        hours = self.SESSION_WORDS.get(self.calendar, "")
+        session = (f"交易中（{hours}）" if state == "交易中" else
+                   f"休市，{self.spec.label(opens)}开盘（{hours}）；休市期间现价为 Pyth 最后发布的价格，概率按剩余交易时段计算" if opens else "休市")
+        return {"range_word": self.range_word, "session": session, "feed": self.feed_symbol or self.spec.feed, "feed_id": self.feed_id,
+                "extremes_note": f"Pyth {self.resolution} 分钟 K 的最高/最低（{self.feed_symbol or self.spec.feed}，只算交易时段内的 K 线，"
+                                 "与结算用的 1 分钟 K 同口径）",
+                "extremes_tail": f"，加上正在走的这根 {self.resolution} 分钟 K 和现价（只算交易时段内发布的）",
+                "rule_note": f"↑ 档：{self.month_word()}任一交易时段内 Pyth 1 分钟 K 的最高价 ≥ 档位即 Yes；↓ 档：最低价 ≤ 档位即 Yes；"
+                             "休市时段（周末、每日休息、SPY 的盘前盘后）的价格不算。方向按每个市场标题的箭头"}
+
+    def missing_note(self, now_ms: int) -> str:
+        if not self.known():
+            return f"等待 Pyth 行情源确认（{brief_error(self.failures['feed'], 80)}）" if self.failures["feed"] else "等待 Pyth 行情源确认"
+        if self.price is None or self.sigma is None:
+            return f"等待 Pyth 行情（{brief_error(self.error, 80)}）" if self.error else "等待 Pyth 行情"
+        if self.price_stale(now_ms) and now_ms < self.window_end:
+            return f"Pyth 价格停在 {stamp(self.priced_ms, seconds=False)}，暂停概率（已触及的档位仍算已触及）"
+        return ""
+
+
+class SettleRangeMarket(RangeMarket):
+    """CME gold (GC) "what will it hit by the end of December": Yes once the Active Month's official settlement on any trading
+    day from the market's creation through 12-31 is at or above the level. Yahoo stands in for CME: the daily closes of GC=F
+    (the front month, the Active Month itself but for the few days around a roll) are the settlements so far and give σ
+    (VOL_DAYS close-to-close returns, annualised over TRADING_DAYS); the active contract itself (GCZ26.CMX; GCG27.CMX from its
+    First Position Date, 11-30) gives the live price. One settlement a day: the touch model runs on a barrier raised by the
+    discrete-monitoring correction (Broadie–Glasserman–Kou: × e^{0.5826 σ √(1/252)}) over the settlement days left. The live
+    price is never a settlement: on its own it touches nothing."""
+    PRICE_SECONDS = 60
+    SCAN_SECONDS = 300
+    SIGMA_STALE_MS = 3 * DAY_MS
+    VOL_DAYS = 60
+    SETTLE_TIME = (13, 30)  # ET: COMEX gold settles on the 13:29–13:30 ET window
+    BGK = 0.5826
+    range_word = "窗口内"
+
+    def __init__(self, store: "Store", spec: RangeSpec):
+        super().__init__(store, spec)
+        self.contract = gc_active_contract(et_date(int(time.time() * 1000)))
+        self.fetched_ms = 0
+        self.settlements: list[tuple[str, float]] = []  # (ET date, settlement) of the window's latest finished days
+        self.failures = {"price": "", "scan": ""}
+        self.times = {"price": -1e9, "scan": -1e9}
+
+    @staticmethod
+    async def chart(symbol: str, **params: Any) -> tuple[dict, list]:
+        errors = []
+        for host in YAHOO_CHART:
+            url = host + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode(params)
+            try:
+                return parse_yahoo_chart(await fetch_source(url))
+            except (RemoteError, TimeoutError, OSError, ValueError) as error:
+                errors.append(clean_error(error) or type(error).__name__)
+        raise RemoteError("；".join(dict.fromkeys(errors)))
+
+    @staticmethod
+    def bar_date(opened_ms: int) -> dt.date:
+        """The trading date of a Yahoo daily bar: Yahoo stamps a futures day bar between the evening Globex open of the day
+        before and the morning of the day itself, so noon after the stamp always falls on the trading date."""
+        return et_date(opened_ms + 12 * 3_600_000)
+
+    def settle_ms(self, day: dt.date) -> int:
+        return et_wall_ms(day, *self.SETTLE_TIME)
+
+    def days_left(self, now_ms: int) -> float:
+        """Settlement days still ahead: every later one whole, today's as the share of a day left before its settlement."""
+        today, last = et_date(now_ms), et_date(self.end_ms)
+        if today > last:
+            return 0.0
+        days = settlement_days(today, last)
+        total = float(sum(1 for d in days if d > today))
+        if today in days and now_ms < self.settle_ms(today):
+            total += min(1.0, (self.settle_ms(today) - now_ms) / DAY_MS)
+        return total
+
+    def remaining_years(self, now_ms: int) -> float:
+        return self.days_left(max(now_ms, self.start_ms)) / TRADING_DAYS
+
+    async def refresh(self, now_ms: int) -> None:
+        mono, why = time.monotonic(), lambda error: clean_error(error) or type(error).__name__
+        self.contract = gc_active_contract(et_date(now_ms))
+        if mono - self.times["price"] >= self.PRICE_SECONDS:
+            self.times["price"] = mono
+            try:
+                meta, _ = await self.chart(self.contract, interval="1m", range="1d")
+                if meta["price"] is None:
+                    raise RemoteError("Yahoo 没有返回 regularMarketPrice")
+                self.price, self.priced_ms, self.fetched_ms = D(f"{meta['price']:.4f}"), meta["time_ms"] or now_ms, now_ms
+                self.failures["price"] = ""
+            except Exception as error:
+                self.failures["price"] = f"价格：{why(error)}"
+        if mono - self.times["scan"] >= self.SCAN_SECONDS:
+            self.times["scan"] = mono
+            try:
+                _, bars = await self.chart(self.spec.feed, interval="1d", range="1y")
+                self.sigma, self.sigma_ms = self.daily_sigma(bars, now_ms), now_ms
+                self.scan_days(bars, now_ms)
+                self.failures["scan"] = ""
+            except Exception as error:
+                self.times["scan"] = mono - self.SCAN_SECONDS + 60  # again in a minute
+                self.failures["scan"] = f"日 K：{why(error)}"
+        self.error = "；".join(text for text in self.failures.values() if text)
+
+    def daily_sigma(self, bars: list, now_ms: int) -> float:
+        """Annualised σ from the last VOL_DAYS settlement-to-settlement log returns of finished days."""
+        today = et_date(now_ms)
+        closes = [D(str(b[4])) for b in bars if self.bar_date(b[0]) < today and b[4] is not None and b[4] > 0][-(self.VOL_DAYS + 1):]
+        sigma, count = realised_vol(closes)
+        if count < 10:
+            raise RemoteError(f"日 K 只有 {count} 个收益，不够估 σ")
+        return sigma * math.sqrt(TRADING_DAYS)
+
+    def scan_days(self, bars: list, now_ms: int) -> None:
+        """The window's settlements so far from the daily bars' closes, finished days only (today's close is the last trade
+        until CME settles, and Yahoo rewrites it then): the highest, persisted, and the latest few for the card."""
+        today, first, last = et_date(now_ms), et_date(self.start_ms), et_date(self.end_ms)
+        hist = dict(self.history) or {"start": self.start_ms, "through": self.start_ms, "high": None, "high_at": 0, "low": None, "low_at": 0}
+        done = [b for b in bars if first <= self.bar_date(b[0]) <= last and self.bar_date(b[0]) < today and b[4] is not None and b[4] > 0]
+        for opened, _, _, _, close in done:
+            if hist["high"] is None or close > hist["high"]:
+                hist["high"], hist["high_at"] = close, opened
+            if hist["low"] is None or close < hist["low"]:
+                hist["low"], hist["low_at"] = close, opened
+        self.settlements = [(self.bar_date(b[0]).isoformat(), float(b[4])) for b in done[-5:]]
+        need = max(settlement_days(first, min(last, today - dt.timedelta(days=1))), default=None)  # the last day the window needs read
+        if need is None or (done and self.bar_date(done[-1][0]) >= need):
+            hist["through"] = max(int(hist["through"]), min(et_wall_ms(today, 0, 0), self.window_end))
+        self.scanned_ms = now_ms
+        self.store.put(f"range:{self.spec.slug}", hist)
+
+    def marks(self) -> dict:
+        """The highest and lowest settlement inside the window so far: finished days only, never the live price."""
+        hist = self.history
+        return {"high": hist.get("high"), "high_at": int(hist.get("high_at") or 0), "low": hist.get("low"), "low_at": int(hist.get("low_at") or 0)}
+
+    def touch(self, level: D, direction: str, sigma: float, years: float, drift: float) -> float:
+        """P(a daily settlement reaches the level before the window ends): the continuous touch probability of a barrier
+        moved away from the price by e^{BGK σ √(1/TRADING_DAYS)} (one look a day misses the path between looks)."""
+        shift = math.exp(self.BGK * sigma * math.sqrt(1 / TRADING_DAYS))
+        if direction == "up":
+            return hit_probability(float(self.price), float(level) * shift, sigma, years, drift)
+        return low_probability(float(self.price), float(level) / shift, sigma, years, drift)
+
+    def probability(self, level: D, direction: str, now_ms: int) -> float | None:
+        if self.reached(level, direction):
+            return 1.0
+        if now_ms >= self.window_end:
+            return 0.0 if self.complete() else None
+        if self.price is None or self.sigma is None or self.price_stale(now_ms):
+            return None
+        years = self.remaining_years(now_ms)
+        if years <= 0:
+            return None  # the last settlement is in but not read yet (Yahoo's bar is read the next day): neither 0 nor 1
+        return self.touch(level, direction, self.sigma, years, -0.5)
+
+    def model_swing(self, level: D, direction: str, now_ms: int, fair: float | None) -> float:
+        if fair is None or fair >= 1.0 or self.price is None or self.sigma is None:
+            return 0.0
+        years = self.remaining_years(now_ms)
+        if years <= 0:
+            return 0.0
+        variants = [(self.sigma * MODEL_SIGMA_ERROR, -0.5), (self.sigma / MODEL_SIGMA_ERROR, -0.5), (self.sigma, LOG_DRIFT_VARIANT)]
+        return max(abs(self.touch(level, direction, sigma, years, drift) - fair) for sigma, drift in variants)
+
+    def price_stale(self, now_ms: int) -> bool:
+        return now_ms - self.fetched_ms > self.PRICE_STALE_MS
+
+    def source_name(self) -> str:
+        return f"Yahoo 行情（{self.contract}）"
+
+    def venue_name(self) -> str:
+        return "Yahoo 期货行情，活跃月"
+
+    def extremes_source(self) -> str:
+        return f"Yahoo {self.spec.feed} 日 K 的收盘（≈ 当日 CME 官方结算价；只算已结束的交易日）"
+
+    def extremes_name(self) -> str:
+        return f"Yahoo {self.spec.feed} 日 K 收盘"
+
+    def settle_name(self) -> str:
+        return "CME 官方结算价"
+
+    def sigma_note(self) -> str:
+        return f"{self.VOL_DAYS} 个交易日收盘（{self.spec.feed}），按 {TRADING_DAYS} 个交易日年化"
+
+    def close_label(self) -> str:
+        return f"{et_date(self.end_ms):%m-%d} 的 CME 结算为止：任一日活跃月结算价 ≥ 档位即 Yes，到期未达到为 No"
+
+    def window_label(self) -> str:
+        return f"市场创建 {self.spec.label(self.start_ms)}起"
+
+    def card_extras(self, now_ms: int) -> dict:
+        today, last = et_date(now_ms), et_date(self.end_ms)
+        nxt = next((d for d in settlement_days(today, last) if self.settle_ms(d) > now_ms), None)
+        final = gc_active_contract(last)
+        latest = "、".join(f"{day[5:]} {value:,.1f}" for day, value in self.settlements[-3:])
+        session = (f"活跃月合约 {self.contract}（Yahoo），" + (f"下一次结算 {self.spec.label(self.settle_ms(nxt))}" if nxt else "本窗口的结算已全部结束")
+                   + f"；剩 {self.days_left(now_ms):.1f} 个结算日" + (f"；{final} 从 11-30（首次通知日）起成为活跃月" if final != self.contract else ""))
+        return {"range_word": self.range_word, "session": session, "extremes_tail": "；现价不是结算价，不计入",
+                "question": f"GC 活跃月合约在 {last:%m-%d} 前任一交易日的 CME 官方结算价是否 ≥ 档位：到期没达到为 No",
+                "extremes_note": f"Yahoo {self.spec.feed} 日 K 的收盘（≈ 当日官方结算价；只算已结束的交易日，当天的结算次日才读到）"
+                                 + (f"；最近结算 {latest}" if latest else ""),
+                "rule_note": "↑ 档：从市场创建（2026-03-02）到 12 月最后一个交易日，活跃月 GC 期货任一日的 CME 官方结算价 ≥ 档位即 Yes；"
+                             "盘中价、最高价不算。活跃月是 CME 交割月（2/4/6/8/10/12 月）中最近的非现货月，在首次通知日切换。"
+                             "模型：每日一次结算的离散触及（障碍上移 e^{0.5826σ√(1/252)}），时间按剩余结算日计"}
+
+    def missing_note(self, now_ms: int) -> str:
+        if self.price is None or self.sigma is None:
+            return f"等待 Yahoo 行情（{brief_error(self.error, 80)}）" if self.error else "等待 Yahoo 行情"
+        if self.price_stale(now_ms) and now_ms < self.window_end:
+            return f"Yahoo 行情停在 {stamp(self.fetched_ms, seconds=False)}，暂停概率（已达到的档位仍算已达到）"
+        if self.remaining_years(now_ms) <= 0 and now_ms < self.window_end:
+            return "最后一个结算日的结算价次日才读到，等待结算"
+        return ""
+
+
 def range_market(store: "Store", spec: RangeSpec, futures: Any, config: "Config") -> RangeMarket:
-    """The market object for a price-ladder spec: a Binance pair, or a US stock read from Yahoo."""
+    """The market object for a price-ladder spec: a Binance pair, a US stock read from Yahoo, a Pyth feed (the 宏观 ladders) or
+    CME gold's daily settlements."""
     if spec.venue == "nasdaq":
         return StockRangeMarket(store, spec, config.ladder_deadlines.get(spec.key, 0))
+    if spec.venue == "pyth":
+        pinned = config.pyth_feeds.get(spec.feed) or config.pyth_feeds.get(spec.key) or config.pyth_feeds.get(spec.symbol, "")
+        return PythRangeMarket(store, spec, pinned)
+    if spec.venue == "cme":
+        return SettleRangeMarket(store, spec)
     return RangeMarket(store, spec, futures)
 
 
@@ -6923,7 +7662,7 @@ def market_driver(kind: str, key: str, settle: dict | None = None, item: str = "
     if kind == "ladder":
         spec = next((s for s in CAP_MARKETS if s.key == key), None)
         return key, spec.name if spec else (item.rsplit(" ", 1)[0] if item else key)
-    specs = {"touch": TOUCH_MARKETS, "updown": UPDOWN_MARKETS, "range": (*RANGE_MARKETS, *STOCK_HIT_MARKETS)}.get(kind, ())
+    specs = {"touch": TOUCH_MARKETS, "updown": UPDOWN_MARKETS, "range": (*RANGE_MARKETS, *STOCK_HIT_MARKETS, *MACRO_MARKETS)}.get(kind, ())
     spec = next((s for s in specs if s.key == key), None)
     symbol = spec.symbol if spec else key
     return symbol, symbol.removesuffix("USDT")
@@ -7435,6 +8174,7 @@ h2 .hbell.floatbtn{font-size:11.5px;color:var(--best)}h2 .hbell.floatbtn.on,#flo
 h2 .hbell{margin-left:8px;border:0;background:none;font:inherit;font-size:14px;line-height:1;cursor:pointer;padding:2px 4px;border-radius:6px;color:var(--muted)}h2 .hbell:hover{background:var(--chip)}h2 .hbell.on{color:var(--best)}.hotrow{margin-top:4px;display:flex;align-items:center;gap:6px}
 .card.flash{animation:flash 1.4s ease-out}@keyframes flash{from{outline:3px solid var(--best);outline-offset:3px}to{outline:3px solid transparent;outline-offset:3px}}
 #g-levels{grid-template-columns:repeat(auto-fill,minmax(min(100%,440px),1fr))}
+.quote-lad .price-top b{font-size:15px;font-weight:650}.pg .pmid{color:var(--text);font-weight:650}
 .card.price-lad{gap:8px}.price-top{display:flex;flex-wrap:wrap;align-items:baseline;gap:5px 9px;font-variant-numeric:tabular-nums}.price-top b{font-size:26px;font-weight:750;letter-spacing:-.02em}.price-top .plabel{font-size:12px;color:var(--muted)}
 .price-range{display:flex;flex-wrap:wrap;gap:4px 14px;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}.price-range b{font-weight:600;color:var(--text)}
 .card.price-lad .lstat{min-height:0;gap:4px}.price-model summary{font-size:12px}.price-model dl{line-height:1.5}.price-model{padding-bottom:2px}
@@ -7511,6 +8251,7 @@ h2{margin:12px 2px 6px}.legend{margin-bottom:4px}.edge{min-height:40px}.pb{paddi
 <h2 id="h-crypto">加密</h2><div class="grid" id="g-crypto"></div>
 <h2 id="h-levels">价格阶梯</h2><div class="grid wide" id="g-levels"></div>
 <h2 id="h-ladder">市值阶梯</h2><div class="grid wide" id="g-ladder"></div>
+<h2 id="h-macro">宏观</h2><div class="grid wide" id="g-macro"></div>
 <h2 id="h-sim">模拟交易</h2><div class="grid wide" id="g-sim"></div>
 <footer id="foot">模型参考，非投资建议。</footer>
 <button type="button" id="totop" title="回到顶部" aria-label="回到顶部">↑</button>
@@ -7531,7 +8272,7 @@ if(!Array.isArray(favs))favs=[];
 favs=[...new Set(favs.filter(k=>typeof k==="string").map(k=>k.includes("|")?(k.split("|")[1]||k.split("|")[0]):k))];  // old "name|symbol" keys
 function toggleFav(k){favs=favs.includes(k)?favs.filter(x=>x!==k):[...favs,k];keep("favs",favs);if(last)render(last)}
 // the viewer's layout, also in this browser only: card order per section, hidden cards and sections, the red-frame bar
-const SECTIONS=["index","contract","crypto","levels","ladder","sim"],SEC_NAMES={fav:"⭐ 收藏",index:"指数",contract:"合约标的",crypto:"加密",levels:"价格阶梯",ladder:"市值阶梯",sim:"模拟交易"};
+const SECTIONS=["index","contract","crypto","levels","ladder","macro","sim"],SEC_NAMES={fav:"⭐ 收藏",index:"指数",contract:"合约标的",crypto:"加密",levels:"价格阶梯",ladder:"市值阶梯",macro:"宏观",sim:"模拟交易"};
 function keep(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
 function stored(k,d,ok){try{const v=JSON.parse(localStorage.getItem(k));return ok(v)?v:d}catch(e){return d}}
 const strs=v=>Array.isArray(v)&&v.every(x=>typeof x==="string");
@@ -7750,6 +8491,7 @@ let filt=stored("filt",[],strs),sortBy=stored("sort","",v=>["","edge","time"].in
 // the ladder sections' own card order (per browser): by market cap, LP points, best edge, closeness, σ or time left
 const SEC_SORTS={ladder:[["","默认顺序"],["cap","市值 高→低"],["capasc","市值 低→高"],["pp","PP/h 高→低"],["edge","最大净优势"],["near","离下一档 近→远"],["sigma","σ 低→高"],["time","剩余时间 短→长"]],
   levels:[["","默认顺序"],["pp","PP/h 高→低"],["edge","最大净优势"],["near","离下一档 近→远"],["sigma","σ 低→高"],["time","剩余时间 短→长"]]};
+SEC_SORTS.macro=SEC_SORTS.levels;  // 宏观: the same price-ladder sorts (its quote-only cards carry no number and go last)
 let secSort=stored("secsort",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Object.values(v).every(x=>typeof x==="string"));
 function secMetric(it,k){  // the number a section sort key reads off a card: its ladder block and its open levels
   const L=it.ladder||{},rows=(L.rows||[]).filter(r=>!r.touched);
@@ -7902,6 +8644,7 @@ function ladder(c,it){
   const L=it.ladder,det=$("details");det.open=open.has(it.name);det.addEventListener("toggle",()=>{det.open?open.add(it.name):open.delete(it.name)});
   const sm=$("summary");sm.title="点开看计算明细";
   if(L.kind==="price")return priceLadder(c,it,L,det,sm);
+  if(L.kind==="quote")return quoteLadder(c,it,L,det,sm);
   const highWord=(L.coverage||!L.bars)?"已观测最高":"窗口最高";  // "窗口最高" only once every finished hour since the opening has been read; without bars it is only ever what the bot saw
   sm.append($("span","rd",L.metric),$("span","v",L.cap),$("span","rd",highWord),$("span","v",L.high));
   if(L.sigma)sm.append($("span","rd","σ"),$("span","v",(L.sigma*100).toFixed(0)+"%"));
@@ -7928,6 +8671,39 @@ function ladder(c,it){
     shown.forEach(r=>{const x=$("span","tchip",r.label+(r.settled?" · 已结算":""));x.title=(r.settled?"Predict 已把这一档结算为已触及（机器人自己的记录不一定看到）；":"")+"窗口内"+L.metric+"已达到："+tip;t.append(x)});
     st.append(t)}
   c.append(st);return priceLadderBook(c,it,L,live)}  // the same table as the price ladders
+function quoteLadder(c,it,L,det,sm){
+  // a ladder the bot prices nothing on (no feed it can read: a private valuation, an IPO still to come): every level's Yes book
+  // as Predict quotes it and the probability that book implies; no model column, no suggestion, nothing red-framed
+  c.classList.add("price-lad","quote-lad");det.classList.add("price-model");
+  const top=$("div","price-top");top.append($("span","plabel","仅盘口"),$("b","",L.implied_total!=null?"Σ 中间价 "+(L.implied_total*100).toFixed(0)+"%":"无模型价"));c.append(top);
+  sm.textContent="规则与说明";det.append(sm);const dl=$("dl"),row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
+  row("问题",L.question||"—");row("截止",it.close_label||"—");row("模型",L.note||"没有可读的行情源，不出模型价");
+  row("隐含概率","Yes 买1 与卖1 的中间价（只有一边时取那一边）"+(L.bracket?"；各档互斥，中间价之和接近 100% 说明盘口自洽":"；各档是独立的 Yes/No 市场，不必相加为 100%"));
+  det.append(dl);c.append(det);
+  const st=$("div","lstat");if(it.missing)st.append($("p","","概率暂缺："+it.missing));else if(L.error)st.append($("div","warn small","⚠️ "+L.error));
+  if(L.question)st.append($("div","qline",L.question));if(L.note)st.append($("div","mut small",L.note));if(L.waiting)st.append($("div","mut small",L.waiting));c.append(st);
+  const w=$("div","pb"),h=$("div","quote"),key=favKey(it);h.append(it.predict?openLink(it.predict.url):$("span","pt","Predict"));
+  if(it.predict&&it.predict.error)h.append($("span","warn qe",it.predict.error));w.append(h);
+  const rows=L.rows||[];
+  if(rows.length){const g=$("div","pg qg");g.append($("span","lh","档位"),$("span","lh lr","Yes 买1"),$("span","lh lr","Yes 卖1"),$("span","lh lr","隐含概率"));
+    rows.forEach(r=>{const rk=key+"#"+r.label,toggle=ev=>{ev.preventDefault();openChip[rk]=openChip[rk]?null:"row";if(last)render(last)};
+      const target=$("button","pcell ptarget");target.type="button";target.title=r.title||r.label;target.setAttribute("aria-expanded",openChip[rk]?"true":"false");
+      const ltl=$("span","ltl");ltl.append($("span","lt",r.label));if(r.settled)ltl.append($("span","pdist","已结算"));const point=pointsPill(r);if(point)ltl.append(point);target.append(ltl);target.addEventListener("click",toggle);
+      const cell=v=>$("span","pcell pmodel",v==null?"—":cent(v)),mid=$("span","pcell pmodel pmid",r.mid==null?"—":(r.mid*100).toFixed(1)+"%");if(r.stale)mid.title="盘口过期";
+      g.append(target,cell(r.bid),cell(r.ask),mid);
+      if(openChip[rk]){const d=$("div","lrow");d.append(quoteNote(r));g.append(d)}});
+    w.append(g)}else if(!L.waiting)w.append($("div","price-empty","暂无档位"));
+  c.append(w);const ag=ages(it);if(ag)c.append(ag);return c}
+function quoteNote(r){  // one line about a quote-only level: the market's title, its book and depth, the points; no model, no edge
+  const d=$("div","lnote"),parts=[];
+  if(r.bid!=null||r.ask!=null)parts.push("Yes 盘口 "+(r.bid==null?"无":(r.bid*100).toFixed(1))+" / "+(r.ask==null?"无":(r.ask*100).toFixed(1))+(r.mid!=null?"，中间价 "+(r.mid*100).toFixed(1)+"%":""));
+  const depth=(side,name)=>{if(!side||!side.length)return;parts.push(name+" "+side.slice(0,3).map(([p,q])=>cent(p)+"×"+qty(q)).join("、"))};depth(r.bids,"买盘");depth(r.asks,"卖盘");
+  if(r.age!=null)parts.push("盘口 "+r.age+" 秒前");
+  d.append($("b","",r.title||r.label),$("span","",parts.length?"："+parts.join(" · "):""));
+  if(r.points_active!==undefined){const point=r.points_note||"积分状态暂缺";d.append($("div","",point+(r.points_active===true&&r.points_rate!=null?" · "+qty(r.points_rate)+" PP/小时":"")))}
+  if(r.error)d.append($("span","warn","⚠️ "+r.error));else if(r.stale)d.append($("span","warn","盘口过期"));
+  d.append($("div","mut","没有模型价：这张卡只看盘口，不给建议、不提醒"));
+  return d}
 function priceLadder(c,it,L,det,sm){
   // a price ladder: one Yes/No market per level, ↑ reached by a 1-minute High, ↓ by a 1-minute Low, inside the month
   c.classList.add("price-lad");det.classList.add("price-model");
@@ -7937,7 +8713,7 @@ function priceLadder(c,it,L,det,sm){
   det.append(sm);const dl=$("dl"),row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("窗口",L.window+" → "+it.close_label);row("价格",L.price+"（"+L.venue+" "+L.symbol+"）");
   row(rw+"最高 / 最低",L.high+(L.high_at?"（"+L.high_at+(L.range_word?"）":" 那一小时）"):"")+" / "+L.low+(L.low_at?"（"+L.low_at+(L.range_word?"）":" 那一小时）"):"")+
-    "："+(L.extremes_note||"币安小时 K 的最高/最低（与 1 分钟 K 一致）")+(L.through?"，已核至 "+L.through:"")+(L.range_word?"，加上今天的 1 分钟 K 和现价":"，加上正在走的这一小时和现价"));
+    "："+(L.extremes_note||"币安小时 K 的最高/最低（与 1 分钟 K 一致）")+(L.through?"，已核至 "+L.through:"")+(L.extremes_tail!=null?L.extremes_tail:L.range_word?"，加上今天的 1 分钟 K 和现价":"，加上正在走的这一小时和现价"));
   if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
   row("规则",L.rule_note||"↑ 档：本月任一 1 分钟 K 的最高价 ≥ 档位即 Yes；↓ 档：最低价 ≤ 档位即 Yes。方向按每个市场自己的规则或标题判断");
   row("模型","零漂移、固定波动率的单边触及概率：↑ Φ((−h−s²/2)/s) + (S/K)·Φ((−h+s²/2)/s)，h = ln(K/S)；↓ Φ((−a+s²/2)/s) + (S/K)·Φ((−a−s²/2)/s)，a = ln(S/K)；s = σ√T");
@@ -8185,7 +8961,7 @@ function render(d){
     const fold=!editing&&folded.includes(g);  // 自定义 shows every section open, so cards can be arranged
     grid.replaceChildren(...items.map(it=>card(it,g)));
     h.hidden=!items.length||(off&&!editing);grid.hidden=h.hidden||fold;grid.classList.toggle("off",off);
-    grid.classList.toggle("wide",["levels","ladder","sim"].includes(g)&&!oneRow.includes(g));  // 自定义 "整行显示": one wide card per row, as in the starred section
+    grid.classList.toggle("wide",["levels","ladder","macro","sim"].includes(g)&&!oneRow.includes(g));  // 自定义 "整行显示": one wide card per row, as in the starred section
     const name=$("span","hn",SEC_NAMES[g]+(off?"（已隐藏）":""));let head=name,sum=null;
     if(!editing){head=$("button","fold");head.type="button";head.setAttribute("aria-expanded",fold?"false":"true");
       head.title=fold?"展开这一栏":"折叠这一栏（标题留着，写明张数和红框机会数）";head.append(name);head.addEventListener("click",()=>toggleFold(g))}
@@ -8222,7 +8998,7 @@ function drawPanel(){
       i.addEventListener("change",()=>{hidden=i.checked?hidden.filter(x=>x!==k):[...hidden,k];keep("hidden",hidden);drawPanel();if(last)render(last)});
       l.append(i,it.name);grp.append(l)});cl.append(grp)}
   const orw=document.getElementById("onerow");orw.replaceChildren($("span","mut","整行显示（每行一张卡）："));
-  ["levels","ladder"].forEach(g=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=oneRow.includes(g);i.dataset.row=g;
+  ["levels","ladder","macro"].forEach(g=>{const l=$("label","tog"),i=$("input");i.type="checkbox";i.checked=oneRow.includes(g);i.dataset.row=g;
     i.addEventListener("change",()=>{oneRow=i.checked?[...oneRow,g]:oneRow.filter(x=>x!==g);keep("oneRow",oneRow);if(last)render(last)});
     l.append(i,SEC_NAMES[g]);l.title="这一栏每行只放一张卡，表格和收藏栏里一样宽";orw.append(l)});
   const os=document.getElementById("oppsrc");os.replaceChildren($("span","mut","🔥 机会条列出："));
@@ -8410,9 +9186,9 @@ function miniRender(box,items,o){  // the starred cards, compact, in the viewer'
     if(it.auction)h.append(mk("span","mtag auc","收盘竞价"));else if(it.preopen)h.append(mk("span","mtag auc","竞价·"+(it.preopen_phase||"进行中")));else if(it.trading)h.append(mk("span","mtag",it.trading));
     if(hot)h.append(mk("span","mhot","🔥"));
     if(it.close_ms){const cd=mk("span","cd");cd.dataset.close=it.close_ms;h.append(cd)}b.append(h);
-    if(it.kind==="ladder"){const L=it.ladder||{},rows=(L.rows||[]).filter(r=>!r.touched&&typeof r.fair==="number"),done=(L.rows||[]).filter(r=>r.touched).length;
-      const m=mk("div","mline");m.append(mk("span","mmut",(L.metric||"")+" "),mk("b","",L.kind==="price"?(L.price||"—"):(L.cap||"—")));if(done)m.append(mk("span","mmut"," · 已触及 "+done+" 档"));b.append(m);
-      const r=mk("div","mrows");rows.forEach(x=>{const sp=mk("span","mrow");sp.append(mk("span","mmut",x.label+" "),mk("b","",pc(x.fair)));r.append(sp)});
+    if(it.kind==="ladder"){const L=it.ladder||{},quote=L.kind==="quote",val=x=>quote?x.mid:x.fair,rows=(L.rows||[]).filter(r=>!r.touched&&typeof val(r)==="number"),done=(L.rows||[]).filter(r=>r.touched).length;
+      const m=mk("div","mline");m.append(mk("span","mmut",(quote?"仅盘口":L.metric||"")+" "),mk("b","",L.kind==="price"?(L.price||"—"):quote?(L.implied_total!=null?"Σ "+pc(L.implied_total):"隐含概率"):(L.cap||"—")));if(done)m.append(mk("span","mmut"," · 已触及 "+done+" 档"));b.append(m);
+      const r=mk("div","mrows");rows.forEach(x=>{const sp=mk("span","mrow");sp.append(mk("span","mmut",x.label+" "),mk("b","",pc(val(x))));r.append(sp)});
       if(!rows.length)r.append(mk("span","mmut",L.waiting||L.error||"暂无待触及的档位"));b.append(r)}
     else if(typeof it.fair_up==="number"){const lb=it.labels||["涨","跌"],od=mk("div","modds"),a=mk("b"),c=mk("b");a.style.color=up;c.style.color=down;
       a.append(mk("i","",lb[0]+" "),pc(it.fair_up));c.append(pc(it.fair_down),mk("i",""," "+lb[1]));
@@ -9449,16 +10225,20 @@ class Bot:
         self.updowns = {spec.key: UpDownMarket(store, spec) for spec in UPDOWN_MARKETS}
         self.flips = {spec.key: FlipMarket(store, spec) for spec in FLIP_MARKETS}
         self.caps = {spec.key: CapMarket(store, spec) for spec in CAP_MARKETS}
-        self.ranges = {spec.key: range_market(store, spec, self.binance_futures, config) for spec in (*RANGE_MARKETS, *STOCK_HIT_MARKETS)}
+        macro = MACRO_MARKETS if config.macro else ()  # the 宏观 section's price ladders ride with the others (MACRO=off leaves them out)
+        self.ranges = {spec.key: range_market(store, spec, self.binance_futures, config) for spec in (*RANGE_MARKETS, *STOCK_HIT_MARKETS, *macro)}
+        self.quotes: dict[str, QuoteSpec] = {spec.key: spec for spec in (QUOTE_MARKETS if config.macro else ())}  # 宏观: the book-only ladders
         self.predict.ladder_parse.update({key: price_level for key in self.ranges})
         for key, rm in self.ranges.items():
             if isinstance(rm, StockRangeMarket):  # "hits $100 by <date>": the date-titled markets, one per deadline
                 self.predict.ladder_parse[key], self.predict.ladder_pick[key] = hit_level_parser(rm.spec.slug), rm.choose
+        self.predict.ladder_parse.update({key: bracket_level if spec.kind == "bracket" else valuation_level for key, spec in self.quotes.items()})
         self.predict.reward_keys.update(self.ranges)
         if config.touch:
             self.predict.want_info.update(spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *FLIP_MARKETS))
             self.predict.ladder_keys.update(self.caps)
             self.predict.ladder_keys.update(self.ranges)
+            self.predict.ladder_keys.update(self.quotes)
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
         self.sim_ran = -1e9  # monotonic time of the paper trader's last look
@@ -10861,7 +11641,8 @@ class Bot:
                          for t in self.touches.values())
             items.extend(self.safe_card(u.spec.name, u.spec.key, "crypto", self.updown_payload, u, now_ms) for u in self.updowns.values())
             items.extend(self.safe_card(f.spec.name, f.spec.key, "crypto", self.flip_payload, f, now_ms) for f in self.flips.values())
-            items.extend(self.safe_card(r.spec.name, r.spec.key, "crypto", self.range_payload, r, now_ms) for r in self.ranges.values())
+            items.extend(self.safe_card(r.spec.name, r.spec.key, r.spec.group, self.range_payload, r, now_ms) for r in self.ranges.values())
+            items.extend(self.safe_card(q.name, q.key, q.group, self.quote_payload, q, now_ms) for q in self.quotes.values())
             items.extend(self.safe_card(c.spec.name, c.spec.key, "crypto", self.cap_payload, c, now_ms) for c in self.caps.values())
         if self.config.sim and self.config.predict:
             items.append(self.safe_card("模拟交易", "SIM", "sim", lambda: {"name": "模拟交易", "symbol": "SIM", "group": "sim",
@@ -12090,6 +12871,8 @@ class Bot:
         """(direction, where it was read) for one level: the market's own rules, else its title or question; failing
         both it is guessed ("推断": shown, never suggested) from the side of the window's first price the level sits on
         (a ↓ level above it would have been reached at once), or, before any price, the category's default ("默认")."""
+        if rm.spec.one_way:  # a settlement ladder: the category's rules fix every level's direction
+            return rm.spec.one_way, "规则"
         meta = (self.predict.market_meta.get(row.market_id) or ({}, 0))[0] if row.market_id else {}
         direction, source = level_direction(meta.get("rules", ""), row.title, row.question or meta.get("question", ""))
         if direction:
@@ -12176,7 +12959,7 @@ class Bot:
                 out.update(bid=float(book.bid[0]) if book.bid else None, ask=float(book.ask[0]) if book.ask else None)
                 if fair == 1.0 and book_disputes(book):
                     # our candles say reached, the market does not: no "sure thing" edge until someone looks
-                    out["error"] = "数据显示已触及，但盘口仍低于 90¢；以币安 1 分钟 K 为准，请核实"
+                    out["error"] = f"数据显示已触及，但盘口仍低于 90¢；以{rm.settle_name()}为准，请核实"
                 priced = fair is not None and not out["error"]
                 swing = rm.model_swing(row.target, direction, now_ms, fair) if priced else 0.0
                 hold = problem or ("Predict 已结算" if self.range_settled(row) else "") or self.range_guess(source)
@@ -12191,7 +12974,7 @@ class Bot:
         high, low = marks["high"], marks["low"]
         price_text = lambda v: f"${v:,.2f}" if v is not None and v < 1000 else f"${v:,.0f}" if v is not None else "—"
         item: dict[str, Any] = {
-            "name": spec.name, "symbol": spec.key, "group": "levels", "kind": "ladder", "close_ms": rm.end_ms,
+            "name": spec.name, "symbol": spec.key, "group": spec.group, "kind": "ladder", "close_ms": rm.end_ms,
             "quote_ms": rm.priced_ms if rm.price is not None else 0,
             "source": rm.source_name(),
             "close_label": rm.close_label(),
@@ -12212,6 +12995,40 @@ class Bot:
             item["missing"] = missing
         if not rows and self.config.predict:
             item["ladder"]["waiting"] = "等待 Predict 档位"  # the Predict line of the card says why (not listed yet, an error)
+        return item
+
+    def quote_payload(self, spec: QuoteSpec, now_ms: int) -> dict:
+        """Web card for a ladder the bot prices nothing on (a private valuation, an IPO bracket): every level's Yes book as
+        Predict quotes it and the probability the book implies (its mid), with the depth and the points, never a fair price
+        or an edge (nothing on it is suggested, alerted or paper-traded)."""
+        rows = []
+        for row in self.predict.ladders.get(spec.key) or []:
+            book, why = self.predict.yes_book(row) if row.market_id else (None, "")
+            if book is None and self.predict.book_absent(row):
+                why = ""  # no book at all (HTTP 404, a settled level) is an answer, not a failure: the level shows unquoted
+            label = bracket_label(row.title) if spec.kind == "bracket" else "≥ " + usd_short(row.target)
+            out: dict[str, Any] = {"label": label, "title": row.title, "level": float(row.target), "fair": None, "error": why,
+                                   "settled": self.range_settled(row), "touched": False, "mid": None}
+            if book is not None:
+                bid = float(book.bid[0]) if book.bid else None
+                ask = float(book.ask[0]) if book.ask else None
+                out.update(bid=bid, ask=ask, mid=(bid + ask) / 2 if bid is not None and ask is not None else bid if ask is None else ask)
+                self.book_block(out, book, None, 0.0, 0.0, "", ("Yes", "No"), now_ms)  # the depth and the points pill; no edges
+            rows.append(out)
+        rows.sort(key=lambda r: -r["level"])
+        mids = [r["mid"] for r in rows if r["mid"] is not None and not r["settled"]]
+        item: dict[str, Any] = {
+            "name": spec.name, "symbol": spec.key, "group": spec.group, "kind": "ladder", "close_ms": spec.end_ms, "quote_ms": 0,
+            "source": "Predict 盘口", "close_label": spec.close_label,
+            "ladder": {"kind": "quote", "metric": "估值", "bracket": spec.kind == "bracket", "rows": rows, "question": spec.question,
+                       "note": spec.note, "error": self.predict.errors.get(spec.key, ""),
+                       "implied_total": sum(mids) if spec.kind == "bracket" and mids else None,
+                       "years": max(0.0, (spec.end_ms - now_ms) / YEAR_MS)},
+        }
+        if self.config.predict:
+            item["predict"] = {"url": predict_url(spec.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
+        if not rows and self.config.predict:
+            item["ladder"]["waiting"] = "等待 Predict 档位"
         return item
 
     def item_market(self, title: str) -> str | None:
@@ -12759,6 +13576,8 @@ class Bot:
         if self.config.touch:
             targets.update({spec.key: spec.slug for spec in (*TOUCH_MARKETS, *UPDOWN_MARKETS, *FLIP_MARKETS, *CAP_MARKETS,
                                                               *RANGE_MARKETS, *STOCK_HIT_MARKETS)})
+            targets.update({key: rm.spec.slug for key, rm in self.ranges.items()})  # the 宏观 ladders too (none with MACRO=off)
+            targets.update({key: spec.slug for key, spec in self.quotes.items()})
         return targets
 
     def edge_costs(self) -> EdgeCosts:
@@ -12766,17 +13585,21 @@ class Bot:
 
     # --- /edge: the announcement bar per section, market or level -------------------------------------------------------
 
-    EDGE_GROUPS = {"index": "指数", "contract": "合约标的", "crypto": "加密", "levels": "价格阶梯", "ladder": "市值阶梯"}
+    EDGE_GROUPS = {"index": "指数", "contract": "合约标的", "crypto": "加密", "levels": "价格阶梯", "ladder": "市值阶梯", "macro": "宏观"}
     EDGE_GROUP_WORDS = {"指数": "index", "index": "index", "合约": "contract", "合约标的": "contract", "个股": "contract",
                         "contract": "contract", "加密": "crypto", "crypto": "crypto", "价格阶梯": "levels", "levels": "levels",
-                        "range": "levels", "市值阶梯": "ladder", "ladder": "ladder", "cap": "ladder"}
+                        "range": "levels", "市值阶梯": "ladder", "ladder": "ladder", "cap": "ladder",
+                        "宏观": "macro", "macro": "macro", "商品": "macro", "宏观资产": "macro"}
     EDGE_ALIASES = {"恒指": "HSI", "恒生": "HSI", "恒生指数": "HSI", "上证": "SSE", "沪指": "SSE", "上证指数": "SSE", "韩国": "KOSPI"}
 
     def edge_group(self, mk: SimMarket) -> str:
         """The web page's section (the big heading) a market's card sits in."""
         if mk.kind == "close":
             return "index" if mk.key in PREDICT_KEYS.values() else "contract"
-        return {"range": "levels", "ladder": "ladder"}.get(mk.kind, "crypto")
+        if mk.kind == "range":  # a price ladder: 价格阶梯, or 宏观 for the Pyth and CME ones
+            rm = self.ranges.get(mk.key)
+            return rm.spec.group if rm else "levels"
+        return "ladder" if mk.kind == "ladder" else "crypto"
 
     @staticmethod
     def edge_level(mk: SimMarket) -> str:
@@ -12811,6 +13634,7 @@ class Bot:
         out += [(symbol, NAMES.get(symbol, symbol)) for symbol in self.config.symbols]
         for table in (self.touches, self.updowns, self.flips, self.caps, self.ranges):
             out += [(key, getattr(mkt.spec, "name", key)) for key, mkt in table.items()]
+        out += [(key, spec.name) for key, spec in self.quotes.items()]  # book-only: a bar set on one changes nothing, 自选 works
         return out
 
     def edge_target(self, words: list[str]) -> tuple[str, str]:
@@ -12856,7 +13680,7 @@ class Bot:
             lines += [f"· {names.get(k, k)}：≥{bars[k]:g}¢" for k in extra]
         else:
             lines.append("没有单独设置的栏目、市场或档位。")
-        lines.append("用法：/edge 6 改默认；/edge 市值阶梯 6（栏目：指数 / 合约标的 / 加密 / 价格阶梯 / 市值阶梯）；"
+        lines.append("用法：/edge 6 改默认；/edge 市值阶梯 6（栏目：指数 / 合约标的 / 加密 / 价格阶梯 / 市值阶梯 / 宏观）；"
                      "/edge 牛来 4（市场：名字、别名或代码）；/edge 牛来 300M 3（档位）；末尾写 off 取消；/edge 清空 全部取消。"
                      "网页红框的门槛另在网页 ✎ 自定义里设置。")
         return "\n".join(lines)
@@ -13443,6 +14267,42 @@ class Bot:
                 url = YAHOO_CHART[0] + urllib.parse.quote(rm.spec.symbol) + "?" + urllib.parse.urlencode(
                     {"interval": "1m", "range": "1d", "includePrePost": "false"})
                 probes.append((f"美股触及·{rm.spec.symbol}", "Yahoo 1 分钟 K", get(url, {}), check_chart))
+            for rm in self.ranges.values():  # the 宏观 ladders: Pyth's feeds, Yahoo's gold contract
+                if isinstance(rm, PythRangeMarket):
+                    if not rm.known():
+                        def check_lookup(raw: bytes, rm=rm) -> str:
+                            found = pyth_feed_match(json.loads(raw), rm.spec.feed, rm.pinned_id)
+                            if not found:
+                                raise ValueError(f"Hermes 没有列出 {rm.spec.feed}")
+                            return f"{found[1]}（id {found[0][:10]}…）"
+                        probes.append((f"宏观·{rm.spec.symbol}", "Pyth Hermes 行情源查找", get(rm.lookup_url(), {}), check_lookup))
+                        continue
+
+                    def check_pyth(raw: bytes, rm=rm) -> str:
+                        got = parse_pyth_latest(json.loads(raw)).get(rm.feed_id)
+                        if got is None:
+                            raise ValueError("没有这个 feed 的价格")
+                        state, opens = macro_session_state(rm.calendar, now_ms)
+                        return (f"{rm.feed_symbol} {got[0]:,.6g}（发布 {when(got[1])}；{state}" + (f"，{rm.spec.label(opens)}开盘" if opens else "") + "）")
+                    probes.append((f"宏观·{rm.spec.symbol}", "Pyth Hermes 最新价", get(rm.latest_url(), {}), check_pyth))
+
+                    def check_candles(raw: bytes) -> str:
+                        bars = parse_pyth_history(json.loads(raw))
+                        if not bars:
+                            raise ValueError("最近 10 天没有日 K")
+                        return f"最近日 K {stamp(bars[-1][0], seconds=False)} 收 {bars[-1][4]:,.6g}（共 {len(bars)} 根）"
+                    probes.append((f"宏观·{rm.spec.symbol}", "Pyth Benchmarks 日 K", get(rm.candles_url("D", now_ms - 10 * DAY_MS, now_ms), {}), check_candles))
+                elif isinstance(rm, SettleRangeMarket):
+                    contract = gc_active_contract(et_date(now_ms))
+
+                    def check_gc(raw: bytes, contract=contract) -> str:
+                        meta, _ = parse_yahoo_chart(raw)
+                        if meta["price"] is None:
+                            raise ValueError("没有 regularMarketPrice")
+                        return f"{contract} {meta['price']:,.2f}（成交 {when(meta['time_ms'])}）"
+                    url = YAHOO_CHART[0] + urllib.parse.quote(contract) + "?" + urllib.parse.urlencode({"interval": "1m", "range": "1d"})
+                    probes.append((f"宏观·{rm.spec.symbol}", f"Yahoo {contract} 1 分钟 K", get(url, {}), check_gc))
+
 
         if self.config.sse_index:
             for name, url, extra in CnIndex.SSE_SOURCES:

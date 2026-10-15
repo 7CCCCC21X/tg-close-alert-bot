@@ -102,7 +102,7 @@ async def layout_check(browser, page):
     await page.evaluate("localStorage.removeItem('favs')"); await page.reload(); await page.wait_for_selector(".card .odds")
     assert not await page.is_visible("#custom") and await page.locator(".ctl").count() == 0
     await page.click("#edit")
-    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == 23
+    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == 30  # every card, the seven 宏观 ones included
     lad = "#g-ladder .card"
     assert await page.is_disabled(f"{lad}:nth-child(1) .ctl button[title='前移']") and await page.is_disabled(f"{lad}:nth-child(8) .ctl button[title='后移']")
     await page.click(f"{lad}:nth-child(1) .ctl button[title='后移']")
@@ -117,7 +117,7 @@ async def layout_check(browser, page):
     assert await page.locator(".card.off").count() == 2 and "已隐藏 2 张卡片" in await page.inner_text("#hidn")
     # the panel's own checklist shows the same state and hides / shows a card too
     assert await page.eval_on_selector_all("#cards input:not(:checked)", "els => els.map(e => e.dataset.card)") == ["上证指数", "UNITREEUSDT"]
-    assert await page.eval_on_selector_all("#cards .cgrp > .mut", "els => els.map(e => e.textContent)") == ["指数：", "合约标的：", "加密：", "价格阶梯：", "市值阶梯：", "模拟交易："]
+    assert await page.eval_on_selector_all("#cards .cgrp > .mut", "els => els.map(e => e.textContent)") == ["指数：", "合约标的：", "加密：", "价格阶梯：", "市值阶梯：", "宏观：", "模拟交易："]
     await page.uncheck("#cards input[data-card=BNBUSDT]")
     assert await page.locator(".card.off").count() == 3 and await stored("hidden") == '["上证指数","UNITREEUSDT","BNBUSDT"]'
     assert await page.inner_text("#g-crypto .card:nth-child(1) .ctl button:nth-last-child(1)") == "显示"
@@ -159,19 +159,19 @@ async def layout_check(browser, page):
     assert await page.inner_text("#h-ladder .hn") == "市值阶梯" and await stored("hideSec") == '["sim"]'
     # ↑ ↓ beside a section title move the whole section (the tick boxes follow); sections without cards are skipped
     heads = lambda: page.eval_on_selector_all(".wrap > h2:not([hidden])", "els => els.map(e => e.id.slice(2))")
-    assert await heads() == ["index", "contract", "crypto", "levels", "ladder", "sim"]
+    assert await heads() == ["index", "contract", "crypto", "levels", "ladder", "macro", "sim"]
     assert await page.is_disabled("#h-index button[title='栏目上移']") and await page.is_disabled("#h-sim button[title='栏目下移']")
     await page.click("#h-crypto button[title='栏目上移']"); await page.click("#h-crypto button[title='栏目上移']")
-    assert await heads() == ["crypto", "index", "contract", "levels", "ladder", "sim"]
-    assert await stored("secs") == '["crypto","index","contract","levels","ladder","sim"]'
-    assert await page.eval_on_selector_all("#secs input", "els => els.map(e => e.dataset.sec)") == ["crypto", "index", "contract", "levels", "ladder", "sim"]
+    assert await heads() == ["crypto", "index", "contract", "levels", "ladder", "macro", "sim"]
+    assert await stored("secs") == '["crypto","index","contract","levels","ladder","macro","sim"]'
+    assert await page.eval_on_selector_all("#secs input", "els => els.map(e => e.dataset.sec)") == ["crypto", "index", "contract", "levels", "ladder", "macro", "sim"]
     await page.click("#g-contract .card .star")  # 合约标的 is now empty: ↓ on 指数 goes straight past it
     await page.click("#h-index button[title='栏目下移']")
-    assert await heads() == ["fav", "crypto", "levels", "index", "ladder", "sim"], await heads()
-    assert await stored("secs") == '["crypto","contract","levels","index","ladder","sim"]', await stored("secs")
+    assert await heads() == ["fav", "crypto", "levels", "index", "ladder", "macro", "sim"], await heads()
+    assert await stored("secs") == '["crypto","contract","levels","index","ladder","macro","sim"]', await stored("secs")
     await page.click("#g-fav .card .star")
     await page.reload(); await page.wait_for_selector("#g-crypto .card"); await page.click("#edit")
-    assert await heads() == ["crypto", "contract", "levels", "index", "ladder", "sim"]
+    assert await heads() == ["crypto", "contract", "levels", "index", "ladder", "macro", "sim"]
     # a section title dragged by its ⠿ past the section below moves the whole section (kept, like the ↑ ↓ moves)
     await page.set_viewport_size({"width": 1300, "height": 2200})
     await page.evaluate("document.getElementById('h-contract').scrollIntoView({block: 'center'})")  # clear of the sticky filter bar
@@ -179,10 +179,10 @@ async def layout_check(browser, page):
     _, _, lv = await box("#g-levels")
     await page.mouse.move(x, y); await page.mouse.down()
     await page.mouse.move(x, lv["y"] + lv["height"] - 4, steps=12)
-    assert await heads() == ["crypto", "levels", "contract", "index", "ladder", "sim"], await heads()
+    assert await heads() == ["crypto", "levels", "contract", "index", "ladder", "macro", "sim"], await heads()
     await page.mouse.up()
-    assert await page.evaluate("drag === null") and await stored("secs") == '["crypto","levels","contract","index","ladder","sim"]'
-    assert await page.eval_on_selector_all("#secs input", "els => els.map(e => e.dataset.sec)") == ["crypto", "levels", "contract", "index", "ladder", "sim"]
+    assert await page.evaluate("drag === null") and await stored("secs") == '["crypto","levels","contract","index","ladder","macro","sim"]'
+    assert await page.eval_on_selector_all("#secs input", "els => els.map(e => e.dataset.sec)") == ["crypto", "levels", "contract", "index", "ladder", "macro", "sim"]
     await page.set_viewport_size({"width": 390, "height": 900})
     # 恢复默认布局 takes a second click within 4 s and leaves the stars alone (folded sections open again too)
     await page.evaluate("keep('folded', ['index']); keep('oneRow', ['ladder'])")
@@ -193,7 +193,7 @@ async def layout_check(browser, page):
     await page.click("#reset")
     assert await page.inner_text("#reset") == "再点一次确认" and await stored("order") is not None
     await page.click("#reset")
-    assert await page.inner_text("#reset") == "恢复默认布局" and await heads() == ["fav", "index", "contract", "crypto", "levels", "ladder", "sim"]
+    assert await page.inner_text("#reset") == "恢复默认布局" and await heads() == ["fav", "index", "contract", "crypto", "levels", "ladder", "macro", "sim"]
     assert await stored("oneRow") is None and await page.evaluate("document.getElementById('g-ladder').classList.contains('wide')")
     assert await names("ladder") == ["$牛来 市值", "$ANSEM FDV", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV"] and await names("crypto") == [*crypto[:3], *crypto[4:]]
     assert await stored("order") is None and await stored("secs") is None and await stored("favs") == '["BTCUSDT"]'
@@ -501,7 +501,8 @@ async def run():
     payload = bot.odds_payload()
     names = [i["name"] for i in payload["items"]]
     assert names == ["上证指数", "宇树 UNITREE", "BNB 先触 700/900", "SOL 先触 60/140", "BTC 先触 70k/90k", "ETH 先触 1k/3k", "BTC 10月涨跌", "ETH 10月涨跌",
-                     "HYPE 反超 SOL", "BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格", "STRC 触及 $100", "$牛来 市值", "$ANSEM FDV", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV", "模拟交易"], names
+                     "HYPE 反超 SOL", "BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格", "STRC 触及 $100", "WTI 原油 10月价格", "黄金 XAUUSD 10月价格", "白银 XAGUSD 10月价格", "标普500 SPY 10月价格",
+                     "黄金期货 GC 12月底前结算价", "Anthropic 估值（12-31 前）", "OpenAI IPO 估值", "$牛来 市值", "$ANSEM FDV", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV", "模拟交易"], names
     bnb = payload["items"][2]
     assert bnb["group"] == "crypto" and bnb["labels"] == ["$900", "$700"] and bnb["missing"].startswith("等待币安行情"), bnb
     assert payload["items"][0]["group"] == "index" and payload["items"][1]["symbol"] == "UNITREEUSDT" and payload["items"][1]["group"] == "contract"
