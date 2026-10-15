@@ -43,6 +43,8 @@ from typing import Any
 
 D = decimal.Decimal
 UTC = dt.timezone.utc
+PYTH_HERMES_DEFAULT = "https://hermes.pyth.network/v2"
+PYTH_HISTORY_DEFAULT = "https://benchmarks.pyth.network/v1/shims/tradingview/history"
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
 VERSION = "1.37.0"
@@ -406,6 +408,33 @@ def parse_pyth_feeds(spec: str) -> dict[str, str]:
     return out
 
 
+def parse_https(value: str, name: str) -> str:
+    """An https URL from the environment (no trailing slash), "" when unset."""
+    url = (value or "").strip().rstrip("/")
+    if url and not re.fullmatch(r"https://[A-Za-z0-9.-]+(?::\d+)?(?:/[^\s?#]*)?", url):
+        raise ValueError(f"{name} 应为 https 地址，不带查询参数")
+    return url
+
+
+def parse_fallbacks(spec: str) -> dict[str, str] | None:
+    """MACRO_FALLBACK="XAU-HIT-10:XAUUSD=X;SPY-HIT-10:SPY": a 宏观 market's key -> the Yahoo symbol that stands in while Pyth
+    cannot be read; "off" = no stand-in for any of them; empty = each spec's own."""
+    text = (spec or "").strip()
+    if not text:
+        return None
+    if text.lower() in {"off", "0", "false", "no", "none"}:
+        return {}
+    out: dict[str, str] = {}
+    for part in re.split(r"[;,]", text):
+        if not part.strip():
+            continue
+        key, sep, symbol = part.partition(":")
+        if not sep or not key.strip() or not re.fullmatch(r"[A-Za-z0-9^=.\-]{1,20}", symbol.strip()):
+            raise ValueError("MACRO_FALLBACK 格式：市场键:Yahoo代码，多个用分号分隔（如 XAU-HIT-10:GC=F），off 关闭")
+        out[key.strip().upper()] = symbol.strip()
+    return out
+
+
 def parse_hl_tickers(spec: str, symbols: tuple[str, ...]) -> dict[str, tuple[str, str]]:
     """HL_TICKERS="SYMBOL=dex:COIN,..." (dex omitted = the main Hyperliquid perp dex); "off" disables."""
     tickers: dict[str, tuple[str, str]] = {}
@@ -484,6 +513,8 @@ class Config:
     ladder_deadlines: dict[str, int] = field(default_factory=dict)  # STOCK_HIT_MARKETS key -> deadline (23:59 ET, ms) pinned by hand
     macro: bool = True       # the 宏观 section: WTI / gold / silver / SPY October ladders (Pyth), GC's December settlements, the valuation ladders
     pyth_feeds: dict[str, str] = field(default_factory=dict)  # PYTH_FEEDS: a MACRO_MARKETS feed ("Metal.XAU/USD", "CLL") or key -> Hermes feed id
+    pyth_urls: tuple[str, str] = (PYTH_HERMES_DEFAULT, PYTH_HISTORY_DEFAULT)  # PYTH_HERMES_URL / PYTH_HISTORY_URL: another Hermes, another candle feed
+    macro_fallback: dict[str, str] | None = None  # MACRO_FALLBACK: market key -> Yahoo stand-in symbol; {} = none at all; None = the specs' own
     kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
@@ -583,6 +614,9 @@ class Config:
             ladder_deadlines=parse_deadlines(e.get("LADDER_DEADLINES", "")),
             macro=e.get("MACRO", "on").strip().lower() not in {"off", "0", "false", "no"},
             pyth_feeds=parse_pyth_feeds(e.get("PYTH_FEEDS", "")),
+            pyth_urls=(parse_https(e.get("PYTH_HERMES_URL", ""), "PYTH_HERMES_URL") or PYTH_HERMES_DEFAULT,
+                       parse_https(e.get("PYTH_HISTORY_URL", ""), "PYTH_HISTORY_URL") or PYTH_HISTORY_DEFAULT),
+            macro_fallback=parse_fallbacks(e.get("MACRO_FALLBACK", "")),
             auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
             preopen_alert=e.get("PREOPEN_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
             preopen_lead=bounded_int(e, "PREOPEN_ALERT_LEAD_MINUTES", 5, 0, 60),
@@ -3864,6 +3898,7 @@ PREDICT_REWARD_STALE_SECONDS = 120  # allows the normal refresh to finish across
 PREDICT_POINTS_STALE_SECONDS = 3 * PREDICT_META_SECONDS  # other markets' points (read with the fee) are shown this long
 PREDICT_STRIKE_SECONDS = 300   # a known target price is re-read this often (the site may correct it)
 PREDICT_MISS_SECONDS = 60      # an unknown slug is looked up again after this long (new markets show up within a minute)
+PREDICT_SLOW_SECONDS = 60      # the 宏观 and valuation ladders (a hundred books between them) are re-read this often, not every round
 PREDICT_DEPTH = 20            # levels kept per side: a fill for the trade size is judged on these (a book "too thin" at
 #                               5 levels was often only cut off there), the page and the evidence show the top of them
 PREDICT_SHOW_DEPTH = 10       # levels sent to the page per side (it recomputes the edges for the viewer's trade size)
@@ -4315,6 +4350,8 @@ class PredictFeed:
         self.meta_errors: dict[str, str] = {}                  # latest detail refresh failure (old rewards are not trusted)
         self.reward_keys: set[str] = set()                      # price ladders: refresh reward metadata more often
         self.ladder_keys: set[str] = set()                       # item keys whose category holds several Yes/No markets
+        self.slow_keys: set[str] = set()                         # ladders re-read every PREDICT_SLOW_SECONDS rather than every poll
+        self.slow_last: dict[str, float] = {}                    # slow key -> monotonic time it was last read
         self.ladder_parse: dict[str, Any] = {}                   # item key -> its markets' level parser (default cap_target)
         self.ladder_pick: dict[str, Any] = {}                    # item key -> which of the category's markets its ladder keeps
         self.ladders: dict[str, list[LadderRow]] = {}            # item key -> one row per market, by threshold
@@ -4610,7 +4647,10 @@ class PredictFeed:
         for table in (self.markets, self.market_lists, self.strikes, self.types, self.info):
             for slug in [s for s in table if s not in keep]:
                 table.pop(slug, None)
-        await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in targets.items()))
+        mono = time.monotonic()
+        due = {k: s for k, s in targets.items() if k not in self.slow_keys or mono - self.slow_last.get(k, -1e9) >= PREDICT_SLOW_SECONDS}
+        self.slow_last.update({k: mono for k in due if k in self.slow_keys})
+        await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in due.items()))
         # a market not listed yet is an answer, not a failure
         failed = [f"{key}：{error}" for key, error in self.errors.items() if key in targets and "还没有这个市场" not in error]
         return refreshed(failed, len(targets) - len(failed))
@@ -6077,6 +6117,7 @@ class RangeSpec:
     calendar: str = ""       # the sessions that count: "metal" (CME metals, 18:00 → 17:00 ET), "ice" (ICE WTI, 20:00 → 18:00 ET),
     #                          "us" (the regular stock session) or "settle" (CME settlement days)
     one_way: str = ""        # "up" when the category's rules fix every level's direction (a settlement "at or above" ladder)
+    fallback: str = ""       # pyth: the Yahoo symbol that stands in while Pyth cannot be read (GC=F for XAU/USD: shown, never advised on)
 
     def label(self, ms: int) -> str:
         et = dt.datetime.fromtimestamp(ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(ms))))
@@ -6111,16 +6152,18 @@ MACRO_MARKETS = (
     # (Monday's from 18:00 ET Sunday) to 18:00 ET, so the window opens 09-30 20:00 ET and closes 10-30 18:00 ET (end_ms is
     # the open of its last minute, as for every ladder)
     RangeSpec("WTI-HIT-10", "what-price-will-wti-hit-in-october-2026", "WTI", "pyth", "WTI 原油 10月价格",
-              et_ms(2026, 9, 30, 20, 0, -4), et_ms(2026, 10, 30, 17, 59, -4), group="macro", feed="CLL", calendar="ice"),
+              et_ms(2026, 9, 30, 20, 0, -4), et_ms(2026, 10, 30, 17, 59, -4), group="macro", feed="CLL", calendar="ice", fallback="CL=F"),
     # Pyth XAU/USD and XAG/USD: a session runs from 18:00 ET of the prior calendar day to 17:00 ET (Sunday 18:00 to Friday
     # 17:00 with an hour's break a day), so the window is 09-30 18:00 ET → 10-30 17:00 ET
     RangeSpec("XAU-HIT-10", "what-price-will-xauusd-hit-in-october-2026", "XAUUSD", "pyth", "黄金 XAUUSD 10月价格",
-              et_ms(2026, 9, 30, 18, 0, -4), et_ms(2026, 10, 30, 16, 59, -4), group="macro", feed="Metal.XAU/USD", calendar="metal"),
+              et_ms(2026, 9, 30, 18, 0, -4), et_ms(2026, 10, 30, 16, 59, -4), group="macro", feed="Metal.XAU/USD", calendar="metal", fallback="GC=F"),
     RangeSpec("XAG-HIT-10", "what-price-will-xagusd-hit-in-october-2026", "XAGUSD", "pyth", "白银 XAGUSD 10月价格",
-              et_ms(2026, 9, 30, 18, 0, -4), et_ms(2026, 10, 30, 16, 59, -4), group="macro", feed="Metal.XAG/USD", calendar="metal"),
-    # Pyth SPY/USD in the regular session only (09:30–16:00 ET; pre-market and after-hours prints do not count): 10-01 … 10-30
+              et_ms(2026, 9, 30, 18, 0, -4), et_ms(2026, 10, 30, 16, 59, -4), group="macro", feed="Metal.XAG/USD", calendar="metal", fallback="SI=F"),
+    # Pyth SPY/USD in the regular session only (09:30–16:00 ET; pre-market and after-hours prints do not count): 10-01 … 10-30.
+    # fallback: Yahoo's nearest quote (the futures for the metals and WTI, SPY itself) while Pyth cannot be read: the card
+    # then shows prices and probabilities but suggests nothing (a futures price is not the spot Pyth settles on)
     RangeSpec("SPY-HIT-10", "what-price-will-spy-hit-in-october-2026", "SPY", "pyth", "标普500 SPY 10月价格",
-              et_ms(2026, 10, 1, 9, 30, -4), et_ms(2026, 10, 30, 15, 59, -4), group="macro", feed="Equity.US.SPY/USD", calendar="us"),
+              et_ms(2026, 10, 1, 9, 30, -4), et_ms(2026, 10, 30, 15, 59, -4), group="macro", feed="Equity.US.SPY/USD", calendar="us", fallback="SPY"),
     # CME gold futures: the Active Month's official settlement on any trading day from the market's creation (2026-03-02
     # 13:22 UTC) through the last trading day of December 2026, at or above the level (every level is an ↑ one). Yahoo's
     # GC=F (the front month) gives the settlements so far and σ, the active contract itself (GCZ26.CMX; GCG27.CMX from its
@@ -6312,8 +6355,8 @@ def gc_active_contract(day: dt.date) -> str:
 
 
 # --- Pyth: the live price from Hermes, the candles from Pyth Benchmarks (the TradingView feed behind pythdata.app) ---------
-PYTH_HERMES = "https://hermes.pyth.network/v2"
-PYTH_HISTORY = "https://benchmarks.pyth.network/v1/shims/tradingview/history"
+PYTH_HERMES = PYTH_HERMES_DEFAULT
+PYTH_HISTORY = PYTH_HISTORY_DEFAULT
 
 
 def pyth_feed_match(rows: Any, want: str, pinned: str = "") -> tuple[str, str] | None:
@@ -6336,11 +6379,18 @@ def pyth_feed_match(rows: Any, want: str, pinned: str = "") -> tuple[str, str] |
         return exact[0]
     found = []
     for fid, symbol, attrs in feeds:
-        names = {str(attrs.get(k) or "").upper() for k in ("base", "generic_symbol", "display_symbol")}
-        names |= {n.split("/")[0] for n in names}
-        if short in names:
+        names = " ".join(str(attrs.get(k) or "") for k in ("symbol", "base", "generic_symbol", "display_symbol", "description")).upper()
+        if short in set(re.split(r"[^A-Z0-9]+", names)):
             found.append((fid, symbol))
+    if not found and len(feeds) == 1:
+        found = [(feeds[0][0], feeds[0][1])]  # the search found just one feed: that is the one
     return found[0] if len(found) == 1 else None
+
+
+def pyth_feed_names(rows: Any) -> list[str]:
+    """The symbols a Hermes listing holds (for the note when none of them is the feed wanted)."""
+    return [str(r["attributes"].get("symbol") or r.get("id") or "")[:40] for r in rows
+            if isinstance(r, dict) and isinstance(r.get("attributes"), dict)] if isinstance(rows, list) else []
 
 
 def parse_pyth_latest(data: Any) -> dict[str, tuple[float, int]]:
@@ -7119,6 +7169,18 @@ class StockRangeMarket(RangeMarket):
         return ""
 
 
+async def yahoo_chart(symbol: str, **params: Any) -> tuple[dict, list]:
+    """Yahoo's v8 chart for a symbol (either host), parsed; the failures of both hosts in the error."""
+    errors = []
+    for host in YAHOO_CHART:
+        url = host + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode(params)
+        try:
+            return parse_yahoo_chart(await fetch_source(url))
+        except (RemoteError, TimeoutError, OSError, ValueError) as error:
+            errors.append(clean_error(error) or type(error).__name__)
+    raise RemoteError("；".join(dict.fromkeys(errors)))
+
+
 class PythRangeMarket(RangeMarket):
     """A Pyth-settled ladder (WTI, gold, silver, SPY in October): Pyth's own 1-minute candles decide it, and the bot reads the
     same feed. Hermes gives the live price (every 30 s; every 2 minutes while the market is shut, when it cannot change), Pyth
@@ -7139,8 +7201,12 @@ class PythRangeMarket(RangeMarket):
     SESSION_WORDS = {"metal": "周日 18:00 至周五 17:00 ET，每日 17:00–18:00 休息", "ice": "前一日 20:00（周日 18:00）至 18:00 ET",
                      "us": "常规时段 09:30–16:00 ET"}
 
-    def __init__(self, store: "Store", spec: RangeSpec, pinned_id: str = ""):
+    def __init__(self, store: "Store", spec: RangeSpec, pinned_id: str = "", urls: tuple[str, str] | None = None,
+                 fallback: str | None = None):
         super().__init__(store, spec)
+        self.hermes, self.history_url = urls or (PYTH_HERMES, PYTH_HISTORY)
+        self.fallback = spec.fallback if fallback is None else fallback  # the Yahoo symbol that stands in; "" = none
+        self.used = {"price": "", "vol": "", "scan": ""}  # where each part last came from: "pyth" or "yahoo"
         saved = store.get(f"pyth:feed:{spec.feed}", {})
         saved = saved if isinstance(saved, dict) else {}
         self.pinned_id = pinned_id.removeprefix("0x").lower()
@@ -7176,25 +7242,50 @@ class PythRangeMarket(RangeMarket):
 
     def lookup_url(self) -> str:
         query = self.spec.feed.split(".")[-1].split("/")[0] if "." in self.spec.feed else self.spec.feed
-        return f"{PYTH_HERMES}/price_feeds?" + urllib.parse.urlencode({"query": query})
+        return f"{self.hermes}/price_feeds?" + urllib.parse.urlencode({"query": query})
 
     async def lookup(self) -> None:
         """The feed's id and symbol from Hermes' listing, kept in SQLite so a restart prices at once."""
-        found = pyth_feed_match(await self.fetch_json(self.lookup_url()), self.spec.feed, self.pinned_id)
+        rows = await self.fetch_json(self.lookup_url())
+        found = pyth_feed_match(rows, self.spec.feed, self.pinned_id)
         if not found:
-            raise RemoteError(f"Hermes 没有列出 {self.spec.feed}" + ("（PYTH_FEEDS 钉的 id 不在列表里）" if self.pinned_id else ""))
+            names = pyth_feed_names(rows)
+            seen = f"查到 {len(names)} 个：" + "、".join(names[:6]) + ("…" if len(names) > 6 else "") if names else "查到 0 个"
+            raise RemoteError(f"Hermes 没有列出 {self.spec.feed}（{seen}" + ("；PYTH_FEEDS 钉的 id 不在其中" if self.pinned_id else "；可用 PYTH_FEEDS 钉 id") + "）")
         self.feed_id, self.feed_symbol = found
         self.store.put(f"pyth:feed:{self.spec.feed}", {"id": self.feed_id, "symbol": self.feed_symbol})
 
     def latest_url(self) -> str:
-        return f"{PYTH_HERMES}/updates/price/latest?ids[]={self.feed_id}&parsed=true"
+        return f"{self.hermes}/updates/price/latest?" + urllib.parse.urlencode({"ids[]": self.feed_id, "parsed": "true"})
 
     def candles_url(self, resolution: str, start_ms: int, end_ms: int) -> str:
-        return PYTH_HISTORY + "?" + urllib.parse.urlencode({"symbol": self.feed_symbol, "resolution": resolution,
-                                                            "from": start_ms // 1000, "to": end_ms // 1000})
+        return self.history_url + "?" + urllib.parse.urlencode({"symbol": self.feed_symbol, "resolution": resolution,
+                                                                "from": start_ms // 1000, "to": end_ms // 1000})
 
     async def candles(self, resolution: str, start_ms: int, end_ms: int) -> list:
-        return parse_pyth_history(await self.fetch_json(self.candles_url(resolution, start_ms, end_ms)))
+        """Pyth Benchmarks' candles; Yahoo's for the stand-in symbol (the same minutes, the same shape) when Pyth cannot be
+        read and there is one. Which was used is remembered per part, so the card can say so and hold its advice."""
+        part = "vol" if resolution == "D" else "scan"
+        try:
+            bars = parse_pyth_history(await self.fetch_json(self.candles_url(resolution, start_ms, end_ms)))
+        except (RemoteError, TimeoutError, OSError, ValueError) as error:
+            if not self.fallback:
+                raise
+            try:
+                params = {"interval": "1d", "range": "1y"} if resolution == "D" else \
+                    {"interval": f"{resolution}m", "period1": start_ms // 1000, "period2": end_ms // 1000, "includePrePost": "true"}
+                _, bars = await yahoo_chart(self.fallback, **params)
+            except (RemoteError, TimeoutError, OSError, ValueError) as error2:
+                raise RemoteError(f"Pyth {clean_error(error) or type(error).__name__}；Yahoo {clean_error(error2) or type(error2).__name__}") from None
+            self.used[part] = "yahoo"
+            self.failures[part] = f"{'波动率' if part == 'vol' else '区间核验'}：Pyth {brief_error(clean_error(error) or type(error).__name__, 60)}；暂用 Yahoo {self.fallback}"
+            return [b for b in bars if b[2] is not None and b[3] is not None]
+        self.used[part] = "pyth"
+        return bars
+
+    def standing_in(self) -> bool:
+        """Any part of the card rests on the Yahoo stand-in rather than Pyth."""
+        return "yahoo" in self.used.values()
 
     def price_seconds(self, now_ms: int) -> int:
         return self.PRICE_SECONDS if self.in_session(now_ms) else self.CLOSED_PRICE_SECONDS
@@ -7216,15 +7307,26 @@ class PythRangeMarket(RangeMarket):
                     if got is None:
                         raise RemoteError("Hermes 没有返回这个 feed 的价格")
                     self.price, self.priced_ms, self.fetched_ms = D(f"{got[0]:.10g}"), got[1], now_ms
-                    self.failures["price"] = ""
+                    self.failures["price"], self.used["price"] = "", "pyth"
                 except Exception as error:
                     self.failures["price"] = f"价格：{why(error)}"
+                    if self.fallback:  # Yahoo's last trade stands in: shown, never advised on
+                        try:
+                            meta, _ = await yahoo_chart(self.fallback, interval="1m", range="1d")
+                            if meta["price"] is None:
+                                raise RemoteError("Yahoo 没有返回 regularMarketPrice")
+                            self.price, self.priced_ms, self.fetched_ms = D(f"{meta['price']:.6f}").normalize(), meta["time_ms"] or now_ms, now_ms
+                            self.used["price"] = "yahoo"
+                            self.failures["price"] = f"价格：Pyth {brief_error(why(error), 60)}；暂用 Yahoo {self.fallback}"
+                        except Exception as error2:
+                            self.failures["price"] = f"价格：Pyth {brief_error(why(error), 60)}；Yahoo {why(error2)}"
             if mono - self.times["vol"] >= self.VOL_SECONDS:
                 self.times["vol"] = mono
                 try:
                     self.sigma = self.daily_sigma(await self.candles("D", now_ms - 400 * DAY_MS, now_ms), now_ms)
                     self.sigma_ms = now_ms
-                    self.failures["vol"] = ""
+                    if self.used["vol"] == "pyth":
+                        self.failures["vol"] = ""
                 except Exception as error:
                     self.times["vol"] = mono - self.VOL_SECONDS + (60 if self.sigma is None else 300)  # again in 1 / 5 minutes
                     self.failures["vol"] = f"波动率：{why(error)}"
@@ -7232,7 +7334,8 @@ class PythRangeMarket(RangeMarket):
                 self.times["scan"] = mono
                 try:
                     await self.scan(now_ms)
-                    self.failures["scan"] = ""
+                    if self.used["scan"] != "yahoo":
+                        self.failures["scan"] = ""
                 except Exception as error:
                     self.failures["scan"] = f"区间核验：{why(error)}"
         self.error = "；".join(text for text in self.failures.values() if text)
@@ -7290,6 +7393,12 @@ class PythRangeMarket(RangeMarket):
         """The live price counts among the window's extremes only when Pyth published it inside a session of the window."""
         return self.start_ms <= self.priced_ms < self.window_end and self.in_session(self.priced_ms)
 
+    def advice_problem(self, now_ms: int) -> str:
+        if self.standing_in():
+            parts = "、".join(n for k, n in (("price", "价格"), ("vol", "σ"), ("scan", "最高/最低")) if self.used[k] == "yahoo")
+            return f"Pyth 读不到，{parts}暂用 Yahoo {self.fallback} 代用（与结算口径不同）；只显示不建议"
+        return super().advice_problem(now_ms)
+
     def price_stale(self, now_ms: int) -> bool:
         """Nothing read for 5 minutes, or, while the market trades, a price Pyth published over 10 minutes ago; between
         sessions the last published price stands (nothing can change)."""
@@ -7301,16 +7410,16 @@ class PythRangeMarket(RangeMarket):
         return macro_trading_years(self.calendar, max(now_ms, self.start_ms), self.window_end)
 
     def source_name(self) -> str:
-        return f"Pyth（{self.feed_symbol or self.spec.feed}）"
+        return f"Yahoo 代用（{self.fallback}）" if self.used["price"] == "yahoo" else f"Pyth（{self.feed_symbol or self.spec.feed}）"
 
     def venue_name(self) -> str:
-        return "Pyth"
+        return f"Yahoo 代用 {self.fallback}，结算源 Pyth" if self.used["price"] == "yahoo" else "Pyth"
 
     def extremes_source(self) -> str:
         return f"Pyth {self.resolution} 分钟 K（{self.feed_symbol or self.spec.feed}，只算交易时段内的；与 1 分钟 K 的最高/最低一致）"
 
     def extremes_name(self) -> str:
-        return f"Pyth {self.resolution} 分钟 K"
+        return f"Yahoo {self.fallback} {self.resolution} 分钟 K（代用）" if self.used["scan"] == "yahoo" else f"Pyth {self.resolution} 分钟 K"
 
     def settle_name(self) -> str:
         return "Pyth 1 分钟 K"
@@ -7332,9 +7441,11 @@ class PythRangeMarket(RangeMarket):
         hours = self.SESSION_WORDS.get(self.calendar, "")
         session = (f"交易中（{hours}）" if state == "交易中" else
                    f"休市，{self.spec.label(opens)}开盘（{hours}）；休市期间现价为 Pyth 最后发布的价格，概率按剩余交易时段计算" if opens else "休市")
+        standin = (f"；Pyth 读不到时用 Yahoo {self.fallback} 代用（现在{'在用' if self.standing_in() else '没用'}）" if self.fallback else "")
         return {"range_word": self.range_word, "session": session, "feed": self.feed_symbol or self.spec.feed, "feed_id": self.feed_id,
-                "extremes_note": f"Pyth {self.resolution} 分钟 K 的最高/最低（{self.feed_symbol or self.spec.feed}，只算交易时段内的 K 线，"
-                                 "与结算用的 1 分钟 K 同口径）",
+                "standin": self.standing_in(),
+                "extremes_note": f"{self.extremes_name()} 的最高/最低（{self.feed_symbol or self.spec.feed}，只算交易时段内的 K 线，"
+                                 f"与结算用的 1 分钟 K 同口径）{standin}",
                 "extremes_tail": f"，加上正在走的这根 {self.resolution} 分钟 K 和现价（只算交易时段内发布的）",
                 "rule_note": f"↑ 档：{self.month_word()}任一交易时段内 Pyth 1 分钟 K 的最高价 ≥ 档位即 Yes；↓ 档：最低价 ≤ 档位即 Yes；"
                              "休市时段（周末、每日休息、SPY 的盘前盘后）的价格不算。方向按每个市场标题的箭头"}
@@ -7375,14 +7486,7 @@ class SettleRangeMarket(RangeMarket):
 
     @staticmethod
     async def chart(symbol: str, **params: Any) -> tuple[dict, list]:
-        errors = []
-        for host in YAHOO_CHART:
-            url = host + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode(params)
-            try:
-                return parse_yahoo_chart(await fetch_source(url))
-            except (RemoteError, TimeoutError, OSError, ValueError) as error:
-                errors.append(clean_error(error) or type(error).__name__)
-        raise RemoteError("；".join(dict.fromkeys(errors)))
+        return await yahoo_chart(symbol, **params)
 
     @staticmethod
     def bar_date(opened_ms: int) -> dt.date:
@@ -7552,7 +7656,8 @@ def range_market(store: "Store", spec: RangeSpec, futures: Any, config: "Config"
         return StockRangeMarket(store, spec, config.ladder_deadlines.get(spec.key, 0))
     if spec.venue == "pyth":
         pinned = config.pyth_feeds.get(spec.feed) or config.pyth_feeds.get(spec.key) or config.pyth_feeds.get(spec.symbol, "")
-        return PythRangeMarket(store, spec, pinned)
+        fallback = None if config.macro_fallback is None else config.macro_fallback.get(spec.key, "")
+        return PythRangeMarket(store, spec, pinned, config.pyth_urls, fallback)
     if spec.venue == "cme":
         return SettleRangeMarket(store, spec)
     return RangeMarket(store, spec, futures)
@@ -10240,6 +10345,8 @@ class Bot:
             self.predict.ladder_keys.update(self.caps)
             self.predict.ladder_keys.update(self.ranges)
             self.predict.ladder_keys.update(self.quotes)
+            self.predict.slow_keys.update(spec.key for spec in macro)  # a hundred books: once a minute keeps Predict's limits
+            self.predict.slow_keys.update(self.quotes)
         self.exchange_bases: dict[str, Baseline] = {}  # exchange_close mode: held until a newer close is confirmed
         self.reference_tasks: list[asyncio.Task] = []
         self.sim_ran = -1e9  # monotonic time of the paper trader's last look

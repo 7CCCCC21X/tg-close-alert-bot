@@ -27,6 +27,7 @@ assert (XAU.feed, XAU.calendar) == ("Metal.XAU/USD", "metal") and (XAG.feed, XAG
 assert (SPY.feed, SPY.calendar) == ("Equity.US.SPY/USD", "us")
 assert (GC.venue, GC.feed, GC.calendar, GC.one_way) == ("cme", "GC=F", "settle", "up") and GC.start_ms == utc(2026, 3, 2, 13, 22)
 assert all(s.one_way == "" for s in (WTI, XAU, XAG, SPY)) and all(s.default_dir == "up" for s in m.MACRO_MARKETS)
+assert [s.fallback for s in m.MACRO_MARKETS] == ["CL=F", "GC=F", "SI=F", "SPY", ""]
 # the first October session's open to the last one's close (end_ms is the open of the window's last minute, as for every ladder)
 assert WTI.start_ms == et(2026, 9, 30, 20, 0) and WTI.end_ms + 60_000 == et(2026, 10, 30, 18, 0)
 assert XAU.start_ms == XAG.start_ms == et(2026, 9, 30, 18, 0) and XAU.end_ms + 60_000 == XAG.end_ms + 60_000 == et(2026, 10, 30, 17, 0)
@@ -80,6 +81,9 @@ assert m.pyth_feed_match(FEEDS, "CLL") == (CLL_ID, "Commodities.CLL")  # by its 
 assert m.pyth_feed_match(FEEDS, "Metal.XPT/USD") is None and m.pyth_feed_match({}, "CLL") is None and m.pyth_feed_match([], "CLL") is None
 assert m.pyth_feed_match(FEEDS, "CLL", pinned="0x" + "AB" * 32) == (CLL_ID, "Commodities.CLL") and m.pyth_feed_match(FEEDS, "CLL", pinned="cd" * 32) is None
 assert m.pyth_feed_match(FEEDS + [{"id": "cd" * 32, "attributes": {"base": "CLL", "symbol": "Commodities.CLL2"}}], "CLL") is None  # ambiguous
+assert m.pyth_feed_match([{"id": "cd" * 32, "attributes": {"symbol": "Commodities.WTI/USD", "description": "ICE WTI CRUDE (CLL)"}}], "CLL") == ("cd" * 32, "Commodities.WTI/USD")
+assert m.pyth_feed_match([{"id": "cd" * 32, "attributes": {"symbol": "Commodities.WTI1M"}}], "CLL") == ("cd" * 32, "Commodities.WTI1M")  # the search found one feed: that is it
+assert m.pyth_feed_names(FEEDS) == ["Metal.XAU/USD", "Metal.XAG/USD", "Equity.US.SPY/USD", "Commodities.CLL", "Metal.XAU/USD"] and m.pyth_feed_names("x") == []
 LATEST = {"binary": {"encoding": "hex", "data": ["00"]}, "parsed": [
     {"id": XAU_ID, "price": {"price": "432112345678", "conf": "123", "expo": -8, "publish_time": 1760000000}, "ema_price": {}},
     {"id": XAG_ID, "price": {"price": "x", "expo": -8, "publish_time": 1}}, {"id": CLL_ID, "price": None}, {"id": SPY_ID, "price": {"price": "-5", "expo": 0, "publish_time": 1}}]}
@@ -117,6 +121,13 @@ assert cfg.macro and cfg.pyth_feeds == {"CLL": "ab" * 32, "Metal.XAU/USD": "cd" 
 assert not m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "MACRO": "off"}).macro and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).pyth_feeds == {}
 for bad in ("CLL", "CLL=xyz", "=" + "ab" * 32):
     try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PYTH_FEEDS": bad}); assert False, bad
+    except ValueError: pass
+assert cfg.pyth_urls == ("https://hermes.pyth.network/v2", "https://benchmarks.pyth.network/v1/shims/tradingview/history") and cfg.macro_fallback is None
+alt = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "PYTH_HERMES_URL": "https://hermes.example.org/v2/", "MACRO_FALLBACK": "xau-hit-10:XAUUSD=X; SPY-HIT-10:SPY"})
+assert alt.pyth_urls[0] == "https://hermes.example.org/v2" and alt.macro_fallback == {"XAU-HIT-10": "XAUUSD=X", "SPY-HIT-10": "SPY"}
+assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "MACRO_FALLBACK": "off"}).macro_fallback == {} and m.parse_fallbacks("") is None
+for bad in ({"PYTH_HERMES_URL": "http://x"}, {"PYTH_HISTORY_URL": "https://x/?a=1"}, {"MACRO_FALLBACK": "XAU-HIT-10"}, {"MACRO_FALLBACK": ":GC=F"}):
+    try: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", **bad}); assert False, bad
     except ValueError: pass
 
 # --- the fixtures: Pyth and Yahoo as the bot sees them -----------------------------------------------------------------------------
@@ -182,15 +193,28 @@ async def fake_fetch(url, extra=None, record=True):
         return json.dumps(FEEDS).encode()
     if parts.netloc == "hermes.pyth.network" and parts.path.endswith("/updates/price/latest"):
         fid = q["ids[]"][0]
+        if fid == XAG_ID:
+            raise m.RemoteError("HTTP 401: 接口请求失败")
         return json.dumps({"parsed": [{"id": fid, "price": {"price": str(int(PRICES[fid] * 1e8)), "expo": -8, "publish_time": (clock["now"] - 20_000) // 1000}}]}).encode()
     if parts.netloc == "benchmarks.pyth.network":
         symbol, res, start, end = q["symbol"][0], q["resolution"][0], int(q["from"][0]), int(q["to"][0])
+        if symbol == "Metal.XAG/USD":
+            raise m.RemoteError("HTTP 404: 接口请求失败")
         assert symbol in {"Metal.XAU/USD", "Equity.US.SPY/USD"}, symbol
         if res == "D":
             return udf(daily(start, end))
         return udf(candles("metal" if "XAU" in symbol else "us", int(res) * 60_000, start, end))
     if parts.netloc == "query1.finance.yahoo.com":
         symbol = urllib.parse.unquote(parts.path.rsplit("/", 1)[-1])
+        if symbol == "SI=F":  # silver's stand-in: the last trade, a year of daily bars, hourly bars for a span
+            if q["interval"][0] == "1m":
+                return yahoo(symbol, [], [], price=52.5, when=(clock["now"] - 30_000) // 1000)
+            if q["interval"][0] == "1d":
+                rows = daily(clock["now"] // 1000 - 400 * 86400, clock["now"] // 1000)
+                return yahoo(symbol, [r[0] for r in rows], [(r[1], r[2], r[3], r[4]) for r in rows])
+            assert q["interval"][0] == "60m", q
+            rows = candles("metal", 3_600_000, int(q["period1"][0]), int(q["period2"][0]))
+            return yahoo(symbol, [r[0] for r in rows], [(r[1], r[2], r[3], r[4]) for r in rows])
         if q["interval"][0] == "1m":
             assert symbol == GC_CONTRACT[0], symbol
             return yahoo(symbol, [], [], price=4350.0, when=(clock["now"] - 30_000) // 1000)
@@ -304,11 +328,29 @@ async def run():
     assert srm.remaining_years(NOW) == m.us_trading_years(NOW, SPY.end_ms + 60_000) and srm.card_extras(NOW)["session"].startswith("交易中（常规时段 09:30–16:00 ET）")
     assert any("resolution=30" in u for u in calls)
 
+    # --- silver: Pyth refuses (401 / 404), Yahoo's SI=F stands in: prices and probabilities shown, nothing advised on ----------------
+    arm = m.PythRangeMarket(m.Store(":memory:"), XAG)
+    assert arm.fallback == "SI=F" and not arm.standing_in()
+    await arm.refresh(NOW)
+    assert arm.known() and arm.price == D("52.5") and arm.used == {"price": "yahoo", "vol": "yahoo", "scan": "yahoo"} and arm.standing_in(), (arm.used, arm.error)
+    assert arm.sigma is not None and arm.history["high"] == 4400.0 and arm.running["open"] == et(2026, 10, 6, 14, 0), arm.history
+    assert "价格：Pyth HTTP 401" in arm.error and "暂用 Yahoo SI=F" in arm.error and "区间核验：Pyth HTTP 404" in arm.error, arm.error
+    assert arm.advice_problem(NOW) == "Pyth 读不到，价格、σ、最高/最低暂用 Yahoo SI=F 代用（与结算口径不同）；只显示不建议"
+    assert arm.probability(D(5000), "up", NOW) == m.hit_probability(52.5, 5000.0, arm.sigma, arm.remaining_years(NOW)) and arm.missing_note(NOW) == ""  # (the stand-in candles are the gold fixture's)
+    assert arm.source_name() == "Yahoo 代用（SI=F）" and arm.extremes_name() == "Yahoo SI=F 60 分钟 K（代用）" and arm.venue_name().startswith("Yahoo 代用 SI=F")
+    assert arm.card_extras(NOW)["standin"] and "现在在用" in arm.card_extras(NOW)["extremes_note"] and "现在没用" in rm.card_extras(NOW)["extremes_note"]
+    assert any("SI%3DF" in u and "interval=60m" in u and "period1=" in u for u in calls) and any("SI%3DF" in u and "interval=1d" in u for u in calls)
+    none = m.PythRangeMarket(m.Store(":memory:"), XAG, fallback="")  # MACRO_FALLBACK=off: the failure stands
+    await none.refresh(NOW)
+    assert none.price is None and none.error.startswith("价格：HTTP 401") and none.missing_note(NOW).startswith("等待 Pyth 行情（")
+
     # --- a lookup that finds nothing: the card waits, the failure is named, nothing else is asked for --------------------------------
     wrm = m.PythRangeMarket(m.Store(":memory:"), m.RangeSpec("XPT-HIT-10", "x", "XPTUSD", "pyth", "铂金", XAU.start_ms, XAU.end_ms, group="macro", feed="Metal.XPT/USD", calendar="metal"))
     before = len(calls)
     await wrm.refresh(NOW)
-    assert not wrm.known() and "Hermes 没有列出 Metal.XPT/USD" in wrm.error and len(calls) == before + 1 and wrm.missing_note(NOW).startswith("等待 Pyth 行情源确认（")
+    assert not wrm.known() and "Hermes 没有列出 Metal.XPT/USD（查到 5 个：Metal.XAU/USD、" in wrm.error and "可用 PYTH_FEEDS 钉 id" in wrm.error, wrm.error
+    assert len(calls) == before + 1 and wrm.missing_note(NOW).startswith("等待 Pyth 行情源确认（")
+    assert "ids%5B%5D=" in rm.latest_url() and "[" not in rm.latest_url()  # the ids[] key URL-encoded, as a browser sends it
 
     # --- GC: the active contract's price, the settlements so far from GC=F, one look a day ----------------------------------------
     GC_NOW = et(2026, 10, 15, 12, 0)  # before today's 13:30 settlement
@@ -366,6 +408,19 @@ async def run():
     assert isinstance(bot.ranges["XAU-HIT-10"], m.PythRangeMarket) and isinstance(bot.ranges["GC-DEC"], m.SettleRangeMarket) and isinstance(bot.ranges["BTC-HIT-10"], m.RangeMarket)
     assert bot.predict.ladder_parse["ANTHROPIC-VAL"] is m.valuation_level and bot.predict.ladder_parse["OPENAI-IPO"] is m.bracket_level and bot.predict.ladder_parse["XAU-HIT-10"] is m.price_level
     assert {"ANTHROPIC-VAL", "OPENAI-IPO", "XAU-HIT-10", "GC-DEC"} <= bot.predict.ladder_keys and "XAU-HIT-10" in bot.predict.reward_keys
+    assert bot.predict.slow_keys == {"WTI-HIT-10", "XAU-HIT-10", "XAG-HIT-10", "SPY-HIT-10", "GC-DEC", "ANTHROPIC-VAL", "OPENAI-IPO"}
+    # the slow ladders are read once a minute, the others every poll
+    seen = []
+    async def fake_one(key, slug): seen.append(key)
+    bot.predict.refresh_one = fake_one
+    await bot.predict.refresh({"BTC-HIT-10": "a", "XAU-HIT-10": "b", "OPENAI-IPO": "c"}, force=True)
+    assert seen == ["BTC-HIT-10", "XAU-HIT-10", "OPENAI-IPO"]
+    await bot.predict.refresh({"BTC-HIT-10": "a", "XAU-HIT-10": "b", "OPENAI-IPO": "c"}, force=True)
+    assert seen == ["BTC-HIT-10", "XAU-HIT-10", "OPENAI-IPO", "BTC-HIT-10"]
+    bot.predict.slow_last["XAU-HIT-10"] -= m.PREDICT_SLOW_SECONDS
+    await bot.predict.refresh({"BTC-HIT-10": "a", "XAU-HIT-10": "b", "OPENAI-IPO": "c"}, force=True)
+    assert seen[-2:] == ["BTC-HIT-10", "XAU-HIT-10"]
+    bot.predict.refresh_one = type(bot.predict).refresh_one.__get__(bot.predict)
     targets = bot.predict_targets(NOW)
     assert targets["XAU-HIT-10"] == XAU.slug and targets["GC-DEC"] == GC.slug and targets["OPENAI-IPO"] == OAI.slug and targets["ANTHROPIC-VAL"] == ANTH.slug
     assert bot.edge_target(["宏观"]) == ("group:macro", "宏观") and bot.edge_target(["macro"]) == ("group:macro", "宏观") and bot.edge_target(["商品"]) == ("group:macro", "宏观")
