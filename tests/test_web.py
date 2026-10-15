@@ -373,13 +373,15 @@ async def browser_check(async_playwright, chrome, port, token, bot):
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         url = f"http://127.0.0.1:{port}/p/{token}"
-        # a fresh browser hides 价格阶梯 (and 模拟交易) but shows 市值阶梯; ticking it in 自定义 brings it back
+        # a fresh browser hides 价格阶梯 and 宏观 (and 模拟交易) but shows 市值阶梯; ticking one in 自定义 brings it back
         fresh = await browser.new_page(viewport={"width": 390, "height": 900})
         await fresh.goto(url); await fresh.wait_for_selector("#g-crypto .card")
-        assert not await fresh.is_visible("#h-levels") and await fresh.is_visible("#g-ladder .card")
-        assert await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim","levels"]' and await fresh.evaluate("localStorage.getItem('levelsDefault')") == "1"
+        assert not await fresh.is_visible("#h-levels") and not await fresh.is_visible("#h-macro") and await fresh.is_visible("#g-ladder .card")
+        assert await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim","levels","macro"]' and await fresh.evaluate("[localStorage.getItem('levelsDefault'), localStorage.getItem('macroDefault')]") == ["1", "1"]
         await fresh.click("#edit"); await fresh.check("#secs input[data-sec=levels]"); await fresh.click("#done")
-        assert await fresh.is_visible("#g-levels .card") and await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim"]'
+        assert await fresh.is_visible("#g-levels .card") and not await fresh.is_visible("#h-macro") and await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim","macro"]'
+        await fresh.click("#edit"); await fresh.check("#secs input[data-sec=macro]"); await fresh.click("#done")
+        assert await fresh.is_visible("#g-macro .card") and await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim"]'
         await fresh.close()
         # a browser that ran 1.21.5 (which hid 市值阶梯 by mistake) gets 市值阶梯 back and 价格阶梯 hidden, once
         older = await browser.new_page(viewport={"width": 390, "height": 900})
@@ -387,10 +389,10 @@ async def browser_check(async_playwright, chrome, port, token, bot):
                                     "localStorage.setItem('hideSec','[\"sim\",\"ladder\"]');localStorage.setItem('ladderDefault','1')}")
         await older.goto(url); await older.wait_for_selector("#g-crypto .card")
         assert await older.is_visible("#g-ladder .card") and not await older.is_visible("#h-levels")
-        assert await older.evaluate("[localStorage.getItem('hideSec'), localStorage.getItem('ladderDefault'), localStorage.getItem('levelsDefault')]") == ['["sim","levels"]', None, "1"]
+        assert await older.evaluate("[localStorage.getItem('hideSec'), localStorage.getItem('ladderDefault'), localStorage.getItem('levelsDefault')]") == ['["sim","levels","macro"]', None, "1"]
         await older.close()
         page = await browser.new_page(viewport={"width": 390, "height": 900})
-        await page.add_init_script("if(!localStorage.getItem('levelsDefault')){localStorage.setItem('hideSec','[\"sim\"]');localStorage.setItem('levelsDefault','1')}")  # 价格阶梯 on, as below; one-shot so a reload keeps what the test changes
+        await page.add_init_script("if(!localStorage.getItem('levelsDefault')){localStorage.setItem('hideSec','[\"sim\"]');localStorage.setItem('levelsDefault','1');localStorage.setItem('macroDefault','1')}")  # 价格阶梯 on, as below; one-shot so a reload keeps what the test changes
         await page.goto(url)
         await page.wait_for_selector(".card .odds")
         text = await page.inner_text(".wrap")

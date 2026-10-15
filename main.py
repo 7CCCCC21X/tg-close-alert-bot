@@ -8277,11 +8277,12 @@ function keep(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
 function stored(k,d,ok){try{const v=JSON.parse(localStorage.getItem(k));return ok(v)?v:d}catch(e){return d}}
 const strs=v=>Array.isArray(v)&&v.every(x=>typeof x==="string");
 let order=stored("order",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Object.values(v).every(strs));
-let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim","levels"],strs),oneRow=stored("oneRow",[],strs);  // oneRow: ladder sections shown one card per row
+let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim","levels","macro"],strs),oneRow=stored("oneRow",[],strs);  // oneRow: ladder sections shown one card per row
 try{if(!localStorage.getItem("simDefault")){if(!hideSec.includes("sim"))hideSec=[...hideSec,"sim"];keep("hideSec",hideSec);localStorage.setItem("simDefault","1")}}catch(e){}  // 模拟交易 starts hidden (show it in 自定义)
 try{if(!localStorage.getItem("levelsDefault")){if(!hideSec.includes("levels"))hideSec=[...hideSec,"levels"];  // 价格阶梯 starts hidden too
   if(localStorage.getItem("ladderDefault")){hideSec=hideSec.filter(x=>x!=="ladder");localStorage.removeItem("ladderDefault")}  // 1.21.5 hid 市值阶梯 instead: undo that once
   keep("hideSec",hideSec);localStorage.setItem("levelsDefault","1")}}catch(e){}
+try{if(!localStorage.getItem("macroDefault")){if(!hideSec.includes("macro"))hideSec=[...hideSec,"macro"];keep("hideSec",hideSec);localStorage.setItem("macroDefault","1")}}catch(e){}  // 宏观 starts hidden while it is being tried out (show it in 自定义)
 let hotCents=stored("hot",10,v=>typeof v==="number"&&v>=1&&v<=50),HOT=hotCents/100;  // an edge this large gets the red frame
 // the red-frame bar can also be set per section ("sec:<group>"), per card ("card:<key>") or per ladder level ("row:<key>#<label>"),
 // in cents; the most specific one set wins, the global one stands in otherwise
@@ -9076,7 +9077,7 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim","levels"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;oppPin=true;oppFold=false;folded=[];oneRow=[];secSort={};hotMap={};oppSound=false;oppSoundAll=true;soundKind="ding";soundVol=70;soundLen="mid";oppNotify=false;favMove=0;favMoveMap={};
+  order={};hidden=[];hideSec=["sim","levels","macro"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;oppPin=true;oppFold=false;folded=[];oneRow=[];secSort={};hotMap={};oppSound=false;oppSoundAll=true;soundKind="ding";soundVol=70;soundLen="mid";oppNotify=false;favMove=0;favMoveMap={};
   ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","oppPin","oppFold","folded","oneRow","secsort","hotmap","oppSound","oppSoundAll","soundKind","soundVol","soundLen","oppNotify","favMove","favmove"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 let loading=null,lastSig="",dead=false;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
