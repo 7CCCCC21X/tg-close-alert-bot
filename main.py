@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.37.0"
+VERSION = "1.37.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -8027,6 +8027,31 @@ def sim_stats(trades: list[dict]) -> dict:
             "markout": markout_stats(trades)}
 
 
+def sim_day_stats(trades: list[dict]) -> dict:
+    """One line of the journal's summary, like a trading log's 记录｜市场｜成交｜盈亏: how many records and distinct markets,
+    the money put into filled shares (成交: a taker's cost with its fee, a maker's price × the shares presumed filled),
+    the settled result and its split, and how many are still open (a position or a resting order)."""
+    done = [t for t in trades if t["status"] == "settled"]
+    return {"trades": len(trades), "markets": len({t["market"] for t in trades}),
+            "turnover": sum(float(t["price"]) * float(t.get("shares") or 0) for t in trades),
+            "pnl": sum((t["payout"] - t["price"]) * t["shares"] for t in done), "settled": len(done),
+            "wins": sum(t["payout"] == 1 for t in done), "losses": sum(t["payout"] == 0 for t in done),
+            "ties": sum(0 < t["payout"] < 1 for t in done), "open": sum(t["status"] in {"filled", "resting"} for t in trades)}
+
+
+def sim_days(trades: list[dict]) -> list[dict]:
+    """The journal's daily summary, newest day first: for each day trades were opened (Beijing), the day's line and the
+    same line per market kind (指数/个股日涨跌, 先触价, ...), so a day reads 日期｜记录｜市场｜成交｜盈亏 with its kinds under it."""
+    by_day: dict[str, list[dict]] = {}
+    for t in trades:
+        day = dt.datetime.fromtimestamp(int(t.get("opened") or 0) / 1000, BEIJING).date().isoformat()
+        by_day.setdefault(day, []).append(t)
+    return [{"day": day, **sim_day_stats(rows),
+             "kinds": [{"key": kind, "name": name, **sim_day_stats([t for t in rows if t["kind"] == kind])}
+                       for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in rows)]}
+            for day, rows in sorted(by_day.items(), reverse=True)]
+
+
 def sim_status(trade: dict) -> str:
     """'持仓' / '挂单中' / '挂单中（推定成交 30/100 份）' / '未成交' / '已撤单' / '赢 +$38.00' / '输 −$62.00' / '平局 −$12.00'."""
     status = trade["status"]
@@ -9281,6 +9306,7 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="csv" href="journal.csv" download="模拟交易日记.csv">导出 CSV</a><a class="btn" id="json" href="journal.json" download="模拟交易日记.json">导出 JSON</a></div>
 <p class="small mut" id="intro"></p>
 <div class="tiles" id="tiles"></div>
+<h2 id="h-days" hidden>每日汇总</h2><p class="small mut" id="days-note" hidden>按下单日期（北京时间）汇总。记录 = 笔数；市场 = 不同市场数（阶梯的每一档算一个）；成交 = 已成交份数的成本（吃单含手续费，挂单按推定成交的份数）；盈亏 = 已结算的盈亏；进行中 = 持仓和挂单中。一天里不止一类市场时按类型分行。</p><div class="tbl" id="days" hidden></div>
 <h2 id="h-groups" hidden>分组</h2><div class="tbl" id="groups" hidden></div>
 <h2 id="h-risk" hidden>共同风险</h2><div id="risk" hidden></div>
 <h2>交易</h2><div class="filters" id="filters"></div>
@@ -9398,6 +9424,14 @@ function tiles(){
     tile("模型预期（成交时）",money(s.expected_fill),"按成交那一刻的公平价；比下单时低很多 = 挂单常在行情转向时被成交"),
     tile("结算确认","已确认 "+s.confirmed,conf),
     tile("进行中","持仓 "+s.open,"挂单中 "+s.resting+" · 部分成交 "+s.partial+" · 作废 "+s.expired+(s.cancelled?" · 撤单 "+s.cancelled:"")))}
+function days(){  // the trading-log view: one line per day the trades were opened, its kinds under it, 全部 on top
+  const el=document.getElementById("days"),h=document.getElementById("h-days"),n=document.getElementById("days-note"),ds=data.days||[];
+  el.hidden=h.hidden=n.hidden=!ds.length;if(!ds.length)return;
+  const line=(r,name,sub)=>{const nm=sub?$("span","mut","├ "+name):$("b","",name),p=$("b","",money(r.pnl));p.className=r.pnl>=0?"ok":"bad";
+    return[nm,r.trades,r.markets,usd(r.turnover),p,r.settled?r.settled+"（赢 "+r.wins+" · 输 "+r.losses+(r.ties?" · 平 "+r.ties:"")+"）":"—",r.open||"—"]};
+  const rows=[];if(ds.length>1&&data.summary)rows.push(line(data.summary,"全部"));
+  ds.forEach(d=>{rows.push(line(d,d.day));if(d.kinds.length>1)d.kinds.forEach(k=>rows.push(line(k,k.name,true)))});
+  el.replaceChildren(table(["日期","记录","市场","成交","盈亏","已结算","进行中"],rows).firstChild)}
 function groups(){
   const rows=[...data.kinds,...(data.modes.length>1?data.modes:[])],g=document.getElementById("groups"),h=document.getElementById("h-groups");
   g.hidden=h.hidden=rows.length<2;if(rows.length<2)return;
@@ -9425,7 +9459,7 @@ function render(){
   if(!data)return;
   const how=[];if(data.ways!=="只挂单")how.push("吃单按这么多份吃到的均价和手续费判断并成交");if(data.ways!=="只吃单")how.push("挂单只挂在双边都有报价、价差不超过 10¢ 的盘口，排在已有挂单之后，只有盘口出现卖到挂价或更低的卖单才按看到的数量推定成交；不再做的挂单撤掉");
   document.getElementById("intro").textContent="净优势 ≥"+(data.edge*100).toFixed(0)+"¢ 时按卡片建议买 "+data.shares+" 份。"+(data.scope?"范围："+data.scope+"；"+data.ways+"。":"")+how.join("；")+"。先用机器人数据预结算，再以 Predict 的结果确认，不一致时按 Predict 重新结算并留下修订记录。";
-  tiles();groups();risk();filters();
+  tiles();days();groups();risk();filters();
   const list=document.getElementById("list"),shown=data.trades.filter(t=>(stateF==="all"||cat(t)===stateF)&&(wayF==="all"||(wayF==="maker")===t.maker)&&(kindF==="all"||t.kind===kindF));
   list.replaceChildren(...(shown.length?shown.map(row):[$("p","mut",data.trades.length?"没有符合条件的交易":"还没有模拟交易")]))}
 let okAt=0,dead=false;
@@ -12747,7 +12781,7 @@ class Bot:
         return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）",
                 "enabled": self.config.sim and self.config.predict, "edge": self.config.sim_edge,
                 "shares": self.config.sim_shares, "ways": sim_scope(self.config)[0], "scope": sim_scope(self.config)[1],
-                "total": sim_stats(values),
+                "total": sim_stats(values), "summary": sim_day_stats(values), "days": sim_days(values),
                 "kinds": [{"key": kind, "name": name, **sim_stats([t for t in values if t["kind"] == kind])}
                           for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in values)],
                 "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}

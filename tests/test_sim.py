@@ -35,6 +35,28 @@ for bad in ({"SIM_EDGE_CENTS": "0"}, {"SIM_EDGE_CENTS": "60"}, {"SIM_SHARES": "0
     except ValueError: pass
 
 
+# --- the daily summary (the review page's 日期｜记录｜市场｜成交｜盈亏 lines) -------------------------------------------------
+def _t(day, kind, market, status, price, shares, payout=None):
+    t = {"opened": BJ(10, day, 11), "kind": kind, "market": market, "status": status, "price": price, "shares": shares, "maker": False}
+    return {**t, "payout": payout} if payout is not None else t
+log = [_t(5, "close", "hsi", "settled", 0.40, 100, 1.0), _t(5, "close", "hsi", "settled", 0.70, 100, 0.0),  # +60 − 70
+       _t(5, "touch", "btc", "filled", 0.25, 100), _t(5, "touch", "btc", "resting", 0.30, 0),  # held $25, a resting order (nothing filled)
+       _t(4, "close", "kospi", "settled", 0.55, 100, 0.5), _t(4, "close", "kospi", "cancelled", 0.55, 0)]  # a tie: −5
+ds = m.sim_days(log)
+assert [d["day"] for d in ds] == ["2026-10-05", "2026-10-04"]
+d5 = ds[0]
+assert (d5["trades"], d5["markets"], d5["settled"], d5["wins"], d5["losses"], d5["ties"], d5["open"]) == (4, 2, 2, 1, 1, 0, 2)
+assert abs(d5["turnover"] - (40 + 70 + 25)) < 1e-9 and abs(d5["pnl"] - (-10)) < 1e-9
+assert [(k["key"], k["trades"], k["markets"], k["settled"]) for k in d5["kinds"]] == [("close", 2, 1, 2), ("touch", 2, 1, 0)]
+assert d5["kinds"][0]["name"] == "指数/个股日涨跌" and abs(d5["kinds"][1]["turnover"] - 25) < 1e-9 and d5["kinds"][1]["open"] == 2
+d4 = ds[1]
+assert (d4["trades"], d4["markets"], d4["settled"], d4["ties"], d4["open"]) == (2, 1, 1, 1, 0) and abs(d4["pnl"] + 5) < 1e-9 and abs(d4["turnover"] - 55) < 1e-9
+assert [k["key"] for k in d4["kinds"]] == ["close"]
+total = m.sim_day_stats(log)
+assert (total["trades"], total["markets"], total["settled"], total["open"]) == (6, 3, 3, 2) and abs(total["pnl"] + 15) < 1e-9
+assert m.sim_days([]) == [] and m.sim_day_stats([])["pnl"] == 0
+
+
 # --- the arithmetic -----------------------------------------------------------------------------------------------------
 def book(bids, asks, at=NOW, slug=HSI_SLUG, key="HSI", fee=None, mid="101"):
     return m.PredictBook(key, slug, mid, "t", tuple((D(p), D(q)) for p, q in bids), tuple((D(p), D(q)) for p, q in asks), at, fee)
@@ -386,6 +408,13 @@ async def run():
     jt = next(x for x in j["trades"] if x["id"] == hsi_maker)
     assert jt["state"] == "已确认" and jt["entry"]["proxy"]["anchor"] == 24500.0 and len(jt["fills"]) == 3 and jt["expected_fill"] < 15
     json.dumps(j, default=str)
+    days = j["days"]  # the daily summary: every record once, newest day first, each day's kinds adding up to it
+    assert days and [d["day"] for d in days] == sorted({d["day"] for d in days}, reverse=True)
+    assert sum(d["trades"] for d in days) == len(j["trades"]) == j["summary"]["trades"]
+    assert all(0 < d["markets"] <= d["trades"] and sum(k["trades"] for k in d["kinds"]) == d["trades"] for d in days)
+    assert abs(sum(d["pnl"] for d in days) - j["total"]["pnl"]) < 1e-9 and abs(j["summary"]["pnl"] - j["total"]["pnl"]) < 1e-9
+    assert abs(j["summary"]["turnover"] - (j["total"]["cost"] + j["total"]["open_cost"])) < 1e-9  # settled cost + what is held
+    assert j["summary"]["open"] == j["total"]["open"] + j["total"]["resting"]
     raw = bot.journal_csv()
     assert raw.startswith("﻿")
     rows = list(csv.reader(io.StringIO(raw[1:])))
@@ -559,6 +588,21 @@ async def browser_check(bot):
         assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "no sideways scroll"
         if os.environ.get("WEB_SCREENSHOT"):
             await page.locator("#g-sim .card").screenshot(path=os.environ["WEB_SCREENSHOT"])
+        # the review page: the daily summary under the tiles, one line per day, its kinds under it, 全部 on top
+        await page.goto(f"http://127.0.0.1:{port}/p/{'t' * 20}/journal")
+        await page.wait_for_selector("#days table")
+        j = bot.journal_payload()
+        rows = await page.locator("#days table tr").all_inner_texts()
+        want = 1 + (1 if len(j["days"]) > 1 else 0) + sum(1 + (len(d["kinds"]) if len(d["kinds"]) > 1 else 0) for d in j["days"])
+        assert len(rows) == want and rows[0].split("\t")[:5] == ["日期", "记录", "市场", "成交", "盈亏"], rows
+        first = rows[2 if len(j["days"]) > 1 else 1].split("\t")
+        assert first[0] == j["days"][0]["day"] and first[1] == str(j["days"][0]["trades"]) and first[2] == str(j["days"][0]["markets"]), first
+        if len(j["days"]) > 1:
+            assert rows[1].split("\t")[1] == str(j["summary"]["trades"]) and rows[1].startswith("全部"), rows[1]
+        assert "每日汇总" in await page.inner_text("#h-days") and not await page.is_hidden("#days-note")
+        assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "no sideways scroll on the review page"
+        if os.environ.get("JOURNAL_SCREENSHOT"):
+            await page.screenshot(path=os.environ["JOURNAL_SCREENSHOT"], full_page=False)
         await browser.close()
     await web.stop()
 
