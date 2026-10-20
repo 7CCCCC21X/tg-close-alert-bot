@@ -23,7 +23,7 @@ FEE = 0.02  # Predict: 2% × min(p, 1 − p) when the market states no rate
 # --- settings ----------------------------------------------------------------------------------------------------------
 c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"})
 assert c.sim and c.sim_edge == 0.10 and c.sim_shares == 100
-assert c.sim_ways == "taker" and c.sim_markets == frozenset({"close"}) and m.sim_scope(c) == ("只吃单", "指数/个股日涨跌")  # the defaults
+assert c.sim_ways == "taker" and c.sim_markets == frozenset({"close", "btc"}) and m.sim_scope(c) == ("只吃单", "指数/个股日涨跌、BTC 涨跌")  # the defaults
 c = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM": "off", "SIM_EDGE_CENTS": "15", "SIM_SHARES": "250", "SIM_WAYS": "Both",
                        "SIM_MARKETS": "range, Ladder"})
 assert not c.sim and abs(c.sim_edge - 0.15) < 1e-12 and c.sim_shares == 250 and c.sim_ways == "both" and c.sim_markets == {"range", "ladder"}
@@ -457,7 +457,7 @@ async def run():
                  m.Store(":memory:"), FM(NOW), None)
     dbot.sim_markets = lambda now: world["markets"]
     rep = dbot.sim_report()
-    assert rep["ways"] == "只吃单" and rep["scope"] == "指数/个股日涨跌" and "范围：指数/个股日涨跌；只吃单。吃单按 100 份" in dbot.cmd_sim(None).text
+    assert rep["ways"] == "只吃单" and rep["scope"] == "指数/个股日涨跌、BTC 涨跌" and "范围：指数/个股日涨跌、BTC 涨跌；只吃单。吃单按 100 份" in dbot.cmd_sim(None).text
     assert "挂单" not in dbot.cmd_sim(None).text.split("\n")[1] and dbot.sim_version()["sim_ways"] == "只吃单"
     far = m.SimMarket("will-bnb-hit-700-or-900", "BNB 先触 700/900", "touch", "BNB", 0.70, book([(0.55, 100)], [(0.58, 100)], NOW), 0.03, "",
                       ("$900", "$700"), {"low": 700, "high": 900, "deadline": CLOSE}, {})
