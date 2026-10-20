@@ -2,7 +2,7 @@
 named for its time. The bot builds the slug of the window running now, reads exactly the Binance candles that fix its
 line and its result (kept in SQLite), prices it like the monthly up/down card, shows the three cards in a section of
 their own (hidden until ticked in 自定义), and paper-trades them in a block of their own."""
-import asyncio, sys, math, json, datetime as dt
+import asyncio, sys, math, json, time, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
@@ -81,22 +81,32 @@ assert m.sim_groups(pos)[0]["driver"] == f"BTCUSDT@5m:{w5.start_ms}"
 S0 = w5.start_ms - w5.start_ms % H
 rows = [[S0 - (721 - i) * H, "0", "0", "0", str(100_000 * (1.003 if i % 2 else 1)), "0", S0 - (720 - i) * H - 1] for i in range(721)]
 rows.append([S0, "0", "0", "0", "100100", "0", S0 + H - 1])
+# 120 finished 1-minute closes alternating ±0.02% (σ ≈ 14.5%) before the hour: the short-horizon σ
+minute_rows = [[S0 - (121 - i) * MIN, "0", "0", "0", str(100_000 * (1.0002 if i % 2 else 1)), "0", S0 - (120 - i) * MIN - 1] for i in range(121)]
+short_sigma = m.short_vol(minute_rows, S0)
+assert abs(short_sigma - math.sqrt(math.log(1.0002) ** 2 * 365 * 24 * 60)) < 1e-9 and 0.14 < short_sigma < 0.15
+try:
+    m.short_vol(minute_rows[-30:], S0); assert False
+except ValueError:
+    pass
 
 
 class Feed:
-    """Binance spot: a ticker, hourly bars, and candles by (interval, open time) -> (open, close). A missing candle is
-    answered with the next one, as Binance does."""
+    """Binance spot: the top of the book (a tick either side of ``price``), hourly and 1-minute bars, and candles by
+    (interval, open time) -> (open, close). A missing candle is answered with the next one, as Binance does."""
     def __init__(self):
-        self.price, self.candles, self.calls, self.down = "118500.00", {}, [], False
+        self.price, self.candles, self.calls, self.down = D("118500.00"), {}, [], False
 
     async def get(self, path, **p):
         self.calls.append((path, p.get("interval"), p.get("startTime"), p.get("symbol")))
         if self.down:
             raise m.RemoteError("data-api.binance.vision: timed out")
-        if path == "ticker/price":
-            return {"symbol": p["symbol"], "price": self.price}
+        if path == "ticker/bookTicker":
+            return {"symbol": p["symbol"], "bidPrice": str(self.price - D("0.01")), "askPrice": str(self.price + D("0.01"))}
         if p["interval"] == "1h" and "startTime" not in p:
             return rows[-p["limit"]:]
+        if p["interval"] == "1m" and "startTime" not in p:
+            return minute_rows[-p["limit"]:]
         t, iv = p["startTime"], m.INTERVAL_MS[p["interval"]]
         if (p["interval"], t) in self.candles:
             o, c = self.candles[(p["interval"], t)]
@@ -124,7 +134,10 @@ async def run():
     S = w5.start_ms
     await refresh(mk, S + 1_000)
     assert mk.window == w5 and mk.odds(S + 1_000) == "起点价要等 10-19 23:35 ET（北京 10-20 11:35）这根 5 分钟 K 线收盘后确定"
-    assert not [c for c in feed.calls if c[2] is not None] and mk.price == D("118500.00") and 0.2 < mk.sigma < 0.35  # the rest refreshed
+    assert not [c for c in feed.calls if c[2] is not None] and mk.price == D("118500.00") and 0.2 < mk.sigma_long < 0.35  # the rest refreshed
+    short = mk.sigma_short(S + 1_000)
+    assert short == short_sigma and abs(mk.sigma_for(S + 1_000) - math.sqrt((mk.sigma_long ** 2 + short ** 2) / 2)) < 1e-12
+    assert mk.sigma_short(S + 1_000 + m.SpotFeed.SHORT_STALE_MS + 1) is None and mk.sigma_for(S + 1_000 + m.SpotFeed.SHORT_STALE_MS + 1) == mk.sigma_long  # a stale short σ is left out
     await refresh(mk, S + 3_000)  # due, but Binance answers with the next candle: never taken for it
     assert mk.line_of(w5) is None and "没有返回 10-19 23:35 ET" in mk.error
     assert mk.odds(S + 3_000).startswith("等待币安 10-19 23:35 ET（北京 10-20 11:35）这根 5 分钟 K 线的收盘价（")
@@ -139,12 +152,14 @@ async def run():
     # --- the odds: the price against the line over the time left, 50/50 for an equal close -----------------------------
     o = mk.odds(NOW)
     years = (w5.end_ms - NOW) / m.YEAR_MS
-    want = m.updown_odds(118500.0, 118100.0, mk.sigma, years)
+    want = m.updown_odds(118500.0, 118100.0, mk.sigma_for(NOW), years)
     assert isinstance(o, m.SeriesOdds) and (o.up, o.flat, o.down) == want[:3] and o.line == D("118100.00") and o.price == D("118500.00")
+    assert o.sigma == mk.sigma_for(NOW) and o.sigma_long == mk.sigma_long and o.sigma_short == mk.sigma_short(NOW) and o.sigma < o.sigma_long
     assert o.fair_up == o.up + o.flat / 2 and abs(o.fair_up + o.fair_down - 1) < 1e-12 and o.years == years and o.tie == "split" and not o.settled
     assert o.fair_up > 0.99, o  # +0.34% with under three minutes left
     assert mk.advice_problem(o, NOW) == "" and mk.model_swing(o) > 0
-    level = m.SeriesOdds(*m.updown_odds(118100.0, 118100.0, mk.sigma, years), D("118100"), D("118100"), years, "split")
+    level = m.SeriesOdds(*m.updown_odds(118100.0, 118100.0, mk.sigma_for(NOW), years), D("118100"), D("118100"), years, "split",
+                         sigma=mk.sigma_for(NOW), sigma_long=mk.sigma_long, sigma_short=mk.sigma_short(NOW))
     assert 0.49 < level.fair_up < 0.5 and 0 < mk.model_swing(level) < 0.001  # at the line: σ²τ/2 is nothing over five minutes
     assert mk.advice_problem(o, mk.sigma_ms + m.SeriesMarket.SIGMA_STALE_MS + 1) == "波动率超过一天未更新；暂不给建议"
     # a stale quote prices nothing (a minute is long for a 5-minute window)
@@ -154,10 +169,13 @@ async def run():
     feed.down = False
     await refresh(mk, NOW + 62_000)
     assert isinstance(mk.odds(NOW + 62_000), m.SeriesOdds)
-    # the last seconds: priced, but no suggestion (the book is refreshed every 15 s)
+    # the last seconds: priced, but no suggestion (a book read 3 s ago and an order placed now may both be too late)
     late = w5.end_ms - 15_000
     await refresh(mk, late)
-    assert isinstance(mk.odds(late), m.SeriesOdds) and mk.advice_problem(mk.odds(late), late) == "窗口只剩 15 秒，盘口的刷新跟不上；暂不给建议"
+    assert isinstance(mk.odds(late), m.SeriesOdds) and mk.advice_problem(mk.odds(late), late) == ""
+    last = w5.end_ms - 5_000
+    await refresh(mk, last)
+    assert mk.advice_problem(mk.odds(last), last) == "窗口只剩 5 秒，不再给建议"
     # --- the window ends: the next one takes over, the ended one's result is read from its candle once it is over ------
     E = w5.end_ms
     assert mk.odds(E, w5) == "窗口已结束，等待币安 10-19 23:40 ET（北京 10-20 11:40）这根 5 分钟 K 线的收盘价"
@@ -249,11 +267,16 @@ async def run():
     cards = {i["name"]: i for i in bot.odds_payload()["items"]}
     card = cards["BTC 5分钟涨跌"]
     assert card["group"] == "btc" and card["symbol"] == "BTC-5M" and card["ekey"] == "BTC-5M" and card["close_ms"] == w5.end_ms
-    assert card["close_label"].startswith("23:40–23:45 ET（北京 11:40–11:45）；终点 5 分钟 K 的收盘价高于起点为涨") and card["series"] == {
-        "cycle": "5m", "period": "5分钟", "slug": w5.slug, "window": "23:40–23:45 ET，北京 11:40–11:45"}
+    assert card["close_label"].startswith("23:40–23:45 ET（北京 11:40–11:45）；终点 5 分钟 K 的收盘价高于起点为涨")
+    assert {k: v for k, v in card["series"].items() if k != "next"} == {"cycle": "5m", "period": "5分钟", "slug": w5.slug, "window": "23:40–23:45 ET，北京 11:40–11:45"}
+    assert card["series"]["next"] == {"slug": f"btc-updown-5m-{w5.end_ms // 1000}", "url": m.PREDICT_SITE + f"btc-updown-5m-{w5.end_ms // 1000}?ref=B00EA",
+                                      "label": "23:45–23:50 ET，北京 11:45–11:50", "start_ms": w5.end_ms}  # the next window: Predict lists it ahead
     assert card["ref"] == "118,100.00" and card["ref_rel"] == "起点" and card["effective"] == "118,500.00" and card["unit"] == "USDT" and not card["warn"]
     assert card["ref_note"] == "币安 BTCUSDT 10-19 23:35 ET（北京 10-20 11:35）这根 5 分钟 K 线的收盘价" and "Chainlink" in card["proxy_note"]
-    assert abs(card["sigma"] - bot.series["BTC-5M"].sigma * math.sqrt(card["remaining"] / 365)) < 1e-12 and card["fair_up"] == bot.series["BTC-5M"].odds(NOW).fair_up
+    assert abs(card["sigma"] - bot.series["BTC-5M"].sigma_for(NOW) * math.sqrt(card["remaining"] / 365)) < 1e-12 and card["fair_up"] == bot.series["BTC-5M"].odds(NOW).fair_up
+    assert card["sigma_note"].startswith("近 2 小时 1 分钟 K 年化 14.5% 与 30 日小时 K 年化 ") and "均方根合成" in card["sigma_note"]
+    assert cards["BTC 1天涨跌"]["sigma_note"].startswith("币安 BTCUSDT 30 日小时收盘年化") and cards["BTC 1天涨跌"]["series"]["next"]["slug"] == "bitcoin-up-or-down-on-october-21-2026"
+    assert cards["BTC 1小时涨跌"]["series"]["next"]["slug"] == "bitcoin-up-or-down-october-20-2026-12am-et" and cards["BTC 1小时涨跌"]["series"]["next"]["label"] == "10-20 00:00–01:00 ET，北京 10-20 12:00–13:00"
     assert card["predict"]["url"] == m.PREDICT_SITE + w5.slug + "?ref=B00EA" and "edges" not in card["predict"]
     assert cards["BTC 1小时涨跌"]["group"] == "btc" and cards["BTC 1天涨跌"]["close_ms"] == wd.end_ms and cards["BTC 1天涨跌"]["ref"] == "117,234.56"
     assert cards["BTC 1小时涨跌"]["close_label"].startswith("10-19 23:00–00:00 ET（北京 10-20 11:00–12:00）；这根 1 小时 K 的收盘价不低于开盘价为涨")
@@ -282,6 +305,37 @@ async def run():
     card = {i["name"]: i for i in bot.odds_payload()["items"]}["BTC 5分钟涨跌"]
     assert card["warn"] == "Predict 起点价 118,200.00 与币安起点 118,100.00 不一致，请核实；暂不给建议" and card["predict"]["hold"] == card["warn"]
     bot.predict.strikes.pop(w5.slug)
+    # a book read more than 20 s ago (it is read every 3 s) holds suggestions back
+    bot.predict.books["BTC-5M"] = m.PredictBook("BTC-5M", w5.slug, "77", "Bitcoin Up or Down", book.bids, book.asks, NOW - 25_000)
+    card = {i["name"]: i for i in bot.odds_payload()["items"]}["BTC 5分钟涨跌"]
+    assert card["warn"] == "盘口 25 秒没刷新（本应每 3 秒），暂不给建议" and card["predict"]["hold"] == card["warn"] and bot.sim_markets(NOW)[0].hold == card["warn"]
+    bot.predict.books["BTC-5M"] = book
+    card = {i["name"]: i for i in bot.odds_payload()["items"]}["BTC 5分钟涨跌"]
+    assert not card["warn"]
+    # the Predict feed reads the series' books every 3 s between its full rounds (every 15 s), nothing else
+    seen = []
+
+    async def refresh_one(key, slug):
+        seen.append(key)
+    bot.predict.refresh_one = refresh_one
+    assert bot.predict.quick_keys == {"BTC-5M", "BTC-1H", "BTC-1D"}
+    targets = bot.predict_targets(NOW)
+    bot.predict.refreshed, bot.predict.quick_refreshed = time.monotonic(), -1e9
+    bot.predict.books["BTC-1H"] = m.PredictBook("BTC-1H", "bitcoin-up-or-down-october-19-2026-10pm-et", "70", "t", (), (), NOW)  # the hour before: dropped
+    quick = await bot.predict.refresh(targets)
+    assert quick.status == "ok" and sorted(seen) == ["BTC-1D", "BTC-1H", "BTC-5M"] and "BTC-1H" not in bot.predict.books and bot.predict.slugs["BTC-5M"] == w5.slug
+    assert bot.predict.books["BTC-5M"] is book and await bot.predict.refresh(targets) is False  # this window's book stays; not due again for 3 s
+    seen.clear(); bot.predict.refreshed = -1e9
+    assert (await bot.predict.refresh(targets)).status == "ok" and len(seen) == len(targets) > 3  # the full round: every target
+    seen.clear(); bot.predict.quick_refreshed = -1e9
+    assert (await bot.predict.refresh(targets)).status == "ok" and sorted(seen) == ["BTC-1D", "BTC-1H", "BTC-5M"]
+    bot.predict.refresh_one = m.PredictFeed.refresh_one.__get__(bot.predict)
+    # the event stream carries the three cards whole (their books every 3 s, their windows rolling over), without the server's edge chips
+    live = bot.live_payload()["items"]
+    whole = {i["name"]: i for i in live if i.get("full")}
+    assert set(whole) == {"BTC 1小时涨跌", "BTC 1天涨跌", "BTC 5分钟涨跌"} and all(i["group"] == "btc" and i["ekey"] == i["symbol"] for i in whole.values())
+    assert whole["BTC 5分钟涨跌"]["fair_up"] == card["fair_up"] and "edges" not in whole["BTC 5分钟涨跌"]["predict"] and "bids" in whole["BTC 5分钟涨跌"]["predict"]
+    assert whole["BTC 5分钟涨跌"]["series"]["next"]["slug"] == f"btc-updown-5m-{w5.end_ms // 1000}" and whole["BTC 5分钟涨跌"]["close_ms"] == w5.end_ms
     # the paper trader's market: one per window, the window named in the item, the 5-minute one without Telegram alerts
     (sim,) = bot.sim_markets(NOW)
     assert (sim.market, sim.item, sim.kind, sim.key, sim.sides) == (w5.slug, "BTC 5分钟涨跌 10-20 11:40", "btc", "BTC-5M", ("涨", "跌"))
@@ -363,6 +417,22 @@ async def run():
     assert {x["id"]: x for x in bot.journal_payload()["trades"]}[tid]["driver_name"] == "BTC 5分钟涨跌 10-20 11:40"
     assert "BTC 涨跌" in bot.journal_csv()
     assert [x["key"] for x in bot.journal_payload()["kinds"]] == ["btc"]
+    # the BTC series' own review (/journal?kind=btc): its trades, its totals, its rows by cycle, its exports
+    jp = bot.journal_payload(bot.SIM_APART)
+    assert jp["title"] == "模拟交易复盘 · BTC 涨跌" and jp["filter"] == ["btc"] and [x["id"] for x in jp["trades"]] == [tid]
+    assert jp["kinds"] == [{"key": "5m", "name": "BTC 5分钟", **m.sim_stats([t])}] and jp["total"]["settled"] == 1
+    assert bot.journal_payload()["title"] == "模拟交易复盘" and bot.journal_payload()["filter"] == [] and bot.journal_payload(frozenset(m.SIM_KINDS) - bot.SIM_APART)["trades"] == []
+    assert m.WebServer.journal_filter("kind=btc") == frozenset({"btc"}) and m.WebServer.journal_filter("kind=main") == frozenset(m.SIM_KINDS) - {"btc"}
+    assert m.WebServer.journal_filter("kind=nope") is None and m.WebServer.journal_filter("") is None and m.WebServer.journal_filter("x=1&kind=Close") == frozenset({"close"})
+    assert "BTC 涨跌" in bot.journal_csv(bot.SIM_APART) and tid in bot.journal_csv(bot.SIM_APART) and tid not in bot.journal_csv(frozenset(m.SIM_KINDS) - bot.SIM_APART)
+    assert f"BTC 涨跌的复盘页（只列这一块）：{bot.web_url()}/journal?kind=btc" in bot.cmd_sim(None).text
+    web = m.WebServer(bot, 0, bot.web_token)
+    st, ctype, body = web.route("GET", f"/p/{bot.web_token}/journal.json", query="kind=btc")
+    assert st == 200 and json.loads(body)["filter"] == ["btc"] and [x["id"] for x in json.loads(body)["trades"]] == [tid]
+    st, ctype, body = web.route("GET", f"/p/{bot.web_token}/journal.json")
+    assert st == 200 and json.loads(body)["filter"] == [] and {"journal.json#btc", "journal.json"} <= set(web.cache)  # cached apart
+    st, ctype, body = web.route("GET", f"/p/{bot.web_token}/journal.csv", query="kind=btc")
+    assert st == 200 and tid in body.decode("utf-8")
     # a restart that never saw the window: the trade asks for its candles, the next refresh reads them and settles it
     fresh = m.Bot(cfg, bstore, FM(w5.end_ms + 60_000), None)
     fresh.spot.get = feed.get
@@ -395,7 +465,9 @@ async def run():
     # --- the page: the section, hidden until ticked; the journal knows the kind --------------------------------------------------
     assert 'btc:"BTC 涨跌"' in m.WEB_PAGE and '<h2 id="h-btc">BTC 涨跌</h2>' in m.WEB_PAGE and '["sim","levels","macro","btc"]' in m.WEB_PAGE
     assert 'localStorage.getItem("btcDefault")' in m.WEB_PAGE and '"crypto","btc","levels"' in m.WEB_PAGE and 'btc:"BTC 涨跌"' in m.JOURNAL_PAGE
-    assert "s.intro||" in m.WEB_PAGE and "if(s.note)" in m.WEB_PAGE
+    assert "s.intro||" in m.WEB_PAGE and "if(s.note)" in m.WEB_PAGE and 'id="journal2"' in m.WEB_PAGE and '"/journal?kind=btc"' in m.WEB_PAGE
+    assert "li.full" in m.WEB_PAGE and "it.series.next" in m.WEB_PAGE and '"simj hd"' in m.WEB_PAGE
+    assert 'id="other"' in m.JOURNAL_PAGE and "kindQ" in m.JOURNAL_PAGE and 'base+"/journal.json"+qs' in m.JOURNAL_PAGE and "data.title" in m.JOURNAL_PAGE
 
 
 asyncio.run(run())

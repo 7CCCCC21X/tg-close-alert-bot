@@ -561,7 +561,11 @@ async def run():
     live = json.loads(event[len(b"event: live\ndata: "):])
     assert live["server_ms"] == bot.market.now_ms() and live["items"][0]["name"] == "上证指数", live
     assert {"fair_up", "fair_down", "effective", "quote_ms", "move", "proxy_note", "warn"} <= set(live["items"][0]) and "ref_note" not in live["items"][0]
-    assert {k: live["items"][1][k] for k in ("name", "symbol", "missing")} == {"name": "宇树 UNITREE", "symbol": "UNITREEUSDT", "missing": "等待行情"} and len(live["items"]) == 2, live["items"]
+    assert {k: live["items"][1][k] for k in ("name", "symbol", "missing")} == {"name": "宇树 UNITREE", "symbol": "UNITREEUSDT", "missing": "等待行情"} and len(live["items"]) == 5, live["items"]
+    # the BTC 涨跌 cards ride along whole (their books are read every 3 s, their windows roll over): the page replaces them in place
+    assert [(i["name"], i["symbol"], i["group"], i["full"], i["ekey"]) for i in live["items"][2:]] == [
+        ("BTC 5分钟涨跌", "BTC-5M", "btc", True, "BTC-5M"), ("BTC 1小时涨跌", "BTC-1H", "btc", True, "BTC-1H"), ("BTC 1天涨跌", "BTC-1D", "btc", True, "BTC-1D")]
+    assert live["items"][2]["missing"].startswith("起点价要等") and live["items"][2]["series"]["next"]["slug"].startswith("btc-updown-5m-") and "edges" not in live["items"][2]["predict"]
     assert {k: live["items"][1][k] for k in ("auction", "preopen", "preopen_phase", "preopen_price", "preopen_at")} == {"auction": "", "preopen": "", "preopen_phase": "", "preopen_price": "", "preopen_at": 0}  # the session tags ride along
     assert live["items"][1]["trading"] == "已收盘" and live["items"][0]["trading"] == "已收盘", live["items"]
     assert live["items"][0]["fair_up"] == json.loads(body)["items"][0]["fair_up"] and web.streams == 1

@@ -558,7 +558,7 @@ async def browser_check(bot):
         assert "· 结果不一致" in await page.inner_text("#g-sim .simrows")
         assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "no sideways scroll"
         if os.environ.get("WEB_SCREENSHOT"):
-            await page.locator("#g-sim .card").screenshot(path=os.environ["WEB_SCREENSHOT"])
+            await page.locator("#g-sim").screenshot(path=os.environ["WEB_SCREENSHOT"])  # both paper-trading cards
         await browser.close()
     await web.stop()
 
