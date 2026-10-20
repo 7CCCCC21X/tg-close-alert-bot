@@ -21,7 +21,7 @@ assert OCT.key not in {s.symbol for s in m.TOUCH_MARKETS} | {s.key for s in m.TO
 # the bare ETH / ETHUSDT are the ETH 先触 card's, ETH-HIT-10 the ETH price ladder's
 assert (ETH.key, ETH.slug, ETH.symbol, ETH.name) == ("ETH-2026-10", "eth-up-down-october-2026", "ETHUSDT", "ETH 10月涨跌")
 assert (ETH.start_ms, ETH.end_ms) == (OCT.start_ms, OCT.end_ms) and ETH.label(ETH.end_ms) == OCT.label(OCT.end_ms)
-others = [*m.TOUCH_MARKETS, *m.RANGE_MARKETS, *m.FLIP_MARKETS, *m.CAP_MARKETS, *m.STOCK_HIT_MARKETS, *m.MACRO_MARKETS, *m.QUOTE_MARKETS]
+others = [*m.TOUCH_MARKETS, *m.RANGE_MARKETS, *m.FLIP_MARKETS, *m.CAP_MARKETS, *m.STOCK_HIT_MARKETS]
 assert ETH.key not in {s.key for s in others} | {getattr(s, "symbol", "") for s in others}
 assert len({s.key for s in m.UPDOWN_MARKETS}) == len({s.slug for s in m.UPDOWN_MARKETS}) == len(m.UPDOWN_MARKETS) == 2
 # US Eastern offset without a tz database: EDT from 03-08 02:00 EST to 11-01 02:00 EDT in 2026
