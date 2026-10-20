@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.37.0"
+VERSION = "1.38.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -406,6 +406,18 @@ def parse_pyth_feeds(spec: str) -> dict[str, str]:
     return out
 
 
+def parse_series_alerts(spec: str) -> frozenset:
+    """BTC_UPDOWN_ALERTS: which of the BTC up/down series get Telegram edge alerts: off, all, or some of 5m, 1h, 1d."""
+    words = {w.strip().lower() for w in spec.split(",") if w.strip()}
+    if not words or words <= {"off", "none", "0", "false", "no"}:
+        return frozenset()
+    if words & {"all", "on"}:
+        return frozenset({"5m", "1h", "1d"})
+    if not words <= {"5m", "1h", "1d"}:
+        raise ValueError("BTC_UPDOWN_ALERTS 只能是 off、all，或 5m、1h、1d 的组合（逗号分隔）")
+    return frozenset(words)
+
+
 def parse_hl_tickers(spec: str, symbols: tuple[str, ...]) -> dict[str, tuple[str, str]]:
     """HL_TICKERS="SYMBOL=dex:COIN,..." (dex omitted = the main Hyperliquid perp dex); "off" disables."""
     tickers: dict[str, tuple[str, str]] = {}
@@ -484,6 +496,8 @@ class Config:
     ladder_deadlines: dict[str, int] = field(default_factory=dict)  # STOCK_HIT_MARKETS key -> deadline (23:59 ET, ms) pinned by hand
     macro: bool = True       # the 宏观 section: WTI / gold / silver / SPY October ladders (Pyth), GC's December settlements, the valuation ladders
     pyth_feeds: dict[str, str] = field(default_factory=dict)  # PYTH_FEEDS: a MACRO_MARKETS feed ("Metal.XAU/USD", "CLL") or key -> Hermes feed id
+    btc_updown: bool = True  # the BTC 涨跌 section: Predict's rolling 5-minute / 1-hour / 1-day BTC up-or-down markets (BTC_UPDOWN)
+    btc_updown_alerts: frozenset = frozenset({"1h", "1d"})  # which of them get Telegram edge alerts (BTC_UPDOWN_ALERTS; the 5-minute one is off by default)
     kospi_index: bool = True  # Show the KOSPI composite index for Korea-listed underlyings.
     hl_index: dict[str, tuple[str, str]] = field(default_factory=dict)  # index name -> (dex, coin), e.g. KR200
     predict: bool = True     # Fetch the matching Predict.fun up/down orderbooks and compare them with the model.
@@ -498,7 +512,7 @@ class Config:
     sim_edge: float = 0.10   # net edge (per $1 share) that triggers a simulated buy
     sim_shares: float = 100.0  # shares per simulated buy
     sim_ways: str = "taker"  # which suggestions it takes: taker (吃单), maker (挂单) or both
-    sim_markets: frozenset = frozenset({"close"})  # the market kinds it trades (SIM_KINDS keys); SIM_MARKETS=all for every kind
+    sim_markets: frozenset = frozenset({"close", "btc"})  # the market kinds it trades (SIM_KINDS keys); SIM_MARKETS=all for every kind
     sim_group_usd: float = 300.0  # the most one driver's positions may lose on a single move (paper $); 0 = no limit
     touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
     auction_alert: bool = True  # Telegram reminder when a market's closing auction starts
@@ -529,7 +543,7 @@ class Config:
         sim_ways = (e.get("SIM_WAYS") or "taker").strip().lower()
         if sim_ways not in {"taker", "maker", "both"}:
             raise ValueError("SIM_WAYS 只能是 taker（只吃单）、maker（只挂单）或 both（都做）")
-        wanted = {k.strip().lower() for k in (e.get("SIM_MARKETS") or "close").split(",") if k.strip()}
+        wanted = {k.strip().lower() for k in (e.get("SIM_MARKETS") or "close,btc").split(",") if k.strip()}
         sim_markets = frozenset(SIM_KINDS) if "all" in wanted else frozenset(wanted)
         if not sim_markets or not sim_markets <= set(SIM_KINDS):
             raise ValueError(f"SIM_MARKETS 只能是 all，或 {'、'.join(SIM_KINDS)} 的组合（逗号分隔）")
@@ -583,6 +597,8 @@ class Config:
             ladder_deadlines=parse_deadlines(e.get("LADDER_DEADLINES", "")),
             macro=e.get("MACRO", "on").strip().lower() not in {"off", "0", "false", "no"},
             pyth_feeds=parse_pyth_feeds(e.get("PYTH_FEEDS", "")),
+            btc_updown=e.get("BTC_UPDOWN", "on").strip().lower() not in {"off", "0", "false", "no"},
+            btc_updown_alerts=parse_series_alerts(e.get("BTC_UPDOWN_ALERTS", "1h,1d")),
             auction_alert=e.get("AUCTION_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
             preopen_alert=e.get("PREOPEN_ALERT", "on").strip().lower() not in {"off", "0", "false", "no"},
             preopen_lead=bounded_int(e, "PREOPEN_ALERT_LEAD_MINUTES", 5, 0, 60),
@@ -3864,6 +3880,7 @@ PREDICT_REWARD_STALE_SECONDS = 120  # allows the normal refresh to finish across
 PREDICT_POINTS_STALE_SECONDS = 3 * PREDICT_META_SECONDS  # other markets' points (read with the fee) are shown this long
 PREDICT_STRIKE_SECONDS = 300   # a known target price is re-read this often (the site may correct it)
 PREDICT_MISS_SECONDS = 60      # an unknown slug is looked up again after this long (new markets show up within a minute)
+PREDICT_QUICK_MISS_SECONDS = 15  # ...the rolling BTC series' next market: within a refresh or two (a 5-minute window cannot wait a minute)
 PREDICT_DEPTH = 20            # levels kept per side: a fill for the trade size is judged on these (a book "too thin" at
 #                               5 levels was often only cut off there), the page and the evidence show the top of them
 PREDICT_SHOW_DEPTH = 10       # levels sent to the page per side (it recomputes the edges for the viewer's trade size)
@@ -4310,6 +4327,7 @@ class PredictFeed:
         self.no_strike: set[str] = set()                         # category types without marketData.startPrice
         self.info: dict[str, dict] = {}                          # slug -> {"outcomes": [...], "created_ms": int}
         self.want_info: set[str] = set()                         # slugs whose outcome names / creation time matter
+        self.quick: set[str] = set()                             # slugs looked up again every refresh while unlisted (the rolling series)
         self.market_lists: dict[str, tuple[list[dict] | None, float]] = {}  # slug -> every market of the category
         self.market_meta: dict[str, tuple[dict, float]] = {}     # market id -> ({"outcomes": [...], "status": str}, when)
         self.meta_errors: dict[str, str] = {}                  # latest detail refresh failure (old rewards are not trusted)
@@ -4352,7 +4370,8 @@ class PredictFeed:
     async def resolve(self, slug: str) -> dict | None:
         """slug -> its (first) market; see find()."""
         cached = self.markets.get(slug)
-        if cached and (cached[0] is not None or time.monotonic() - cached[1] < PREDICT_MISS_SECONDS):
+        miss = PREDICT_QUICK_MISS_SECONDS if slug in self.quick else PREDICT_MISS_SECONDS
+        if cached and (cached[0] is not None or time.monotonic() - cached[1] < miss):
             return cached[0]
         found = await self.find(slug)
         market = found[0] if found else None
@@ -5205,6 +5224,344 @@ class UpDownMarket:
             return "已出结果，以 Predict 结算为准；不再给建议"
         if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
             return "波动率超过一天未更新；暂不给建议"
+        return ""
+
+
+# --- BTC up/down series (Predict's rolling 5-minute, 1-hour and 1-day markets) ----------------------------------------
+EN_MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november",
+             "december")
+INTERVAL_MS = {"1m": 60_000, "5m": 300_000, "1h": 3_600_000}
+INTERVAL_WORDS = {"1m": "1 分钟", "5m": "5 分钟", "1h": "1 小时"}
+SERIES_CYCLES = {"5m": "5分钟", "1h": "1小时", "1d": "1天"}
+
+
+def et_time(ms: int) -> dt.datetime:
+    """An instant as US Eastern wall time (EDT or EST, as that instant has it)."""
+    return dt.datetime.fromtimestamp(ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(ms))))
+
+
+@dataclass(frozen=True)
+class SeriesSpec:
+    """One of Predict's rolling BTC up/down series: a new market every period, each named for its window.
+    5m (btc-updown-5m-<window start, Unix seconds>): Up when the Chainlink BTC/USDT 5-minute candle closing at the end
+    is above the price at the start, equal 50/50; the stream is Binance's top-of-book mid, so Binance's own 5-minute
+    candles (trade prices, a tick or two from the mid) stand in for it. 1h (bitcoin-up-or-down-<month>-<day>-<year>-
+    <hour>am/pm-et): the Binance BTC/USDT 1-hour candle opening at that ET hour, Up when it closes at or above its open.
+    1d (bitcoin-up-or-down-on-<month>-<day>-<year>): the Binance 1-minute candle of that date's 12:00 ET against the
+    previous day's, Up when it closes higher, equal 50/50."""
+    key: str          # card / favourite / book key
+    cycle: str        # "5m" | "1h" | "1d"
+    symbol: str       # Binance spot pair the candles are read from
+    name: str         # card title
+    period_ms: int
+    tie: str          # "split": an equal close settles 50/50; "up": counts as Up (close >= open)
+    interval: str     # Binance kline interval of the candles the line and the final price are read from
+    line_field: str   # "open": the window's own candle's open is the line; "close": the previous candle's close is
+
+
+BTC_SERIES = (
+    SeriesSpec("BTC-5M", "5m", "BTCUSDT", "BTC 5分钟涨跌", 300_000, "split", "5m", "close"),
+    SeriesSpec("BTC-1H", "1h", "BTCUSDT", "BTC 1小时涨跌", 3_600_000, "up", "1h", "open"),
+    SeriesSpec("BTC-1D", "1d", "BTCUSDT", "BTC 1天涨跌", DAY_MS, "split", "1m", "close"),
+)
+
+
+@dataclass(frozen=True)
+class SeriesWindow:
+    """One market of a series: its slug, when its line is fixed and when its result is."""
+    cycle: str
+    slug: str
+    start_ms: int    # the window opens (the line is the price then)
+    end_ms: int      # the result is fixed (the final candle has closed)
+    line_at: int     # open time of the candle the line is read from
+    final_at: int    # open time of the candle whose close is the final price
+    interval: str
+
+    @property
+    def interval_ms(self) -> int:
+        return INTERVAL_MS[self.interval]
+
+    def label(self, plain: bool = False) -> str:
+        """The window in ET and Beijing time: '23:40–23:45 ET（北京 11:40–11:45）' (5m), '10-19 23:00–00:00 ET（北京 10-20
+        11:00–12:00）' (1h), '10-19 12:00 → 10-20 12:00 ET（北京 10-20 00:00 → 10-21 00:00）' (1d)."""
+        last = self.final_at if self.cycle == "1d" else self.end_ms
+        a, b = et_time(self.start_ms), et_time(last)
+        ba, bb = (dt.datetime.fromtimestamp(ms / 1000, BEIJING) for ms in (self.start_ms, last))
+        if self.cycle == "5m":
+            et, bj = f"{a:%H:%M}–{b:%H:%M} ET", f"北京 {ba:%H:%M}–{bb:%H:%M}"
+        elif self.cycle == "1h":
+            et, bj = f"{a:%m-%d %H:%M}–{b:%H:%M} ET", f"北京 {ba:%m-%d %H:%M}–{bb:%H:%M}"
+        else:
+            et, bj = f"{a:%m-%d %H:%M} → {b:%m-%d %H:%M} ET", f"北京 {ba:%m-%d %H:%M} → {bb:%m-%d %H:%M}"
+        return f"{et}，{bj}" if plain else f"{et}（{bj}）"
+
+    def short(self) -> str:
+        """The window as the paper trader names it: '10-20 11:40' (Beijing; 5m and 1h), '10-20 ET' (1d)."""
+        if self.cycle == "1d":
+            return f"{et_time(self.final_at):%m-%d} ET"
+        return dt.datetime.fromtimestamp(self.start_ms / 1000, BEIJING).strftime("%m-%d %H:%M")
+
+
+def series_slug(cycle: str, start_ms: int, final_at: int = 0) -> str:
+    """A window's Predict slug: the 5m one by its start in Unix seconds, the 1h one by the ET date and hour it opens,
+    the 1d one by the ET date of its final (12:00) candle."""
+    if cycle == "5m":
+        return f"btc-updown-5m-{start_ms // 1000}"
+    if cycle == "1h":
+        et = et_time(start_ms)
+        return (f"bitcoin-up-or-down-{EN_MONTHS[et.month - 1]}-{et.day}-{et.year}-{et.hour % 12 or 12}"
+                f"{'am' if et.hour < 12 else 'pm'}-et")
+    day = et_time(final_at or start_ms).date()
+    return f"bitcoin-up-or-down-on-{EN_MONTHS[day.month - 1]}-{day.day}-{day.year}"
+
+
+def series_window_from(spec: SeriesSpec, start_ms: int) -> SeriesWindow:
+    """The window that opens at start_ms (a period boundary; for 1d a 12:00 ET)."""
+    if spec.cycle != "1d":
+        line_at = start_ms if spec.line_field == "open" else start_ms - spec.period_ms
+        return SeriesWindow(spec.cycle, series_slug(spec.cycle, start_ms), start_ms, start_ms + spec.period_ms, line_at,
+                            start_ms, spec.interval)
+    day = et_time(start_ms).date() + dt.timedelta(days=1)
+    final_at = et_wall_ms(day, 12, 0)
+    return SeriesWindow("1d", series_slug("1d", start_ms, final_at), start_ms, final_at + 60_000, start_ms, final_at, "1m")
+
+
+def series_window(spec: SeriesSpec, now_ms: int) -> SeriesWindow:
+    """The window running at now_ms. A series' windows are back to back: the next opens as one ends (the 1d windows
+    share their 12:00 candle, which is one's final and the next one's line: the one whose result is not fixed runs)."""
+    if spec.cycle != "1d":
+        return series_window_from(spec, now_ms - now_ms % spec.period_ms)  # Binance's UTC-aligned candles are ET-aligned too
+    day = et_date(now_ms)
+    while et_wall_ms(day, 12, 1) <= now_ms:  # that date's 12:00 candle has closed: the next date's window runs
+        day += dt.timedelta(days=1)
+    return series_window_from(spec, et_wall_ms(day - dt.timedelta(days=1), 12, 0))
+
+
+@dataclass(frozen=True)
+class SeriesOdds:
+    up: float
+    flat: float      # the final price equals the line
+    down: float
+    z: float
+    line: D
+    price: D         # the live price, or the final price once settled
+    years: float     # time left until the result is fixed (0 once settled)
+    tie: str         # what an equal close settles as: "split" (50/50) or "up"
+    settled: bool = False
+
+    @property
+    def fair_up(self) -> float:
+        return self.up + (self.flat if self.tie == "up" else self.flat / 2)
+
+    @property
+    def fair_down(self) -> float:
+        return 1 - self.fair_up
+
+
+class SpotFeed:
+    """Binance spot quotes shared by the markets on one pair: the last trade price every PRICE_SECONDS, the 30-day σ
+    (hourly closes) once an hour. Each market's refresh asks for its pair; the first ask in a period fetches."""
+    PRICE_SECONDS = 5
+    VOL_SECONDS = 3600
+
+    def __init__(self):
+        self.prices: dict[str, tuple[D, int]] = {}      # symbol -> (last price, when quoted)
+        self.sigmas: dict[str, tuple[float, int]] = {}  # symbol -> (annualised σ, when measured)
+        self.times: dict[str, float] = {}
+
+    async def get(self, path: str, **params: Any) -> Any:
+        return await binance_spot(path, **params)
+
+    async def refresh(self, symbol: str, now_ms: int) -> None:
+        mono = time.monotonic()
+        if mono - self.times.get(f"price:{symbol}", -1e9) >= self.PRICE_SECONDS:
+            self.times[f"price:{symbol}"] = mono
+            data = await self.get("ticker/price", symbol=symbol)
+            self.prices[symbol] = (number(data["price"], symbol), now_ms)
+        if mono - self.times.get(f"vol:{symbol}", -1e9) >= self.VOL_SECONDS or symbol not in self.sigmas:
+            self.times[f"vol:{symbol}"] = mono
+            rows = await self.get("klines", symbol=symbol, interval="1h", limit=722)
+            self.sigmas[symbol] = (realized_vol(rows, now_ms), now_ms)
+
+
+class SeriesMarket:
+    """One series: the window running now, its line and final price read from Binance's candles (exactly the candles
+    named, kept in SQLite under series:<slug> so a restart, and the paper trader settling a window that has ended, read
+    them back), the live price and σ from the shared spot feed."""
+    CANDLE_SECONDS = 5           # a candle not read yet is asked for again this often
+    CANDLE_GRACE_MS = 2_000      # and only this long after it should exist (Binance finalises a candle within a second)
+    PRICE_STALE_MS = 60_000      # a quote older than this prices nothing (a 5-minute window cannot wait on a stale one)
+    SIGMA_STALE_MS = TouchMarket.SIGMA_STALE_MS
+    PENDING_MAX = 12             # ended windows whose final price is still to be read
+    KEEP_MS = 3 * DAY_MS         # candles read are kept this long; older windows are left to Predict's own result
+    CLOSE_HOLD_MS = {"5m": 30_000, "1h": 60_000, "1d": 60_000}  # no suggestion this close to the end: the book refreshes every 15 s
+
+    def __init__(self, store: "Store", spec: SeriesSpec, feed: SpotFeed):
+        self.store, self.spec, self.feed = store, spec, feed
+        self.window: SeriesWindow | None = None
+        self.pending: list[SeriesWindow] = []
+        self.error = ""
+        self.times = {"candle": -1e9, "prune": -1e9}
+
+    def current(self, now_ms: int) -> SeriesWindow:
+        return series_window(self.spec, now_ms)
+
+    @property
+    def price(self) -> D | None:
+        return (self.feed.prices.get(self.spec.symbol) or (None, 0))[0]
+
+    @property
+    def priced_ms(self) -> int:
+        return (self.feed.prices.get(self.spec.symbol) or (None, 0))[1]
+
+    @property
+    def sigma(self) -> float | None:
+        return (self.feed.sigmas.get(self.spec.symbol) or (None, 0))[0]
+
+    @property
+    def sigma_ms(self) -> int:
+        return (self.feed.sigmas.get(self.spec.symbol) or (None, 0))[1]
+
+    def record(self, slug: str) -> dict:
+        saved = self.store.get(f"series:{slug}")
+        return saved if isinstance(saved, dict) else {}
+
+    def saved(self, slug: str, which: str) -> D | None:
+        """The kept line or final price of a window, None until it has been read."""
+        with contextlib.suppress(TypeError, KeyError, ValueError, decimal.InvalidOperation):
+            value = D(str(self.record(slug)[which]))
+            return value if value > 0 else None
+        return None
+
+    def line_of(self, window: SeriesWindow) -> D | None:
+        return self.saved(window.slug, "line")
+
+    def final_of(self, window: SeriesWindow) -> D | None:
+        return self.saved(window.slug, "final")
+
+    def line_due(self, window: SeriesWindow) -> int:
+        """When the line can be read: the window's own candle's open once it has traded, else the previous candle's
+        close once that candle is over."""
+        return window.line_at + (0 if self.spec.line_field == "open" else window.interval_ms) + self.CANDLE_GRACE_MS
+
+    def final_due(self, window: SeriesWindow) -> int:
+        return window.final_at + window.interval_ms + self.CANDLE_GRACE_MS
+
+    def candle_name(self, open_ms: int) -> str:
+        return f"{et_time(open_ms):%m-%d %H:%M} ET（北京 {stamp(open_ms, seconds=False)}）这根 {INTERVAL_WORDS[self.spec.interval]} K 线"
+
+    async def read_candle(self, open_ms: int) -> list:
+        """Exactly the candle opening at open_ms (Binance answers with the next one when it is missing: a neighbour is
+        never taken for it)."""
+        rows = await self.feed.get("klines", symbol=self.spec.symbol, interval=self.spec.interval, startTime=open_ms,
+                                   endTime=open_ms + INTERVAL_MS[self.spec.interval] - 1, limit=1)
+        row = next((r for r in rows or [] if isinstance(r, list) and len(r) > 6 and int(r[0]) == open_ms), None)
+        if row is None:
+            raise ValueError(f"币安没有返回 {self.candle_name(open_ms)}")
+        return row
+
+    async def read_window(self, window: SeriesWindow, now_ms: int) -> None:
+        """Read what the window's candles can give by now: its line, then its final price; each kept once read."""
+        rec = self.record(window.slug)
+        changed = False
+        if rec.get("line") is None and now_ms >= self.line_due(window):
+            row = await self.read_candle(window.line_at)
+            if self.spec.line_field == "close" and int(row[6]) >= now_ms:
+                raise ValueError(f"{self.candle_name(window.line_at)}还没收盘")
+            value = row[1] if self.spec.line_field == "open" else row[4]
+            rec.update(line=str(number(value, f"{self.spec.symbol} K 线价格")), line_at=window.line_at)
+            changed = True
+        if rec.get("line") is not None and rec.get("final") is None and now_ms >= self.final_due(window):
+            row = await self.read_candle(window.final_at)
+            if int(row[6]) >= now_ms:
+                raise ValueError(f"{self.candle_name(window.final_at)}还没收盘")
+            rec.update(final=str(number(row[4], f"{self.spec.symbol} K 线收盘价")), final_at=window.final_at)
+            changed = True
+        if changed:
+            rec.update(cycle=window.cycle, start=window.start_ms, end=window.end_ms, read_ms=now_ms)
+            self.store.put(f"series:{window.slug}", rec)
+
+    def want(self, window: SeriesWindow) -> None:
+        """Ask for a window's candles on the next rounds (a window that ended whose result the paper trader waits for)."""
+        if (self.window is None or window.slug != self.window.slug) and window.slug not in {w.slug for w in self.pending}:
+            self.pending = [*self.pending, window][-self.PENDING_MAX:]
+
+    async def refresh(self, now_ms: int) -> None:
+        window = self.current(now_ms)
+        if self.window is None or window.slug != self.window.slug:
+            ended, self.window = self.window, window
+            self.times["candle"] = -1e9
+            if ended is not None:
+                self.want(ended)  # the window that just ended: its final price is still to be read
+        errors = []
+        mono = time.monotonic()
+        if mono - self.times["candle"] >= self.CANDLE_SECONDS:
+            self.times["candle"] = mono
+            for w in (window, *self.pending):
+                try:
+                    await self.read_window(w, now_ms)
+                except Exception as error:
+                    errors.append(clean_error(error) or type(error).__name__)
+            self.pending = [w for w in self.pending if self.final_of(w) is None and now_ms - w.end_ms < self.KEEP_MS]
+        try:
+            await self.feed.refresh(self.spec.symbol, now_ms)
+        except Exception as error:
+            errors.append(clean_error(error) or type(error).__name__)
+        if mono - self.times["prune"] >= 3600:
+            self.times["prune"] = mono
+            old = [k for k, v in self.store.items("series:")
+                   if isinstance(v, dict) and int(v.get("end") or 0) < now_ms - self.KEEP_MS]
+            if old:
+                self.store.delete_keys(old)
+        self.error = "；".join(dict.fromkeys(errors))
+
+    def odds(self, now_ms: int, window: SeriesWindow | None = None) -> SeriesOdds | str:
+        spec = self.spec
+        w = window or self.window or self.current(now_ms)
+        line, final = self.line_of(w), self.final_of(w)
+        if line is not None and final is not None:
+            up, down = float(final > line), float(final < line)
+            return SeriesOdds(up, 1.0 - up - down, down, 0.0, line, final, 0.0, spec.tie, True)
+        why = f"（{brief_error(self.error, 60)}）" if self.error else ""
+        word = "开盘" if spec.line_field == "open" else "收盘"
+        if line is None:
+            if now_ms < self.line_due(w):
+                return f"起点价要等 {self.candle_name(w.line_at)}{word}后确定"
+            return f"等待币安 {self.candle_name(w.line_at)}的{word}价{why}"
+        if now_ms >= w.end_ms:
+            return f"窗口已结束，等待币安 {self.candle_name(w.final_at)}的收盘价{why}"
+        price, sigma = self.price, self.sigma
+        if price is None or sigma is None:
+            return f"等待币安行情{why}"
+        if now_ms - self.priced_ms > self.PRICE_STALE_MS:
+            return (f"币安价格停在 {stamp(self.priced_ms)}（{(now_ms - self.priced_ms) // 1000} 秒未更新"
+                    f"{'：' + brief_error(self.error, 60) if self.error else ''}），暂停概率")
+        if not sigma > 0:
+            return "波动率无效，暂停概率"
+        years = (w.end_ms - now_ms) / YEAR_MS
+        up, flat, down, z = updown_odds(float(price), float(line), sigma, years)
+        return SeriesOdds(up, flat, down, z, line, price, years, spec.tie)
+
+    def model_swing(self, odds: SeriesOdds) -> float:
+        """How far the fair Up price moves with σ ×/÷ 1.25, or with the median at today's price (each varied alone)."""
+        if odds.settled or not self.sigma:
+            return 0.0
+
+        def fair(sigma: float, drift: float) -> float:
+            up, flat, _, _ = updown_odds(float(odds.price), float(odds.line), sigma, odds.years, drift)
+            return up + (flat if odds.tie == "up" else flat / 2)
+        return max(abs(fair(sigma, drift) - odds.fair_up) for sigma, drift in
+                   ((self.sigma * MODEL_SIGMA_ERROR, -0.5), (self.sigma / MODEL_SIGMA_ERROR, -0.5), (self.sigma, 0.0)))
+
+    def advice_problem(self, odds: SeriesOdds, now_ms: int) -> str:
+        """Why no trade is suggested from these odds ("" when one may be)."""
+        if odds.settled:
+            return "已出结果，以 Predict 结算为准；不再给建议"
+        if now_ms - self.sigma_ms > self.SIGMA_STALE_MS:
+            return "波动率超过一天未更新；暂不给建议"
+        left_ms = odds.years * YEAR_MS
+        if left_ms < self.CLOSE_HOLD_MS.get(self.spec.cycle, 60_000):
+            return f"窗口只剩 {max(0, int(left_ms // 1000))} 秒，盘口的刷新跟不上；暂不给建议"
         return ""
 
 
@@ -7578,6 +7935,7 @@ class SimMarket:
     makers: bool = True      # paper-trading maker orders (price ladders remain taker-only)
     maker_alerts: bool = False  # price ladders: separately gated maker opportunities, independent of taker alerts
     maker_note: str = ""     # why a price-ladder maker suggestion is unavailable
+    alerts: bool = True      # Telegram edge alerts for it (the BTC series: only the cycles BTC_UPDOWN_ALERTS names)
 
 
 class LazyEvidence(Mapping):
@@ -7610,7 +7968,7 @@ class LazyEvidence(Mapping):
 
 
 SIM_KINDS = {"close": "指数/个股日涨跌", "touch": "先触价", "updown": "月度涨跌", "flip": "反超", "range": "价格阶梯",
-             "ladder": "市值阶梯"}
+             "ladder": "市值阶梯", "btc": "BTC 涨跌"}
 # A resting paper order is placed only on a book it could fill in: both sides quoted, no further apart than this. A lone
 # 0.2¢ bid under an 80¢ ask is not a quote anyone sells into: an order joining it would rest until the result and tell
 # nothing (10-03: 54 such price-ladder orders sat as 挂单中 0/100 for weeks).
@@ -7662,6 +8020,9 @@ def market_driver(kind: str, key: str, settle: dict | None = None, item: str = "
     if kind == "ladder":
         spec = next((s for s in CAP_MARKETS if s.key == key), None)
         return key, spec.name if spec else (item.rsplit(" ", 1)[0] if item else key)
+    if kind == "btc":  # one of the rolling BTC series: each window is an event of its own (its one candle, or its one day)
+        spec = next((s for s in BTC_SERIES if s.key == key), None)
+        return f"{spec.symbol if spec else 'BTCUSDT'}@{settle.get('cycle') or ''}:{int(settle.get('start') or 0)}", item or key
     specs = {"touch": TOUCH_MARKETS, "updown": UPDOWN_MARKETS, "range": (*RANGE_MARKETS, *STOCK_HIT_MARKETS, *MACRO_MARKETS)}.get(kind, ())
     spec = next((s for s in specs if s.key == key), None)
     symbol = spec.symbol if spec else key
@@ -7688,7 +8049,7 @@ def scenario_result(kind: str, settle: dict, direction: str, level: float | None
             return 1.0
         return 1.0 if (target <= level if direction == "up" else target >= level) else 0.0
     if direction == "flat":
-        return 0.0 if kind == "flip" else 0.5
+        return 0.0 if kind == "flip" else 1.0 if kind == "btc" and settle.get("tie") == "up" else 0.5
     return 1.0 if direction == "up" else 0.0
 
 
@@ -7696,7 +8057,7 @@ def scenario_text(name: str, kinds: set[str], direction: str, level: float | Non
     """The move in words: '$PONS FDV 涨到 $1B', 'BTC 跌到 $60k', '恒生指数（10-07）收跌', 'BTC 先触高线', 'HYPE/SOL 反超'."""
     label = usd_short if "ladder" in kinds else level_label
     name = name + (" " if name and name[-1].isascii() else "")
-    if kinds <= {"close", "updown"}:
+    if kinds <= {"close", "updown", "btc"}:
         return name + {"up": "收涨", "down": "收跌"}.get(direction, "收平")
     if kinds == {"touch"}:
         return name + {"up": "先触高线", "down": "先触低线"}.get(direction, "都没触及")
@@ -8249,6 +8610,7 @@ h2{margin:12px 2px 6px}.legend{margin-bottom:4px}.edge{min-height:40px}.pb{paddi
 <h2 id="h-index">指数</h2><div class="grid" id="g-index"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>
 <h2 id="h-contract">合约标的</h2><div class="grid" id="g-contract"></div>
 <h2 id="h-crypto">加密</h2><div class="grid" id="g-crypto"></div>
+<h2 id="h-btc">BTC 涨跌</h2><div class="grid" id="g-btc"></div>
 <h2 id="h-levels">价格阶梯</h2><div class="grid wide" id="g-levels"></div>
 <h2 id="h-ladder">市值阶梯</h2><div class="grid wide" id="g-ladder"></div>
 <h2 id="h-macro">宏观</h2><div class="grid wide" id="g-macro"></div>
@@ -8272,17 +8634,18 @@ if(!Array.isArray(favs))favs=[];
 favs=[...new Set(favs.filter(k=>typeof k==="string").map(k=>k.includes("|")?(k.split("|")[1]||k.split("|")[0]):k))];  // old "name|symbol" keys
 function toggleFav(k){favs=favs.includes(k)?favs.filter(x=>x!==k):[...favs,k];keep("favs",favs);if(last)render(last)}
 // the viewer's layout, also in this browser only: card order per section, hidden cards and sections, the red-frame bar
-const SECTIONS=["index","contract","crypto","levels","ladder","macro","sim"],SEC_NAMES={fav:"⭐ 收藏",index:"指数",contract:"合约标的",crypto:"加密",levels:"价格阶梯",ladder:"市值阶梯",macro:"宏观",sim:"模拟交易"};
+const SECTIONS=["index","contract","crypto","btc","levels","ladder","macro","sim"],SEC_NAMES={fav:"⭐ 收藏",index:"指数",contract:"合约标的",crypto:"加密",btc:"BTC 涨跌",levels:"价格阶梯",ladder:"市值阶梯",macro:"宏观",sim:"模拟交易"};
 function keep(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
 function stored(k,d,ok){try{const v=JSON.parse(localStorage.getItem(k));return ok(v)?v:d}catch(e){return d}}
 const strs=v=>Array.isArray(v)&&v.every(x=>typeof x==="string");
 let order=stored("order",{},v=>!!v&&typeof v==="object"&&!Array.isArray(v)&&Object.values(v).every(strs));
-let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim","levels","macro"],strs),oneRow=stored("oneRow",[],strs);  // oneRow: ladder sections shown one card per row
+let hidden=stored("hidden",[],strs),hideSec=stored("hideSec",["sim","levels","macro","btc"],strs),oneRow=stored("oneRow",[],strs);  // oneRow: ladder sections shown one card per row
 try{if(!localStorage.getItem("simDefault")){if(!hideSec.includes("sim"))hideSec=[...hideSec,"sim"];keep("hideSec",hideSec);localStorage.setItem("simDefault","1")}}catch(e){}  // 模拟交易 starts hidden (show it in 自定义)
 try{if(!localStorage.getItem("levelsDefault")){if(!hideSec.includes("levels"))hideSec=[...hideSec,"levels"];  // 价格阶梯 starts hidden too
   if(localStorage.getItem("ladderDefault")){hideSec=hideSec.filter(x=>x!=="ladder");localStorage.removeItem("ladderDefault")}  // 1.21.5 hid 市值阶梯 instead: undo that once
   keep("hideSec",hideSec);localStorage.setItem("levelsDefault","1")}}catch(e){}
 try{if(!localStorage.getItem("macroDefault")){if(!hideSec.includes("macro"))hideSec=[...hideSec,"macro"];keep("hideSec",hideSec);localStorage.setItem("macroDefault","1")}}catch(e){}  // 宏观 starts hidden while it is being tried out (show it in 自定义)
+try{if(!localStorage.getItem("btcDefault")){if(!hideSec.includes("btc"))hideSec=[...hideSec,"btc"];keep("hideSec",hideSec);localStorage.setItem("btcDefault","1")}}catch(e){}  // BTC 涨跌 (5分钟 / 1小时 / 1天) starts hidden while it is being tried out: tick it in 自定义
 let hotCents=stored("hot",10,v=>typeof v==="number"&&v>=1&&v<=50),HOT=hotCents/100;  // an edge this large gets the red frame
 // the red-frame bar can also be set per section ("sec:<group>"), per card ("card:<key>") or per ladder level ("row:<key>#<label>"),
 // in cents; the most specific one set wins, the global one stands in otherwise
@@ -8424,6 +8787,7 @@ async function saveWatch(ch){const prev=watch;watch={...watch,...ch};watchSaving
   finally{watchSaving--;if(editing)drawPanel();if(last)render(last)}}
 function toggleFold(g){folded=folded.includes(g)?folded.filter(x=>x!==g):[...folded,g];keep("folded",folded);if(last)render(last)}
 let secOrder=stored("secs",SECTIONS,strs);secOrder=[...new Set(secOrder.filter(g=>SECTIONS.includes(g)))];
+SECTIONS.forEach((g,i)=>{if(secOrder.includes(g))return;const prev=SECTIONS.slice(0,i).reverse().find(p=>secOrder.includes(p));secOrder.splice(prev?secOrder.indexOf(prev)+1:0,0,g)});  // a section added since this browser saved its order: slotted where the default has it
 SECTIONS.forEach((g,i)=>{if(!secOrder.includes(g)){const prev=SECTIONS.slice(0,i).reverse().find(x=>secOrder.includes(x));  // a new section joins after its default neighbour
   secOrder.splice(prev?secOrder.indexOf(prev)+1:0,0,g)}});
 let editing=false,drag=null,pending=null;
@@ -8605,7 +8969,8 @@ function simCard(c,it){
   const s=it.sim,t=s.total,cents=(s.edge*100).toFixed(0),money=x=>(x>=0?"+$":"−$")+Math.abs(x).toFixed(2),usd=x=>"$"+x.toFixed(2);
   const col=x=>x>0?upColor():x<0?downColor():"var(--muted)";
   const how=[];if(s.ways!=="只挂单")how.push("吃单按这么多份吃到的均价和手续费成交");if(s.ways!=="只吃单")how.push("挂单只挂在价差不超过 10¢ 的双边盘口，只按盘口出现的卖单数量推定成交，出结果时没成交的部分作废，不再做的挂单撤掉");
-  c.append($("div","small mut","净优势 ≥"+cents+"¢ 时按卡片建议买 "+s.shares+" 份，只记账不下单。"+(s.scope?"范围："+s.scope+"；"+s.ways+"。":"")+how.join("；")+"。先预结算，再以 Predict 结果确认。"));
+  c.append($("div","small mut",s.intro||("净优势 ≥"+cents+"¢ 时按卡片建议买 "+s.shares+" 份，只记账不下单。"+(s.scope?"范围："+s.scope+"；"+s.ways+"。":"")+how.join("；")+"。先预结算，再以 Predict 结果确认。")));
+  if(s.note)c.append($("div","small warn",s.note));  // the BTC 涨跌 block: not traded right now (its records stay)
   const jl=$("a","simj","完整复盘（每笔证据、导出）↗");jl.href=location.pathname.replace(/\\/$/,"")+"/journal";c.append(jl);
   if(!t.trades){c.append($("p","","还没有触发过：等有卡片的净优势达到 "+cents+"¢ 就开始记录。"));return c}
   const top=$("div","simtop"),big=$("b","simpnl",money(t.pnl));big.style.color=col(t.pnl);
@@ -9077,7 +9442,7 @@ let armed=0;  // 恢复默认布局 takes a second click within 4 s: no dialog, 
 document.getElementById("reset").addEventListener("click",e=>{const b=e.currentTarget,idle=()=>{b.textContent="恢复默认布局";b.classList.remove("arm")};
   if(Date.now()-armed>4000){armed=Date.now();b.textContent="再点一次确认";b.classList.add("arm");setTimeout(()=>{if(Date.now()-armed>=4000)idle()},4100);return}
   armed=0;idle();  // the layout only: stars stay, their order too
-  order={};hidden=[];hideSec=["sim","levels","macro"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;oppPin=true;oppFold=false;folded=[];oneRow=[];secSort={};hotMap={};oppSound=false;oppSoundAll=true;soundKind="ding";soundVol=70;soundLen="mid";oppNotify=false;favMove=0;favMoveMap={};
+  order={};hidden=[];hideSec=["sim","levels","macro","btc"];secOrder=[...SECTIONS];hotCents=10;HOT=.1;oppOff=[];oppMakers=oppTakers=oppPoints=true;oppPin=true;oppFold=false;folded=[];oneRow=[];secSort={};hotMap={};oppSound=false;oppSoundAll=true;soundKind="ding";soundVol=70;soundLen="mid";oppNotify=false;favMove=0;favMoveMap={};
   ["order","hidden","secs","hot","oppOff","oppTaker","oppMakers","oppTakers","oppPoints","oppPin","oppFold","folded","oneRow","secsort","hotmap","oppSound","oppSoundAll","soundKind","soundVol","soundLen","oppNotify","favMove","favmove"].forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});keep("hideSec",hideSec);
   drawPanel();drawLegend();if(last)render(last)});
 let loading=null,lastSig="",dead=false;  // the fetch in flight: a slow answer never piles up behind the next tick, and a hung one is cut off
@@ -9295,7 +9660,7 @@ const num=x=>x==null||x===""?"—":typeof x==="number"?x.toLocaleString("en-US",
 const when=ms=>ms?new Date(ms).toLocaleString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false,month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}):"—";
 const span=ms=>{if(ms==null||!isFinite(ms))return"—";const a=Math.abs(ms),s=Math.round(a/1000);
   const t=s<90?s+" 秒":s<5400?Math.round(s/60)+" 分钟":s<172800?(s/3600).toFixed(1)+" 小时":(s/86400).toFixed(1)+" 天";return ms<0?t+"后":t};
-const KINDS={close:"指数/个股日涨跌",touch:"先触价",updown:"月度涨跌",flip:"反超",range:"价格阶梯",ladder:"市值阶梯"};
+const KINDS={close:"指数/个股日涨跌",touch:"先触价",updown:"月度涨跌",flip:"反超",range:"价格阶梯",ladder:"市值阶梯",btc:"BTC 涨跌"};
 const LABELS={fair_up:"模型 涨/Yes 公平价",ref:"参考线",ref_note:"参考说明",effective:"有效价",sigma_daily:"σ（日）",sigma_note:"σ 来源",
   remaining:"剩余方差占比",sigma:"σ（剩余）",z:"z",beta:"β",mode:"口径",direct:"直接用现货",proxy_note:"代理换算",target:"目标日",warn:"提示",
   close_ms:"收盘/截止",price:"现价",low:"低线",high:"高线",sigma_ms:"σ 计算时间",deadline_ms:"截止",years:"剩余年数",path:"路径核验",start_ms:"窗口开始",
@@ -10224,6 +10589,10 @@ class Bot:
         self.hsi.dated_close = lambda day: self.hsi_daily.daily.get(day)  # checks the cash index belongs to the right day
         self.touches = {spec.key: TouchMarket(store, spec) for spec in TOUCH_MARKETS}
         self.updowns = {spec.key: UpDownMarket(store, spec) for spec in UPDOWN_MARKETS}
+        self.spot = SpotFeed()  # Binance spot quotes the BTC series share
+        self.series = {spec.key: SeriesMarket(store, spec, self.spot)  # BTC 5分钟 / 1小时 / 1天涨跌 (their own section)
+                       for spec in (BTC_SERIES if config.btc_updown else ())}
+        self.series_slugs: set[str] = set()  # the series' current slugs, as last told to the Predict feed
         self.flips = {spec.key: FlipMarket(store, spec) for spec in FLIP_MARKETS}
         self.caps = {spec.key: CapMarket(store, spec) for spec in CAP_MARKETS}
         macro = MACRO_MARKETS if config.macro else ()  # the 宏观 section's price ladders ride with the others (MACRO=off leaves them out)
@@ -11645,9 +12014,14 @@ class Bot:
             items.extend(self.safe_card(r.spec.name, r.spec.key, r.spec.group, self.range_payload, r, now_ms) for r in self.ranges.values())
             items.extend(self.safe_card(q.name, q.key, q.group, self.quote_payload, q, now_ms) for q in self.quotes.values())
             items.extend(self.safe_card(c.spec.name, c.spec.key, "crypto", self.cap_payload, c, now_ms) for c in self.caps.values())
+        items.extend(self.safe_card(s.spec.name, s.spec.key, "btc", self.series_payload, s, now_ms) for s in self.series.values())  # BTC 涨跌
         if self.config.sim and self.config.predict:
             items.append(self.safe_card("模拟交易", "SIM", "sim", lambda: {"name": "模拟交易", "symbol": "SIM", "group": "sim",
                                                                           "kind": "sim", "sim": self.sim_report()}))
+            if self.series_sim_shown():  # the BTC series' paper trades: a block of their own, after the main one
+                items.append(self.safe_card("模拟交易 · BTC 涨跌", "SIM-BTC", "sim",
+                                            lambda: {"name": "模拟交易 · BTC 涨跌", "symbol": "SIM-BTC", "group": "sim", "kind": "sim",
+                                                     "sim": self.sim_report(kinds=self.SIM_APART)}))
         for item in items:
             item.setdefault("ekey", self.item_ekey(item))  # the key /edge and /watch know the card by
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
@@ -11884,6 +12258,82 @@ class Bot:
                 "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
                 "fair_up": odds.fair_up, "fair_down": odds.fair_down}
 
+    # --- BTC up/down series (5 分钟 / 1 小时 / 1 天): the cards of the BTC 涨跌 section ------------------------------------
+
+    def series_book(self, mkt: "SeriesMarket", window: SeriesWindow) -> tuple[PredictBook | None, str]:
+        """The window's book priced as "Up" (the card's 涨 side), whatever the market's outcome order. None when the book
+        the feed holds is another window's (the slug moved on; the next refresh fetches the new market's)."""
+        book = self.predict.books.get(mkt.spec.key)
+        if book is None or book.slug != window.slug:
+            return None, ""
+        names = (self.predict.info.get(window.slug) or {}).get("outcomes") or []
+        first = names[0].strip().lower() if names else ""
+        if first in {"up", "涨", "上涨"}:
+            return book, ""
+        if first in {"down", "跌", "下跌"}:  # the book prices "Down": its complement is "Up"
+            return flip_book(book), ""
+        return None, f"盘口方向未确认（结果名称：{'、'.join(names) or '未取得'}），暂不比较"
+
+    def series_hold(self, mkt: "SeriesMarket", odds: SeriesOdds, window: SeriesWindow, now_ms: int) -> tuple[str, str]:
+        """(why no trade is suggested, a note on the line): the market's own reasons, and Predict's start price (when its
+        category shows one) must be the line we read from Binance: exactly for the Binance-settled 1h and 1d series,
+        within 0.02% for the 5m one (Chainlink's mid against Binance's trade price)."""
+        hold = mkt.advice_problem(odds, now_ms)
+        strike = (self.predict.strikes.get(window.slug) or (None,))[0]
+        if strike is None:
+            return hold, ""
+        if abs(percent(strike, odds.line)) > (D("0.02") if window.cycle == "5m" else D("0.005")):
+            return hold or f"Predict 起点价 {strike:,.2f} 与币安起点 {odds.line:,.2f} 不一致，请核实；暂不给建议", ""
+        return hold, "；与 Predict 起点价一致"
+
+    SERIES_RULES = {"5m": "终点 5 分钟 K 的收盘价高于起点为涨、低于为跌、相同按 50/50（结算源 Chainlink BTC/USDT 流，即币安买一卖一中间价）",
+                    "1h": "这根 1 小时 K 的收盘价不低于开盘价为涨（相同算涨）、低于为跌（结算源币安 BTC/USDT 1 小时 K）",
+                    "1d": "终点 1 分钟 K 的收盘价高于起点为涨、低于为跌、相同按 50/50（结算源币安 BTC/USDT 1 分钟 K）"}
+
+    def series_sim_shown(self) -> bool:
+        """Whether the page gets the BTC series' own paper-trading block: the trader takes them, or has records of them."""
+        if "btc" in self.config.sim_markets and self.series:
+            return True
+        return any(t.get("kind") == "btc" for t in self.sim_trades().values())
+
+    def series_payload(self, mkt: "SeriesMarket", now_ms: int) -> dict:
+        """Web card for one of the rolling BTC series: the usual 涨/跌 card for the window running now, measured from
+        its line; the countdown runs to the window's end and the next window takes the card over."""
+        spec, w = mkt.spec, mkt.window or mkt.current(now_ms)
+        base = {"name": spec.name, "symbol": spec.key, "group": "btc", "close_ms": w.end_ms,
+                "close_label": f"{w.label()}；{self.SERIES_RULES[spec.cycle]}",
+                "series": {"cycle": spec.cycle, "period": SERIES_CYCLES[spec.cycle], "slug": w.slug, "window": w.label(plain=True)}}
+        odds = mkt.odds(now_ms, w)
+        hold, agree = self.series_hold(mkt, odds, w, now_ms) if isinstance(odds, SeriesOdds) else ("", "")
+        out: dict[str, Any] = {"url": predict_url(w.slug, self.config.predict_ref), "error": self.predict.errors.get(spec.key, "")}
+        book, why = self.series_book(mkt, w)
+        if book is not None:
+            ok = isinstance(odds, SeriesOdds)
+            swing = mkt.model_swing(odds) if ok else 0.0
+            self.book_block(out, book, odds.fair_up if ok else None, self.edge_need(swing), swing, hold, ("涨", "跌"), now_ms)
+        elif why and spec.key in self.predict.books:
+            out["error"] = why
+        if self.config.predict:
+            base["predict"] = out
+        if isinstance(odds, str):
+            return {**base, "missing": odds}
+        sigma = mkt.sigma or 0.0
+        verdict = "涨" if odds.up or (odds.flat and odds.tie == "up") else "跌" if odds.down else "持平，按 50/50"
+        line_word = "开盘价" if spec.line_field == "open" else "收盘价"
+        return {**base, "quote_ms": 0 if odds.settled else mkt.priced_ms, "source": "已结算" if odds.settled else "币安现货",
+                "ref": f"{odds.line:,.2f}", "ref_rel": "起点", "unit": "USDT",
+                "ref_note": f"币安 {spec.symbol} {mkt.candle_name(w.line_at)}的{line_word}{agree}",
+                "eff_label": "终点" if odds.settled else "现价", "effective": f"{odds.price:,.2f}",
+                "move": float(percent(odds.price, odds.line)),
+                "proxy_note": (f"已结算：终点 {odds.price:,.2f} 对起点 {odds.line:,.2f} → {verdict}" if odds.settled
+                               else f"不用代理：币安 {spec.symbol} 现价就是结算源"
+                               + ("的近似（Chainlink 流取币安买一卖一的中间价，相差不过一两跳）" if spec.cycle == "5m" else "")),
+                "warn": hold, "sigma_daily": sigma / math.sqrt(365), "remaining": odds.years * 365,
+                "sigma": sigma * math.sqrt(odds.years),
+                "sigma_note": (f"币安 {spec.symbol} 30 日小时收盘年化 {sigma * 100:.1f}%；价格零漂移" if not odds.settled else "已结算"),
+                "z": odds.z, "up": odds.up, "flat": odds.flat, "down": odds.down,
+                "fair_up": odds.fair_up, "fair_down": odds.fair_down}
+
     def ladder_fair(self, cap: "CapMarket", row: "LadderRow", now_ms: int) -> float | None:
         """A ladder level's Yes fair price as its card shows it (a market Predict settled before the window closed counts
         as reached: only a touch settles one early)."""
@@ -12040,6 +12490,16 @@ class Bot:
                     "sources": [price_evidence("现货", "币安现货", spec.symbol, "最新价", mkt.price, mkt.priced_ms, mkt.priced_ms),
                                 price_evidence("起点", "币安 1 分钟 K", spec.symbol, "收盘", odds.line, spec.start_ms)],
                     "proxy": None}
+        if kind == "btc":
+            mkt: SeriesMarket = parts["mkt"]
+            odds: SeriesOdds = parts["odds"]
+            w: SeriesWindow = parts["window"]
+            return {"basis": {"line": float(odds.line), "price": float(odds.price), "sigma": mkt.sigma, "years": odds.years,
+                              "settled": odds.settled, "window": w.label(plain=True), "slug": w.slug, "tie": odds.tie},
+                    "sources": [price_evidence("现货", "币安现货", mkt.spec.symbol, "最新价", mkt.price, mkt.priced_ms, mkt.priced_ms),
+                                price_evidence("起点", f"币安 {INTERVAL_WORDS[mkt.spec.interval]} K", mkt.spec.symbol,
+                                               "开盘" if mkt.spec.line_field == "open" else "收盘", odds.line, w.line_at)],
+                    "proxy": None}
         if kind == "flip":
             fm: FlipMarket = parts["fm"]
             spec = fm.spec
@@ -12107,6 +12567,16 @@ class Bot:
                                      ("涨", "跌"), {"key": symbol or key, "target": odds.target.isoformat(),
                                                    "line": float(odds.ref), "close_ms": close_ms},
                                      self.evidence(lambda title=title, odds=odds: self.close_evidence(title, odds, now_ms))))
+        for mkt in self.series.values():  # the rolling BTC series: the window running now, its book (never an older window's)
+            w = mkt.window or mkt.current(now_ms)
+            odds = mkt.odds(now_ms, w)
+            book, _ = self.series_book(mkt, w)
+            if isinstance(odds, SeriesOdds) and book is not None:
+                out.append(SimMarket(w.slug, f"{mkt.spec.name} {w.short()}", "btc", mkt.spec.key, odds.fair_up, book,
+                                     self.edge_need(mkt.model_swing(odds)), self.series_hold(mkt, odds, w, now_ms)[0], ("涨", "跌"),
+                                     {"end": w.end_ms, "start": w.start_ms, "cycle": w.cycle, "tie": mkt.spec.tie, "line": float(odds.line)},
+                                     self.evidence(lambda mkt=mkt, odds=odds, w=w: self.market_evidence("btc", now_ms, mkt=mkt, odds=odds, window=w)),
+                                     alerts=w.cycle in self.config.btc_updown_alerts))
         if not self.config.touch:
             return out
         for touch in self.touches.values():
@@ -12284,6 +12754,8 @@ class Bot:
             return f"等 {str(s.get('target') or '')[5:]} 收盘（{at(end)}）后 1 小时（{at(settle_at)}），按官方收盘预结算，再等 Predict 确认"
         if kind == "touch":
             return f"先碰到哪条线就按那条线结算；都没碰到的话等截止 {at(end)} 后按 50/50（{at(settle_at)} 起核验）"
+        if kind == "btc":
+            return f"等窗口结束 {at(end)}，按币安 K 线结算（结束后几秒内），再等 Predict 确认"
         if kind == "updown":
             return f"等窗口结束 {at(end)}，按终点 1 分钟 K 结算（{at(settle_at)} 起）"
         if kind == "flip":
@@ -12325,6 +12797,22 @@ class Bot:
                 return odds.fair_up, f"终点 {odds.price:,.2f}，起点 {odds.line:,.2f}", {
                     "rule": "终点那根 1 分钟 K 收盘高于起点为涨，低于为跌，相同 50/50", "source": "币安 1 分钟 K",
                     "start": float(odds.line), "end": float(odds.price)}
+            return None
+        if kind == "btc":
+            mkt = self.series.get(str(trade.get("key") or ""))
+            if mkt is None:
+                return None  # BTC_UPDOWN=off: Predict's own result settles it
+            slug = str(trade.get("slug") or trade["market"])
+            line, final = mkt.saved(slug, "line"), mkt.saved(slug, "final")
+            if line is not None and final is not None:
+                tie = str(s.get("tie") or mkt.spec.tie)
+                up = 1.0 if final > line else 0.0 if final < line else 1.0 if tie == "up" else 0.5
+                return up, f"终点 {final:,.2f}，起点 {line:,.2f}", {
+                    "rule": "终点收盘价高于起点为涨，低于为跌，相同" + ("算涨" if tie == "up" else "50/50"),
+                    "source": f"币安 {INTERVAL_WORDS[mkt.spec.interval]} K", "start": float(line), "end": float(final), "slug": slug}
+            end, start = int(s.get("end") or 0), int(s.get("start") or 0)
+            if start and end and now_ms >= end and now_ms - end < mkt.KEEP_MS:
+                mkt.want(series_window_from(mkt.spec, start))  # a window that ended before the bot read it (a restart): read it now
             return None
         if kind == "flip":
             fm = self.flips.get(trade["key"])
@@ -12639,9 +13127,16 @@ class Bot:
             marks[label] = {"at": now_ms, "after_s": (now_ms - int(filled)) // 1000, "mid": mid, "move": mid - paid,
                             "fair": fair, "fair_move": fair - float(trade.get("fill_fair", trade["fair"]))}
 
-    def sim_report(self, recent: int = 30) -> dict:
-        """The paper trader's record for the page: totals, by market kind and by maker / taker, the latest trades."""
-        trades = sorted(self.sim_trades().items(), key=lambda kv: kv[1].get("opened", 0))
+    SIM_APART = frozenset({"btc"})  # kinds reported in a block of their own (the BTC series: many short windows a day)
+    SERIES_DRIVER = re.compile(r"@(5m|1h|1d):")  # a BTC series window's driver key (market_driver)
+
+    def sim_report(self, recent: int = 30, kinds: frozenset | None = None) -> dict:
+        """The paper trader's record for the page: totals, by market kind and by maker / taker, the latest trades.
+        ``kinds``: only these market kinds; None = every kind but SIM_APART (the BTC series have a block of their own,
+        split by cycle: 5 分钟 / 1 小时 / 1 天)."""
+        apart = kinds is not None and kinds <= self.SIM_APART
+        mine = (lambda t: t["kind"] in kinds) if kinds is not None else (lambda t: t["kind"] not in self.SIM_APART)
+        trades = sorted(((tid, t) for tid, t in self.sim_trades().items() if mine(t)), key=lambda kv: kv[1].get("opened", 0))
         rows = [{"id": tid, "opened": stamp(t["opened"], seconds=False), "item": t["item"], "label": t["label"],
                  "maker": t["maker"], "price": t["price"], "shares": t["shares"], "order": t.get("order", t["shares"]),
                  "edge": t["edge"], "status": t["status"], "text": sim_status(t), "state": sim_state(t),
@@ -12649,14 +13144,29 @@ class Bot:
                  "note": t.get("note", ""), "url": self.sim_url(t)}
                 for tid, t in reversed(trades[-recent:])]
         values = [t for _, t in trades]
-        ways, kinds = sim_scope(self.config)
-        return {"edge": self.config.sim_edge, "shares": self.config.sim_shares, "ways": ways, "scope": kinds, "total": sim_stats(values),
-                "kinds": [{"name": name, **sim_stats([t for t in values if t["kind"] == kind])}
-                          for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in values)],
+        ways, scope = sim_scope(self.config)
+        extra: dict[str, Any] = {}
+        if apart:
+            cycle = lambda t: str((t.get("settle") or {}).get("cycle") or "")
+            kind_rows = [{"name": f"BTC {name}", **sim_stats([t for t in values if cycle(t) == c])}
+                         for c, name in SERIES_CYCLES.items() if any(cycle(t) == c for t in values)]
+            scope = "BTC 5分钟 / 1小时 / 1天涨跌"
+            extra = {"intro": (f"BTC 涨跌（5 分钟 / 1 小时 / 1 天）的模拟交易单独记在这里，不计入“模拟交易”栏的数字。净优势 ≥"
+                               f"{self.config.sim_edge * 100:g}¢ 时按卡片建议买 {self.config.sim_shares:g} 份，{ways}，只记账不下单；"
+                               "窗口一结束按币安 K 线预结算，再以 Predict 结果确认。"),
+                     "note": ("" if "btc" in self.config.sim_markets and self.series else
+                              "BTC 涨跌已关闭（BTC_UPDOWN=off），只显示已有记录" if not self.series else
+                              "模拟交易范围不含 BTC 涨跌（SIM_MARKETS 加 btc 才开仓），只显示已有记录")}
+        else:
+            kind_rows = [{"name": name, **sim_stats([t for t in values if t["kind"] == kind])}
+                         for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in values)]
+        blocks = [b for b in self.sim_blocks() if bool(self.SERIES_DRIVER.search(str(b.get("driver") or ""))) == apart]
+        return {"edge": self.config.sim_edge, "shares": self.config.sim_shares, "ways": ways, "scope": scope, "total": sim_stats(values),
+                "kinds": kind_rows,
                 "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
                           for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
-                "groups": sim_groups(values), "sources": sim_sources(values), "blocks": self.sim_blocks(),
-                "group_cap": self.config.sim_group_usd, "rows": rows}
+                "groups": sim_groups(values), "sources": sim_sources(values), "blocks": blocks,
+                "group_cap": self.config.sim_group_usd, "rows": rows, **extra}
 
     def sim_text(self) -> str:
         r = self.sim_report(recent=10)
@@ -12667,29 +13177,58 @@ class Bot:
                        "出结果时没成交的部分作废；不再做的挂单撤掉")
         lines = [f"🧪 {bold('模拟交易')}（净优势 ≥{edge:g}¢ 时按卡片建议买 {shares} 份，只记账不下单）",
                  f"范围：{r['scope']}；{r['ways']}。" + "；".join(how) + "。先按机器人数据预结算，再以 Predict 的结果确认。"]
+        money = lambda x: f"{'+' if x >= 0 else '−'}${abs(x):,.2f}"
         if not t["trades"]:
             lines.append(f"\n还没有触发过：等有卡片的净优势达到 {edge:g}¢ 就开始记录。")
-            return "\n".join(lines)
+        else:
+            lines += ["", f"已结算 {t['settled']} 笔：赢 {t['wins']}｜输 {t['losses']}｜平 {t['ties']}"
+                          f"（已确认 {t['confirmed']}｜预结算 {t['local']}｜结果不一致 {t['mismatch']}）",
+                      f"成本 ${t['cost']:,.2f} → 回款 ${t['payout']:,.2f}｜盈亏 {bold(money(t['pnl']))}"
+                      + (f"（{t['roi'] * 100:+.1f}%）" if t["cost"] else ""),
+                      f"模型预期：下单时 {money(t['expected'])}｜成交时 {money(t['expected_fill'])}",
+                      f"持仓 {t['open']} 笔（成本 ${t['open_cost']:,.2f}）｜挂单中 {t['resting']} 笔｜部分成交 {t['partial']} 笔"
+                      f"｜未成交作废 {t['expired']} 笔" + (f"｜撤单 {t['cancelled']} 笔" if t["cancelled"] else "")]
+            for group in (r["kinds"], r["modes"]):
+                if len(group) > 1:
+                    lines.append("｜".join(f"{g['name']} {g['settled']} 笔 {money(g['pnl'])}" for g in group))
+            lines.append("｜".join(f"{label} {s['settled']} 笔 {money(s['pnl'])}（预期 {money(s['expected'])}）"
+                                   for label, s in self.sim_recent_stats().items()))  # is the model holding up lately?
+            lines.extend(self.sim_risk_lines(r))
+            lines.append("\n最近：")
+            lines += [f"{x['opened']} {x['item']} {x['label']} {x['price'] * 100:.1f}¢×{x['shares']:g} → {x['text']}"
+                      + (f"·{x['state']}" if x["state"] else "") for x in r["rows"]]
+        lines.extend(self.series_sim_lines())
+        if self.config.web_port and self.web_token:
+            lines.append(f"\n完整复盘（每笔的判断依据、来源、成交与结算证据，可导出）：{self.web_url()}/journal")
+        return "\n".join(lines)
+
+    def series_sim_lines(self) -> list[str]:
+        """The BTC series' paper trades for /sim: their own block, by cycle, with their latest trades."""
+        if not self.series_sim_shown():
+            return []
+        r = self.sim_report(recent=5, kinds=self.SIM_APART)
+        t = r["total"]
         money = lambda x: f"{'+' if x >= 0 else '−'}${abs(x):,.2f}"
-        lines += ["", f"已结算 {t['settled']} 笔：赢 {t['wins']}｜输 {t['losses']}｜平 {t['ties']}"
-                      f"（已确认 {t['confirmed']}｜预结算 {t['local']}｜结果不一致 {t['mismatch']}）",
+        lines = ["", f"🪙 {bold('BTC 涨跌（5 分钟 / 1 小时 / 1 天）')}：单独统计，不计入上面的数字" + (f"；{r['note']}" if r.get("note") else "")]
+        if not t["trades"]:
+            lines.append("还没有记录。")
+            return lines
+        lines += [f"已结算 {t['settled']} 笔：赢 {t['wins']}｜输 {t['losses']}｜平 {t['ties']}"
+                  f"（已确认 {t['confirmed']}｜预结算 {t['local']}｜结果不一致 {t['mismatch']}）",
                   f"成本 ${t['cost']:,.2f} → 回款 ${t['payout']:,.2f}｜盈亏 {bold(money(t['pnl']))}"
                   + (f"（{t['roi'] * 100:+.1f}%）" if t["cost"] else ""),
                   f"模型预期：下单时 {money(t['expected'])}｜成交时 {money(t['expected_fill'])}",
-                  f"持仓 {t['open']} 笔（成本 ${t['open_cost']:,.2f}）｜挂单中 {t['resting']} 笔｜部分成交 {t['partial']} 笔"
-                  f"｜未成交作废 {t['expired']} 笔" + (f"｜撤单 {t['cancelled']} 笔" if t["cancelled"] else "")]
+                  f"持仓 {t['open']} 笔（成本 ${t['open_cost']:,.2f}）｜挂单中 {t['resting']} 笔｜未成交作废 {t['expired']} 笔"
+                  + (f"｜撤单 {t['cancelled']} 笔" if t["cancelled"] else "")]
         for group in (r["kinds"], r["modes"]):
             if len(group) > 1:
                 lines.append("｜".join(f"{g['name']} {g['settled']} 笔 {money(g['pnl'])}" for g in group))
         lines.append("｜".join(f"{label} {s['settled']} 笔 {money(s['pnl'])}（预期 {money(s['expected'])}）"
-                               for label, s in self.sim_recent_stats().items()))  # is the model holding up lately?
-        lines.extend(self.sim_risk_lines(r))
-        lines.append("\n最近：")
+                               for label, s in self.sim_recent_stats(self.SIM_APART).items()))
+        lines.append("最近：")
         lines += [f"{x['opened']} {x['item']} {x['label']} {x['price'] * 100:.1f}¢×{x['shares']:g} → {x['text']}"
                   + (f"·{x['state']}" if x["state"] else "") for x in r["rows"]]
-        if self.config.web_port and self.web_token:
-            lines.append(f"\n完整复盘（每笔的判断依据、来源、成交与结算证据，可导出）：{self.web_url()}/journal")
-        return "\n".join(lines)
+        return lines
 
     def sim_risk_lines(self, r: dict) -> list[str]:
         """The common-risk view of the open positions and the markouts of the fills, for /sim: one event can hold many
@@ -12718,13 +13257,14 @@ class Bot:
                 for _, label in MARKOUT_HORIZONS if label in marks) + "；持续为负 = 挂单常被更快的人吃掉旧报价")
         return lines
 
-    def sim_recent_stats(self) -> dict[str, dict]:
+    def sim_recent_stats(self, kinds: frozenset | None = None) -> dict[str, dict]:
         """{'今天': stats, '近 7 天': stats} over the trades settled in those windows (Beijing days): the lifetime total
-        cannot say whether the model has stopped working lately."""
+        cannot say whether the model has stopped working lately. ``kinds`` as in sim_report."""
         now_ms = self.market.now_ms()
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).replace(hour=0, minute=0, second=0, microsecond=0)
         windows = {"今天": int(today.timestamp() * 1000), "近 7 天": int((today - dt.timedelta(days=6)).timestamp() * 1000)}
-        trades = [t for t in self.sim_trades().values() if t["status"] == "settled" and t.get("settled")]
+        mine = (lambda t: t["kind"] in kinds) if kinds is not None else (lambda t: t["kind"] not in self.SIM_APART)
+        trades = [t for t in self.sim_trades().values() if t["status"] == "settled" and t.get("settled") and mine(t)]
         return {label: sim_stats([t for t in trades if int(t["settled"]) >= since]) for label, since in windows.items()}
 
     def journal_payload(self) -> dict:
@@ -13063,6 +13603,8 @@ class Bot:
         bars, _ = self.edge_bars()  # read once a round, not once a market
         observed_makers = set()
         for mk in self.sim_markets(now_ms):
+            if not mk.alerts:
+                continue  # the 5-minute BTC series unless BTC_UPDOWN_ALERTS says so: too short for a confirmed alert to be acted on
             bar = self.edge_bar(mk, bars)  # the level's, market's or section's own bar (/edge), else EDGE_ALERT_CENTS
             self.edge_observe(state, mk.market, mk, costs, bar, now_ms)
             if mk.kind == "range":
@@ -13579,6 +14121,15 @@ class Bot:
                                                               *RANGE_MARKETS, *STOCK_HIT_MARKETS)})
             targets.update({key: rm.spec.slug for key, rm in self.ranges.items()})  # the 宏观 ladders too (none with MACRO=off)
             targets.update({key: spec.slug for key, spec in self.quotes.items()})
+        slugs = set()
+        for key, mkt in self.series.items():  # the rolling BTC series: the window running now (a new slug every period)
+            targets[key] = mkt.current(now_ms).slug
+            slugs.add(targets[key])
+        if slugs != self.series_slugs:
+            for table in (self.predict.want_info, self.predict.quick):
+                table.difference_update(self.series_slugs - slugs)
+                table.update(slugs)
+            self.series_slugs = slugs
         return targets
 
     def edge_costs(self) -> EdgeCosts:
@@ -13586,11 +14137,13 @@ class Bot:
 
     # --- /edge: the announcement bar per section, market or level -------------------------------------------------------
 
-    EDGE_GROUPS = {"index": "指数", "contract": "合约标的", "crypto": "加密", "levels": "价格阶梯", "ladder": "市值阶梯", "macro": "宏观"}
+    EDGE_GROUPS = {"index": "指数", "contract": "合约标的", "crypto": "加密", "btc": "BTC 涨跌", "levels": "价格阶梯", "ladder": "市值阶梯",
+                   "macro": "宏观"}
     EDGE_GROUP_WORDS = {"指数": "index", "index": "index", "合约": "contract", "合约标的": "contract", "个股": "contract",
                         "contract": "contract", "加密": "crypto", "crypto": "crypto", "价格阶梯": "levels", "levels": "levels",
                         "range": "levels", "市值阶梯": "ladder", "ladder": "ladder", "cap": "ladder",
-                        "宏观": "macro", "macro": "macro", "商品": "macro", "宏观资产": "macro"}
+                        "宏观": "macro", "macro": "macro", "商品": "macro", "宏观资产": "macro",
+                        "btc涨跌": "btc", "btc 涨跌": "btc", "比特币涨跌": "btc", "btc-updown": "btc", "btc_updown": "btc"}
     EDGE_ALIASES = {"恒指": "HSI", "恒生": "HSI", "恒生指数": "HSI", "上证": "SSE", "沪指": "SSE", "上证指数": "SSE", "韩国": "KOSPI"}
 
     def edge_group(self, mk: SimMarket) -> str:
@@ -13600,7 +14153,7 @@ class Bot:
         if mk.kind == "range":  # a price ladder: 价格阶梯, or 宏观 for the Pyth and CME ones
             rm = self.ranges.get(mk.key)
             return rm.spec.group if rm else "levels"
-        return "ladder" if mk.kind == "ladder" else "crypto"
+        return "ladder" if mk.kind == "ladder" else "btc" if mk.kind == "btc" else "crypto"
 
     @staticmethod
     def edge_level(mk: SimMarket) -> str:
@@ -13633,7 +14186,7 @@ class Bot:
         """(key, card name) of every market the bars can be set for."""
         out = [(key, title) for key, title, _ in PREDICT_ITEMS]
         out += [(symbol, NAMES.get(symbol, symbol)) for symbol in self.config.symbols]
-        for table in (self.touches, self.updowns, self.flips, self.caps, self.ranges):
+        for table in (self.touches, self.updowns, self.flips, self.caps, self.ranges, self.series):
             out += [(key, getattr(mkt.spec, "name", key)) for key, mkt in table.items()]
         out += [(key, spec.name) for key, spec in self.quotes.items()]  # book-only: a bar set on one changes nothing, 自选 works
         return out
@@ -13681,7 +14234,7 @@ class Bot:
             lines += [f"· {names.get(k, k)}：≥{bars[k]:g}¢" for k in extra]
         else:
             lines.append("没有单独设置的栏目、市场或档位。")
-        lines.append("用法：/edge 6 改默认；/edge 市值阶梯 6（栏目：指数 / 合约标的 / 加密 / 价格阶梯 / 市值阶梯 / 宏观）；"
+        lines.append("用法：/edge 6 改默认；/edge 市值阶梯 6（栏目：指数 / 合约标的 / 加密 / BTC涨跌 / 价格阶梯 / 市值阶梯 / 宏观）；"
                      "/edge 牛来 4（市场：名字、别名或代码）；/edge 牛来 300M 3（档位）；末尾写 off 取消；/edge 清空 全部取消。"
                      "网页红框的门槛另在网页 ✎ 自定义里设置。")
         return "\n".join(lines)
@@ -14612,6 +15165,8 @@ class Bot:
             jobs.append(("反超市场", lambda: self.refresh_flip(now())))
             jobs.append(("市值阶梯", lambda: self.refresh_caps(now())))
             jobs.append(("价格阶梯", lambda: self.refresh_ranges(now())))
+        if self.series:
+            jobs.append(("BTC 涨跌", lambda: self.refresh_series(now())))
         if self.config.sim and self.config.predict:
             jobs.append(("模拟交易", lambda: self.sim_step(now())))
         if self.config.predict:
@@ -14653,6 +15208,12 @@ class Bot:
             await mkt.refresh(now_ms)
         failed = [f"{key}：{mkt.error}" for key, mkt in self.updowns.items() if mkt.error]
         return refreshed(failed, len(self.updowns) - len(failed))
+
+    async def refresh_series(self, now_ms: int) -> Refreshed:
+        for mkt in self.series.values():
+            await mkt.refresh(now_ms)
+        failed = [f"{key}：{mkt.error}" for key, mkt in self.series.items() if mkt.error]
+        return refreshed(failed, len(self.series) - len(failed))
 
     async def refresh_touch(self, now_ms: int) -> Refreshed:
         for touch in self.touches.values():

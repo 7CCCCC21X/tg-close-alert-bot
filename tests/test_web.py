@@ -102,7 +102,7 @@ async def layout_check(browser, page):
     await page.evaluate("localStorage.removeItem('favs')"); await page.reload(); await page.wait_for_selector(".card .odds")
     assert not await page.is_visible("#custom") and await page.locator(".ctl").count() == 0
     await page.click("#edit")
-    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == 30  # every card, the seven 宏观 ones included
+    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == 34  # every card: the seven 宏观, the three BTC 涨跌 and the two 模拟交易 ones included
     lad = "#g-ladder .card"
     assert await page.is_disabled(f"{lad}:nth-child(1) .ctl button[title='前移']") and await page.is_disabled(f"{lad}:nth-child(8) .ctl button[title='后移']")
     await page.click(f"{lad}:nth-child(1) .ctl button[title='后移']")
@@ -117,7 +117,7 @@ async def layout_check(browser, page):
     assert await page.locator(".card.off").count() == 2 and "已隐藏 2 张卡片" in await page.inner_text("#hidn")
     # the panel's own checklist shows the same state and hides / shows a card too
     assert await page.eval_on_selector_all("#cards input:not(:checked)", "els => els.map(e => e.dataset.card)") == ["上证指数", "UNITREEUSDT"]
-    assert await page.eval_on_selector_all("#cards .cgrp > .mut", "els => els.map(e => e.textContent)") == ["指数：", "合约标的：", "加密：", "价格阶梯：", "市值阶梯：", "宏观：", "模拟交易："]
+    assert await page.eval_on_selector_all("#cards .cgrp > .mut", "els => els.map(e => e.textContent)") == ["指数：", "合约标的：", "加密：", "BTC 涨跌：", "价格阶梯：", "市值阶梯：", "宏观：", "模拟交易："]
     await page.uncheck("#cards input[data-card=BNBUSDT]")
     assert await page.locator(".card.off").count() == 3 and await stored("hidden") == '["上证指数","UNITREEUSDT","BNBUSDT"]'
     assert await page.inner_text("#g-crypto .card:nth-child(1) .ctl button:nth-last-child(1)") == "显示"
@@ -159,19 +159,19 @@ async def layout_check(browser, page):
     assert await page.inner_text("#h-ladder .hn") == "市值阶梯" and await stored("hideSec") == '["sim"]'
     # ↑ ↓ beside a section title move the whole section (the tick boxes follow); sections without cards are skipped
     heads = lambda: page.eval_on_selector_all(".wrap > h2:not([hidden])", "els => els.map(e => e.id.slice(2))")
-    assert await heads() == ["index", "contract", "crypto", "levels", "ladder", "macro", "sim"]
+    assert await heads() == ["index", "contract", "crypto", "btc", "levels", "ladder", "macro", "sim"]
     assert await page.is_disabled("#h-index button[title='栏目上移']") and await page.is_disabled("#h-sim button[title='栏目下移']")
     await page.click("#h-crypto button[title='栏目上移']"); await page.click("#h-crypto button[title='栏目上移']")
-    assert await heads() == ["crypto", "index", "contract", "levels", "ladder", "macro", "sim"]
-    assert await stored("secs") == '["crypto","index","contract","levels","ladder","macro","sim"]'
-    assert await page.eval_on_selector_all("#secs input", "els => els.map(e => e.dataset.sec)") == ["crypto", "index", "contract", "levels", "ladder", "macro", "sim"]
+    assert await heads() == ["crypto", "index", "contract", "btc", "levels", "ladder", "macro", "sim"]
+    assert await stored("secs") == '["crypto","index","contract","btc","levels","ladder","macro","sim"]'
+    assert await page.eval_on_selector_all("#secs input", "els => els.map(e => e.dataset.sec)") == ["crypto", "index", "contract", "btc", "levels", "ladder", "macro", "sim"]
     await page.click("#g-contract .card .star")  # 合约标的 is now empty: ↓ on 指数 goes straight past it
     await page.click("#h-index button[title='栏目下移']")
-    assert await heads() == ["fav", "crypto", "levels", "index", "ladder", "macro", "sim"], await heads()
-    assert await stored("secs") == '["crypto","contract","levels","index","ladder","macro","sim"]', await stored("secs")
+    assert await heads() == ["fav", "crypto", "btc", "index", "levels", "ladder", "macro", "sim"], await heads()
+    assert await stored("secs") == '["crypto","contract","btc","index","levels","ladder","macro","sim"]', await stored("secs")
     await page.click("#g-fav .card .star")
     await page.reload(); await page.wait_for_selector("#g-crypto .card"); await page.click("#edit")
-    assert await heads() == ["crypto", "contract", "levels", "index", "ladder", "macro", "sim"]
+    assert await heads() == ["crypto", "contract", "btc", "index", "levels", "ladder", "macro", "sim"]
     # a section title dragged by its ⠿ past the section below moves the whole section (kept, like the ↑ ↓ moves)
     await page.set_viewport_size({"width": 1300, "height": 2200})
     await page.evaluate("document.getElementById('h-contract').scrollIntoView({block: 'center'})")  # clear of the sticky filter bar
@@ -179,10 +179,10 @@ async def layout_check(browser, page):
     _, _, lv = await box("#g-levels")
     await page.mouse.move(x, y); await page.mouse.down()
     await page.mouse.move(x, lv["y"] + lv["height"] - 4, steps=12)
-    assert await heads() == ["crypto", "levels", "contract", "index", "ladder", "macro", "sim"], await heads()
+    assert await heads() == ["crypto", "btc", "index", "contract", "levels", "ladder", "macro", "sim"], await heads()
     await page.mouse.up()
-    assert await page.evaluate("drag === null") and await stored("secs") == '["crypto","levels","contract","index","ladder","macro","sim"]'
-    assert await page.eval_on_selector_all("#secs input", "els => els.map(e => e.dataset.sec)") == ["crypto", "levels", "contract", "index", "ladder", "macro", "sim"]
+    assert await page.evaluate("drag === null") and await stored("secs") == '["crypto","btc","index","contract","levels","ladder","macro","sim"]'
+    assert await page.eval_on_selector_all("#secs input", "els => els.map(e => e.dataset.sec)") == ["crypto", "btc", "index", "contract", "levels", "ladder", "macro", "sim"]
     await page.set_viewport_size({"width": 390, "height": 900})
     # 恢复默认布局 takes a second click within 4 s and leaves the stars alone (folded sections open again too)
     await page.evaluate("keep('folded', ['index']); keep('oneRow', ['ladder'])")
@@ -193,7 +193,7 @@ async def layout_check(browser, page):
     await page.click("#reset")
     assert await page.inner_text("#reset") == "再点一次确认" and await stored("order") is not None
     await page.click("#reset")
-    assert await page.inner_text("#reset") == "恢复默认布局" and await heads() == ["fav", "index", "contract", "crypto", "levels", "ladder", "macro", "sim"]
+    assert await page.inner_text("#reset") == "恢复默认布局" and await heads() == ["fav", "index", "contract", "crypto", "btc", "levels", "ladder", "macro", "sim"]
     assert await stored("oneRow") is None and await page.evaluate("document.getElementById('g-ladder').classList.contains('wide')")
     assert await names("ladder") == ["$牛来 市值", "$ANSEM FDV", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV"] and await names("crypto") == [*crypto[:3], *crypto[4:]]
     assert await stored("order") is None and await stored("secs") is None and await stored("favs") == '["BTCUSDT"]'
@@ -373,26 +373,39 @@ async def browser_check(async_playwright, chrome, port, token, bot):
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**({"executable_path": chrome} if chrome else {}))
         url = f"http://127.0.0.1:{port}/p/{token}"
-        # a fresh browser hides 价格阶梯 and 宏观 (and 模拟交易) but shows 市值阶梯; ticking one in 自定义 brings it back
+        # a fresh browser hides 价格阶梯, 宏观 and BTC 涨跌 (and 模拟交易) but shows 市值阶梯; ticking one in 自定义 brings it back
         fresh = await browser.new_page(viewport={"width": 390, "height": 900})
         await fresh.goto(url); await fresh.wait_for_selector("#g-crypto .card")
-        assert not await fresh.is_visible("#h-levels") and not await fresh.is_visible("#h-macro") and await fresh.is_visible("#g-ladder .card")
-        assert await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim","levels","macro"]' and await fresh.evaluate("[localStorage.getItem('levelsDefault'), localStorage.getItem('macroDefault')]") == ["1", "1"]
+        assert not await fresh.is_visible("#h-levels") and not await fresh.is_visible("#h-macro") and not await fresh.is_visible("#h-btc") and await fresh.is_visible("#g-ladder .card")
+        assert await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim","levels","macro","btc"]' and await fresh.evaluate("[localStorage.getItem('levelsDefault'), localStorage.getItem('macroDefault'), localStorage.getItem('btcDefault')]") == ["1", "1", "1"]
         await fresh.click("#edit"); await fresh.check("#secs input[data-sec=levels]"); await fresh.click("#done")
-        assert await fresh.is_visible("#g-levels .card") and not await fresh.is_visible("#h-macro") and await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim","macro"]'
+        assert await fresh.is_visible("#g-levels .card") and not await fresh.is_visible("#h-macro") and await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim","macro","btc"]'
         await fresh.click("#edit"); await fresh.check("#secs input[data-sec=macro]"); await fresh.click("#done")
-        assert await fresh.is_visible("#g-macro .card") and await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim"]'
+        assert await fresh.is_visible("#g-macro .card") and not await fresh.is_visible("#h-btc") and await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim","btc"]'
+        await fresh.click("#edit"); await fresh.check("#secs input[data-sec=btc]"); await fresh.click("#done")
+        assert await fresh.is_visible("#g-btc .card") and await fresh.locator("#g-btc .card").count() == 3 and await fresh.evaluate("localStorage.getItem('hideSec')") == '["sim"]'
+        assert "BTC 5分钟涨跌" in await fresh.inner_text("#g-btc") and "⏳" in await fresh.inner_text("#g-btc .card .cd")
         await fresh.close()
+        # a browser that saved its section order before BTC 涨跌 existed: the section is slotted in after 加密, hidden once
+        saved = await browser.new_page(viewport={"width": 390, "height": 900})
+        await saved.add_init_script("localStorage.setItem('secs','[\"crypto\",\"index\",\"contract\",\"levels\",\"ladder\",\"macro\",\"sim\"]');"
+                                    "localStorage.setItem('hideSec','[\"sim\"]');localStorage.setItem('levelsDefault','1');localStorage.setItem('macroDefault','1')")
+        await saved.goto(url); await saved.wait_for_selector("#g-crypto .card")
+        assert await saved.evaluate("secOrder") == ["crypto", "btc", "index", "contract", "levels", "ladder", "macro", "sim"]
+        assert await saved.evaluate("localStorage.getItem('hideSec')") == '["sim","btc"]' and not await saved.is_visible("#h-btc")
+        await saved.click("#edit")
+        assert await saved.eval_on_selector_all("#secs input", "els => els.map(e => e.dataset.sec)") == ["crypto", "btc", "index", "contract", "levels", "ladder", "macro", "sim"]
+        await saved.close()
         # a browser that ran 1.21.5 (which hid 市值阶梯 by mistake) gets 市值阶梯 back and 价格阶梯 hidden, once
         older = await browser.new_page(viewport={"width": 390, "height": 900})
         await older.add_init_script("if(!localStorage.getItem('levelsDefault')&&!localStorage.getItem('hideSec')){"
                                     "localStorage.setItem('hideSec','[\"sim\",\"ladder\"]');localStorage.setItem('ladderDefault','1')}")
         await older.goto(url); await older.wait_for_selector("#g-crypto .card")
         assert await older.is_visible("#g-ladder .card") and not await older.is_visible("#h-levels")
-        assert await older.evaluate("[localStorage.getItem('hideSec'), localStorage.getItem('ladderDefault'), localStorage.getItem('levelsDefault')]") == ['["sim","levels","macro"]', None, "1"]
+        assert await older.evaluate("[localStorage.getItem('hideSec'), localStorage.getItem('ladderDefault'), localStorage.getItem('levelsDefault')]") == ['["sim","levels","macro","btc"]', None, "1"]
         await older.close()
         page = await browser.new_page(viewport={"width": 390, "height": 900})
-        await page.add_init_script("if(!localStorage.getItem('levelsDefault')){localStorage.setItem('hideSec','[\"sim\"]');localStorage.setItem('levelsDefault','1');localStorage.setItem('macroDefault','1')}")  # 价格阶梯 on, as below; one-shot so a reload keeps what the test changes
+        await page.add_init_script("if(!localStorage.getItem('levelsDefault')){localStorage.setItem('hideSec','[\"sim\"]');localStorage.setItem('levelsDefault','1');localStorage.setItem('macroDefault','1');localStorage.setItem('btcDefault','1')}")  # 价格阶梯 on, as below; one-shot so a reload keeps what the test changes
         await page.goto(url)
         await page.wait_for_selector(".card .odds")
         text = await page.inner_text(".wrap")
@@ -504,7 +517,8 @@ async def run():
     names = [i["name"] for i in payload["items"]]
     assert names == ["上证指数", "宇树 UNITREE", "BNB 先触 700/900", "SOL 先触 60/140", "BTC 先触 70k/90k", "ETH 先触 1k/3k", "BTC 10月涨跌", "ETH 10月涨跌",
                      "HYPE 反超 SOL", "BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格", "STRC 触及 $100", "WTI 原油 10月价格", "黄金 XAUUSD 10月价格", "白银 XAGUSD 10月价格", "标普500 SPY 10月价格",
-                     "黄金期货 GC 12月底前结算价", "Anthropic 估值（12-31 前）", "OpenAI IPO 估值", "$牛来 市值", "$ANSEM FDV", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV", "模拟交易"], names
+                     "黄金期货 GC 12月底前结算价", "Anthropic 估值（12-31 前）", "OpenAI IPO 估值", "$牛来 市值", "$ANSEM FDV", "$PONS FDV", "$MEME FDV", "$CASHCAT FDV", "$AI FDV", "$STONK FDV", "$STONKBROKER FDV",
+                     "BTC 5分钟涨跌", "BTC 1小时涨跌", "BTC 1天涨跌", "模拟交易", "模拟交易 · BTC 涨跌"], names
     bnb = payload["items"][2]
     assert bnb["group"] == "crypto" and bnb["labels"] == ["$900", "$700"] and bnb["missing"].startswith("等待币安行情"), bnb
     assert payload["items"][0]["group"] == "index" and payload["items"][1]["symbol"] == "UNITREEUSDT" and payload["items"][1]["group"] == "contract"
@@ -576,7 +590,7 @@ async def run():
     # data.json carries them, and each card's market key (the one /edge and /watch know it by)
     d = json.loads((await request(port, f"GET /p/{token}/data.json HTTP/1.1\r\n\r\n".encode()))[2])
     assert d["watch"] == {"keys": [], "names": {}, "tg_only": False, "tg": True} and [i["ekey"] for i in d["items"][:4]] == ["SSE", "UNITREEUSDT", "BNB", "SOL"], d["watch"]
-    assert d["items"][-1]["ekey"] == "SIM" and {i["ekey"] for i in d["items"][:-1]} <= {k for k, _ in bot.edge_markets()}
+    assert [i["ekey"] for i in d["items"][-2:]] == ["SIM", "SIM-BTC"] and {i["ekey"] for i in d["items"][:-2]} <= {k for k, _ in bot.edge_markets()}
     post = lambda body, ctype="Content-Type: application/json\r\n": request(port, f"POST /p/{token}/watch HTTP/1.1\r\nHost: x\r\n{ctype}Content-Length: {len(body)}\r\n\r\n".encode() + body)
     st, head, body = await post(b'{"keys": ["UNITREEUSDT", "SOL"], "tg_only": true}')
     assert st == 200 and "application/json" in head and json.loads(body) == {"keys": ["UNITREEUSDT", "SOL"], "names": {"UNITREEUSDT": "宇树 UNITREE", "SOL": "SOL"}, "tg_only": True, "tg": True}, body
