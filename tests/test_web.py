@@ -102,7 +102,7 @@ async def layout_check(browser, page):
     await page.evaluate("localStorage.removeItem('favs')"); await page.reload(); await page.wait_for_selector(".card .odds")
     assert not await page.is_visible("#custom") and await page.locator(".ctl").count() == 0
     await page.click("#edit")
-    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == 23
+    assert await page.is_visible("#custom") and await page.inner_text("#edit") == "✓ 完成" and await page.locator(".card .ctl").count() == 24
     lad = "#g-ladder .card"
     assert await page.is_disabled(f"{lad}:nth-child(1) .ctl button[title='前移']") and await page.is_disabled(f"{lad}:nth-child(8) .ctl button[title='后移']")
     await page.click(f"{lad}:nth-child(1) .ctl button[title='后移']")
