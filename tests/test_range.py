@@ -3,25 +3,36 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
 D = m.D
-BTC, ETH, SOL, HYPE = m.RANGE_MARKETS
+BTC, ETH, SOL, HYPE, BTC27 = m.RANGE_MARKETS
+OCTOBER = m.RANGE_MARKETS[:4]
 H = 3_600_000
 utc = lambda *a: int(dt.datetime(*a, tzinfo=dt.timezone.utc).timestamp() * 1000)
 
-# --- the four markets as their rules state them -------------------------------------------------------------------
+# --- the five markets as their rules state them -------------------------------------------------------------------
 assert BTC.start_ms == utc(2026, 10, 1, 4, 0) and BTC.end_ms == utc(2026, 11, 1, 3, 59)  # 10-01 00:00 → 10-31 23:59 EDT
-assert all(s.start_ms == BTC.start_ms and s.end_ms == BTC.end_ms for s in m.RANGE_MARKETS)
-assert [s.slug for s in m.RANGE_MARKETS] == [f"what-price-will-{c}-hit-in-october-2026" for c in ("bitcoin", "ethereum", "solana", "hyperliquid")]
-assert [(s.symbol, s.venue) for s in m.RANGE_MARKETS] == [("BTCUSDT", "spot"), ("ETHUSDT", "spot"), ("SOLUSDT", "spot"), ("HYPEUSDT", "futures")]
-# the rules each category came with: BTC's "final Low ≤", the others' "final High ≥" (each market's own rules decide)
-assert [s.default_dir for s in m.RANGE_MARKETS] == ["down", "up", "up", "up"]
-assert [s.name for s in m.RANGE_MARKETS] == ["BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格"]
+assert all(s.start_ms == BTC.start_ms and s.end_ms == BTC.end_ms for s in OCTOBER)
+assert [s.slug for s in OCTOBER] == [f"what-price-will-{c}-hit-in-october-2026" for c in ("bitcoin", "ethereum", "solana", "hyperliquid")]
+assert [(s.symbol, s.venue) for s in m.RANGE_MARKETS] == [("BTCUSDT", "spot"), ("ETHUSDT", "spot"), ("SOLUSDT", "spot"), ("HYPEUSDT", "futures"),
+                                                          ("BTCUSDT", "spot")]
+# the rules each category came with: BTC October's "final Low ≤", the others' "final High ≥" (each market's own rules decide)
+assert [s.default_dir for s in m.RANGE_MARKETS] == ["down", "up", "up", "up", "up"]
+assert [s.name for s in m.RANGE_MARKETS] == ["BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格", "BTC 2026年价格"]
 assert BTC.label(BTC.start_ms) == "10-01 00:00 ET（北京 10-01 12:00）" and BTC.label(BTC.end_ms) == "10-31 23:59 ET（北京 11-01 11:59）"
+# BTC to 2027: "between November 24, 2025, 14:00 and December 31, 2026, 23:59 in the ET timezone", EST (UTC−5) at both ends
+# although the window runs through both 2026 DST switches; its times name the year, its card says 窗口内 rather than 本月
+assert BTC27.key == "BTC-HIT-2026" and BTC27.slug == "what-price-will-bitcoin-hit-before-2027"
+assert BTC27.start_ms == utc(2025, 11, 24, 19, 0) and BTC27.end_ms == utc(2027, 1, 1, 4, 59)
+assert BTC27.start_ms % H == 0  # on the hour: hourly candles cover the window exactly
+assert BTC.monthly and not BTC.span_years and not BTC27.monthly and BTC27.span_years
+assert BTC27.label(BTC27.start_ms) == "2025-11-24 14:00 ET（北京 11-25 03:00）" and BTC27.label(BTC27.end_ms) == "2026-12-31 23:59 ET（北京 01-01 12:59）"
 
 # --- a level from a market's title or question --------------------------------------------------------------------
 levels = {"↑ 130,000": "130000", "↓ $100k": "100000", "$4.5K": "4500", "130K": "130000", "↑ 0.5": "0.5", "↓ 87.5": "87.5",
           "Will Solana reach $250 in October 2026?": "250", "Will Bitcoin dip to $95,000 in October?": "95000",
           "Will Ethereum hit $5,000 in October 2026?": "5000", "HYPE ↑ $60": "60", "Will Hyperliquid reach $62.5?": "62.5",
-          "October 2026 ↑ 130k": "130000", "BTC above 130000 by Oct 31, 2026": "130000", "↑ $102,500": "102500"}
+          "October 2026 ↑ 130k": "130000", "BTC above 130000 by Oct 31, 2026": "130000", "↑ $102,500": "102500",
+          "Will Bitcoin reach $150,000 before 2027?": "150000", "Will Bitcoin dip to $60,000 by December 31, 2026?": "60000",
+          "↑ 1,000,000": "1000000"}
 for title, want in levels.items():
     assert m.price_level(title) == D(want), (title, m.price_level(title))
 for title in ("Yes", "October 2026", "Other", ""):
@@ -44,6 +55,12 @@ assert m.level_direction(LOW + " " + HIGH, "↓ $100k") == ("down", "标题")  #
 assert m.level_direction("", "↑ 130,000") == ("up", "标题") and m.level_direction("", "$95k", "Will Bitcoin dip to $95,000?") == ("down", "标题")
 assert m.level_direction("", "$250", "Will Solana reach $250 in October?") == ("up", "标题")
 assert m.level_direction("", "$130k", "Will Bitcoin hit $130k in October?") == ("", "")  # "hit" says neither
+# BTC to 2027, as its rules state them (an ↑ level's)
+RULES27 = ('This market will immediately resolve to "Yes" if any Binance 1 minute candle for Bitcoin (BTC/USDT) between November 24, '
+           '2025, 14:00 and December 31, 2026, 23:59 in the ET timezone has a final "High" price equal to or greater than the price '
+           'specified in the title. Otherwise, this market will resolve to "No."')
+assert m.level_direction(RULES27, "↑ 150,000") == ("up", "规则") and m.level_direction(RULES27, "↓ 60,000") == ("down", "冲突")
+assert m.level_direction(RULES27.replace('"High" price equal to or greater', '"Low" price equal to or less'), "↓ 60,000") == ("down", "规则")
 
 # --- the touch model both ways: the textbook first-passage formula for a Brownian motion with drift μ = −σ²/2 ---------
 def first_passage(barrier, mu, sigma, years):
@@ -404,11 +421,12 @@ async def run():
     sol.error = "价格：网络错误 (URLError)"
     assert bot.range_payload(sol, NOW)["missing"] == "等待币安行情（价格：网络错误 (URLError)）"
 
-    # the page's list: the four cards (and the STRC stock market) in their own section, between 加密 and 市值阶梯
+    # the page's list: the five cards (and the STRC stock market) in their own section, between 加密 and 市值阶梯
     payload = bot.odds_payload()
     groups = [i["group"] for i in payload["items"]]
     names = [i["name"] for i in payload["items"] if i["group"] == "levels"]
-    assert names == ["BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格", "STRC 触及 $100"] and groups.index("levels") > groups.index("crypto"), groups
+    assert names == ["BTC 10月价格", "ETH 10月价格", "SOL 10月价格", "HYPE 10月价格", "BTC 2026年价格", "STRC 触及 $100"] and \
+        groups.index("levels") > groups.index("crypto"), groups
     assert max(i for i, g in enumerate(groups) if g == "levels") < groups.index("ladder")
     m.json.dumps(payload)
     # BNB_TOUCH=off switches them off with the other crypto markets
@@ -480,6 +498,97 @@ async def run():
     return bot
 
 
+async def long_window(bot):
+    """BTC to 2027: a 13-month window, read from Binance hourly candles in pages of 1000 (the first read takes eight,
+    each kept once read); the card says 窗口内 rather than 本月 and names the year of every time it shows."""
+    start, now = BTC27.start_ms, utc(2026, 10, 21, 13, 20)
+    run_hour, high_at, low_at = now - now % H, utc(2026, 1, 14, 20, 0), utc(2026, 2, 6, 3, 0)
+    rows = []
+    for t in range(start - 30 * H, now, H):
+        close = 84000.0 * (1.004 if t // H % 2 else 1.0)
+        high, low = close * 1.001, close * 0.999
+        if t == start - H: high, low = 130000.0, 50000.0  # the hour before the window opens: never counted
+        if t == high_at: high = 97900.0
+        if t == low_at: low = 74500.0
+        rows.append([t, f"{close:.2f}", f"{high:.2f}", f"{low:.2f}", f"{close:.2f}", "1", t + H - 1, "0", 1, "0", "0", "0"])
+    rm = m.RangeMarket(m.Store(":memory:"), BTC27)
+    rm.get, calls = world(price="84210.5", rows=rows)
+    await rm.refresh(now)
+    pages = [p["startTime"] for path, p in calls if path == "klines" and "startTime" in p]
+    assert pages == [start + i * 1000 * H for i in range(8)] and rm.error == "", (len(pages), rm.error)
+    assert rm.history == {"start": start, "through": run_hour, "open": float(rows[30][1]), "high": 97900.0, "high_at": high_at,
+                          "low": 74500.0, "low_at": low_at}, rm.history
+    assert rm.range_word == "窗口内" and rm.reference() == float(rows[30][1])
+    years = (rm.window_end - now) / m.YEAR_MS
+    assert abs(years * 365 - 71.65) < 0.01  # to 2027-01-01 05:00 UTC, the end of the window's last minute
+    assert rm.probability(D("100000"), "up", now) == m.hit_probability(84210.5, 100000.0, rm.sigma, years)
+    assert rm.probability(D("95000"), "up", now) == 1.0 and rm.probability(D("75000"), "down", now) == 1.0
+    rm.scanned_ms = now - rm.SCAN_STALE_MS - 1
+    assert rm.advice_problem(now).startswith("窗口内最高/最低核验停在 10-21 ") and rm.advice_problem(now).endswith("；暂不给建议")
+    rm.scanned_ms = now
+    # a page failing part-way through that first read: the pages before it are kept, the next read goes on from there
+    flaky = m.RangeMarket(m.Store(":memory:"), BTC27)
+    good, fcalls = world(price="84210.5", rows=rows)
+    async def fifth_fails(path, **params):
+        if params.get("startTime") == start + 4000 * H:
+            raise m.RemoteError("网络错误 (TimeoutError)")
+        return await good(path, **params)
+    flaky.get = fifth_fails
+    try:
+        await flaky.scan(now); assert False
+    except m.RemoteError:
+        pass
+    assert flaky.history["through"] == start + 4000 * H and flaky.history["high"] == 97900.0 and flaky.scanned_ms == 0
+    flaky.get, n = good, len(fcalls)
+    await flaky.scan(now)
+    assert [p["startTime"] for _, p in fcalls[n:]] == [start + (4 + i) * 1000 * H for i in range(4)] and flaky.history == rm.history
+
+    # the card: levels from Predict, each direction from its own market's rules (an ↑ level's rules on a ↓ title: 冲突)
+    LOW27 = RULES27.replace('"High" price equal to or greater', '"Low" price equal to or less')
+    def level(mid, target, title, question, rules, bid, ask):
+        bot.predict.market_meta[mid] = ({"outcomes": ["Yes", "No"], "status": "OPEN", "rules": rules, "question": question}, time.monotonic())
+        book = m.PredictBook("BTC-HIT-2026", BTC27.slug, mid, title, ((D(bid), D("500")),), ((D(ask), D("500")),), now)
+        return m.LadderRow(D(target), mid, title, book, "", question)
+    q27 = lambda what: f"Will Bitcoin {what} by December 31, 2026?"
+    bot.predict.ladders["BTC-HIT-2026"] = [
+        level("60", "60000", "↓ 60,000", q27("dip to $60,000"), RULES27, "0.10", "0.12"),   # the ↑ rules on a ↓ title
+        level("70", "70000", "$70,000", "Bitcoin $70,000 by December 31, 2026?", "", "0.20", "0.25"),  # nothing says: guessed
+        level("75", "75000", "↓ 75,000", q27("dip to $75,000"), LOW27, "0.97", "0.99"),     # reached in February
+        level("95", "95000", "↑ 95,000", q27("reach $95,000"), RULES27, "0.98", "0.99"),    # reached in January
+        level("99", "100000", "↑ 100,000", q27("reach $100,000"), RULES27, "0.10", "0.14")]
+    bot.ranges["BTC-HIT-2026"] = rm
+    item = bot.range_payload(rm, now)
+    assert item["name"] == "BTC 2026年价格" and item["close_ms"] == BTC27.end_ms and "missing" not in item, item
+    assert item["close_label"] == "2026-12-31 23:59 ET（北京 01-01 12:59）这根 1 分钟 K 为止"
+    assert item["predict"]["url"].startswith("https://predict.fun/zh-cn/market/what-price-will-bitcoin-hit-before-2027")
+    L = item["ladder"]
+    assert {k: L[k] for k in ("price", "high", "low", "window", "period", "high_at", "low_at", "through", "hold")} == {
+        "price": "$84,210", "high": "$97,900", "low": "$74,500", "window": "2025-11-24 14:00 ET（北京 11-25 03:00）起", "period": "窗口内",
+        "high_at": "2026-01-15 04:00", "low_at": "2026-02-06 11:00", "through": "2026-10-21 21:00", "hold": ""}, L
+    assert "range_word" not in L  # a stock's (its extremes are daily); a Binance pair's are hourly
+    assert [(r["label"], r["dir_source"], r["touched"]) for r in L["rows"]] == [
+        ("↑ $100k", "规则", False), ("↑ $95k", "规则", True), ("↓ $75k", "规则", True), ("↓ $70k", "推断", False), ("↓ $60k", "冲突", False)]
+    r100, r70, r60 = L["rows"][0], L["rows"][3], L["rows"][4]
+    assert r100["fair"] == rm.probability(D("100000"), "up", now) and r100["hold"] == "" and r100["edges"]
+    assert r70["hold"] == r70["dir_note"] == "这个市场的规则和标题都没写明上破还是下破，按档位在开窗时的价格之上（↑）还是之下（↓）推断；只作参考"
+    assert r60["hold"] == m.RANGE_GUESS["冲突"] and not any(e["best"] for e in r60["edges"])
+    # the paper trader and the alerts: the card's name with the level; its evidence names the window, not the month
+    sims = {mk.market: mk for mk in bot.sim_markets(now) if mk.key == "BTC-HIT-2026"}
+    s100 = sims[f"{BTC27.slug}#99"]
+    assert s100.item == "BTC 2026年价格 ↑ $100k" and s100.settle == {"target": "100000", "dir": "up", "end": BTC27.end_ms}
+    assert [(e["what"], e["source"], e["price"]) for e in s100.evidence["sources"]] == [
+        ("现价", "币安现货", 84210.5), ("窗口内最高", "币安小时 K", 97900.0), ("窗口内最低", "币安小时 K", 74500.0)]
+    assert m.market_driver("range", "BTC-HIT-2026") == ("BTCUSDT", "BTC")  # one risk with BTC's other markets
+    up, note, _ = bot.sim_result({"kind": "range", "key": "BTC-HIT-2026", "market": f"{BTC27.slug}#75",
+                                  "settle": {"target": "75000", "dir": "down", "end": BTC27.end_ms}}, now)
+    assert up == 1.0 and note == "↓ $75k 已触及（BTCUSDT 窗口内最低 74,500）", note
+    # /edge names it apart from BTC's October ladder
+    assert bot.edge_target(["BTC", "2026年价格"]) == ("key:BTC-HIT-2026", "BTC 2026年价格")
+    assert bot.edge_target(["2026年价格", "100k"]) == ("level:BTC-HIT-2026|100k", "BTC 2026年价格 100k")
+    assert bot.edge_target(["BTC", "10月价格"]) == ("key:BTC-HIT-10", "BTC 10月价格")
+    del bot.predict.ladders["BTC-HIT-2026"]  # the page check below: the card without levels (no extra 🔥 on the strip)
+
+
 async def browser_check(bot):
     """The price ladder card: ↑ levels above the price, ↓ below, signed distances, reached levels as chips, the default
     direction and the 请核实 warning marked; no sideways scroll on a phone or a wide screen."""
@@ -536,6 +645,15 @@ async def browser_check(bot):
         assert await card.locator(".touched .tchip").all_inner_texts() == ["↑ $118k", "↑ $110k"]
         assert await card.locator(".touched .tchip").first.get_attribute("title") == "本月最高价已到 $118k"
         await card.locator(".touched summary").click()
+        # BTC to 2027: the window's extremes (窗口内, not 本月), every time with its year
+        card27 = page.locator("#g-levels .card:has(.name:text-is('BTC 2026年价格'))")
+        assert re.sub(r"\s+", " ", await card27.locator(".price-range").inner_text()).strip() == "窗口内最高 $97,900 最低 $74,500"
+        await card27.locator(".price-model summary").click()
+        text27 = await card27.locator(".price-model dl").inner_text()
+        assert "2025-11-24 14:00 ET（北京 11-25 03:00）起 → 2026-12-31 23:59 ET（北京 01-01 12:59）这根 1 分钟 K 为止" in text27, text27
+        assert "$97,900（2026-01-15 04:00 那一小时）" in text27 and "已核至 2026-10-21 21:00，加上正在走的这一小时和现价" in text27, text27
+        assert "↑ 档：窗口内任一 1 分钟 K 的最高价 ≥ 档位即 Yes" in text27, text27
+        await card27.locator(".price-model summary").click()
         assert await card.locator(".pg .ptarget:has(.lt:text-is('↓ $100k'))").get_attribute("title") == \
             "这个市场的规则和标题都没写明上破还是下破，按档位在月初价格之上（↑）还是之下（↓）推断；只作参考"
         cells = await card.locator(".pg .paction").evaluate_all("els => els.map(e => [e.className, e.title, e.innerText])")
@@ -653,7 +771,7 @@ async def browser_check(bot):
         assert (await page.inner_text("#opps")).startswith("🔥 机会 2")
         # a folded section still counts its red-framed cards in its title; the strip unfolds it before jumping in
         await page.click("#h-levels .fold")
-        assert not await page.is_visible("#g-levels") and await page.inner_text("#h-levels .fs") == "5 张 · 🔥 1"
+        assert not await page.is_visible("#g-levels") and await page.inner_text("#h-levels .fs") == "6 张 · 🔥 1"
         await page.locator("#opps .opp").nth(1).click(); await page.wait_for_timeout(300)
         assert await page.is_visible("#g-levels .card") and await card.evaluate("c => c.classList.contains('flash')")
         assert await page.evaluate("localStorage.getItem('folded')") == "[]"
@@ -773,5 +891,6 @@ def rm_sigma(bot):
 
 
 bot = asyncio.run(run())
+asyncio.run(long_window(bot))
 asyncio.run(browser_check(bot))
 print("RANGE_OK")
