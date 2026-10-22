@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.40.0"
+VERSION = "1.41.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -6074,7 +6074,7 @@ class RangeSpec:
     symbol: str       # the Binance pair the rules name
     venue: str        # "spot" (BTC/USDT, ETH/USDT, SOL/USDT) or "futures" (HYPEUSDT, a USDⓈ-M perpetual)
     name: str         # card title
-    start_ms: int     # open of the first candle: 00:00 ET on the 1st of a month's ladder
+    start_ms: int     # open of the first candle: 00:00 ET on the 1st of a month's ladder; 0 = from each market's creation
     end_ms: int       # open of the last candle: 23:59 ET on the last day
     default_dir: str = "up"  # the direction of the rules the category was added with ("up": High ≥, "down": Low ≤)
 
@@ -6109,6 +6109,10 @@ RANGE_MARKETS = (
     # DST switches inside); "a final High … equal to or greater than the price specified in the title"
     RangeSpec("BTC-HIT-2026", "what-price-will-bitcoin-hit-before-2027", "BTCUSDT", "spot", "BTC 2026年价格",
               et_ms(2025, 11, 24, 14, 0, -5), et_ms(2026, 12, 31, 23, 59, -5)),
+    # "from the creation of this market through 11:59 PM ET on the last day of the year" (2026: the title says "before
+    # 2027"); the rules name both ways ("High" or "Low" … above for ↑, below for ↓): each level's title arrow decides
+    RangeSpec("ZEC-HIT-2026", "what-price-will-zcash-hit-before-2027", "ZECUSDT", "spot", "ZEC 2026年价格",
+              0, et_ms(2026, 12, 31, 23, 59, -5)),
 )
 
 
@@ -6280,7 +6284,10 @@ def level_direction(rules: str, *titles: str) -> tuple[str, str]:
     text = re.sub(r"\s+", " ", re.sub(r"[\"'“”‘’*]", "", str(rules))).lower()
     down = re.search(r"\blow(?: price)? (?:is )?(?:equal to or (?:lower|less|below)|at or below|<=|≤)|\bfinal low\b", text)
     up = re.search(r"\bhigh(?: price)? (?:is )?(?:equal to or (?:greater|higher|above)|at or above|>=|≥)|\bfinal high\b", text)
-    by_rules = ("down" if down else "up") if bool(down) != bool(up) else ""
+    # rules written for the whole category that name both ways ("final High or Low price equal to or beyond (above for ↑ …,
+    # below for ↓ …)", ZEC's) say nothing about one market: its title's arrow does
+    both = re.search(r"\bhigh\b[^.]{0,40}?\bor\b[^.]{0,20}?\blow\b|\babove for\b.{0,60}?\bbelow for\b", text)
+    by_rules = "" if both else (("down" if down else "up") if bool(down) != bool(up) else "")
     arrow = next((d for t in titles for d, mark in (("down", r"[↓▼]"), ("up", r"[↑▲]")) if re.search(mark, str(t))), "")
     if by_rules and arrow and arrow != by_rules:
         return arrow, "冲突"
@@ -6553,10 +6560,10 @@ class RangeMarket:
         self.running, self.scanned_ms = running, now_ms
         self.store.put(f"range:{self.spec.slug}", hist)
 
-    def marks(self) -> dict:
+    def marks(self, level: D | None = None) -> dict:
         """{'high', 'high_at', 'low', 'low_at'}: the highest High and lowest Low inside the window so far, and the hour
         each was seen in: finished hours, the running hour, the live price (only while it falls inside the window). The
-        earliest hour wins a tie."""
+        earliest hour wins a tie. (``level``: the window a level is decided on; every level shares this one.)"""
         hist, run = self.history, self.running
         highs = [(hist.get("high"), int(hist.get("high_at") or 0)), (run.get("high"), int(run.get("open") or 0))]
         lows = [(hist.get("low"), int(hist.get("low_at") or 0)), (run.get("low"), int(run.get("open") or 0))]
@@ -6864,10 +6871,202 @@ class StockRangeMarket(RangeMarket):
         return ""
 
 
+class CreatedRangeMarket(RangeMarket):
+    """A Binance pair whose levels each count "from the creation of this market" (Predict's createdAt) to the spec's end:
+    ZEC to 2027 (RangeSpec start_ms = 0). A level's window opens at the first whole minute after its market's creation
+    (the candle it was created in holds earlier prices). Markets created at different times keep windows of their own:
+    one hourly scan serves them all, each counting the hours from its first whole one, and the partial hour a market
+    was created in is read minute by minute once that hour is over. The record's own extremes are the earliest window's,
+    which holds every other one: the card shows them; a level is decided on its market's window."""
+    range_word = "窗口内"
+
+    def __init__(self, store: "Store", spec: RangeSpec, futures: Any = None):
+        super().__init__(store, spec, futures)
+        saved = store.get(f"range:{spec.slug}:created", {})
+        saved = saved if isinstance(saved, dict) else {}
+        pick = lambda key: {str(k): v for k, v in (saved.get(key) or {}).items() if isinstance(v, int) and v > 0}
+        # kept for a restart: the cards, the alerts and the paper trader may ask before Predict's listing is read again
+        self.created: dict[str, int] = pick("markets")     # market id -> createdAt (ms)
+        self.level_start: dict[str, int] = pick("levels")  # level ("500") -> its market's window start
+
+    @staticmethod
+    def opening(created_ms: int) -> int:
+        """A window's first minute: the first whole minute after the market's creation."""
+        return -(-created_ms // 60_000) * 60_000
+
+    @staticmethod
+    def first_hour(start: int) -> int:
+        """The first whole hour of a window starting at ``start``."""
+        return -(-start // 3_600_000) * 3_600_000
+
+    def starts(self) -> list[int]:
+        return sorted({self.opening(c) for c in self.created.values()})
+
+    @property
+    def start_ms(self) -> int:
+        """The earliest window's start; 0 until Predict has given a creation time."""
+        starts = self.starts()
+        return starts[0] if starts else 0
+
+    def learn(self, rows: list, meta: dict) -> None:
+        """Each level's market and that market's creation time, from Predict's listing (its details)."""
+        created, levels = dict(self.created), dict(self.level_start)
+        for row in rows:
+            details = (meta.get(row.market_id) or ({}, 0))[0] if row.market_id else {}
+            if int(details.get("created_ms") or 0) > 0:
+                created[row.market_id] = int(details["created_ms"])
+            if row.market_id in created:
+                levels[str(row.target)] = self.opening(created[row.market_id])
+        if (created, levels) != (self.created, self.level_start):
+            self.created, self.level_start = created, levels
+            self.store.put(f"range:{self.spec.slug}:created", {"markets": created, "levels": levels})
+
+    async def scan(self, now_ms: int) -> None:
+        """Extend every window's extremes with the hours finished since the last scan (one request for all of them; a
+        window first seen now has the hours since its own opening read again, which the others take as repeats), and
+        read the partial hour each window opened in, minute by minute, once that hour is over."""
+        starts, end = self.starts(), self.window_end
+        if not starts or now_ms <= starts[0]:
+            return
+        hist = dict(self.history) or {"start": starts[0], "high": None, "high_at": 0, "low": None, "low_at": 0}
+        old = hist.get("windows") or {}
+        windows = {str(s): dict(old.get(str(s)) or {"high": None, "high_at": 0, "low": None, "low_at": 0,
+                                                       "first": s == self.first_hour(s)}) for s in starts}
+        cursor = min([int(hist.get("through") or self.first_hour(starts[0]))]
+                     + [self.first_hour(s) for s in starts if str(s) not in old])
+        hist["windows"] = windows
+
+        def extend(window: dict, high: float, low: float, at: int) -> None:
+            if window["high"] is None or high > window["high"]:
+                window["high"], window["high_at"] = high, at
+            if window["low"] is None or low < window["low"]:
+                window["low"], window["low_at"] = low, at
+
+        def save() -> None:
+            hist.update({k: windows[str(starts[0])][k] for k in ("high", "high_at", "low", "low_at")}, through=cursor)
+            self.store.put(f"range:{self.spec.slug}", hist)
+
+        running: dict = {}
+        for _ in range(50):
+            if cursor >= end:
+                break
+            rows = await self.get("klines", symbol=self.spec.symbol, interval="1h", startTime=cursor,
+                                  endTime=min(now_ms, end) - 1, limit=1000)
+            if not isinstance(rows, list):  # an error object is not "no candles" (that would close the window unread)
+                raise RemoteError(f"币安小时 K 格式异常：{str(rows)[:80]}")
+            rows = [r for r in rows if isinstance(r, list) and len(r) > 6 and cursor <= int(r[0]) < end]
+            for row in rows:
+                opened, closed, high, low = int(row[0]), int(row[6]), float(row[2]), float(row[3])
+                if opened == starts[0] and hist.get("open") is None:
+                    hist["open"] = float(row[1])  # the earliest window opens on the hour: its first price
+                if closed >= now_ms:  # still running: counts now, persisted once it is over
+                    running = {"open": opened, "high": high, "low": low}
+                    continue
+                for start, window in windows.items():
+                    if self.first_hour(int(start)) <= opened:
+                        extend(window, high, low, opened)
+                cursor = closed + 1
+            if len(rows) < 1000 or running:
+                break
+            save()  # a long window's first read keeps each page
+        if now_ms >= end and not running:
+            cursor = max(cursor, end)  # hours without a candle had no trades
+        for start in starts:
+            window, hour = windows[str(start)], self.first_hour(start)
+            if window["first"] or hour > now_ms:
+                continue  # read already, or the hour it opened in is still running (the live price stands in for it)
+            minutes = await self.get("klines", symbol=self.spec.symbol, interval="1m", startTime=start,
+                                     endTime=min(hour, end) - 1, limit=60)
+            if not isinstance(minutes, list):
+                raise RemoteError(f"币安分钟 K 格式异常：{str(minutes)[:80]}")
+            minutes = [r for r in minutes if isinstance(r, list) and len(r) > 6 and start <= int(r[0]) < min(hour, end)]
+            for row in minutes:
+                extend(window, float(row[2]), float(row[3]), int(row[0]))
+            if start == starts[0] and minutes and hist.get("open") is None:
+                hist["open"] = float(minutes[0][1])
+            window["first"] = True
+        self.running, self.scanned_ms = running, now_ms
+        save()
+
+    def window_of(self, level: D | None) -> int:
+        """The start of the window a level is decided on: its market's (0 while its creation time is not known: no
+        price counts for it yet); the earliest one for the card as a whole."""
+        if level is None:
+            return self.start_ms
+        start = self.level_start.get(str(level), 0)
+        return start if start in self.starts() else 0
+
+    def marks(self, level: D | None = None) -> dict:
+        """As RangeMarket's, inside one window: the level's (see window_of). The running hour counts only for a window
+        opened before it began, the live price only once read inside the window."""
+        start = self.window_of(level)
+        if not start:
+            return {"high": None, "high_at": 0, "low": None, "low_at": 0}
+        hist, run = self.history, self.running
+        window = (hist.get("windows") or {}).get(str(start)) or {}
+        highs = [(window.get("high"), int(window.get("high_at") or 0))]
+        lows = [(window.get("low"), int(window.get("low_at") or 0))]
+        if run and self.first_hour(start) <= int(run["open"]):
+            highs.append((run.get("high"), int(run["open"])))
+            lows.append((run.get("low"), int(run["open"])))
+        if self.price is not None and start and start <= self.priced_ms < self.window_end:
+            hour = self.priced_ms - self.priced_ms % 3_600_000
+            highs.append((float(self.price), hour))
+            lows.append((float(self.price), hour))
+        high = max((x for x in highs if x[0] is not None), key=lambda x: x[0], default=(None, 0))
+        low = min((x for x in lows if x[0] is not None), key=lambda x: x[0], default=(None, 0))
+        return {"high": high[0], "high_at": high[1], "low": low[0], "low_at": low[1]}
+
+    def reached(self, level: D, direction: str) -> bool:
+        marks = self.marks(level)
+        if direction == "up":
+            return marks["high"] is not None and marks["high"] >= float(level)
+        return marks["low"] is not None and marks["low"] <= float(level)
+
+    def probability(self, level: D, direction: str, now_ms: int) -> float | None:
+        """None while the level's market's creation time is not known: which prices count is not known either."""
+        return super().probability(level, direction, now_ms) if self.window_of(level) else None
+
+    def complete(self) -> bool:
+        windows = self.history.get("windows") or {}
+        return (super().complete() and bool(self.start_ms)
+                and all((windows.get(str(s)) or {}).get("first") for s in self.starts()))
+
+    def advice_problem(self, now_ms: int) -> str:
+        if not self.start_ms:
+            return "等待 Predict 的创建时间；暂不给建议"
+        windows = self.history.get("windows") or {}
+        fresh = [s for s in self.starts() if not (windows.get(str(s)) or {}).get("first")]
+        if fresh and now_ms < self.window_end:
+            # a window not read since its opening (the scan has not reached it yet, or it opened within the running
+            # hour): a level of it may have been reached already
+            later = "：创建那一小时结束后按分钟 K 核验" if self.first_hour(fresh[0]) > now_ms else "还没核验完"
+            return f"{self.spec.label(fresh[0])}起的窗口{later}；暂不给建议"
+        return super().advice_problem(now_ms)
+
+    def window_label(self) -> str:
+        return f"市场创建后的 {self.spec.label(self.start_ms)}起" if self.start_ms else "市场创建起（时间待 Predict 确认）"
+
+    def card_extras(self, now_ms: int) -> dict:
+        starts = self.starts()
+        several = (f"；各档从自己市场的创建时间起算（{len(starts)} 个不同的创建时间，最晚 {self.spec.label(starts[-1])}）"
+                   if len(starts) > 1 else "")
+        return {"rule_note": "↑ 档：市场创建后任一 1 分钟 K 的最高价 ≥ 档位即 Yes；↓ 档：最低价 ≤ 档位即 Yes；创建之前的价格不算"
+                             "（从创建后的第一个整分钟起，创建那一小时按分钟 K）。方向按每个市场的标题" + several}
+
+    def missing_note(self, now_ms: int) -> str:
+        if not self.start_ms:
+            return "等待 Predict 的创建时间"
+        return super().missing_note(now_ms)
+
+
 def range_market(store: "Store", spec: RangeSpec, futures: Any, config: "Config") -> RangeMarket:
-    """The market object for a price-ladder spec: a Binance pair, or a US stock read from Yahoo."""
+    """The market object for a price-ladder spec: a Binance pair (over a fixed window, or from each market's creation when
+    the spec has no start), or a US stock read from Yahoo."""
     if spec.venue == "nasdaq":
         return StockRangeMarket(store, spec, config.ladder_deadlines.get(spec.key, 0))
+    if not spec.start_ms:
+        return CreatedRangeMarket(store, spec, futures)
     return RangeMarket(store, spec, futures)
 
 
@@ -11612,7 +11811,7 @@ class Bot:
             if rm is None:
                 return None
             level, direction = D(str(s["target"])), s.get("dir", "up")
-            marks = rm.marks()
+            marks = rm.marks(level)  # the level's own window (ZEC's start at each market's creation)
             high, low = marks["high"], marks["low"]
             proof = {"rule": f"窗口内任一 1 分钟 K 的{'最高价 ≥' if direction == 'up' else '最低价 ≤'} {level_label(level)} 即 Yes",
                      "source": rm.extremes_source(),
@@ -11625,7 +11824,8 @@ class Bot:
                 seen = high if direction == "up" else low
                 return 1.0, (f"{'↑' if direction == 'up' else '↓'} {level_label(level)} 已触及（{rm.spec.symbol} {rm.range_word}"
                              f"{'最高' if direction == 'up' else '最低'} {seen:,.6g}）"), proof
-            if rm.complete() and now_ms > rm.window_end + self.SIM_SETTLE_MS:
+            # read to its end without the level (and the level's own window known: ZEC's start at its market's creation)
+            if rm.complete() and now_ms > rm.window_end + self.SIM_SETTLE_MS and rm.probability(level, direction, now_ms) == 0.0:
                 return 0.0, f"整个窗口都没到 {level_label(level)}", proof
             return None
         if kind == "ladder":
