@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.41.0"
+VERSION = "1.41.1"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -7691,8 +7691,10 @@ h2 .hbell{margin-left:8px;border:0;background:none;font:inherit;font-size:14px;l
 .card.price-lad .lstat{min-height:0;gap:4px}.price-model summary{font-size:12px}.price-model dl{line-height:1.5}.price-model{padding-bottom:2px}
 .price-lad .touched{gap:4px}.price-lad .touched summary{font-size:12px;color:var(--down)}.price-lad .touched .tchips{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
 .price-tools{display:flex;flex-wrap:wrap;align-items:center;gap:5px 8px;margin-top:8px;font-size:11px;color:var(--muted)}.price-tools .cb{font-size:11px;margin-left:auto}.price-tools .hint{flex:1;min-width:0}
+/* every cell starts at the top with one line height, so a row's first lines share a baseline even beside a cell with a second line
+   (低于门槛 / 暂不建议); the buttons say so themselves (a button centres its content by default) */
 .pg{display:grid;grid-template-columns:fit-content(190px) minmax(40px,auto) minmax(0,1fr) minmax(0,1fr);column-gap:10px;row-gap:0;align-items:stretch;margin-top:7px;font-size:12px;font-variant-numeric:tabular-nums}
-.pg .lh{padding:0 0 6px;font-size:11px;font-weight:600;letter-spacing:.03em;color:var(--faint);white-space:nowrap}.pg .lr{text-align:right}.pg .pcell{border-top:1px solid var(--line2);padding:7px 0;min-width:0;align-content:center}.pg .pmodel{text-align:right;color:var(--muted)}
+.pg .lh{padding:0 0 6px;font-size:11px;font-weight:600;letter-spacing:.03em;color:var(--faint);white-space:nowrap}.pg .lr{text-align:right}.pg .pcell{border-top:1px solid var(--line2);padding:7px 0;min-width:0;line-height:1.35;display:flex;flex-direction:column;justify-content:flex-start;align-content:start}.pg .pmodel{text-align:right;color:var(--muted)}
 .ptarget{font:inherit;color:var(--text);border:0;background:none;text-align:left;cursor:pointer;min-width:0;padding-right:0}.ptarget .ltl{display:flex;flex-wrap:wrap;align-items:baseline;gap:1px 6px}.ptarget .lt{font-weight:700;white-space:nowrap}.ptarget .pdist{font-size:10.5px;color:var(--faint)}
 .ppoints{display:inline-block;font-size:10.5px;line-height:1.7;border-radius:999px;padding:0 7px;background:var(--chip);color:var(--muted);white-space:nowrap;font-weight:600;vertical-align:1px}
 .ppoints.active{background:var(--best-bg);color:var(--best)}.ppoints.off{padding:0 5px;color:var(--faint);font-weight:400}.quote .ppoints{align-self:center}
