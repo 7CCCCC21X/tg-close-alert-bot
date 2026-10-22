@@ -731,6 +731,16 @@ async def created_window(bot):
     del bot.predict.ladders["ZEC-HIT-2026"]  # the page check below: the card without levels
 
 
+# per table row of a section (its selector): how far apart (px) the bottoms of the four cells' first lines of text are
+# (the same 12px type in each)
+ROW_SPREAD = """sel => [...document.querySelectorAll(sel + ' .pg .ptarget')].map(t => {
+    const cells = [t, t.nextElementSibling, t.nextElementSibling.nextElementSibling, t.nextElementSibling.nextElementSibling.nextElementSibling];
+    const ys = cells.map(c => { const w = document.createTreeWalker(c, NodeFilter.SHOW_TEXT,
+        {acceptNode: n => n.textContent.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP});
+        const n = w.nextNode(), r = document.createRange(); r.selectNodeContents(n); return r.getClientRects()[0].bottom });
+    return Math.round((Math.max(...ys) - Math.min(...ys)) * 10) / 10 })"""
+
+
 async def browser_check(bot):
     """The price ladder card: ↑ levels above the price, ↓ below, signed distances, reached levels as chips, the default
     direction and the 请核实 warning marked; no sideways scroll on a phone or a wide screen."""
@@ -778,6 +788,13 @@ async def browser_check(bot):
         assert dists == ["+43%", "+12%", "+7.1%", "−3.2%", "−6.3%", "−11%"], dists
         assert await card.locator(".pg .ppoints").count() == 0
         assert await card.locator(".pg .lh").all_inner_texts() == ["目标", "模型", "挂单", "吃单"]
+        # every row's four cells start their first line on one baseline, also next to a cell with a second line
+        # (低于门槛 / 暂不建议): the photo of 10-22 showed 吃单 a line lower than 目标 in such rows
+        for width in (390, 1300):
+            await page.set_viewport_size({"width": width, "height": 900})
+            spreads = await page.evaluate(ROW_SPREAD, "#g-levels")
+            assert spreads and max(spreads) <= 0.5, (width, spreads)
+        await page.set_viewport_size({"width": 390, "height": 900})
         # 甲 (an index card) carries its points on its Predict line: ● with the hourly rate
         pill = await page.locator("#g-index .quote .ppoints.active").inner_text()
         assert pill == "● 120 PP/h", repr(pill)
@@ -971,6 +988,11 @@ async def browser_check(bot):
         await page.wait_for_selector("#g-levels .pg")
         card = page.locator("#g-levels .card").first
         assert await card.locator(".pg .ptarget").count() == 7
+        for width in (390, 900, 1300):  # with points pills in the 目标 cells too
+            await page.set_viewport_size({"width": width, "height": 900})
+            spreads = await page.evaluate(ROW_SPREAD, "#g-levels")
+            assert len(spreads) == 7 and max(spreads) <= 0.5, (width, spreads)
+        await page.set_viewport_size({"width": 390, "height": 900})
         visible = await card.locator(".pg .lt").all_inner_texts()
         # the compact view: the five levels that earn points now, ↑ $114k's taker suggestion, and ↓ $100k as the price's lower neighbour
         # (the earning levels alone fill the five, so nothing else is padded in); ↑ $185k pays but cannot earn now, so it stays out

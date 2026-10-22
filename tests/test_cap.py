@@ -484,6 +484,15 @@ async def run():
 
 
 
+# per table row: how far apart (px) the bottoms of the four cells' first lines of text are (the price ladders' check)
+ROW_SPREAD = """sel => [...document.querySelectorAll(sel + ' .pg .ptarget')].map(t => {
+    const cells = [t, t.nextElementSibling, t.nextElementSibling.nextElementSibling, t.nextElementSibling.nextElementSibling.nextElementSibling];
+    const ys = cells.map(c => { const w = document.createTreeWalker(c, NodeFilter.SHOW_TEXT,
+        {acceptNode: n => n.textContent.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP});
+        const n = w.nextNode(), r = document.createRange(); r.selectNodeContents(n); return r.getClientRects()[0].bottom });
+    return Math.round((Math.max(...ys) - Math.min(...ys)) * 10) / 10 })"""
+
+
 async def browser_check():
     """The cap ladder's table (shared with the price ladders): the best maker and the best taker per level, in colour when
     suggested, grey otherwise (the bar itself is never shown); 盘口过期 / 暂不建议 as text."""
@@ -622,8 +631,13 @@ async def browser_check():
             # on a wide card the level, its distance and its points pill are three aligned columns ($1B / $2B carry pills)
             pl, dl = await lefts("#g-ladder .pg .ptarget .ppoints"), await lefts("#g-ladder .pg .ptarget .pdist")
             assert len(pl) == 2 and len(set(pl)) == 1 and len(dl) == 6 and len(set(dl)) == 1 and pl[0] > dl[0], (width, pl, dl)
+            # each row's cells start on one line, beside the 低于门槛 / 暂不建议 lines too
+            spreads = await page.evaluate(ROW_SPREAD, "#g-ladder")
+            assert len(spreads) == 6 and max(spreads) <= 0.5, (width, spreads)
         assert await page.evaluate("document.querySelector('#g-ladder .ages').compareDocumentPosition(document.querySelector('#g-ladder .pb')) & 2")  # ages after the table
         await page.set_viewport_size({"width": 390, "height": 900})
+        spreads = await page.evaluate(ROW_SPREAD, "#g-ladder")
+        assert len(spreads) == 6 and max(spreads) <= 0.5, spreads
         # a phone: the pill sits under the level, at its left edge, on every row (no inline pill on the short labels)
         rect = "e => { const r = e.getBoundingClientRect(); return [r.left, r.top, r.bottom] }"
         for label in ("$1B", "$2B"):
