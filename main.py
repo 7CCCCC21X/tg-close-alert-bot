@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.39.0"
+VERSION = "1.41.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -3845,6 +3845,7 @@ PREDICT_REWARD_STALE_SECONDS = 120  # allows the normal refresh to finish across
 PREDICT_POINTS_STALE_SECONDS = 3 * PREDICT_META_SECONDS  # other markets' points (read with the fee) are shown this long
 PREDICT_STRIKE_SECONDS = 300   # a known target price is re-read this often (the site may correct it)
 PREDICT_MISS_SECONDS = 60      # an unknown slug is looked up again after this long (new markets show up within a minute)
+PREDICT_PAGE = 20              # a category's markets per GraphQL page (a full one: the rest are read from REST)
 PREDICT_DEPTH = 20            # levels kept per side: a fill for the trade size is judged on these (a book "too thin" at
 #                               5 levels was often only cut off there), the page and the evidence show the top of them
 PREDICT_SHOW_DEPTH = 10       # levels sent to the page per side (it recomputes the edges for the viewer's trade size)
@@ -4292,6 +4293,7 @@ class PredictFeed:
         self.info: dict[str, dict] = {}                          # slug -> {"outcomes": [...], "created_ms": int}
         self.want_info: set[str] = set()                         # slugs whose outcome names / creation time matter
         self.market_lists: dict[str, tuple[list[dict] | None, float]] = {}  # slug -> every market of the category
+        self.partial: set[str] = set()                           # slugs whose list may be one page short of the category
         self.market_meta: dict[str, tuple[dict, float]] = {}     # market id -> ({"outcomes": [...], "status": str}, when)
         self.meta_errors: dict[str, str] = {}                  # latest detail refresh failure (old rewards are not trusted)
         self.reward_keys: set[str] = set()                      # price ladders: refresh reward metadata more often
@@ -4341,17 +4343,24 @@ class PredictFeed:
         return market
 
     async def resolve_all(self, slug: str) -> list[dict] | None:
-        """slug -> every market of the category (a ladder such as $200M / $300M / ...); None = not listed."""
+        """slug -> every market of the category (a ladder such as $200M / $300M / ...); None = not listed. A list that
+        may be cut short (a full page whose rest could not be read) is looked up again a minute later, kept meanwhile."""
         cached = self.market_lists.get(slug)
-        if cached and (cached[0] is not None or time.monotonic() - cached[1] < PREDICT_MISS_SECONDS):
+        if cached and (cached[0] is not None and slug not in self.partial or time.monotonic() - cached[1] < PREDICT_MISS_SECONDS):
             return cached[0]
-        found = await self.find(slug) or None
+        try:
+            found = await self.find(slug) or None
+        except (RemoteError, TimeoutError, OSError):
+            if not cached or cached[0] is None:
+                raise
+            found = cached[0]  # the page already read stands while the lookup fails
         self.market_lists[slug] = (found, time.monotonic())
         return found
 
     async def find(self, slug: str) -> list[dict]:
-        """slug -> markets via GraphQL category(id: slug) → markets(categoryId); REST /categories/<slug> as fallback.
-        [] = not listed; network trouble raises (and is not cached as "not listed")."""
+        """slug -> markets via GraphQL category(id: slug) → markets(categoryId); REST /categories/<slug> as fallback,
+        and for the rest of a full page (a long ladder). [] = not listed; network trouble raises (and is not cached as
+        "not listed")."""
         found: list[dict] = []
         errors = []  # only failures that leave the answer unknown; "no such category" is an answer
         try:
@@ -4361,11 +4370,21 @@ class PredictFeed:
                 self.types[slug] = category["__typename"]
             if category.get("id") is not None:
                 data = await self.graphql(
-                    "query($f: MarketFilterInput!) { markets(filter: $f, pagination: { first: 20 }) "
+                    f"query($f: MarketFilterInput!) {{ markets(filter: $f, pagination: {{ first: {PREDICT_PAGE} }}) "
                     "{ edges { node { id conditionId title question } } } }", {"f": {"categoryId": str(category["id"])}})
                 found = predict_markets(data)
         except (RemoteError, TimeoutError, OSError) as error:
             errors.append(clean_error(error))
+        partial = False
+        if len(found) >= PREDICT_PAGE:
+            # a full page: the category may hold more markets than that (BTC's ladder to 2027 lists many levels), and
+            # REST lists the whole category. If that fails the page stands, and is looked up again (resolve_all)
+            try:
+                more = predict_markets(await self.fetch(f"{PREDICT_REST}/categories/{urllib.parse.quote(slug)}"))
+                known = {m["id"] for m in found} | {m["conditionId"] for m in found if m["conditionId"]}
+                found += [m for m in more if m["id"] not in known and m["conditionId"] not in known]
+            except (RemoteError, TimeoutError, OSError):
+                partial = True
         if not found:
             try:
                 found = predict_markets(await self.fetch(f"{PREDICT_REST}/categories/{urllib.parse.quote(slug)}"))
@@ -4376,6 +4395,10 @@ class PredictFeed:
                     errors.clear()  # GraphQL answered "no such category", or REST did (404)
         if not found and errors:
             raise RemoteError("；".join(errors))  # network trouble: not cached as "not listed"
+        if partial:
+            self.partial.add(slug)
+        else:
+            self.partial.discard(slug)
         return found
 
     async def orderbook(self, market: dict) -> tuple[tuple, tuple, str]:
@@ -4527,9 +4550,12 @@ class PredictFeed:
             rows = self.ladder_pick[key](rows, self.market_meta)
         self.ladders[key] = sorted(rows, key=lambda row: row.target)
         failed = [row for row in rows if row.error and not self.book_absent(row)]  # no book at all is an answer, not a failure
+        notes = [f"档位可能不全：只读到 Predict 的前 {len(markets)} 个市场，其余的 1 分钟后再读"] if slug in self.partial else []
         if failed:
             which = "、".join(brief_error(row.title or str(row.target), 14) for row in failed[:3]) + ("…" if len(failed) > 3 else "")
-            self.errors[key] = f"{len(failed)}/{len(rows)} 档盘口刷新失败（{which}：{brief_error(failed[0].error, 60)}）；显示上次盘口"
+            notes.append(f"{len(failed)}/{len(rows)} 档盘口刷新失败（{which}：{brief_error(failed[0].error, 60)}）；显示上次盘口")
+        if notes:
+            self.errors[key] = "；".join(notes)
         else:
             self.errors.pop(key, None)
 
@@ -4589,6 +4615,7 @@ class PredictFeed:
         for table in (self.markets, self.market_lists, self.strikes, self.types, self.info):
             for slug in [s for s in table if s not in keep]:
                 table.pop(slug, None)
+        self.partial &= keep
         await asyncio.gather(*(self.refresh_one(key, slug) for key, slug in targets.items()))
         # a market not listed yet is an answer, not a failure
         failed = [f"{key}：{error}" for key, error in self.errors.items() if key in targets and "还没有这个市场" not in error]
@@ -6039,21 +6066,32 @@ class CapMarket:
 # --- price ladders ("what price will Bitcoin hit in October?": one Yes/No market per level) ---------------------------
 @dataclass(frozen=True)
 class RangeSpec:
-    """A "what price will X hit in <month>" category: one Yes/No market per price level, Yes as soon as any Binance
-    1-minute candle of the window has a High at or above an upward level (a Low at or below a downward one). Each market's
-    own rules (or its title) say which; the rules for this category's levels name the default."""
+    """A "what price will X hit in <month>" (or "before <year>") category: one Yes/No market per price level, Yes as soon
+    as any Binance 1-minute candle of the window has a High at or above an upward level (a Low at or below a downward
+    one). Each market's own rules (or its title) say which; the rules for this category's levels name the default."""
     key: str          # item / book key and the card's favourite key
     slug: str
     symbol: str       # the Binance pair the rules name
     venue: str        # "spot" (BTC/USDT, ETH/USDT, SOL/USDT) or "futures" (HYPEUSDT, a USDⓈ-M perpetual)
     name: str         # card title
-    start_ms: int     # open of the first candle: 00:00 ET on the 1st
+    start_ms: int     # open of the first candle: 00:00 ET on the 1st of a month's ladder; 0 = from each market's creation
     end_ms: int       # open of the last candle: 23:59 ET on the last day
     default_dir: str = "up"  # the direction of the rules the category was added with ("up": High ≥, "down": Low ≤)
 
+    @property
+    def monthly(self) -> bool:
+        """The window is one month (the card says 本月); a longer one is just the window (窗口内)."""
+        return self.end_ms - self.start_ms < 31 * DAY_MS
+
+    @property
+    def span_years(self) -> bool:
+        """The window runs into another year: its times name the year."""
+        return et_date(self.start_ms).year != et_date(self.end_ms).year
+
     def label(self, ms: int) -> str:
         et = dt.datetime.fromtimestamp(ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(ms))))
-        return f"{et:%m-%d %H:%M} ET（北京 {stamp(ms, seconds=False)}）"
+        year = f"{et:%Y}-" if self.span_years else ""
+        return f"{year}{et:%m-%d %H:%M} ET（北京 {stamp(ms, seconds=False)}）"
 
 
 RANGE_MARKETS = (
@@ -6067,6 +6105,14 @@ RANGE_MARKETS = (
     # HYPEUSDT on Binance futures (the rules link binance.com/en/futures/HYPEUSDT)
     RangeSpec("HYPE-HIT-10", "what-price-will-hyperliquid-hit-in-october-2026", "HYPEUSDT", "futures", "HYPE 10月价格",
               et_ms(2026, 10, 1, 0, 0, -4), et_ms(2026, 10, 31, 23, 59, -4)),
+    # "between November 24, 2025, 14:00 and December 31, 2026, 23:59 in the ET timezone" (EST at both ends, both 2026
+    # DST switches inside); "a final High … equal to or greater than the price specified in the title"
+    RangeSpec("BTC-HIT-2026", "what-price-will-bitcoin-hit-before-2027", "BTCUSDT", "spot", "BTC 2026年价格",
+              et_ms(2025, 11, 24, 14, 0, -5), et_ms(2026, 12, 31, 23, 59, -5)),
+    # "from the creation of this market through 11:59 PM ET on the last day of the year" (2026: the title says "before
+    # 2027"); the rules name both ways ("High" or "Low" … above for ↑, below for ↓): each level's title arrow decides
+    RangeSpec("ZEC-HIT-2026", "what-price-will-zcash-hit-before-2027", "ZECUSDT", "spot", "ZEC 2026年价格",
+              0, et_ms(2026, 12, 31, 23, 59, -5)),
 )
 
 
@@ -6238,7 +6284,10 @@ def level_direction(rules: str, *titles: str) -> tuple[str, str]:
     text = re.sub(r"\s+", " ", re.sub(r"[\"'“”‘’*]", "", str(rules))).lower()
     down = re.search(r"\blow(?: price)? (?:is )?(?:equal to or (?:lower|less|below)|at or below|<=|≤)|\bfinal low\b", text)
     up = re.search(r"\bhigh(?: price)? (?:is )?(?:equal to or (?:greater|higher|above)|at or above|>=|≥)|\bfinal high\b", text)
-    by_rules = ("down" if down else "up") if bool(down) != bool(up) else ""
+    # rules written for the whole category that name both ways ("final High or Low price equal to or beyond (above for ↑ …,
+    # below for ↓ …)", ZEC's) say nothing about one market: its title's arrow does
+    both = re.search(r"\bhigh\b[^.]{0,40}?\bor\b[^.]{0,20}?\blow\b|\babove for\b.{0,60}?\bbelow for\b", text)
+    by_rules = "" if both else (("down" if down else "up") if bool(down) != bool(up) else "")
     arrow = next((d for t in titles for d, mark in (("down", r"[↓▼]"), ("up", r"[↑▲]")) if re.search(mark, str(t))), "")
     if by_rules and arrow and arrow != by_rules:
         return arrow, "冲突"
@@ -6256,7 +6305,7 @@ def level_direction(rules: str, *titles: str) -> tuple[str, str]:
 
 
 # a level whose market does not say ↑ or ↓ (or says both ways): the card's note, and the short reason the paper trader keeps
-RANGE_GUESS = {"推断": "这个市场的规则和标题都没写明上破还是下破，按档位在月初价格之上（↑）还是之下（↓）推断；只作参考",
+RANGE_GUESS = {"推断": "这个市场的规则和标题都没写明上破还是下破，按档位在{first}之上（↑）还是之下（↓）推断；只作参考",
                "默认": "这个市场的规则和标题都没写明上破还是下破，方向按本类规则默认；只作参考",
                "冲突": "标题的箭头和规则写的方向相反，按标题显示；请到 Predict 核实后再看"}
 RANGE_GUESS_SHORT = {"推断": "方向是推断的", "默认": "方向按本类规则默认", "冲突": "标题与规则的方向相反"}
@@ -6345,9 +6394,10 @@ async def binance_futures(path: str, **params: Any) -> Any:
 
 
 class RangeMarket:
-    """A Binance pair over one month: live price, 30-day σ, and the window's highest High and lowest Low so far. Hourly
-    candles carry exactly the extremes of their minutes, and the window runs from one hour boundary to another, so they
-    decide every level; the running hour's own candle counts at once (a level reached resolves the market at once)."""
+    """A Binance pair over its window (a month, or BTC's 13 months to 2027): live price, 30-day σ, and the window's
+    highest High and lowest Low so far. Hourly candles carry exactly the extremes of their minutes, and the window runs
+    from one hour boundary to another, so they decide every level; the running hour's own candle counts at once (a level
+    reached resolves the market at once)."""
     PRICE_SECONDS = 30
     VOL_SECONDS = 3600
     SCAN_SECONDS = 60
@@ -6384,7 +6434,15 @@ class RangeMarket:
         return saved if isinstance(saved, dict) and saved.get("start") == self.start_ms else {}
 
     # the window and the card's wording: a stock market (StockRangeMarket) answers these differently
-    range_word = "本月"
+    @property
+    def range_word(self) -> str:
+        return "本月" if self.spec.monthly else "窗口内"
+
+    def moment(self, ms: int) -> str:
+        """A Beijing time on the card (an extreme's hour, how far the window is read): with the year when the window
+        spans two."""
+        year = dt.datetime.fromtimestamp(ms / 1000, BEIJING).strftime("%Y-") if self.spec.span_years else ""
+        return year + stamp(ms, seconds=False)
 
     @property
     def start_ms(self) -> int:
@@ -6496,15 +6554,16 @@ class RangeMarket:
                 hist["through"] = closed + 1
             if len(rows) < 1000 or running:
                 break
+            self.store.put(f"range:{self.spec.slug}", hist)  # a long window's first read (BTC to 2027: 8 pages) keeps each one
         if now_ms >= end and not running:
             hist["through"] = max(int(hist["through"]), end)  # hours without a candle had no trades
         self.running, self.scanned_ms = running, now_ms
         self.store.put(f"range:{self.spec.slug}", hist)
 
-    def marks(self) -> dict:
+    def marks(self, level: D | None = None) -> dict:
         """{'high', 'high_at', 'low', 'low_at'}: the highest High and lowest Low inside the window so far, and the hour
         each was seen in: finished hours, the running hour, the live price (only while it falls inside the window). The
-        earliest hour wins a tie."""
+        earliest hour wins a tie. (``level``: the window a level is decided on; every level shares this one.)"""
         hist, run = self.history, self.running
         highs = [(hist.get("high"), int(hist.get("high_at") or 0)), (run.get("high"), int(run.get("open") or 0))]
         lows = [(hist.get("low"), int(hist.get("low_at") or 0)), (run.get("low"), int(run.get("open") or 0))]
@@ -6812,10 +6871,202 @@ class StockRangeMarket(RangeMarket):
         return ""
 
 
+class CreatedRangeMarket(RangeMarket):
+    """A Binance pair whose levels each count "from the creation of this market" (Predict's createdAt) to the spec's end:
+    ZEC to 2027 (RangeSpec start_ms = 0). A level's window opens at the first whole minute after its market's creation
+    (the candle it was created in holds earlier prices). Markets created at different times keep windows of their own:
+    one hourly scan serves them all, each counting the hours from its first whole one, and the partial hour a market
+    was created in is read minute by minute once that hour is over. The record's own extremes are the earliest window's,
+    which holds every other one: the card shows them; a level is decided on its market's window."""
+    range_word = "窗口内"
+
+    def __init__(self, store: "Store", spec: RangeSpec, futures: Any = None):
+        super().__init__(store, spec, futures)
+        saved = store.get(f"range:{spec.slug}:created", {})
+        saved = saved if isinstance(saved, dict) else {}
+        pick = lambda key: {str(k): v for k, v in (saved.get(key) or {}).items() if isinstance(v, int) and v > 0}
+        # kept for a restart: the cards, the alerts and the paper trader may ask before Predict's listing is read again
+        self.created: dict[str, int] = pick("markets")     # market id -> createdAt (ms)
+        self.level_start: dict[str, int] = pick("levels")  # level ("500") -> its market's window start
+
+    @staticmethod
+    def opening(created_ms: int) -> int:
+        """A window's first minute: the first whole minute after the market's creation."""
+        return -(-created_ms // 60_000) * 60_000
+
+    @staticmethod
+    def first_hour(start: int) -> int:
+        """The first whole hour of a window starting at ``start``."""
+        return -(-start // 3_600_000) * 3_600_000
+
+    def starts(self) -> list[int]:
+        return sorted({self.opening(c) for c in self.created.values()})
+
+    @property
+    def start_ms(self) -> int:
+        """The earliest window's start; 0 until Predict has given a creation time."""
+        starts = self.starts()
+        return starts[0] if starts else 0
+
+    def learn(self, rows: list, meta: dict) -> None:
+        """Each level's market and that market's creation time, from Predict's listing (its details)."""
+        created, levels = dict(self.created), dict(self.level_start)
+        for row in rows:
+            details = (meta.get(row.market_id) or ({}, 0))[0] if row.market_id else {}
+            if int(details.get("created_ms") or 0) > 0:
+                created[row.market_id] = int(details["created_ms"])
+            if row.market_id in created:
+                levels[str(row.target)] = self.opening(created[row.market_id])
+        if (created, levels) != (self.created, self.level_start):
+            self.created, self.level_start = created, levels
+            self.store.put(f"range:{self.spec.slug}:created", {"markets": created, "levels": levels})
+
+    async def scan(self, now_ms: int) -> None:
+        """Extend every window's extremes with the hours finished since the last scan (one request for all of them; a
+        window first seen now has the hours since its own opening read again, which the others take as repeats), and
+        read the partial hour each window opened in, minute by minute, once that hour is over."""
+        starts, end = self.starts(), self.window_end
+        if not starts or now_ms <= starts[0]:
+            return
+        hist = dict(self.history) or {"start": starts[0], "high": None, "high_at": 0, "low": None, "low_at": 0}
+        old = hist.get("windows") or {}
+        windows = {str(s): dict(old.get(str(s)) or {"high": None, "high_at": 0, "low": None, "low_at": 0,
+                                                       "first": s == self.first_hour(s)}) for s in starts}
+        cursor = min([int(hist.get("through") or self.first_hour(starts[0]))]
+                     + [self.first_hour(s) for s in starts if str(s) not in old])
+        hist["windows"] = windows
+
+        def extend(window: dict, high: float, low: float, at: int) -> None:
+            if window["high"] is None or high > window["high"]:
+                window["high"], window["high_at"] = high, at
+            if window["low"] is None or low < window["low"]:
+                window["low"], window["low_at"] = low, at
+
+        def save() -> None:
+            hist.update({k: windows[str(starts[0])][k] for k in ("high", "high_at", "low", "low_at")}, through=cursor)
+            self.store.put(f"range:{self.spec.slug}", hist)
+
+        running: dict = {}
+        for _ in range(50):
+            if cursor >= end:
+                break
+            rows = await self.get("klines", symbol=self.spec.symbol, interval="1h", startTime=cursor,
+                                  endTime=min(now_ms, end) - 1, limit=1000)
+            if not isinstance(rows, list):  # an error object is not "no candles" (that would close the window unread)
+                raise RemoteError(f"币安小时 K 格式异常：{str(rows)[:80]}")
+            rows = [r for r in rows if isinstance(r, list) and len(r) > 6 and cursor <= int(r[0]) < end]
+            for row in rows:
+                opened, closed, high, low = int(row[0]), int(row[6]), float(row[2]), float(row[3])
+                if opened == starts[0] and hist.get("open") is None:
+                    hist["open"] = float(row[1])  # the earliest window opens on the hour: its first price
+                if closed >= now_ms:  # still running: counts now, persisted once it is over
+                    running = {"open": opened, "high": high, "low": low}
+                    continue
+                for start, window in windows.items():
+                    if self.first_hour(int(start)) <= opened:
+                        extend(window, high, low, opened)
+                cursor = closed + 1
+            if len(rows) < 1000 or running:
+                break
+            save()  # a long window's first read keeps each page
+        if now_ms >= end and not running:
+            cursor = max(cursor, end)  # hours without a candle had no trades
+        for start in starts:
+            window, hour = windows[str(start)], self.first_hour(start)
+            if window["first"] or hour > now_ms:
+                continue  # read already, or the hour it opened in is still running (the live price stands in for it)
+            minutes = await self.get("klines", symbol=self.spec.symbol, interval="1m", startTime=start,
+                                     endTime=min(hour, end) - 1, limit=60)
+            if not isinstance(minutes, list):
+                raise RemoteError(f"币安分钟 K 格式异常：{str(minutes)[:80]}")
+            minutes = [r for r in minutes if isinstance(r, list) and len(r) > 6 and start <= int(r[0]) < min(hour, end)]
+            for row in minutes:
+                extend(window, float(row[2]), float(row[3]), int(row[0]))
+            if start == starts[0] and minutes and hist.get("open") is None:
+                hist["open"] = float(minutes[0][1])
+            window["first"] = True
+        self.running, self.scanned_ms = running, now_ms
+        save()
+
+    def window_of(self, level: D | None) -> int:
+        """The start of the window a level is decided on: its market's (0 while its creation time is not known: no
+        price counts for it yet); the earliest one for the card as a whole."""
+        if level is None:
+            return self.start_ms
+        start = self.level_start.get(str(level), 0)
+        return start if start in self.starts() else 0
+
+    def marks(self, level: D | None = None) -> dict:
+        """As RangeMarket's, inside one window: the level's (see window_of). The running hour counts only for a window
+        opened before it began, the live price only once read inside the window."""
+        start = self.window_of(level)
+        if not start:
+            return {"high": None, "high_at": 0, "low": None, "low_at": 0}
+        hist, run = self.history, self.running
+        window = (hist.get("windows") or {}).get(str(start)) or {}
+        highs = [(window.get("high"), int(window.get("high_at") or 0))]
+        lows = [(window.get("low"), int(window.get("low_at") or 0))]
+        if run and self.first_hour(start) <= int(run["open"]):
+            highs.append((run.get("high"), int(run["open"])))
+            lows.append((run.get("low"), int(run["open"])))
+        if self.price is not None and start and start <= self.priced_ms < self.window_end:
+            hour = self.priced_ms - self.priced_ms % 3_600_000
+            highs.append((float(self.price), hour))
+            lows.append((float(self.price), hour))
+        high = max((x for x in highs if x[0] is not None), key=lambda x: x[0], default=(None, 0))
+        low = min((x for x in lows if x[0] is not None), key=lambda x: x[0], default=(None, 0))
+        return {"high": high[0], "high_at": high[1], "low": low[0], "low_at": low[1]}
+
+    def reached(self, level: D, direction: str) -> bool:
+        marks = self.marks(level)
+        if direction == "up":
+            return marks["high"] is not None and marks["high"] >= float(level)
+        return marks["low"] is not None and marks["low"] <= float(level)
+
+    def probability(self, level: D, direction: str, now_ms: int) -> float | None:
+        """None while the level's market's creation time is not known: which prices count is not known either."""
+        return super().probability(level, direction, now_ms) if self.window_of(level) else None
+
+    def complete(self) -> bool:
+        windows = self.history.get("windows") or {}
+        return (super().complete() and bool(self.start_ms)
+                and all((windows.get(str(s)) or {}).get("first") for s in self.starts()))
+
+    def advice_problem(self, now_ms: int) -> str:
+        if not self.start_ms:
+            return "等待 Predict 的创建时间；暂不给建议"
+        windows = self.history.get("windows") or {}
+        fresh = [s for s in self.starts() if not (windows.get(str(s)) or {}).get("first")]
+        if fresh and now_ms < self.window_end:
+            # a window not read since its opening (the scan has not reached it yet, or it opened within the running
+            # hour): a level of it may have been reached already
+            later = "：创建那一小时结束后按分钟 K 核验" if self.first_hour(fresh[0]) > now_ms else "还没核验完"
+            return f"{self.spec.label(fresh[0])}起的窗口{later}；暂不给建议"
+        return super().advice_problem(now_ms)
+
+    def window_label(self) -> str:
+        return f"市场创建后的 {self.spec.label(self.start_ms)}起" if self.start_ms else "市场创建起（时间待 Predict 确认）"
+
+    def card_extras(self, now_ms: int) -> dict:
+        starts = self.starts()
+        several = (f"；各档从自己市场的创建时间起算（{len(starts)} 个不同的创建时间，最晚 {self.spec.label(starts[-1])}）"
+                   if len(starts) > 1 else "")
+        return {"rule_note": "↑ 档：市场创建后任一 1 分钟 K 的最高价 ≥ 档位即 Yes；↓ 档：最低价 ≤ 档位即 Yes；创建之前的价格不算"
+                             "（从创建后的第一个整分钟起，创建那一小时按分钟 K）。方向按每个市场的标题" + several}
+
+    def missing_note(self, now_ms: int) -> str:
+        if not self.start_ms:
+            return "等待 Predict 的创建时间"
+        return super().missing_note(now_ms)
+
+
 def range_market(store: "Store", spec: RangeSpec, futures: Any, config: "Config") -> RangeMarket:
-    """The market object for a price-ladder spec: a Binance pair, or a US stock read from Yahoo."""
+    """The market object for a price-ladder spec: a Binance pair (over a fixed window, or from each market's creation when
+    the spec has no start), or a US stock read from Yahoo."""
     if spec.venue == "nasdaq":
         return StockRangeMarket(store, spec, config.ladder_deadlines.get(spec.key, 0))
+    if not spec.start_ms:
+        return CreatedRangeMarket(store, spec, futures)
     return RangeMarket(store, spec, futures)
 
 
@@ -7929,17 +8180,18 @@ function ladder(c,it){
     st.append(t)}
   c.append(st);return priceLadderBook(c,it,L,live)}  // the same table as the price ladders
 function priceLadder(c,it,L,det,sm){
-  // a price ladder: one Yes/No market per level, ↑ reached by a 1-minute High, ↓ by a 1-minute Low, inside the month
+  // a price ladder: one Yes/No market per level, ↑ reached by a 1-minute High, ↓ by a 1-minute Low, inside the window
+  // (a month: 本月; BTC to 2027: 窗口内). L.range_word is a stock's (its extremes are daily; it also says so below)
   c.classList.add("price-lad");det.classList.add("price-model");
   const top=$("div","price-top");top.append($("span","plabel","现价"),$("b","",L.price));c.append(top);
-  const rw=L.range_word||"本月",range=$("div","price-range"),high=$("span","",rw+"最高 "),low=$("span","","最低 ");high.append($("b","",L.high));low.append($("b","",L.low));range.append(high,low);c.append(range);
+  const rw=L.range_word||L.period||"本月",range=$("div","price-range"),high=$("span","",rw+"最高 "),low=$("span","","最低 ");high.append($("b","",L.high));low.append($("b","",L.low));range.append(high,low);c.append(range);
   sm.textContent="规则与计算明细";
   det.append(sm);const dl=$("dl"),row=(k,v)=>dl.append($("dt","",k),$("dd","",v));
   row("窗口",L.window+" → "+it.close_label);row("价格",L.price+"（"+L.venue+" "+L.symbol+"）");
   row(rw+"最高 / 最低",L.high+(L.high_at?"（"+L.high_at+(L.range_word?"）":" 那一小时）"):"")+" / "+L.low+(L.low_at?"（"+L.low_at+(L.range_word?"）":" 那一小时）"):"")+
     "："+(L.extremes_note||"币安小时 K 的最高/最低（与 1 分钟 K 一致）")+(L.through?"，已核至 "+L.through:"")+(L.range_word?"，加上今天的 1 分钟 K 和现价":"，加上正在走的这一小时和现价"));
   if(L.sigma)row("σ",(L.sigma*100).toFixed(0)+"%（"+L.sigma_note+"）｜剩 "+(L.years*365).toFixed(1)+" 天");
-  row("规则",L.rule_note||"↑ 档：本月任一 1 分钟 K 的最高价 ≥ 档位即 Yes；↓ 档：最低价 ≤ 档位即 Yes。方向按每个市场自己的规则或标题判断");
+  row("规则",L.rule_note||"↑ 档："+rw+"任一 1 分钟 K 的最高价 ≥ 档位即 Yes；↓ 档：最低价 ≤ 档位即 Yes。方向按每个市场自己的规则或标题判断");
   row("模型","零漂移、固定波动率的单边触及概率：↑ Φ((−h−s²/2)/s) + (S/K)·Φ((−h+s²/2)/s)，h = ln(K/S)；↓ Φ((−a+s²/2)/s) + (S/K)·Φ((−a−s²/2)/s)，a = ln(S/K)；s = σ√T");
   det.append(dl);c.append(det);
   const st=$("div","lstat");
@@ -7951,7 +8203,7 @@ function priceLadder(c,it,L,det,sm){
   const done=L.rows.filter(r=>r.touched),live=L.rows.filter(r=>!r.touched);
   if(done.length){const t=$("details","touched"),dk=it.name+"#touched";t.open=open.has(dk);t.addEventListener("toggle",()=>{t.open?open.add(dk):open.delete(dk)});
     t.append($("summary","","✓ 已触及 "+done.length+" 档"));const ts=$("div","tchips");
-    done.forEach(r=>{const x=$("span","tchip",r.label+(r.settled?" · 已结算":""));x.title=(r.settled?"Predict 已把这一档结算为已触及；":"")+(L.range_word||"本月")+(r.dir==="up"?"最高价":"最低价")+"已到 "+r.label.slice(2);ts.append(x)});t.append(ts);st.append(t)}
+    done.forEach(r=>{const x=$("span","tchip",r.label+(r.settled?" · 已结算":""));x.title=(r.settled?"Predict 已把这一档结算为已触及；":"")+rw+(r.dir==="up"?"最高价":"最低价")+"已到 "+r.label.slice(2);ts.append(x)});t.append(ts);st.append(t)}
   c.append(st);return priceLadderBook(c,it,L,live)}
 function priceLadderBook(c,it,L,live){
   const w=$("div","pb"),h=$("div","quote"),key=favKey(it);h.append(it.predict?openLink(it.predict.url):$("span","pt","Predict"));
@@ -11559,7 +11811,7 @@ class Bot:
             if rm is None:
                 return None
             level, direction = D(str(s["target"])), s.get("dir", "up")
-            marks = rm.marks()
+            marks = rm.marks(level)  # the level's own window (ZEC's start at each market's creation)
             high, low = marks["high"], marks["low"]
             proof = {"rule": f"窗口内任一 1 分钟 K 的{'最高价 ≥' if direction == 'up' else '最低价 ≤'} {level_label(level)} 即 Yes",
                      "source": rm.extremes_source(),
@@ -11572,7 +11824,8 @@ class Bot:
                 seen = high if direction == "up" else low
                 return 1.0, (f"{'↑' if direction == 'up' else '↓'} {level_label(level)} 已触及（{rm.spec.symbol} {rm.range_word}"
                              f"{'最高' if direction == 'up' else '最低'} {seen:,.6g}）"), proof
-            if rm.complete() and now_ms > rm.window_end + self.SIM_SETTLE_MS:
+            # read to its end without the level (and the level's own window known: ZEC's start at its market's creation)
+            if rm.complete() and now_ms > rm.window_end + self.SIM_SETTLE_MS and rm.probability(level, direction, now_ms) == 0.0:
                 return 0.0, f"整个窗口都没到 {level_label(level)}", proof
             return None
         if kind == "ladder":
@@ -12098,9 +12351,9 @@ class Bot:
         return ("up" if float(row.target) > ref else "down", "推断") if ref else (rm.spec.default_dir, "默认")
 
     @staticmethod
-    def range_guess(source: str) -> str:
+    def range_guess(source: str, rm: RangeMarket) -> str:
         """Why a level's direction is only a guess, or disputed ("" when its market says it)."""
-        return RANGE_GUESS.get(source, "")
+        return RANGE_GUESS.get(source, "").format(first="月初价格" if rm.range_word == "本月" else "开窗时的价格")
 
     def range_settled(self, row: LadderRow) -> bool:
         """Predict has settled this level's market (nothing is suggested on it any more)."""
@@ -12168,7 +12421,7 @@ class Bot:
             fair = self.range_fair(rm, row, direction, now_ms)
             book, why = self.predict.yes_book(row) if row.market_id else (None, "")
             out: dict[str, Any] = {"label": ("↑ " if direction == "up" else "↓ ") + level_label(row.target), "dir": direction,
-                                   "dir_source": source, "dir_note": self.range_guess(source), "level": float(row.target),
+                                   "dir_source": source, "dir_note": self.range_guess(source, rm), "level": float(row.target),
                                    "fair": fair, "error": why, "settled": self.range_settled(row),
                                    "dist": float(row.target / rm.price - 1) if rm.price else None}
             out.update(self.range_maker_status(row, book, now_ms))
@@ -12179,7 +12432,7 @@ class Bot:
                     out["error"] = "数据显示已触及，但盘口仍低于 90¢；以币安 1 分钟 K 为准，请核实"
                 priced = fair is not None and not out["error"]
                 swing = rm.model_swing(row.target, direction, now_ms, fair) if priced else 0.0
-                hold = problem or ("Predict 已结算" if self.range_settled(row) else "") or self.range_guess(source)
+                hold = problem or ("Predict 已结算" if self.range_settled(row) else "") or self.range_guess(source, rm)
                 self.book_block(out, book, fair if priced else None, self.edge_need(swing), swing, hold, ("Yes", "No"), now_ms,
                                 makers=out["makers"])
             out["touched"] = fair == 1.0 and "请核实" not in out["error"]
@@ -12198,12 +12451,12 @@ class Bot:
             "ladder": {"kind": "price", "metric": "价格", "price": price_text(float(rm.price) if rm.price is not None else None),
                        "spot": float(rm.price) if rm.price is not None else None,  # the page draws its line among the levels
                        "high": price_text(high), "low": price_text(low),
-                       "high_at": stamp(marks["high_at"], seconds=False) if marks["high_at"] else "",
-                       "low_at": stamp(marks["low_at"], seconds=False) if marks["low_at"] else "",
-                       "through": stamp(int(hist["through"]), seconds=False) if hist.get("through") else "",
+                       "high_at": rm.moment(marks["high_at"]) if marks["high_at"] else "",
+                       "low_at": rm.moment(marks["low_at"]) if marks["low_at"] else "",
+                       "through": rm.moment(int(hist["through"])) if hist.get("through") else "",
                        "sigma": rm.sigma, "sigma_note": rm.sigma_note(), "rows": rows, "error": rm.error, "hold": problem,
                        "symbol": spec.symbol, "venue": rm.venue_name(),
-                       "window": rm.window_label(),
+                       "window": rm.window_label(), "period": rm.range_word,
                        "years": rm.remaining_years(now_ms), **rm.card_extras(now_ms)},
         }
         if self.config.predict:

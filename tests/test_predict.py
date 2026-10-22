@@ -132,6 +132,64 @@ async def run():
     other = "x-up-or-down-on-september-29-2026"
     feed.types[other] = "X"; feed.fetch = no_field
     assert await feed.strike(other, "1") is None and "X" in feed.no_strike
+    # a category with more markets than one GraphQL page (BTC's ladder to 2027): REST lists the rest. One market REST
+    # names by another id but the same conditionId is not taken twice; a short page never asks REST
+    long_slug, rest_up, lookups = "what-price-will-bitcoin-hit-before-2027", [True], []
+    page = [{"id": str(700 + i), "conditionId": f"0x{700 + i}", "title": f"↑ {100 + 5 * i},000", "question": ""} for i in range(m.PREDICT_PAGE)]
+    async def paged(url, payload=None, size=m.PREDICT_PAGE):
+        lookups.append(url)
+        if url == m.PREDICT_GRAPHQL:
+            if "__typename" in payload["query"]:
+                return {"data": {"category": {"id": "88", "__typename": "MultiCategory"}}}
+            assert f"first: {m.PREDICT_PAGE}" in payload["query"], payload["query"]
+            return {"data": {"markets": {"edges": [{"node": n} for n in page[:size]]}}}
+        if "/markets/" in url:  # a level's details and its (empty) book
+            if url.endswith("/orderbook"):
+                return {"data": {"bids": [], "asks": []}}
+            return {"data": {"id": url.rsplit("/", 1)[1], "status": "OPEN",
+                             "outcomes": [{"name": "Yes", "indexSet": 1}, {"name": "No", "indexSet": 2}]}}
+        assert url.endswith("/categories/" + long_slug), url
+        if not rest_up[0]:
+            raise m.RemoteError("网络错误 (TimeoutError)")
+        listed = [{**n, "id": int(n["id"])} for n in page]
+        return {"success": True, "data": {"id": 88, "slug": long_slug, "markets": listed + [
+            {"id": 731, "conditionId": "0x731", "title": "↓ 60,000"}, {"id": 732, "conditionId": "0x732", "title": "↓ 50,000"},
+            {"id": 799, "conditionId": "0x705", "title": "↑ 125,000"}]}}
+    feed = m.PredictFeed(cfg); feed.fetch = paged
+    found = await feed.resolve_all(long_slug)
+    assert [x["id"] for x in found] == [str(700 + i) for i in range(m.PREDICT_PAGE)] + ["731", "732"] and long_slug not in feed.partial
+    short = m.PredictFeed(cfg); short.fetch = lambda url, payload=None: paged(url, payload, m.PREDICT_PAGE - 1)
+    n = len(lookups)
+    assert len(await short.resolve_all(long_slug)) == m.PREDICT_PAGE - 1 and not any("/categories/" in u for u in lookups[n:])
+    # REST down: the page stands and is looked up again a minute later (kept if that lookup fails altogether), not every tick
+    rest_up[0] = False
+    cut = m.PredictFeed(cfg); cut.fetch = paged
+    found = await cut.resolve_all(long_slug)
+    assert len(found) == m.PREDICT_PAGE and long_slug in cut.partial
+    cut.ladder_parse["BTC-HIT-2026"] = m.price_level  # the card's Predict line says its levels may be incomplete
+    await cut.refresh_ladder("BTC-HIT-2026", long_slug)
+    assert cut.errors["BTC-HIT-2026"] == f"档位可能不全：只读到 Predict 的前 {m.PREDICT_PAGE} 个市场，其余的 1 分钟后再读", cut.errors
+    assert len(cut.ladders["BTC-HIT-2026"]) == m.PREDICT_PAGE
+    n = len(lookups)
+    assert await cut.resolve_all(long_slug) == found and len(lookups) == n
+    cut.market_lists[long_slug] = (found, time.monotonic() - m.PREDICT_MISS_SECONDS - 1)
+    async def down(url, payload=None):
+        raise m.RemoteError("网络错误 (URLError)")
+    cut.fetch = down
+    assert await cut.resolve_all(long_slug) == found and long_slug in cut.partial
+    assert time.monotonic() - cut.market_lists[long_slug][1] < 5  # tried again in a minute, not on the next tick
+    rest_up[0], cut.fetch = True, paged
+    cut.market_lists[long_slug] = (found, time.monotonic() - m.PREDICT_MISS_SECONDS - 1)
+    assert len(await cut.resolve_all(long_slug)) == m.PREDICT_PAGE + 2 and long_slug not in cut.partial
+    await cut.refresh_ladder("BTC-HIT-2026", long_slug)
+    assert "BTC-HIT-2026" not in cut.errors and len(cut.ladders["BTC-HIT-2026"]) == m.PREDICT_PAGE + 2
+    cut.market_lists[long_slug] = (cut.market_lists[long_slug][0], time.monotonic() - 3600)
+    n = len(lookups)
+    assert len(await cut.resolve_all(long_slug)) == m.PREDICT_PAGE + 2 and len(lookups) == n  # complete: kept for good
+    # a slug no longer followed is forgotten with the others
+    cut.partial.add(long_slug); cut.refreshed = -1e9
+    await cut.refresh({})
+    assert long_slug not in cut.partial and long_slug not in cut.market_lists
     # the odds are measured against it; a proxy-mapped estimate moves with it, a live print does not
     kcfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "SKHYNIXUSDT"})
     kbot = m.Bot(kcfg, m.Store(":memory:"), FakeMarket(), tg)
