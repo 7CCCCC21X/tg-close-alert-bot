@@ -91,10 +91,15 @@ TOUCH_BTC = (
 )
 
 
+TOUCH_BNB = (
+    TouchSpec("BNB", "will-bnb-hit-700-or-900", "BNBUSDT", D("700"), D("900")),
+)
+
+
 def install() -> None:
     """Put the ended markets back into main, in their old order (the October ladders before the live ones)."""
     if any(s.key == RANGE_OCTOBER[0].key for s in main.RANGE_MARKETS):
         return
     main.UPDOWN_MARKETS, main.FLIP_MARKETS, main.CAP_MARKETS = UPDOWN_MARKETS, FLIP_MARKETS, CAP_MARKETS
     main.RANGE_MARKETS = (*RANGE_OCTOBER, *main.RANGE_MARKETS)
-    main.TOUCH_MARKETS = (*main.TOUCH_MARKETS[:2], *TOUCH_BTC, *main.TOUCH_MARKETS[2:])  # BNB, SOL, BTC, ETH
+    main.TOUCH_MARKETS = (*TOUCH_BNB, main.TOUCH_MARKETS[0], *TOUCH_BTC, *main.TOUCH_MARKETS[1:])  # BNB, SOL, BTC, ETH
