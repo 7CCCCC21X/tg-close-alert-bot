@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.42.0"
+VERSION = "1.42.2"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -483,7 +483,7 @@ class Config:
     sim_ways: str = "taker"  # which suggestions it takes: taker (吃单), maker (挂单) or both
     sim_markets: frozenset = frozenset({"close"})  # the market kinds it trades (SIM_KINDS keys); SIM_MARKETS=all for every kind
     sim_group_usd: float = 300.0  # the most one driver's positions may lose on a single move (paper $); 0 = no limit
-    touch: bool = True       # BNB $700 / $900 first-touch market card (Binance spot + Predict book)
+    touch: bool = True       # the 加密 / 价格阶梯 / 市值阶梯 cards (Binance / DexScreener prices + Predict books); BNB_TOUCH=off
     auction_alert: bool = True  # Telegram reminder when a market's closing auction starts
     preopen_alert: bool = True  # Telegram reminder before a market's pre-open auction (its first direction signal)
     preopen_lead: int = 5       # minutes before the pre-open auction starts (0 = as it starts)
@@ -4634,7 +4634,7 @@ TOUCH_DEADLINE_MS = et_ms(2026, 12, 31, 23, 59, -5)
 @dataclass(frozen=True)
 class TouchSpec:
     """One "which price is hit first" market: Binance spot pair, the two barriers, and its Predict slug."""
-    key: str          # item / book key, e.g. BNB
+    key: str          # item / book key, e.g. SOL
     slug: str
     symbol: str       # Binance spot pair (the resolution source)
     low: D
@@ -4655,7 +4655,7 @@ class TouchSpec:
 
 
 TOUCH_MARKETS = (
-    TouchSpec("BNB", "will-bnb-hit-700-or-900", "BNBUSDT", D("700"), D("900")),
+    # BNB 先触 700/900 hit $700 and resolved on Predict (its book now answers HTTP 400): removed
     TouchSpec("SOL", "will-solana-hit-60-or-140-first", "SOLUSDT", D("60"), D("140"),
               int(dt.datetime(2026, 3, 12, 13, 27, 8, 415000, tzinfo=dt.timezone.utc).timestamp() * 1000)),
     # BTC 先触 70k/90k (window 08-25 – 10-25 23:59 ET) ended and was removed
@@ -4852,7 +4852,7 @@ class TouchMarket:
             if mono - self.times["price"] >= self.PRICE_SECONDS:
                 self.times["price"] = mono
                 data = await self.get("ticker/price", symbol=self.spec.symbol)
-                self.price, self.priced_ms = number(data["price"], "BNB"), now_ms
+                self.price, self.priced_ms = number(data["price"], self.spec.key), now_ms
                 if (self.price <= self.spec.low or self.price >= self.spec.high) and self.history.get("kind") in {None, "clear"}:
                     self.times["scan"] = -1e9  # the price is at a line right now: check the path at once, not in 5 minutes
             if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
@@ -6051,12 +6051,9 @@ RANGE_MARKETS = (
 
 
 # --- a US stock's "hits $X by <date>" market: TradingView 1-minute candles of the regular session, read from Yahoo -----------
-STOCK_HIT_MARKETS = (
-    # "any TradingView 1 minute candle for STRC between market creation and the listed date, 11:59 PM ET, has a final
-    # High of at least $100" (NASDAQ:STRC). The window is read from Predict: the market's createdAt and the date its title
-    # names (start_ms / end_ms = 0 here); LADDER_DEADLINES=STRC-100=2026-12-31 pins the deadline by hand.
-    RangeSpec("STRC-100", "strc-hits-100-by-20260618001620693", "STRC", "nasdaq", "STRC 触及 $100", 0, 0),
-)
+# none open: STRC 触及 $100 has ended and was removed. A new one is a RangeSpec(key, slug, ticker, "nasdaq", name, 0, 0): the
+# window is read from Predict (createdAt and the date its title names); LADDER_DEADLINES=<key>=<date> pins the deadline by hand.
+STOCK_HIT_MARKETS: tuple[RangeSpec, ...] = ()
 YAHOO_CHART = ("https://query1.finance.yahoo.com/v8/finance/chart/", "https://query2.finance.yahoo.com/v8/finance/chart/")
 # NYSE / Nasdaq closures and 13:00 ET early closes, 2026–2027 (weekends are never sessions)
 US_MARKET_HOLIDAYS = frozenset({
