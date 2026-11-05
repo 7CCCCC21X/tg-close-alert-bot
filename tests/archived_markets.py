@@ -1,4 +1,4 @@
-"""Markets that have ended and were taken out of main.py (TOUCH / UPDOWN / FLIP / CAP / RANGE_MARKETS), kept here as fixtures.
+"""Markets that have ended and were taken out of main.py (TOUCH / UPDOWN / FLIP / CAP / RANGE / STOCK_HIT_MARKETS), kept here as fixtures.
 
 offline.py puts them back into main before any suite runs, so the 涨跌 / 反超 / 市值阶梯 cards and the monthly price ladder keep
 their test coverage (and the fixtures, times and card lists the suites were written against) while the bot no longer shows them.
@@ -96,10 +96,19 @@ TOUCH_BNB = (
 )
 
 
+STOCK_HIT = (
+    # "any TradingView 1 minute candle for STRC between market creation and the listed date, 11:59 PM ET, has a final
+    # High of at least $100" (NASDAQ:STRC). The window is read from Predict: the market's createdAt and the date its title
+    # names (start_ms / end_ms = 0 here); LADDER_DEADLINES=STRC-100=2026-12-31 pins the deadline by hand.
+    RangeSpec("STRC-100", "strc-hits-100-by-20260618001620693", "STRC", "nasdaq", "STRC 触及 $100", 0, 0),
+)
+
+
 def install() -> None:
     """Put the ended markets back into main, in their old order (the October ladders before the live ones)."""
     if any(s.key == RANGE_OCTOBER[0].key for s in main.RANGE_MARKETS):
         return
     main.UPDOWN_MARKETS, main.FLIP_MARKETS, main.CAP_MARKETS = UPDOWN_MARKETS, FLIP_MARKETS, CAP_MARKETS
     main.RANGE_MARKETS = (*RANGE_OCTOBER, *main.RANGE_MARKETS)
+    main.STOCK_HIT_MARKETS = STOCK_HIT
     main.TOUCH_MARKETS = (*TOUCH_BNB, main.TOUCH_MARKETS[0], *TOUCH_BTC, *main.TOUCH_MARKETS[1:])  # BNB, SOL, BTC, ETH
