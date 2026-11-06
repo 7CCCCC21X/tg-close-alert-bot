@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.42.2"
+VERSION = "1.43.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4659,6 +4659,10 @@ TOUCH_MARKETS = (
     TouchSpec("SOL", "will-solana-hit-60-or-140-first", "SOLUSDT", D("60"), D("140"),
               int(dt.datetime(2026, 3, 12, 13, 27, 8, 415000, tzinfo=dt.timezone.utc).timestamp() * 1000)),
     # BTC 先触 70k/90k (window 08-25 – 10-25 23:59 ET) ended and was removed
+    # its successor: "between November 5th 2026 at 9:00 AM ET (EST) and May 5th, 2027 at 11:59 PM ET (EDT)"; Binance BTC/USDT
+    # 1-minute High / Low. Its own key: the old one's unconfirmed paper trades look their card up by "BTC"
+    TouchSpec("BTC-2027", "will-btc-hit-70000-or-90000-first-before-may-6-2027", "BTCUSDT", D("70000"), D("90000"),
+              et_ms(2026, 11, 5, 9, 0, -5), et_ms(2027, 5, 5, 23, 59, -4), -4, fixed_start=True),
     # window opens at the market's creation (from Predict; the rules give no date)
     TouchSpec("ETH", "will-ethereum-hit-1k-or-3k-first", "ETHUSDT", D("1000"), D("3000")),
 )
@@ -5218,17 +5222,25 @@ class FlipSpec:
     name: str        # card title
     coin: str        # the one that has to climb (HYPE)
     other: str       # the one it has to pass (SOL)
-    start_ms: int    # open time of the first 1-minute candle that counts
+    start_ms: int    # open time of the first 1-minute candle that counts; 0 = from the market's creation (Predict createdAt)
     end_ms: int      # open time of the last one
 
     def window(self) -> str:
+        if not self.start_ms:
+            et_end = dt.datetime.fromtimestamp(self.end_ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(self.end_ms))))
+            return f"市场创建 – {et_end:%m-%d %H:%M} ET（北京 {stamp(self.end_ms, seconds=False)}）"
         et = lambda ms: dt.datetime.fromtimestamp(ms / 1000, dt.timezone(dt.timedelta(hours=us_eastern_offset(ms)))).strftime("%m-%d %H:%M")
         return (f"{et(self.start_ms)} – {et(self.end_ms)} ET（北京 {stamp(self.start_ms, seconds=False)} – "
                 f"{stamp(self.end_ms, seconds=False)}）")
 
 
 # none open: the October 2026 ones (HYPE 反超 SOL) ended 10-31 23:59 ET and were removed; add new ones here
-FLIP_MARKETS: tuple[FlipSpec, ...] = ()
+FLIP_MARKETS: tuple[FlipSpec, ...] = (
+    # "between market creation and November 30, 2026, 11:59 PM ET" (EST): the HYPE/USDC and SOL/USDC 1-minute closes with
+    # the same timestamp on Hyperliquid; the window opens at Predict's createdAt (start_ms 0), first whole minute after it
+    FlipSpec("HYPE-SOL-12", "will-hype-flip-sol-by-december-2026", "HYPE 反超 SOL", "HYPE", "SOL",
+             0, et_ms(2026, 11, 30, 23, 59, -5)),
+)
 
 
 def short_price(value: D | None) -> str:
@@ -5263,13 +5275,26 @@ class FlipMarket:
     SCAN_STALE_MS = 3 * 3600_000    # the path check must reach this close to now before advice is given
 
     def __init__(self, store: "Store", spec: FlipSpec):
-        self.store, self.spec = store, spec
+        self.store, self.spec, self.base = store, spec, spec  # spec: base with the learned window start (start_ms 0 = from creation)
         self.prices: dict[str, D] = {}
         self.priced_ms = 0
         self.sigma: float | None = None
         self.sigma_ms = 0
         self.error = ""
         self.times = {"price": -1e9, "vol": -1e9, "scan": -1e9}
+        if not spec.start_ms:
+            self.learn_created(int(store.get(f"flip:{spec.slug}:created") or 0))  # a restart prices at once
+
+    def learn_created(self, created_ms: int) -> None:
+        """A window that opens at the market's creation starts with the first whole minute after Predict's createdAt
+        (the minute it was created in began before it). Kept in SQLite; a changed creation time re-checks from it."""
+        if self.base.start_ms or created_ms <= 0:
+            return
+        start = -(-created_ms // 60_000) * 60_000
+        if start != self.spec.start_ms:
+            self.spec = dataclasses.replace(self.base, start_ms=start)
+            self.times["scan"] = -1e9
+            self.store.put(f"flip:{self.base.slug}:created", created_ms)
 
     async def info(self, payload: dict) -> Any:
         return await http_json(Hyperliquid.URL, payload)
@@ -5316,7 +5341,7 @@ class FlipMarket:
                 self.sigma, self.sigma_ms = ratio_vol(a, b, now_ms), now_ms
             except Exception as error:
                 errors.append(f"波动率：{clean_error(error) or type(error).__name__}")
-        if mono - self.times["scan"] >= self.SCAN_SECONDS:
+        if self.spec.start_ms and mono - self.times["scan"] >= self.SCAN_SECONDS:  # no window start yet: nothing to check
             self.times["scan"] = mono
             try:
                 await self.scan(now_ms)
@@ -5378,6 +5403,8 @@ class FlipMarket:
         if hist.get("kind") == "flip":
             return 1.0
         why = f"（{brief_error(self.error, 60)}）" if self.error else ""
+        if not spec.start_ms:
+            return f"等待 Predict 的市场创建时间（窗口从创建起算）{why}"
         if now_ms >= spec.end_ms + 60_000:
             if hist.get("kind") == "clear" and int(hist.get("through") or 0) >= spec.end_ms + 60_000:
                 return 0.0
@@ -5406,6 +5433,8 @@ class FlipMarket:
         hist, kind = self.history, self.history.get("kind")
         if kind == "flip":
             return ""
+        if not self.spec.start_ms:
+            return "等待 Predict 的市场创建时间；暂不给建议"
         if now_ms > self.spec.start_ms + self.SCAN_STALE_MS:
             if kind != "clear":
                 return "窗口开始以来是否反超尚未核验；暂不给建议"
@@ -5420,6 +5449,8 @@ class FlipMarket:
         spec, hist = self.spec, self.history
         if hist.get("kind") == "flip":
             return (f"已于 {stamp(hist['time'], seconds=False)} 这一分钟反超：{spec.coin} {hist['a']:g} > {spec.other} {hist['b']:g}")
+        if not spec.start_ms:
+            return "等待 Predict 的市场创建时间（窗口从创建后的第一个整分钟起）"
         if now_ms < spec.start_ms:
             return f"窗口北京 {stamp(spec.start_ms, seconds=False)} 开始"
         if hist.get("kind") == "clear":
@@ -13969,6 +14000,7 @@ class Bot:
 
     async def refresh_flip(self, now_ms: int) -> Refreshed:
         for fm in self.flips.values():
+            fm.learn_created(int((self.predict.info.get(fm.base.slug) or {}).get("created_ms") or 0))
             await fm.refresh(now_ms)
         failed = [f"{key}：{fm.error}" for key, fm in self.flips.items() if fm.error]
         return refreshed(failed, len(self.flips) - len(failed))

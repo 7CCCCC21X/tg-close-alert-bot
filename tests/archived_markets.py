@@ -2,6 +2,8 @@
 
 offline.py puts them back into main before any suite runs, so the 涨跌 / 反超 / 市值阶梯 cards and the monthly price ladder keep
 their test coverage (and the fixtures, times and card lists the suites were written against) while the bot no longer shows them.
+Markets added later that replaced one of these (BTC 先触 before May 2027, HYPE 反超 SOL by December) are left out of the
+installed lists so the old suites see the set they were written against; LIVE_TOUCH / LIVE_FLIP keep main's own lists.
 """
 import main
 from main import D, CapSpec, FlipSpec, RangeSpec, TouchSpec, UpDownSpec, et_ms
@@ -104,6 +106,10 @@ STOCK_HIT = (
 )
 
 
+# the live lists as main.py has them, before install() swaps in the old set (tests/test_newmarkets.py covers these)
+LIVE_TOUCH, LIVE_FLIP = main.TOUCH_MARKETS, main.FLIP_MARKETS
+
+
 def install() -> None:
     """Put the ended markets back into main, in their old order (the October ladders before the live ones)."""
     if any(s.key == RANGE_OCTOBER[0].key for s in main.RANGE_MARKETS):
@@ -111,4 +117,5 @@ def install() -> None:
     main.UPDOWN_MARKETS, main.FLIP_MARKETS, main.CAP_MARKETS = UPDOWN_MARKETS, FLIP_MARKETS, CAP_MARKETS
     main.RANGE_MARKETS = (*RANGE_OCTOBER, *main.RANGE_MARKETS)
     main.STOCK_HIT_MARKETS = STOCK_HIT
-    main.TOUCH_MARKETS = (*TOUCH_BNB, main.TOUCH_MARKETS[0], *TOUCH_BTC, *main.TOUCH_MARKETS[1:])  # BNB, SOL, BTC, ETH
+    sol, eth = (next(s for s in LIVE_TOUCH if s.key == k) for k in ("SOL", "ETH"))
+    main.TOUCH_MARKETS = (*TOUCH_BNB, sol, *TOUCH_BTC, eth)  # BNB, SOL, BTC, ETH: the set the suites were written against
