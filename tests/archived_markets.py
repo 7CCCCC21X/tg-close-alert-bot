@@ -2,7 +2,7 @@
 
 offline.py puts them back into main before any suite runs, so the 涨跌 / 反超 / 市值阶梯 cards and the monthly price ladder keep
 their test coverage (and the fixtures, times and card lists the suites were written against) while the bot no longer shows them.
-Markets added later that replaced one of these (BTC 先触 before May 2027, HYPE 反超 SOL by December) are left out of the
+Markets added later that replaced one of these (BTC 先触 before May 2027, BNB 先触 600/800, HYPE 反超 SOL by December) are left out of the
 installed lists so the old suites see the set they were written against; LIVE_TOUCH / LIVE_FLIP keep main's own lists.
 """
 import main

@@ -1,5 +1,6 @@
-"""The markets added in 1.43.0: HYPE 反超 SOL by December 2026 (the window opens at the market's creation, read from Predict)
-and BTC 先触 $70k / $90k before May 6 2027 (a fixed window from the rules). The suites written for the earlier HYPE 反超 SOL
+"""The markets added in 1.43.0 / 1.44.0: HYPE 反超 SOL by December 2026 (the window opens at the market's creation, read from
+Predict), BTC 先触 $70k / $90k before May 6 2027 (a fixed window from the rules) and BNB 先触 $600 / $800 (from creation to
+May 5 2027). The suites written for the earlier HYPE 反超 SOL
 and BTC 先触 see the old set (tests/archived_markets.py); this one runs on the lists main.py has."""
 import asyncio, sys, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
@@ -12,9 +13,10 @@ utc = lambda *a: int(dt.datetime(*a, tzinfo=dt.timezone.utc).timestamp() * 1000)
 
 # this process runs on main's own touch / flip lists (the other kinds stay as offline.py installed them)
 m.TOUCH_MARKETS, m.FLIP_MARKETS = archived_markets.LIVE_TOUCH, archived_markets.LIVE_FLIP
-assert [s.key for s in m.TOUCH_MARKETS] == ["SOL", "BTC-2027", "ETH"], [s.key for s in m.TOUCH_MARKETS]
+assert [s.key for s in m.TOUCH_MARKETS] == ["SOL", "BTC-2027", "BNB-2027", "ETH"], [s.key for s in m.TOUCH_MARKETS]
 (FLIP,) = m.FLIP_MARKETS
 BTC = next(s for s in m.TOUCH_MARKETS if s.key == "BTC-2027")
+BNB = next(s for s in m.TOUCH_MARKETS if s.key == "BNB-2027")
 
 # --- BTC 先触 $70k / $90k: "between November 5th 2026 at 9:00 AM ET and May 5th, 2027 at 11:59 PM ET" ------------------
 assert BTC.slug == "will-btc-hit-70000-or-90000-first-before-may-6-2027" and BTC.symbol == "BTCUSDT"
@@ -28,6 +30,17 @@ assert m.TouchMarket(m.Store(":memory:"), BTC).start_ms == BTC.created_ms
 # its own key: the earlier BTC 先触's unconfirmed paper trades look their card up by "BTC"; one risk group with every BTCUSDT market
 assert BTC.key != archived_markets.TOUCH_BTC[0].key
 assert m.market_driver("touch", "BTC-2027") == ("BTCUSDT", "BTC") == m.market_driver("range", "BTC-HIT-2026")
+
+# --- BNB 先触 $600 / $800: "between the creation of this market and May 5th 2027 at 11:59 PM ET" ----------------------
+assert BNB.slug == "will-bnb-hit-600-or-800-first" and BNB.symbol == "BNBUSDT" and (BNB.low, BNB.high) == (D("600"), D("800"))
+assert BNB.created_ms == 0 and not BNB.fixed_start  # the window opens at Predict's createdAt (the rules name no date)
+assert BNB.deadline_ms == BTC.deadline_ms == utc(2027, 5, 6, 3, 59) and BNB.et_offset == -4
+assert BNB.close_label() == "05-05 23:59 ET（北京 05-06 11:59）截止；都没碰到按 50/50 结算", BNB.close_label()
+assert BNB.label(BNB.low) == "600" and BNB.label(BNB.high) == "800"
+assert m.touch_outcome("$600", BNB) == "low" and m.touch_outcome("$800", BNB) == "high" and m.touch_outcome("$1,600", BNB) == ""
+assert m.TouchMarket(m.Store(":memory:"), BNB).start_ms == 0  # unknown until Predict says
+# its own key: the earlier BNB 先触 700/900's unconfirmed paper trades look their card up by "BNB"
+assert BNB.key != archived_markets.TOUCH_BNB[0].key and m.market_driver("touch", BNB.key) == ("BNBUSDT", "BNB")
 
 # --- HYPE 反超 SOL by December: "between market creation and November 30, 2026, 11:59 PM ET" ----------------------------
 assert FLIP.slug == "will-hype-flip-sol-by-december-2026" and (FLIP.coin, FLIP.other) == ("HYPE", "SOL")
@@ -116,17 +129,25 @@ async def run():
         def now_ms(self): return NOW
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"})
     bot = m.Bot(cfg, m.Store(":memory:"), FM(), None)
-    assert set(bot.touches) == {"SOL", "BTC-2027", "ETH"} and set(bot.flips) == {"HYPE-SOL-12"}
+    assert set(bot.touches) == {"SOL", "BTC-2027", "BNB-2027", "ETH"} and set(bot.flips) == {"HYPE-SOL-12"}
     targets = bot.predict_targets(NOW)
-    assert targets["BTC-2027"] == BTC.slug and targets["HYPE-SOL-12"] == FLIP.slug
-    assert {BTC.slug, FLIP.slug} <= bot.predict.want_info
+    assert targets["BTC-2027"] == BTC.slug and targets["BNB-2027"] == BNB.slug and targets["HYPE-SOL-12"] == FLIP.slug
+    assert {BTC.slug, BNB.slug, FLIP.slug} <= bot.predict.want_info
+    # BNB's window opens at Predict's createdAt (BTC's stays at the rules' 11-05 09:00 ET whatever Predict says)
+    bnb, btc = bot.touches["BNB-2027"], bot.touches["BTC-2027"]
+    async def quiet(now_ms): pass
+    bnb.refresh = btc.refresh = quiet
+    bot.predict.info[BNB.slug] = {"outcomes": ["$600", "$800"], "created_ms": CREATED}
+    bot.predict.info[BTC.slug] = {"outcomes": ["$70,000", "$90,000"], "created_ms": CREATED + 9 * H}
+    await bot.refresh_touch(NOW)
+    assert bnb.start_ms == CREATED and btc.start_ms == BTC.created_ms, (bnb.start_ms, btc.start_ms)
     bfm = bot.flips["HYPE-SOL-12"]
     bfm.info = World(NOW).info
     bot.predict.info[FLIP.slug] = {"outcomes": ["Yes", "No"], "created_ms": CREATED}
     await bot.refresh_flip(NOW)
     assert bfm.spec.start_ms == START and bfm.history.get("kind") == "clear", (bfm.spec.start_ms, bfm.history, bfm.error)
     names = [i["name"] for i in bot.odds_payload()["items"]]
-    assert "BTC 先触 70k/90k" in names and "HYPE 反超 SOL" in names, names
+    assert "BTC 先触 70k/90k" in names and "BNB 先触 600/800" in names and "HYPE 反超 SOL" in names, names
     card = next(i for i in bot.odds_payload()["items"] if i["name"] == "HYPE 反超 SOL")
     assert card["flip"]["window"] == "11-05 10:31 – 11-30 23:59 ET（北京 11-05 23:31 – 12-01 12:59）", card["flip"]["window"]
     assert card["close_label"].startswith("11-05 10:31 – 11-30 23:59 ET")
