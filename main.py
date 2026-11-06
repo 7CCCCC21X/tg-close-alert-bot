@@ -45,7 +45,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.43.0"
+VERSION = "1.44.0"
 LOG = logging.getLogger("close-alert")
 NAMES = {"UNITREEUSDT": "宇树 UNITREE", "HK0625USDT": "SHEIN 希音",
          "CXMTUSDT": "长鑫 CXMT", "SKHYNIXUSDT": "SK 海力士"}
@@ -4663,6 +4663,10 @@ TOUCH_MARKETS = (
     # 1-minute High / Low. Its own key: the old one's unconfirmed paper trades look their card up by "BTC"
     TouchSpec("BTC-2027", "will-btc-hit-70000-or-90000-first-before-may-6-2027", "BTCUSDT", D("70000"), D("90000"),
               et_ms(2026, 11, 5, 9, 0, -5), et_ms(2027, 5, 5, 23, 59, -4), -4, fixed_start=True),
+    # "between the creation of this market and May 5th 2027 at 11:59 PM ET" (EDT); Binance BNB/USDT 1-minute High / Low.
+    # The window opens at Predict's createdAt. Its own key: the earlier BNB 先触 700/900's paper trades look their card up by "BNB"
+    TouchSpec("BNB-2027", "will-bnb-hit-600-or-800-first", "BNBUSDT", D("600"), D("800"),
+              0, et_ms(2027, 5, 5, 23, 59, -4), -4),
     # window opens at the market's creation (from Predict; the rules give no date)
     TouchSpec("ETH", "will-ethereum-hit-1k-or-3k-first", "ETHUSDT", D("1000"), D("3000")),
 )

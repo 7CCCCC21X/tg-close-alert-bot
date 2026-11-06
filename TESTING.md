@@ -1,9 +1,10 @@
 # 测试与交付状态
 
-版本：1.43.0
+版本：1.44.0
 
 ## 已完成
 
+- 1.44.0（新增 BNB 先触 600/800）：`TOUCH_MARKETS` 加 `BNB-2027`（will-bnb-hit-600-or-800-first，卡片“BNB 先触 600/800”），窗口从市场创建到 2027-05-05 23:59 ET（EDT），币安 BNB/USDT 1 分钟 K 最高 / 最低价，都没碰到 50/50。规则没写具体起点，和 ETH 先触一样从 Predict 市场详情的 createdAt 起算（先触卡本来就支持）。用新代码，不复用上一期的 `BNB`（上一期还没确认的模拟交易按代码找卡片）。tests/test_newmarkets.py 加 BNB 的规格、截止标签、结果名称识别（$600 / $800，$1,600 不误认）、风险分组，以及 Bot 从 predict.info 学到 BNB 的起点而 BTC-2027 仍用规则写死的起点；49/49 通过。不装回旧市场时网页卡片清单为 上证指数、宇树、SOL / BTC / BNB / ETH 先触、HYPE 反超 SOL、BTC / ZEC 2026年价格、模拟交易。
 - 1.43.0（新增 HYPE 12 月前反超 SOL、BTC 先触 70k/90k 2027-05 期）：`FLIP_MARKETS` 加 `HYPE-SOL-12`（will-hype-flip-sol-by-december-2026，窗口从市场创建到 11-30 23:59 ET），`TOUCH_MARKETS` 加 `BTC-2027`（will-btc-hit-70000-or-90000-first-before-may-6-2027，窗口 11-05 09:00 ET 至 2027-05-05 23:59 ET，起点按规则固定）。两个都用新代码，不复用上一期的 `HYPE-SOL` / `BTC`：上一期还没确认的模拟交易按代码找卡片做本地预结算，复用会让新一期的数据去结算旧交易。反超卡原来只支持规则写死的起点，现在 `start_ms=0` 表示从市场创建起算：`FlipMarket.learn_created` 从 Predict 市场详情的 createdAt 学到起点（创建后的第一个整分钟，和 ZEC 价格阶梯同一口径），存 SQLite（`flip:<slug>:created`），换了创建时间就从新起点重新核验；读到前不核验路径、不给概率和建议，卡片和状态写“等待 Predict 的市场创建时间”。这个容器连不到 Predict 的接口，没法事先查到创建时间写进代码，所以运行时读取。测试：新增 tests/test_newmarkets.py（规格、ET 冬夏令时换算后的窗口和截止标签、没有创建时间时不扫路径不给概率、创建那一分钟的反超不算、学到起点后核验与概率、重启从 SQLite 恢复、之后某分钟反超即 Yes、Bot 从 predict.info 学到起点并出两张卡）；把起点改成向下取整时这个测试会失败。tests/archived_markets.py 给旧套件装回旧的四张先触（BNB / SOL / BTC / ETH）和旧反超，新增的两张不进旧套件，`LIVE_TOUCH` / `LIVE_FLIP` 保留 main 自己的列表。49/49 通过。
 - 1.42.2（删除 STRC）：STRC 触及 $100 已结束，从 `STOCK_HIT_MARKETS` 移除（列表现在为空，美股触及卡的代码和 `LADDER_DEADLINES` 保留，新增同类市场照旧加一行），“价格阶梯”栏剩 BTC、ZEC 2026年价格；/diag 不再探测“美股触及·STRC”（这组探测跟着卡片走）。规格搬到 tests/archived_markets.py，测试照旧装回，48/48 通过；不装回旧市场时 test_smoke / test_ui / test_board / test_predict 通过，test_web 卡片清单为 上证指数、宇树、SOL / ETH 先触、BTC / ZEC 2026年价格、模拟交易。.env.example 的 LADDER_DEADLINES 示例改成通用写法。
 - 1.42.1（删除 BNB 先触）：BNB 先触 700/900 已经触及 $700（卡片 100¢），Predict 上已结算，订单簿请求返回 “HTTP 400: failed to parse path `param0`”，卡片一直挂着这条错误。从 `TOUCH_MARKETS` 移除，“加密”栏剩 SOL、ETH 先触。先触卡片读现价失败时的报错标签原来写死为“BNB”，改为各卡自己的代码（SOL / ETH）。BNB 的规格搬到 tests/archived_markets.py，测试照旧装回，48/48 通过；不装回旧市场时 test_smoke / test_ui / test_board / test_predict 通过，test_web 卡片清单为 上证指数、宇树、SOL / ETH 先触、BTC / ZEC 2026年价格、STRC、模拟交易。
