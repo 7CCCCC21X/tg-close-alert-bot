@@ -1,7 +1,8 @@
 """The markets added in 1.43.0 / 1.44.0: HYPE 反超 SOL by December 2026 (the window opens at the market's creation, read from
 Predict), BTC 先触 $70k / $90k before May 6 2027 (a fixed window from the rules) and BNB 先触 $600 / $800 (from creation to
 May 5 2027). The suites written for the earlier HYPE 反超 SOL
-and BTC 先触 see the old set (tests/archived_markets.py); this one runs on the lists main.py has."""
+and BTC 先触 see the old set (tests/archived_markets.py); this one runs on main's flip list and on its touch list with the two
+1.43 / 1.44 touch markets put back (they resolved early and were removed in 1.44.1)."""
 import asyncio, sys, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
@@ -12,7 +13,10 @@ H = m.HOUR_MS
 utc = lambda *a: int(dt.datetime(*a, tzinfo=dt.timezone.utc).timestamp() * 1000)
 
 # this process runs on main's own touch / flip lists (the other kinds stay as offline.py installed them)
-m.TOUCH_MARKETS, m.FLIP_MARKETS = archived_markets.LIVE_TOUCH, archived_markets.LIVE_FLIP
+# main.py has only SOL and ETH left; BTC-2027 and BNB-2027 resolved and were removed (1.44.1): they come from the fixtures
+assert [s.key for s in archived_markets.LIVE_TOUCH] == ["SOL", "ETH"], [s.key for s in archived_markets.LIVE_TOUCH]
+m.TOUCH_MARKETS = (archived_markets.LIVE_TOUCH[0], *archived_markets.TOUCH_2027, archived_markets.LIVE_TOUCH[1])
+m.FLIP_MARKETS = archived_markets.LIVE_FLIP
 assert [s.key for s in m.TOUCH_MARKETS] == ["SOL", "BTC-2027", "BNB-2027", "ETH"], [s.key for s in m.TOUCH_MARKETS]
 (FLIP,) = m.FLIP_MARKETS
 BTC = next(s for s in m.TOUCH_MARKETS if s.key == "BTC-2027")
