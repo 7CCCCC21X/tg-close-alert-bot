@@ -2,7 +2,8 @@
 
 offline.py puts them back into main before any suite runs, so the 涨跌 / 反超 / 市值阶梯 cards and the monthly price ladder keep
 their test coverage (and the fixtures, times and card lists the suites were written against) while the bot no longer shows them.
-Markets added later that replaced one of these (BTC 先触 before May 2027, BNB 先触 600/800, HYPE 反超 SOL by December) are left out of the
+Markets added later that replaced one of these (HYPE 反超 SOL by December; BTC 先触 before May 2027 and BNB 先触 600/800, now
+ended too and kept in TOUCH_2027 for tests/test_newmarkets.py) are left out of the
 installed lists so the old suites see the set they were written against; LIVE_TOUCH / LIVE_FLIP keep main's own lists.
 """
 import main
@@ -105,6 +106,17 @@ STOCK_HIT = (
     RangeSpec("STRC-100", "strc-hits-100-by-20260618001620693", "STRC", "nasdaq", "STRC 触及 $100", 0, 0),
 )
 
+
+TOUCH_2027 = (
+    # its successor: "between November 5th 2026 at 9:00 AM ET (EST) and May 5th, 2027 at 11:59 PM ET (EDT)"; Binance BTC/USDT
+    # 1-minute High / Low. Its own key: the old one's unconfirmed paper trades look their card up by "BTC"
+    TouchSpec("BTC-2027", "will-btc-hit-70000-or-90000-first-before-may-6-2027", "BTCUSDT", D("70000"), D("90000"),
+              et_ms(2026, 11, 5, 9, 0, -5), et_ms(2027, 5, 5, 23, 59, -4), -4, fixed_start=True),
+    # "between the creation of this market and May 5th 2027 at 11:59 PM ET" (EDT); Binance BNB/USDT 1-minute High / Low.
+    # The window opens at Predict's createdAt. Its own key: the earlier BNB 先触 700/900's paper trades look their card up by "BNB"
+    TouchSpec("BNB-2027", "will-bnb-hit-600-or-800-first", "BNBUSDT", D("600"), D("800"),
+              0, et_ms(2027, 5, 5, 23, 59, -4), -4),
+)
 
 # the live lists as main.py has them, before install() swaps in the old set (tests/test_newmarkets.py covers these)
 LIVE_TOUCH, LIVE_FLIP = main.TOUCH_MARKETS, main.FLIP_MARKETS
